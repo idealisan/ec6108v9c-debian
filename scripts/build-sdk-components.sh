@@ -19,13 +19,39 @@ mkdir -p "$DIST"
 
 cd "$SDK"
 
+# SDK needs the upstream kernel tarball in third_party/open_source
+OPEN_SRC="$SDK/third_party/open_source"
+KTAR="$OPEN_SRC/linux-4.4.35.tar.gz"
+mkdir -p "$OPEN_SRC"
+if [ ! -s "$KTAR" ] || [ "$(stat -c%s "$KTAR")" -lt 10000000 ]; then
+  echo "== fetching linux-4.4.35.tar.gz =="
+  rm -f "$KTAR"
+  for m in cdn.kernel.org/pub/linux/kernel/v4.x \
+           mirrors.edge.kernel.org/pub/linux/kernel/v4.x \
+           mirrors.tuna.tsinghua.edu.cn/kernel/v4.x; do
+    echo "   trying https://$m"
+    if curl -fSL --retry 3 --retry-delay 5 --max-time 1800 \
+         -o "$KTAR.part" "https://$m/linux-4.4.35.tar.gz"; then
+      mv "$KTAR.part" "$KTAR"
+      break
+    fi
+    rm -f "$KTAR.part"
+  done
+fi
+[ -s "$KTAR" ] || { echo "linux-4.4.35.tar.gz not available" >&2; exit 1; }
+ls -lh "$KTAR"
+
 echo "== configure SDK for $BOARD =="
 cp -f "configs/hi3798mv100/$BOARD"_cfg.mak ./cfg.mak
 # shellcheck disable=SC1091
 source ./env.sh
 
-echo "== build prebuilts + hiboot + kernel =="
-make prebuilts hiboot linux -j"$JOBS"
+echo "== build prebuilts =="
+make prebuilts
+echo "== build hiboot =="
+make hiboot
+echo "== build kernel (linux 4.4) =="
+make linux -j"$JOBS"
 
 echo "== locate SDK outputs =="
 FB=$(find out -type f -name 'fastboot-burn.bin' | head -1)

@@ -56,7 +56,11 @@ owner=zjkanjie; repo=HiSTBLinuxV100R005C00SPC060
 sha=$(resolve_sha "$owner" "$repo")
 echo "== $owner/$repo @ $sha (fastboot subset) =="
 full="$WORK/tmp/spc060.tar.gz"
-if [ ! -f "$full" ]; then
+cached="build/cache/sdk-$sha.tar.gz"
+if [ -f "$cached" ]; then
+  echo "   reusing $cached"
+  full="$cached"
+elif [ ! -f "$full" ]; then
   curl -fSL --retry 5 --retry-delay 5 --max-time 3600 \
     -o "$full" "https://codeload.github.com/$owner/$repo/tar.gz/$sha"
 fi
