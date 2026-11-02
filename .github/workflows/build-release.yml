@@ -1,0 +1,89 @@
+name: build-release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/build-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Init kernel submodule (shallow, pinned commit)
+        run: git submodule update --init --depth 1 third_party/linux-hi3798mv100
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabihf u-boot-tools bc bison flex libssl-dev libelf-dev \
+            lz4 zstd xz-utils cpio rsync \
+            debootstrap qemu-user-static binfmt-support e2fsprogs zip
+
+      - name: Build kernel (hi_kernel.bin + modules.tar.gz)
+        run: bash scripts/build-kernel.sh
+
+      - name: Build Debian rootfs
+        run: bash scripts/build-rootfs.sh
+
+      - name: Assemble U-disk flash package
+        run: |
+          echo "STAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
+          bash scripts/make-flash-package.sh
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Write release notes
+        run: |
+          cat > RELEASE_NOTES.md <<EOF
+          EC6108V9C (Hi3798MV100) Debian armhf build
+
+          - build (UTC): $STAMP
+          - kernel: Linux 6.3.0-rc5 + hi3798mv100 port (pinned submodule)
+          - rootfs: Debian 12 bookworm armhf (debootstrap, serial console ttyAMA0)
+          - boot: uImage = zImage + appended DTB, load address 0x2000000
+          - login: root / ec6108v9c (change it after first boot)
+
+          Assets:
+          - mv100-mdmo1g-debian-usb-flash-*.zip  U-disk flash package
+          - hi_kernel.bin                        kernel uImage for the p6 partition
+          - modules.tar.gz                       kernel modules (/lib/modules)
+          - debian-rootfs-armhf-bookworm.tar.gz  plain rootfs tarball (not for flashing)
+          - SHA256SUMS.txt
+
+          Flashing (see docs/report.md for the full analysis):
+          1. Format a USB stick as FAT32, extract the flash zip to its root.
+          2. Power on the box while holding the recovery key so its hiboot
+             picks up bootargs.bin from the stick.
+          3. The script writes p6 (kernel), p9 (rootfs) and p2 (bootargs),
+             then resets. p1/p3/p4/p5/p7/p8 are untouched.
+          4. First boot grows the filesystem; serial console 115200 8N1.
+          EOF
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-$STAMP" \
+            --title "$STAMP · debian12-armhf + linux-6.3.0-rc5 (hi3798mv100) + usb-flash" \
+            --notes-file RELEASE_NOTES.md \
+            dist/*
