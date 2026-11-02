@@ -27,15 +27,21 @@ source ./env.sh
 echo "== build prebuilts + hiboot + kernel =="
 make prebuilts hiboot linux -j"$JOBS"
 
-OUT="out/hi3798mv100"
-echo "== SDK outputs =="
-find "$OUT" -maxdepth 2 -type f \( -name '*.bin' -o -name '*.img' \) | head -30
+echo "== locate SDK outputs =="
+FB=$(find out -type f -name 'fastboot-burn.bin' | head -1)
+UIMG=$(find out -type f -path '*arch/arm/boot/uImage' | head -1)
+[ -n "$UIMG" ] || UIMG=$(find out -type f -name 'hi_kernel.bin' | head -1)
+BA=$(find out -type f -name 'bootargs.bin' | head -1)
+echo "hiboot:  $FB"
+echo "kernel:  $UIMG"
+echo "bootargs:$BA"
 
-cp -f "$OUT/fastboot-burn.bin" "$ROOT_DIR/$DIST/fastboot-burn.bin"
-cp -f "$OUT/hi_kernel.bin" "$ROOT_DIR/$DIST/hi_kernel.bin"
-if [ -f "$OUT/bootargs.bin" ]; then
-  cp -f "$OUT/bootargs.bin" "$ROOT_DIR/$DIST/bootargs-sdk.bin"
-fi
+[ -n "$FB" ] || { echo "fastboot-burn.bin not found" >&2; exit 1; }
+[ -n "$UIMG" ] || { echo "kernel image not found" >&2; exit 1; }
+
+cp -f "$FB" "$ROOT_DIR/$DIST/fastboot-burn.bin"
+cp -f "$UIMG" "$ROOT_DIR/$DIST/hi_kernel.bin"
+[ -n "$BA" ] && cp -f "$BA" "$ROOT_DIR/$DIST/bootargs-sdk.bin"
 
 echo "== results =="
 ls -l "$ROOT_DIR/$DIST/fastboot-burn.bin" "$ROOT_DIR/$DIST/hi_kernel.bin"
