@@ -2,7 +2,7 @@
 
 - 日期：2026-11-02
 - 范围：从 Linux 主线内核 + Debian rootfs 出发做 EC6108V9C 系统的可行性调查，含社区内核仓库评估
-- 配套文档：`docs/report.md`（刷机包引导与刷机机制逆向分析）
+- 配套文档：`docs/001-boot-and-flash-analysis.md`（刷机包引导与刷机机制逆向分析）
 
 ## 0. 结论速览
 
@@ -58,7 +58,7 @@
 | 模块形式 | `usb-storage`、`fuse`、`loop`、无线驱动（realtek 等）及其余 1900+ |
 | 结论 | **根分区所需驱动全部内置 → 不需要 initramfs/initrd** |
 
-#### 构建方式（与 `report.md` 逆向出的引导格式完全吻合）
+#### 构建方式（与 `001-boot-and-flash-analysis.md` 逆向出的引导格式完全吻合）
 
 ```
 cat arch/arm/boot/zImage arch/arm/boot/dts/hi3798mv100-ec6108v9c.dtb > zImage-dtb
@@ -94,7 +94,7 @@ mkimage -A arm -O linux -T kernel -C none -a 0X2000000 -e 0X2000000 -n linux -d 
 
 ### 2.3 生态参考
 
-- **海纳思系统**（www.ecoo.top，开发者 teasiu）：基于 Ubuntu 20.04 的机顶盒 NAS 发行版，适配 hi3798mv1xx/2xx/3xx，有 U 盘卡刷固件 —— 正是 `report.md` 分析的刷机包生态；配套论坛 bbs.histb.com（含 WiFi 驱动安装教程）。
+- **海纳思系统**（www.ecoo.top，开发者 teasiu）：基于 Ubuntu 20.04 的机顶盒 NAS 发行版，适配 hi3798mv1xx/2xx/3xx，有 U 盘卡刷固件 —— 正是 `001-boot-and-flash-analysis.md` 分析的刷机包生态；配套论坛 bbs.histb.com（含 WiFi 驱动安装教程）。
 - `lorzzn` 博客：debootstrap 构建 Debian 9 / Ubuntu 20.04/22.04 刷入 EC6108V9C，实测 Ubuntu 20.04 最稳；刷完需 `resize2fs /dev/mmcblk0p9`（初始根分区仅约 420MB）。
 
 ## 3. Debian rootfs 路线
@@ -140,9 +140,9 @@ chroot rootfs dpkg --configure -a
 | 内核 | 将 uImage（6.02MB）写入 p6 kernel 分区：LBA `0x7000`（14MB 处），分区上限 20MB，容量足够 |
 | rootfs | Debian 根分区（ext4）写入 p9：起始 LBA `0x131000`（610MB 处），占满剩余空间；U 盘脚本用 `mmc write.ext4sp` 写 sparse 镜像，或用 `dd` |
 | bootargs | `root=/dev/mmcblk0p9 rootfstype=ext4 rootwait blkdevparts=mmcblk0:1M(boot),1M(bootargs),4M(baseparam),4M(pqparam),4M(logo),20M(kernel),64M(busybox),512M(backup),-(ubuntu)`；内核有 `CONFIG_CMDLINE_PARTITION` 支持该命令行分区 |
-| 兜底 | 也可把 `root=` 编进 DTB 的 `chosen.bootargs`（社区包就是这么做的，见 `report.md` 中 bootargs9） |
+| 兜底 | 也可把 `root=` 编进 DTB 的 `chosen.bootargs`（社区包就是这么做的，见 `001-boot-and-flash-analysis.md` 中 bootargs9） |
 | 救援 | 保留 p7 的 recoverybox（OpenWrt）不动，改 p2 bootargs 即可来回切换主系统/救援系统 |
-| CRC | 自制 `bootargs.bin` 必须重算头部小端 CRC32（算法见 `report.md` 第 6.1 节），否则 hiboot 拒绝执行 |
+| CRC | 自制 `bootargs.bin` 必须重算头部小端 CRC32（算法见 `001-boot-and-flash-analysis.md` 第 6.1 节），否则 hiboot 拒绝执行 |
 
 ## 5. 推荐路线
 

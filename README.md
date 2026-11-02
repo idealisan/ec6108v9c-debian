@@ -5,7 +5,7 @@
 本仓库只做两件事：
 
 1. 逆向记录：`docs/` 下的分析报告，说明该平台的引导链、分区表、刷机机制；
-2. 自动化构建：GitHub Actions 从源码构建 **内核 / Debian rootfs / U 盘刷机包** 三个产物，并按 UTC 时间戳发布到 Release。
+2. 自动化构建：GitHub Actions 从源码构建 **内核 / Debian rootfs / U 盘刷机包 / 参考资料存档** 四类产物，并按 UTC 时间戳发布到 Release。
 
 ## 目录结构
 
@@ -15,12 +15,14 @@
     scripts/make-flash-package.sh         组装 U 盘刷机包（ext4 -> sparse -> zip）
     scripts/mkbootargs.py                 生成 bootargs.bin（含 hiboot 校验的 CRC32 头）
     scripts/img2simg.py                   ext4 -> Android sparse（hiboot write.ext4sp 用）
+    scripts/make-references-archive.sh    归档第三方资料与源码快照（防死链）
     scripts/env/runtime.env               写入 p2 的运行时环境变量（root=/dev/mmcblk0p9）
     third_party/linux-hi3798mv100         内核源码子模块（固定 commit）
-    docs/report.md                        刷机包引导/刷机机制逆向分析
-    docs/mainline-kernel-debian-survey.md 主线内核 + Debian rootfs 路线调查
-    docs/usb-format-tool-analysis.md      U 盘格式化工具（USBFormat.exe/fbinst）分析
-    docs/hiboot-vs-uboot-analysis.md      hiboot 与 U-Boot 差异及改用 U-Boot 的路径
+    references/                           本地归档的工具与说明（USBFormat.exe 等）
+    docs/001-boot-and-flash-analysis.md                        刷机包引导/刷机机制逆向分析
+    docs/002-mainline-kernel-debian-survey.md 主线内核 + Debian rootfs 路线调查
+    docs/003-usb-format-tool-analysis.md      U 盘格式化工具（USBFormat.exe/fbinst）分析
+    docs/004-hiboot-vs-uboot-analysis.md      hiboot 与 U-Boot 差异及改用 U-Boot 的路径
 
 ## 内核源码
 
@@ -43,7 +45,21 @@ CI 里用 `git submodule update --init --depth 1` 拉取，不拉完整历史。
 | `hi_kernel.bin` | 内核 uImage（zImage + 尾附 DTB，load 0x2000000） |
 | `modules.tar.gz` | 内核模块（/lib/modules） |
 | `debian-rootfs-armhf-bookworm.tar.gz` | 根文件系统 tar（参考用，不直接刷） |
+| `references-*.tar.gz` | 文档 + 脚本 + 工具（USBFormat.exe）+ MANIFEST 的存档 |
+| `snapshot-glinuz-hi3798mv100-*.tar.gz` | 上游参考仓库完整快照（教程 + SDK 041） |
+| `snapshot-histb-sdk-SPC050-*.tar.gz` | 海思 SDK SPC050 完整快照 |
+| `snapshot-histb-SPC060-fastboot-*.tar.gz` | SDK SPC060 中抽取的 hiboot 源码 |
 | `SHA256SUMS.txt` | 校验和 |
+
+## 资料存档
+
+第三方资料（教程、SDK、工具）都随 release 存档，避免上游链接失效：
+
+- `references/README.md`：存档清单与各快照用途说明
+- `references/tools/`：社区格式化工具等本地文件，`references/SHA256SUMS` 记录校验和
+- 快照按上游 commit 固定，文件名里带 commit 前缀，MANIFEST.txt 记录 URL/commit/抓取时间/sha256
+
+如需跳过体积较大的快照（约 2 GB），可用 `workflow_dispatch` 手动触发并把 `archive_refs` 设为 false。
 
 ## 刷机方式
 

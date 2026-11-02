@@ -3,7 +3,7 @@
 - 分析日期：2026-11-02
 - 对象：EC6108V9C（Hi3798MV100）p1 分区中的 `fastboot.bin`（"Fastboot 3.3.0_ecoo_81082668"）
 - 方法：二进制静态分析（字符串/头部/命令表）+ 海思 SDK 源码比对 + 主线 U-Boot 现状调查
-- 相关文档：`docs/report.md`（引导与刷机）、`docs/mainline-kernel-debian-survey.md`（内核）
+- 相关文档：`docs/001-boot-and-flash-analysis.md`（引导与刷机）、`docs/002-mainline-kernel-debian-survey.md`（内核）
 
 ## 1. 结论摘要
 

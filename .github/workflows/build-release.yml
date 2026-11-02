@@ -2,6 +2,11 @@ name: build-release
 
 on:
   workflow_dispatch:
+    inputs:
+      archive_refs:
+        description: 'Archive third-party reference snapshots (large, ~2GB)'
+        type: boolean
+        default: true
   push:
     branches: [main]
     paths:
@@ -46,6 +51,10 @@ jobs:
           echo "STAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
           bash scripts/make-flash-package.sh
 
+      - name: Archive reference materials
+        if: ${{ github.event_name == 'push' || inputs.archive_refs }}
+        run: bash scripts/make-references-archive.sh
+
       - name: Checksums
         run: |
           cd dist
@@ -68,9 +77,11 @@ jobs:
           - hi_kernel.bin                        kernel uImage for the p6 partition
           - modules.tar.gz                       kernel modules (/lib/modules)
           - debian-rootfs-armhf-bookworm.tar.gz  plain rootfs tarball (not for flashing)
+          - references-*.tar.gz                  docs + scripts + tools + manifest
+          - snapshot-*.tar.gz                    upstream source snapshots (SDK, guides)
           - SHA256SUMS.txt
 
-          Flashing (see docs/report.md for the full analysis):
+          Flashing (see docs/001-boot-and-flash-analysis.md for the full analysis):
           1. Format a USB stick as FAT32, extract the flash zip to its root.
           2. Power on the box while holding the recovery key so its hiboot
              picks up bootargs.bin from the stick.

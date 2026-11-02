@@ -3,7 +3,7 @@
 - 分析日期：2026-11-02
 - 分析对象：社区刷机教程要求使用的 `USBFormat.exe`
 - 分析方法：静态解包（NSIS 安装包 LZMA 解压 + fbinst 二进制字符串与 PE 头分析），未在本机执行
-- 相关文档：`docs/report.md`（引导与刷机机制）、`docs/mainline-kernel-debian-survey.md`（内核/rootfs 路线）
+- 相关文档：`docs/001-boot-and-flash-analysis.md`（引导与刷机机制）、`docs/002-mainline-kernel-debian-survey.md`（内核/rootfs 路线）
 
 ## 1. 结论
 
@@ -54,7 +54,7 @@ NSIS 安装包解出 7 个文件：
 
 ## 4. 为什么社区要求必须用它
 
-结合 `docs/report.md` 中逆向的 hiboot（`fastboot.bin`）行为，其 `fatload usb 0` 是一个极简 FAT 驱动，只认：
+结合 `docs/001-boot-and-flash-analysis.md` 中逆向的 hiboot（`fastboot.bin`）行为，其 `fatload usb 0` 是一个极简 FAT 驱动，只认：
 
 1. **MBR** 分区表（不认 GPT）
 2. **第一个主分区**（不认逻辑分区/多分区）
