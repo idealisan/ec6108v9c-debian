@@ -53,6 +53,7 @@ ls -lh "$KTAR"
 # Extract ourselves so we fail loudly instead of relying on the SDK's tar rule
 if [ ! -d "$SDK/source/kernel/linux-4.4.y" ]; then
   echo "== extracting kernel source =="
+  mkdir -p "$SDK/source/kernel"
   tar -xzf "$KTAR" -C "$SDK/source/kernel/"
   mv "$SDK/source/kernel/linux-4.4.35" "$SDK/source/kernel/linux-4.4.y"
 fi
