@@ -20,6 +20,7 @@
     docs/report.md                        刷机包引导/刷机机制逆向分析
     docs/mainline-kernel-debian-survey.md 主线内核 + Debian rootfs 路线调查
     docs/usb-format-tool-analysis.md      U 盘格式化工具（USBFormat.exe/fbinst）分析
+    docs/hiboot-vs-uboot-analysis.md      hiboot 与 U-Boot 差异及改用 U-Boot 的路径
 
 ## 内核源码
 
