@@ -95,6 +95,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "build-$STAMP" \
-            --title "$STAMP · debian12-armhf + linux-6.3.0-rc5 (hi3798mv100) + usb-flash" \
+            --title "$STAMP · debian12-armhf + histb-sdk linux-4.4 + hiboot + usb-flash" \
             --notes-file RELEASE_NOTES.md \
             dist/*
