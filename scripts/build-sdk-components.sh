@@ -23,23 +23,39 @@ cd "$SDK"
 OPEN_SRC="$SDK/third_party/open_source"
 KTAR="$OPEN_SRC/linux-4.4.35.tar.gz"
 mkdir -p "$OPEN_SRC"
-if [ ! -s "$KTAR" ] || [ "$(stat -c%s "$KTAR")" -lt 10000000 ]; then
+valid_tar() { [ -s "$1" ] && gzip -t "$1" 2>/dev/null; }
+
+if ! valid_tar "$KTAR"; then
   echo "== fetching linux-4.4.35.tar.gz =="
   rm -f "$KTAR"
+  got=0
   for m in cdn.kernel.org/pub/linux/kernel/v4.x \
            mirrors.edge.kernel.org/pub/linux/kernel/v4.x \
+           mirrors.ustc.edu.cn/kernel/v4.x \
            mirrors.tuna.tsinghua.edu.cn/kernel/v4.x; do
     echo "   trying https://$m"
     if curl -fSL --retry 3 --retry-delay 5 --max-time 1800 \
          -o "$KTAR.part" "https://$m/linux-4.4.35.tar.gz"; then
-      mv "$KTAR.part" "$KTAR"
-      break
+      if valid_tar "$KTAR.part"; then
+        mv "$KTAR.part" "$KTAR"
+        got=1
+        break
+      fi
+      echo "   corrupt download; first bytes:"
+      head -c 32 "$KTAR.part" | od -An -tx1
     fi
     rm -f "$KTAR.part"
   done
+  [ "$got" = "1" ] || { echo "linux-4.4.35.tar.gz not available" >&2; exit 1; }
 fi
-[ -s "$KTAR" ] || { echo "linux-4.4.35.tar.gz not available" >&2; exit 1; }
 ls -lh "$KTAR"
+
+# Extract ourselves so we fail loudly instead of relying on the SDK's tar rule
+if [ ! -d "$SDK/source/kernel/linux-4.4.y" ]; then
+  echo "== extracting kernel source =="
+  tar -xzf "$KTAR" -C "$SDK/source/kernel/"
+  mv "$SDK/source/kernel/linux-4.4.35" "$SDK/source/kernel/linux-4.4.y"
+fi
 
 echo "== configure SDK for $BOARD =="
 cp -f "configs/hi3798mv100/$BOARD"_cfg.mak ./cfg.mak
