@@ -69,6 +69,12 @@ make prebuilts
 echo "== build hiboot =="
 make hiboot
 echo "== build kernel (linux 4.4) =="
+# Old kernels fail on modern GCC (dtc yylloc multiple definition); -fcommon fixes it
+DTC_MK="$SDK/source/kernel/linux-4.4.y/scripts/dtc/Makefile"
+if [ -f "$DTC_MK" ] && ! grep -q -- '-fcommon' "$DTC_MK"; then
+  sed -i 's|^\(HOSTCFLAGS_dtc-lexer.lex.o.*\)$|\1 -fcommon|' "$DTC_MK"
+fi
+export HOSTCFLAGS="-fcommon"
 make linux -j"$JOBS"
 
 echo "== locate SDK outputs =="
