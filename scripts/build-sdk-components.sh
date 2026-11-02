@@ -18,6 +18,7 @@ fi
 mkdir -p "$DIST"
 
 cd "$SDK"
+SDK=$(pwd)
 
 # SDK needs the upstream kernel tarball in third_party/open_source
 OPEN_SRC="$SDK/third_party/open_source"
