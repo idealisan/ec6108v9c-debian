@@ -36,8 +36,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf u-boot-tools bc bison flex libssl-dev libelf-dev \
             lz4 zstd xz-utils cpio rsync unzip file \
-            debootstrap qemu-user-static binfmt-support e2fsprogs zip \
-            libc6:i386 libstdc++6:i386 lib32z1 python2 || true
+            debootstrap qemu-user-static binfmt-support e2fsprogs zip
+          sudo apt-get install -y --no-install-recommends libc6:i386 libstdc++6:i386 lib32z1 || true
 
       - name: Build SDK components (hiboot + kernel)
         run: bash scripts/build-sdk-components.sh
