@@ -29,19 +29,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Init kernel submodule (shallow, pinned commit)
-        run: git submodule update --init --depth 1 third_party/linux-hi3798mv100
-
       - name: Install build dependencies
         run: |
+          sudo dpkg --add-architecture i386 || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf u-boot-tools bc bison flex libssl-dev libelf-dev \
-            lz4 zstd xz-utils cpio rsync \
-            debootstrap qemu-user-static binfmt-support e2fsprogs zip
+            lz4 zstd xz-utils cpio rsync unzip file \
+            debootstrap qemu-user-static binfmt-support e2fsprogs zip \
+            libc6:i386 libstdc++6:i386 lib32z1 python2 || true
 
-      - name: Build kernel (hi_kernel.bin + modules.tar.gz)
-        run: bash scripts/build-kernel.sh
+      - name: Build SDK components (hiboot + kernel)
+        run: bash scripts/build-sdk-components.sh
 
       - name: Build Debian rootfs
         run: bash scripts/build-rootfs.sh
@@ -67,15 +66,16 @@ jobs:
           EC6108V9C (Hi3798MV100) Debian armhf build
 
           - build (UTC): $STAMP
-          - kernel: Linux 6.3.0-rc5 + hi3798mv100 port (pinned submodule)
+          - kernel: Linux 4.4 (HiSTB SDK build, hi3798mv100_defconfig)
+          - hiboot: HiSTB SDK fastboot (fastboot-burn.bin -> p1)
           - rootfs: Debian 12 bookworm armhf (debootstrap, serial console ttyAMA0)
           - boot: uImage = zImage + appended DTB, load address 0x2000000
           - login: root / ec6108v9c (change it after first boot)
 
           Assets:
           - mv100-mdmo1g-debian-usb-flash-*.zip  U-disk flash package
-          - hi_kernel.bin                        kernel uImage for the p6 partition
-          - modules.tar.gz                       kernel modules (/lib/modules)
+          - hi_kernel.bin                        SDK kernel uImage for the p6 partition
+          - fastboot-burn.bin                    SDK hiboot image for the p1 partition
           - debian-rootfs-armhf-bookworm.tar.gz  plain rootfs tarball (not for flashing)
           - references-*.tar.gz                  docs + scripts + tools + manifest
           - snapshot-*.tar.gz                    upstream source snapshots (SDK, guides)

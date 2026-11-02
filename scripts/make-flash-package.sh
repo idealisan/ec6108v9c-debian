@@ -5,6 +5,7 @@ set -eo pipefail
 
 DIST=${DIST:-dist}
 KERNEL_IMG=${KERNEL_IMG:-$DIST/hi_kernel.bin}
+FASTBOOT=${FASTBOOT:-$DIST/fastboot-burn.bin}
 MODULES_TAR=${MODULES_TAR:-$DIST/modules.tar.gz}
 ROOTFS_TAR=${ROOTFS_TAR:-$DIST/debian-rootfs-armhf-bookworm.tar.gz}
 IMG_SIZE_MB=${IMG_SIZE_MB:-2048}
@@ -22,7 +23,10 @@ mkdir -p "$PKG" "$WORK/root"
 
 echo "== unpack rootfs + modules =="
 sudo tar -xzf "$ROOTFS_TAR" -C "$WORK/root" --numeric-owner
-sudo tar -xzf "$MODULES_TAR" -C "$WORK/root"
+if [ -f "$MODULES_TAR" ]; then
+  echo "== install kernel modules into image =="
+  sudo tar -xzf "$MODULES_TAR" -C "$WORK/root"
+fi
 
 echo "== create $IMG_SIZE_MB MiB ext4 image =="
 rm -f "$WORK/debian.ext4"
@@ -51,7 +55,7 @@ ipaddr=192.168.1.10
 netmask=255.255.255.0
 gatewayip=192.168.1.1
 serverip=192.168.1.1
-bootcmd=run flashkernel; run flashrootfs; run flashbootargs; reset
+bootcmd=run flashkernel; run flashrootfs; run flashbootargs; run flashhiboot; reset
 bootdelay=0
 stdin=serial
 stdout=serial
@@ -59,13 +63,30 @@ stderr=serial
 loadfileb=getinfo ddrfree; mw.b 0x1000000 0xFF 0x10000; fatload usb 0 0x1000000 mv100/bootargs.bin; crc32 1000000 10000
 loadfilek=fatload usb 0 0x1000000 mv100/hi_kernel.bin
 loadfiler=fatload usb 0 0x1000000 mv100/debian.ext4
+loadfileh=fatload usb 0 0x1000000 mv100/fastboot-burn.bin
 flashpartitionb=mmc write 0 0x1000000 0x800 0x80
 flashpartitionk=mmc write 0 0x1000000 0x7000 $K_HEX
 flashpartitionr=mmc write.ext4sp 0 0x1000000 0x131000 $R_HEX
 flashbootargs=run loadfileb flashpartitionb
 flashkernel=run loadfilek flashpartitionk
 flashrootfs=run loadfiler flashpartitionr
+flashpartitionh=mmc write 0 0x1000000 0x0 HIBOOT_SECTORS
+flashhiboot=run loadfileh flashpartitionh
 EOF
+if [ -f "$FASTBOOT" ]; then
+  echo "== hiboot (p1) =="
+  cp "$FASTBOOT" "$PKG/fastboot-burn.bin"
+  H_SIZE=$(stat -c%s "$PKG/fastboot-burn.bin")
+  H_SECTORS=$(( (H_SIZE + 511) / 512 ))
+  truncate -s "$((H_SECTORS * 512))" "$PKG/fastboot-burn.bin"
+  H_HEX=$(printf '0x%x' $H_SECTORS)
+  sed -i "s/HIBOOT_SECTORS/$H_HEX/" "$WORK/flash.env"
+else
+  echo "== hiboot not provided, p1 untouched =="
+  sed -i "/flashpartitionh=/d;/flashhiboot=/d" "$WORK/flash.env"
+  sed -i "s/; run flashhiboot//" "$WORK/flash.env"
+fi
+
 python3 scripts/mkbootargs.py "$WORK/flash.env" "$WORK/bootargs.bin"
 
 echo "== package README =="
@@ -79,9 +100,11 @@ built (UTC): $STAMP
      mv100/bootargs.bin  (runtime env -> p2, root=/dev/mmcblk0p9)
      mv100/hi_kernel.bin (linux uImage -> p6)
      mv100/debian.ext4   (sparse Debian rootfs -> p9)
+     mv100/fastboot-burn.bin (SDK-built hiboot -> p1, written last)
 
 2) Power off, insert the USB stick, power on while holding the recovery key
-   so the hiboot picks up bootargs.bin from the stick (see docs/report.md).
+   so the hiboot picks up bootargs.bin from the stick.
+   (see docs/001-boot-and-flash-analysis.md)
 
 3) The script writes p6 and p9 and then p2, and resets. p1/p3/p4/p5/p7/p8
    are left untouched.

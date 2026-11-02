@@ -5,12 +5,14 @@
 本仓库只做两件事：
 
 1. 逆向记录：`docs/` 下的分析报告，说明该平台的引导链、分区表、刷机机制；
-2. 自动化构建：GitHub Actions 从源码构建 **内核 / Debian rootfs / U 盘刷机包 / 参考资料存档** 四类产物，并按 UTC 时间戳发布到 Release。
+2. 自动化构建：GitHub Actions 用**海思 SDK 构建 hiboot 与内核**、用 debootstrap 构建 Debian rootfs，组装成 U 盘刷机包，并归档参考资料，按 UTC 时间戳发布到 Release。
 
 ## 目录结构
 
     .github/workflows/build-release.yml   CI：构建 + 发布 release
-    scripts/build-kernel.sh               编译内核（uImage + modules）
+    scripts/fetch-sdk.sh                  下载并解压 HiSTB SDK（固定 commit 快照）
+    scripts/build-sdk-components.sh       用 SDK 构建 hiboot + Linux 4.4 内核
+    scripts/build-kernel.sh               备用：编译主线移植内核（当前流水线未使用）
     scripts/build-rootfs.sh               debootstrap 构建 Debian armhf rootfs
     scripts/make-flash-package.sh         组装 U 盘刷机包（ext4 -> sparse -> zip）
     scripts/mkbootargs.py                 生成 bootargs.bin（含 hiboot 校验的 CRC32 头）
@@ -42,8 +44,8 @@ CI 里用 `git submodule update --init --depth 1` 拉取，不拉完整历史。
 | 文件 | 说明 |
 |---|---|
 | `mv100-mdmo1g-debian-usb-flash-*.zip` | U 盘刷机包（bootargs.bin + mv100/） |
-| `hi_kernel.bin` | 内核 uImage（zImage + 尾附 DTB，load 0x2000000） |
-| `modules.tar.gz` | 内核模块（/lib/modules） |
+| `hi_kernel.bin` | SDK 构建的 Linux 4.4 内核 uImage（写入 p6） |
+| `fastboot-burn.bin` | SDK 构建的 hiboot（写入 p1，最后写、可覆盖原厂） |
 | `debian-rootfs-armhf-bookworm.tar.gz` | 根文件系统 tar（参考用，不直接刷） |
 | `references-*.tar.gz` | 文档 + 脚本 + 工具（USBFormat.exe）+ MANIFEST 的存档 |
 | `snapshot-glinuz-hi3798mv100-*.tar.gz` | 上游参考仓库完整快照（教程 + SDK 041） |
