@@ -19,6 +19,7 @@
     third_party/linux-hi3798mv100         内核源码子模块（固定 commit）
     docs/report.md                        刷机包引导/刷机机制逆向分析
     docs/mainline-kernel-debian-survey.md 主线内核 + Debian rootfs 路线调查
+    docs/usb-format-tool-analysis.md      U 盘格式化工具（USBFormat.exe/fbinst）分析
 
 ## 内核源码
 
