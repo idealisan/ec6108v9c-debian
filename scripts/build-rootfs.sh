@@ -48,10 +48,12 @@ sudo tee "$ROOT/etc/hosts" >/dev/null <<EOF
 ::1 localhost ip6-localhost ip6-loopback
 EOF
 
+# root is mounted by the kernel (root= on cmdline); keep fstab free of a
+# hard-coded root device so the same image works on eMMC and on live-USB.
 sudo tee "$ROOT/etc/fstab" >/dev/null <<EOF
-/dev/mmcblk0p9 / ext4 defaults,noatime 0 1
 proc /proc proc defaults 0 0
 devpts /dev/pts devpts defaults 0 0
+tmpfs /tmp tmpfs defaults 0 0
 EOF
 
 # serial console on ttyAMA0
@@ -77,12 +79,11 @@ echo "root:$ROOT_PASSWD" | sudo chroot "$ROOT" chpasswd
 sudo tee "$ROOT/etc/systemd/system/resize-rootfs.service" >/dev/null <<EOF
 [Unit]
 Description=Grow the root filesystem to fill the ubuntu partition
-ConditionPathExists=/dev/mmcblk0p9
 After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/sbin/resize2fs /dev/mmcblk0p9
+ExecStart=/bin/sh -c 'dev=$$(findmnt -n -o SOURCE /); [ -n "$$dev" ] && /sbin/resize2fs "$$dev" || true'
 RemainAfterExit=yes
 
 [Install]

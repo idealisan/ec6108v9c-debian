@@ -21,6 +21,12 @@ echo "== kernel: defconfig =="
 make -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="$CROSS" \
     hi3798mv100_defconfig
 
+echo "== kernel: enable USB storage + SCSI built-in (live-USB root) =="
+"$KERNEL_SRC/scripts/config" --file "$OUT/.config" \
+    -e USB_STORAGE -e USB_UAS -e SCSI -e BLK_DEV_SD -e USB_EHCI_HCD -e USB_OHCI_HCD \
+    -e EXT4_FS -e VFAT_FS -e FAT_FS
+make -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="$CROSS" olddefconfig
+
 echo "== kernel: build zImage / dtbs / modules =="
 make -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="$CROSS" \
     -j"$JOBS" zImage dtbs modules
@@ -29,6 +35,7 @@ echo "== kernel: wrap zImage + DTB into uImage =="
 cat "$OUT/arch/arm/boot/zImage" "$OUT/arch/arm/boot/dts/$DTS.dtb" > "$OUT/zImage-dtb"
 mkimage -A arm -O linux -T kernel -C none -a $LOADADDR -e $LOADADDR \
     -n "linux-hi3798mv100" -d "$OUT/zImage-dtb" "$DIST/hi_kernel.bin"
+cp -f "$OUT/zImage-dtb" "$DIST/zImage-dtb"   # raw kernel for Android boot.img wrapping
 
 echo "== kernel: modules =="
 make -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="$CROSS" \

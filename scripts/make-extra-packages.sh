@@ -70,7 +70,6 @@ load12=fatload usb 0 0x1000000 backup/p12_iptv_data.img
 load13=fatload usb 0 0x1000000 backup/p13_backup.img
 load14=fatload usb 0 0x1000000 backup/p14_cache.img
 load15=fatload usb 0 0x1000000 backup/p15_system.img
-load1=fatload usb 0 0x1000000 backup/p01_fastboot.img
 f2=mmc write 0 0x1000000 0x800 0x2000
 f3=mmc write 0 0x1000000 0x2800 0x8000
 f4=mmc write 0 0x1000000 0xA800 0x800
@@ -85,7 +84,6 @@ f12=mmc write 0 0x1000000 0x2F000 0x4000
 f13=mmc write 0 0x1000000 0x33000 0xAA000
 f14=mmc write 0 0x1000000 0xDD000 0xAA000
 f15=mmc write 0 0x1000000 0x187000 0x104000
-f1=mmc write 0 0x1000000 0x0 0x800
 r2=run load2 f2
 r3=run load3 f3
 r4=run load4 f4
@@ -100,8 +98,7 @@ r12=run load12 f12
 r13=run load13 f13
 r14=run load14 f14
 r15=run load15 f15
-r1=run load1 f1
-bootcmd=run r2; run r3; run r4; run r5; run r6; run r7; run r8; run r9; run r10; run r11; run r12; run r13; run r14; run r15; run r1; reset
+bootcmd=run r2; run r3; run r4; run r5; run r6; run r7; run r8; run r9; run r10; run r11; run r12; run r13; run r14; run r15; reset
 EOF
 python3 scripts/mkbootargs.py "$R/restore.env" "$R/bootargs.bin"
 cat > "$R/README.txt" <<EOF
@@ -117,8 +114,8 @@ Requirements:
         backup/p15_system.img
   - bootargs.bin from THIS zip at the stick root (next to backup/)
 
-Order: p2,p3,...,p15 are written first and p1 (fastboot) LAST, so a partial run
-never leaves the box without a bootloader.
+p1 (fastboot/hiboot) is NEVER written by this package - the bootloader is
+left untouched on purpose.
 
 Not covered: p16 userdata (6 GB, cannot be loaded into 1 GB DDR by hiboot).
 After the restore the box will boot with a fresh/blank userdata - Android will
