@@ -100,3 +100,64 @@ release 中的 `mv100-mdmo1g-probe-*.zip`：只有一个 `bootargs.bin`，`bootc
 - 阶段 1 失败（仍进 Android）：无需还原，直接进入阶段 2 或停止；
 - 阶段 2 失败（SDK hiboot 不启动）：插还原 U 盘上电，写回 p01–p15（p1 最后写）；
 - 若还原 U 盘也无法触发：串口 + HiTool 烧 `p01_fastboot.img`（BootROM 下载模式）。
+
+## 7. 反汇编验证（2026-11-03 补充）
+
+用 capstone 对原厂 p1（`Fastboot 3.3.0-00786`，载入地址 0xC00000）做全量反汇编（skipdata 模式，
+共 258,107 条有效指令），定位到启动主流程：
+
+```
+0xC05458  getenv("bootargs_512M")，为空则 setenv 默认值
+0xC05474  getenv("bootargs_1G")   ，为空则 setenv "mem=1G mmz=ddr,0,0,380M"
+0xC05490  getenv("bootargs_2G")
+0xC054AC  printf(版本/环境信息)
+0xC054C0  bl 0xC706EC              ; 打印启动横幅（版本串、环境位置等）
+0xC054C4  bl 0xC231F4              ; aboot()
+0xC054C8  b  0xC054C4              ; 循环
+```
+
+### aboot（0xC231F4）的关键逻辑
+
+```
+0xC231F8  ldr r1, ="Fastboot 3.3.0-00786..."   ; 打印版本
+0xC2320C  ldr r0, ="bootdelay" ; bl getenv
+0xC23214  ldr r0, ="bootcmd"   ; bl getenv      ← 取 env 的 bootcmd
+0xC2321C  mov sl, r0                            ; sl = bootcmd 字符串
+0xC23234  cmp sl, #0
+0xC23238  beq 0xC233D0                          ; bootcmd 为空 → 进交互 shell
+...
+0xC23288  ldr r0, ="Press Ctrl+C to stop autoboot
+"
+...
+0xC233D0  ldr r0, ="fastboot# "                 ; 交互提示符
+...
+0xC23440  mov r1, r6 ; mov r4, r0 ; mov r0, sl
+0xC2344C  bl 0xC222B8                           ; run_command(bootcmd)
+0xC23450  mov r0, r4 ; bl 0xC1F84C
+0xC23458  b  0xC233D0                           ; 返回后落入 shell
+```
+
+**结论（代码级）**：
+1. hiboot **确实读取并执行 env 里的 `bootcmd`**（与社区/我们刷机脚本同一条路径）；
+2. `bootcmd` 执行失败返回后，进入的是 **`fastboot#` 交互 shell**，**没有**任何"自动回退到 Android_Main"的分支；
+3. 因此"原厂 env 的 bootcmd 指向 150 MiB 却仍能启动 Android"**在代码上无法成立** —— 说明实际生效的
+   环境不是 p2 里这份（可能被覆盖/来自其他位置），或启动时读取的参数与静态推断不同。
+
+### Android_Main 的归属
+
+| 镜像 | 含 "Android_Main" |
+|---|---|
+| 原厂 2016 hiboot | **有**（唯一） |
+| 社区 2022 / 2025 hiboot | 无 |
+| 我们 SDK 构建的 hiboot | 无 |
+
+即 Android 专用启动路径是华为在原厂镜像里加的，社区版与 SDK 版都是纯 U-Boot 流程。
+刷入 SDK hiboot 后不存在任何 Android 回退逻辑，完全由 `bootcmd` 决定。
+
+## 8. 对刷机结论的影响（更新）
+
+- 刷机脚本依赖 `bootcmd`，而代码证明 hiboot 会执行它 —— **可行**；
+- 但"p2 里的 bootcmd 与实际启动不符"这个矛盾仍未解释，**必须实测**：
+  1. 探针包（`bootcmd=reset`）验证 hiboot 是否读取 U 盘 env；
+  2. 串口观察 `mmc read` 的实际执行情况（能看到 block# 与结果）；
+  3. 若串口显示读 0x4B000 失败后直接进 `fastboot#`，说明该 env 就是真实生效的，只是启动靠其他机制。
