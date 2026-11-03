@@ -112,6 +112,43 @@ p02/p11/p16 <- 备份镜像（stock-restore 包扩展这三项）
 ## 6. 待确认
 
 - [ ] 探针实测结果（短接是否稳定、hiboot 是否执行 U 盘 env）
-- [ ] 原厂 p11 的 boot.img 头参数（kernel_addr/ramdisk_addr/tags_addr/page_size）——
+- [x] 原厂 p11 的 boot.img 头参数（kernel_addr/ramdisk_addr/tags_addr/page_size）——
       需要从 `p11_kernel.img` 备份里读出，作为我们 boot.img 的模板
 - [ ] 内核 `usb-storage` 改内置后，Live-USB 能否挂上 ext4 根分区
+
+## 7. 原厂 p11 的 boot.img 头（实测，2026-11-03）
+
+通过 telnet root 直接读取 `/dev/block/mmcblk0p11` 前 64 字节：
+
+```
+offset 0   : 41 4e 44 52 4f 49 44 21     "ANDROID!"
+offset 8   : kernel_size   = 0x007885D0 (7,899,600 B ≈ 7.5 MiB)
+offset 12  : kernel_addr   = 0x03E08000
+offset 16  : ramdisk_size  = 0x00051A89 (334,473 B)
+offset 20  : ramdisk_addr  = 0x04E00000
+offset 24  : second_size   = 0
+offset 28  : second_addr   = 0x04D00000
+offset 32  : tags_addr     = 0x03E00100
+offset 36  : page_size     = 0x800 (2048)
+offset 48  : name[16]      = 空
+offset 64  : cmdline[512]  = "coherent_pool=2M console=ttyAMA0,115200 blkdevparts=mmcblk0:1M(fastboot),4M(bootargs),16M(recovery),1M(deviceinfo),4M(baseparam),4M(pqparam),4M(logo),16M(fastplay),8M(misc),24M(factory),12M(kernel),8M(iptv_data),340M(backup),340M(cache),520M(system),-(userdata)"
+```
+
+要点：
+
+1. 内核加载在 **0x03E08000**（约 62 MiB），ramdisk 在 **0x04E00000**（78 MiB），tags 在 **0x03E00100**；
+2. **boot.img 自带 cmdline**，里面没有 `root=`；运行时的 `mem=1G mmz=...` 来自 env（`bootargs_1G` 合并）；
+3. 内核分区总大小 12 MiB，原厂 boot.img 约 8.2 MiB（7.5 + 0.33 + 头），**我们的 6 MiB 内核放得下**；
+4. ramdisk 只有 334 KB —— 说明 Android 侧是极简 initrd 或空的占位。
+
+因此我们的 boot.img 可以照抄这些参数：
+
+| 字段 | 取值 |
+|---|---|
+| kernel | `zImage-dtb`（zImage + 尾附 DTB，去掉 uImage 头） |
+| kernel_addr | `0x03E08000` |
+| ramdisk | 空（`ramdisk_size=0`，hiboot 代码支持跳过） |
+| ramdisk_addr | `0x04E00000`（保留，无 ramdisk 时不用） |
+| tags_addr | `0x03E00100` |
+| page_size | `2048` |
+| cmdline | 原厂 cmdline + ` root=/dev/mmcblk0p16 rootwait rw` |
