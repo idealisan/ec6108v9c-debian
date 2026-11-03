@@ -161,3 +161,44 @@ release 中的 `mv100-mdmo1g-probe-*.zip`：只有一个 `bootargs.bin`，`bootc
   1. 探针包（`bootcmd=reset`）验证 hiboot 是否读取 U 盘 env；
   2. 串口观察 `mmc read` 的实际执行情况（能看到 block# 与结果）；
   3. 若串口显示读 0x4B000 失败后直接进 `fastboot#`，说明该 env 就是真实生效的，只是启动靠其他机制。
+## 9. Android 启动路径（静态定位，2026-11-03）
+
+### 9.1 关键发现：镜像用 PIE 方式寻址
+
+代码里大量出现 `add r4, pc, r4` 取基址、再 `add r0, r4, rX` 取字符串，
+所以**文件里几乎不存在指向字符串的绝对地址**——这也是最初"只按绝对指针扫不到引用"的原因。
+
+### 9.2 Android 启动链（已定位到指令级）
+
+```
+0xC17BF0  bl 0xC70D94            ; android_check(buf, 0x4000000)
+            0xC70D94: cmp r1,#0x260 ; ldr r1,="ANDROID!" ; memcmp(buf,"ANDROID!",8)
+0xC17C10  bl 0xC70E4C            ; android_image_get_kernel()
+0xC17C44  bl 0xC70DC0            ; android_load()（拷贝 kernel/ramdisk 到目标地址）
+0xC17C50  getenv("bootargs")
+0xC17C88  sprintf("%s initrd=0x%X,0x%X", ...)   ; 把 initrd 参数追加进 bootargs
+0xC17CB4  setenv("bootargs", ...)
+0xC17CBC  bl 0xC70E88            ; 打印 "Found Initrd at 0x%08X ..."，随后跳入内核入口
+```
+
+即：**`bootm <addr>` 在检测到 `ANDROID!` 魔数时走 Android 启动分支**（解析 boot.img 头、
+拷贝 kernel+ramdisk、给 bootargs 追加 initrd 参数、跳转）。这就是原厂"能启动 Android"的代码路径。
+
+### 9.3 另外还有一个 `bootimg` 命令
+
+命令表（`cmd_tbl_t`，条目步长 0x1C）中存在：
+
+```
+0x93EC4  name="bootimg"  maxargs=16  repeat=1  cmd=0xC2B1A4  usage=0xC8017C
+```
+
+`do_bootimg`（0xC2B1A4）是手动解析 boot.img 的工具命令，与 `bootm` 的 Android 分支是两条入口。
+
+### 9.4 结论与仍存疑点
+
+1. **Android 启动路径确实存在，只有 `bootm`/`bootimg` 两种入口**，都要求目标地址上是 `ANDROID!` 镜像；
+   不存在"无条件进 Android"的旁路。
+2. 因此：只要 env 的 `bootcmd` 指向一个**有效 uImage**（我们的内核在 14 MiB），`bootm` 就走 uImage
+   分支启动 Linux —— 这正是刷机包依赖的行为。
+3. **仍存疑点**：原厂 p2 的 `bootcmd` 指向 150 MiB，该处无 `ANDROID!` 镜像（实测为随机数据），
+   按代码逻辑应失败并落到 `fastboot#`。要解释只能看运行时（串口/再次读设备），静态分析到此为止。
