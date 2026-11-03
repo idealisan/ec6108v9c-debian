@@ -48,7 +48,7 @@ CI 里用 `git submodule update --init --depth 1` 拉取，不拉完整历史。
 |---|---|
 | `mv100-mdmo1g-debian-usb-flash-stock-hiboot-*.zip` | 刷机包（保留原厂 p1，推荐） |
 | `mv100-mdmo1g-debian-usb-flash-sdk-hiboot-*.zip` | 刷机包（额外写入 SDK hiboot 到 p1） |
-| `mv100-mdmo1g-probe-*.zip` | 探针包：只复位不写盘，验证原厂 hiboot 会读取 U 盘环境 |
+| `mv100-mdmo1g-probe-*.zip` | 探针包：只复位不写盘，验证短接后 hiboot 会读取 U 盘环境 |
 | `mv100-mdmo1g-stock-restore-*.zip` | 回滚包：把备份镜像写回原厂布局 |
 | `hi_kernel.bin` | SDK 构建的 Linux 4.4 内核 uImage（写入 p6） |
 | `fastboot-burn.bin` | SDK 构建的 hiboot（写入 p1，最后写、可覆盖原厂） |
