@@ -202,3 +202,39 @@ release 中的 `mv100-mdmo1g-probe-*.zip`：只有一个 `bootargs.bin`，`bootc
    分支启动 Linux —— 这正是刷机包依赖的行为。
 3. **仍存疑点**：原厂 p2 的 `bootcmd` 指向 150 MiB，该处无 `ANDROID!` 镜像（实测为随机数据），
    按代码逻辑应失败并落到 `fastboot#`。要解释只能看运行时（串口/再次读设备），静态分析到此为止。
+## 10. 动态验证（telnet root，2026-11-03）
+
+ADB 5555 关闭，但 **telnet 23 端口直接给 root shell**（无密码），据此在设备上实测：
+
+| 地址 | 内容 | 判定 |
+|---|---|---|
+| 58 MiB（内置默认 bootcmd 指向 0x1D000） | 全 0x00 | 无镜像 |
+| 82 MiB（blkdevparts 的 kernel 分区） | `ANDROID!` | **真实 boot.img 在这里** |
+| 150 MiB（p2 env 的 bootcmd 指向 0x4B000） | 随机数据 | 无镜像 |
+
+补充证据：
+- `/proc/uptime` = 7958 s（约 2.2 小时），`btime` 与当前时间差一致 → **设备 2 小时前刚冷启动过**，
+  排除了"只是没重启、env 未生效"的可能；
+- `/proc/cmdline` 里同时有 `coherent_pool=2M`、`mem=1G mmz=ddr,0,0,400M`，
+  而 p2 的 `bootargs` 里并没有这两项 → 说明启动参数**不是**直接取自 p2，更像来自 boot.img 自带 cmdline + 合并默认值。
+
+### 结论
+
+1. 原厂 hiboot 的**正常启动不走 env 的 `bootcmd`**；它走内部 `Android_Main`：
+   从 `kernel` 分区（82 MiB）读 boot.img → 校验 `ANDROID!` → 启动。
+2. `bootcmd` 只在**升级/覆盖环境**场景下生效（例如 U 盘 bootargs.bin 提供新 env 时），
+   这就是社区"U 盘卡刷"能工作的原因。
+3. 因此原厂 env 里那条指向 150 MiB 的 `bootcmd` 属于**遗留/无效项**，与正常启动无关。
+
+### 对刷机的直接影响（重要，推翻此前判断）
+
+| 刷机包 | p1 保留原厂 hiboot | 预期结果 |
+|---|---|---|
+| stock-hiboot 变体 | 是 | **很可能仍启动 Android**（内部 Android_Main 读 82 MiB 的旧 boot.img，而我们的内核写在 14 MiB，不会被读到） |
+| sdk-hiboot 变体 | 否（写入 SDK hiboot） | SDK hiboot **不含** Android_Main/bootimg/boot-recovery（字符串计数 0），是纯 U-Boot 流程 → 按 `bootcmd` 启动我们的内核 |
+
+**修正建议：要实现 Debian 启动，必须替换 p1（用 sdk-hiboot 变体）**；
+"保留原厂 hiboot 更安全"只在"不打算启动 Debian"的前提下成立。
+
+U 盘刷机流程本身不受影响：升级模式下 hiboot 会读 U 盘 bootargs.bin 并执行其 `bootcmd`，
+因此可以先用 U 盘把 SDK hiboot 写进 p1，再由它引导 Linux。
