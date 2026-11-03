@@ -27,6 +27,7 @@
     docs/004-hiboot-vs-uboot-analysis.md      hiboot 与 U-Boot 差异及改用 U-Boot 的路径
     docs/005-stock-device-analysis.md         原厂设备软硬件深度分析（真机采集）
     docs/006-restore-to-stock.md              刷回原厂的完整方案（含变砖救砖）
+    docs/007-boot-path-analysis.md            启动路径专项分析（bootcmd 疑点与分阶段验证）
 
 ## 内核源码
 

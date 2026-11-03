@@ -116,10 +116,10 @@ signature_check=sign:recovery,recovery,0x200000 sign:kernel,kernel,0x700000
    同时写 p2 的新 `blkdevparts`，刷完分区语义整体切换 → 原 recovery/factory/backup/cache/system 被覆盖。
    已做全量备份（见第 9 节），可回滚。
 2. **hiboot 能力已满足**：原厂 hiboot 就支持 `bootargs.bin` + `write.ext4sp`，理论上原厂固件就能执行我们的 U 盘脚本。
-3. **bootcmd 疑点（需实测）**：原厂 env 的 `bootcmd` 与实际内核位置不符，说明原厂启动走的是 hiboot 内置 Android 路径。
-   我们的刷机包依赖 `bootcmd` 生效（社区包同款做法，历史验证可行），但首次刷机建议：
-   - 串口全程观察，确认 hiboot 执行的是新 `bootcmd`
-   - 如出现"仍启动 Android"，说明 hiboot 走了内置路径，需要改用其他方式（如覆盖 82 MiB 的 boot.img 或改刷 hiboot）
+3. **bootcmd 疑点**：原厂 env 的 `bootcmd` 指向 150 MiB（该处无镜像），而真实 boot.img 在 82 MiB。
+   原厂 hiboot 内含 `Android_Main`/`bootimg`/`boot-recovery` 等 Android 专用代码，
+   说明正常启动很可能走内置 Android 路径，而非 env 的 `bootcmd`。
+   该问题尚未在本机实测，专项分析与分阶段验证方案见 `007-boot-path-analysis.md`。
 4. **签名校验关闭**：`verify=n`，无需签名即可引导自制镜像（利好改造）。
 5. **eMMC 布局注意**：写入点 14 MiB 落在原 `recovery`（5–21 MiB）内，20 MiB 内核区会溢出到 deviceinfo/baseparam 起点，
    与社区布局一致，属预期行为。
