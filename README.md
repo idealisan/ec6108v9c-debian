@@ -26,6 +26,7 @@
     docs/003-usb-format-tool-analysis.md      U 盘格式化工具（USBFormat.exe/fbinst）分析
     docs/004-hiboot-vs-uboot-analysis.md      hiboot 与 U-Boot 差异及改用 U-Boot 的路径
     docs/005-stock-device-analysis.md         原厂设备软硬件深度分析（真机采集）
+    docs/006-restore-to-stock.md              刷回原厂的完整方案（含变砖救砖）
 
 ## 内核源码
 
@@ -44,7 +45,10 @@ CI 里用 `git submodule update --init --depth 1` 拉取，不拉完整历史。
 
 | 文件 | 说明 |
 |---|---|
-| `mv100-mdmo1g-debian-usb-flash-*.zip` | U 盘刷机包（bootargs.bin + mv100/） |
+| `mv100-mdmo1g-debian-usb-flash-stock-hiboot-*.zip` | 刷机包（保留原厂 p1，推荐） |
+| `mv100-mdmo1g-debian-usb-flash-sdk-hiboot-*.zip` | 刷机包（额外写入 SDK hiboot 到 p1） |
+| `mv100-mdmo1g-probe-*.zip` | 探针包：只复位不写盘，验证原厂 hiboot 会读取 U 盘环境 |
+| `mv100-mdmo1g-stock-restore-*.zip` | 回滚包：把备份镜像写回原厂布局 |
 | `hi_kernel.bin` | SDK 构建的 Linux 4.4 内核 uImage（写入 p6） |
 | `fastboot-burn.bin` | SDK 构建的 hiboot（写入 p1，最后写、可覆盖原厂） |
 | `debian-rootfs-armhf-bookworm.tar.gz` | 根文件系统 tar（参考用，不直接刷） |

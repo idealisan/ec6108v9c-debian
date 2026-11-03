@@ -56,6 +56,9 @@ jobs:
           echo "STAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
           bash scripts/make-flash-package.sh
 
+      - name: Build probe and stock-restore packages
+        run: bash scripts/make-extra-packages.sh
+
       - name: Archive reference materials
         if: ${{ github.event_name == 'push' || inputs.archive_refs }}
         run: bash scripts/make-references-archive.sh
@@ -79,7 +82,10 @@ jobs:
           - login: root / ec6108v9c (change it after first boot)
 
           Assets:
-          - mv100-mdmo1g-debian-usb-flash-*.zip  U-disk flash package
+          - mv100-mdmo1g-debian-usb-flash-stock-hiboot-*.zip  flash, keeps factory hiboot
+          - mv100-mdmo1g-debian-usb-flash-sdk-hiboot-*.zip    flash + SDK hiboot into p1
+          - mv100-mdmo1g-probe-*.zip                          verify hiboot reads the stick (no writes)
+          - mv100-mdmo1g-stock-restore-*.zip                  restore factory images from the backup stick
           - hi_kernel.bin                        mainline kernel uImage for the p6 partition
           - modules.tar.gz                       kernel modules (/lib/modules)
           - fastboot-burn.bin                    SDK hiboot image for the p1 partition
