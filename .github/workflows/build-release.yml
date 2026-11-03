@@ -39,8 +39,14 @@ jobs:
             debootstrap qemu-user-static binfmt-support e2fsprogs zip
           sudo apt-get install -y --no-install-recommends libc6:i386 libstdc++6:i386 lib32z1 || true
 
-      - name: Build SDK components (hiboot + kernel)
+      - name: Build hiboot from HiSTB SDK
         run: bash scripts/build-sdk-components.sh
+
+      - name: Init kernel submodule (shallow, pinned commit)
+        run: git submodule update --init --depth 1 third_party/linux-hi3798mv100
+
+      - name: Build mainline kernel (6.x)
+        run: bash scripts/build-kernel.sh
 
       - name: Build Debian rootfs
         run: bash scripts/build-rootfs.sh
@@ -66,7 +72,7 @@ jobs:
           EC6108V9C (Hi3798MV100) Debian armhf build
 
           - build (UTC): $STAMP
-          - kernel: Linux 4.4 (HiSTB SDK build, hi3798mv100_defconfig)
+          - kernel: mainline 6.3.0-rc5 + hi3798mv100 port (loonpn tree, pinned submodule)
           - hiboot: HiSTB SDK fastboot (fastboot-burn.bin -> p1)
           - rootfs: Debian 12 bookworm armhf (debootstrap, serial console ttyAMA0)
           - boot: uImage = zImage + appended DTB, load address 0x2000000
@@ -74,7 +80,8 @@ jobs:
 
           Assets:
           - mv100-mdmo1g-debian-usb-flash-*.zip  U-disk flash package
-          - hi_kernel.bin                        SDK kernel uImage for the p6 partition
+          - hi_kernel.bin                        mainline kernel uImage for the p6 partition
+          - modules.tar.gz                       kernel modules (/lib/modules)
           - fastboot-burn.bin                    SDK hiboot image for the p1 partition
           - debian-rootfs-armhf-bookworm.tar.gz  plain rootfs tarball (not for flashing)
           - references-*.tar.gz                  docs + scripts + tools + manifest
@@ -95,6 +102,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "build-$STAMP" \
-            --title "$STAMP · debian12-armhf + histb-sdk linux-4.4 + hiboot + usb-flash" \
+            --title "$STAMP · debian12-armhf + linux-6.3.0-rc5 + sdk-hiboot + usb-flash" \
             --notes-file RELEASE_NOTES.md \
             dist/*
