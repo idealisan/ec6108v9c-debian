@@ -143,6 +143,73 @@ EOF
 ( cd "$N" && zip -q "mv100-mdmo1g-probe-net-$STAMP.zip" bootargs.bin README.txt )
 mv "$N/mv100-mdmo1g-probe-net-$STAMP.zip" "$DIST/"
 
+# ---------------- probe-tftp ----------------
+# hiboot fetches a file from a TFTP server on the LAN. A line appears in the
+# server's terminal (and the transfer succeeds), which is the most human
+# readable "it worked" signal available without a serial port or a screen.
+T=build/extra/probe-tftp
+rm -rf "$T"; mkdir -p "$T"
+cat > "$T/probe.env" <<EOF
+baudrate=115200
+bootdelay=0
+stdin=serial
+stdout=serial
+stderr=serial
+ethaddr=02:00:ec:61:08:01
+ipaddr=192.168.3.240
+netmask=255.255.255.0
+gatewayip=192.168.3.1
+serverip=192.168.3.189
+bootcmd=tftp 0x02000000 probe.txt; ping 192.168.3.189; reset
+EOF
+python3 scripts/mkbootargs.py "$T/probe.env" "$T/bootargs.bin"
+cat > "$T/README.txt" <<EOF
+EC6108V9C hiboot U-disk probe, TFTP beacon (zero writes)
+built (UTC): $STAMP
+
+Why not the screen
+  The stock hiboot console is UART only and it has no framebuffer console or
+  glyph code; the Linux kernel we can build has no display driver either (the
+  SDK defconfig has CONFIG_FB=y with every fb driver off, CONFIG_LOGO=n, and
+  the only display driver in the whole SDK sits inside hiboot). So no kernel
+  can paint the TV on this box - the picture you see today is hiboot's logo
+  from the logo partition.
+
+What this probe does
+  tftp 0x02000000 probe.txt  -> hiboot downloads a file from the PC
+  ping 192.168.3.189         -> ARP/ICMP to the PC
+  reset                      -> repeats
+  No storage write of any kind: the file is loaded to RAM at 0x02000000,
+  nothing is programmed into flash.
+
+How to run
+  1. Put bootargs.bin in the ROOT of a FAT32 stick.
+  2. On the PC (192.168.3.189, en16) run:
+         sudo python3 scripts/probe-tftp-server.py --dir dist/probe-tftp
+  3. Insert the stick into the box, power on through the upgrade path.
+  4. Watch that terminal.
+
+Result
+  A block like this appears and the transfer completes:
+      RRQ  'probe.txt'  from 192.168.3.240:xxxx
+      -> the box's hiboot loaded and ran the U-disk env
+  -> PASS: the U-disk env path works, go to the next stage.
+
+  Nothing appears and the box boots Android: env not consumed (trigger or
+  file location), nothing written, retry.
+  Nothing appears and the box stays dark: most likely SoC USB download mode
+  (BootROM), where hiboot never runs.
+
+Fallbacks
+  - No traffic at all: use the plain probe (mv100-mdmo1g-probe-*.zip) and judge
+    by the reboot loop, or the ping-only probe (probe-net).
+  - Definitive answer needs UART (ttyAMA0, 115200): one CH340 adapter shows
+    bootargs CRC results and MMC reads directly.
+EOF
+( cd "$T" && zip -q "mv100-mdmo1g-probe-tftp-$STAMP.zip" bootargs.bin README.txt )
+mv "$T/mv100-mdmo1g-probe-tftp-$STAMP.zip" "$DIST/"
+
+
 
 # ---------------- restore ----------------
 R=build/extra/restore
@@ -226,4 +293,4 @@ EOF
 ( cd "$R" && zip -q "mv100-mdmo1g-stock-restore-$STAMP.zip" bootargs.bin README.txt )
 mv "$R/mv100-mdmo1g-stock-restore-$STAMP.zip" "$DIST/"
 
-ls -l "$DIST"/mv100-mdmo1g-probe-*.zip "$DIST"/mv100-mdmo1g-probe-net-*.zip "$DIST"/mv100-mdmo1g-stock-restore-*.zip
+ls -l "$DIST"/mv100-mdmo1g-probe-*.zip "$DIST"/mv100-mdmo1g-probe-net-*.zip "$DIST"/mv100-mdmo1g-probe-tftp-*.zip "$DIST"/mv100-mdmo1g-stock-restore-*.zip

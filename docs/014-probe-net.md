@@ -76,3 +76,41 @@ sudo tcpdump -n -e -i en16 'arp or icmp'
 1. 先用 probe-net；若 PHY 一直不 link（完全没有流量），退回 `bootcmd=reset` 的普通探针看是否重启循环；
 2. 最可靠的仍是**串口**（`ttyAMA0 115200`）：一个 CH340 就能直接看到 `bootargs crc failed`、
    `MMC read` 等打印，无需猜测。本项目所有"靠现象反推"的手段都只是等串口线的替代品。
+
+## 6. 为什么"编个内核让它画出画面"不可行（2026-11-04 调查）
+
+结论：**这台盒子上，画面不是内核画的，是 hiboot 画的**；内核既没有显示驱动，也没有网卡驱动。
+
+证据（SDK 仓库 `JasonFreeLab/HiSTBLinuxV100R005C00SPC050`，master 分支，全树 57413 个路径）：
+
+| 检查 | 结果 |
+|---|---|
+| `arch/arm/configs/hi3798mv100_defconfig` | `CONFIG_FB=y`，但下面所有 fb 驱动全 `is not set`（`FB_SIMPLE`/cfb 系列全关），`CONFIG_LOGO is not set` |
+| 内核树里的显示驱动 | 没有 hifb / fbdev 面板驱动；`source/kernel/linux-4.4.y/drivers/video/` 只有通用框架（adf/backlight 等） |
+| 唯一的显示驱动 | `source/boot/product/driver/graphic/hifb` —— **在 hiboot 里** |
+| 内核里的网卡 | `CONFIG_HIX5HD2_GMAC`、`CONFIG_HIP04_ETH` 均 `is not set`；higmac 驱动只存在于 `source/boot/fastboot/drivers/net/higmac`（**也在 hiboot 里**） |
+| 主线移植（loonpn `linux-hi3798mv100`） | 有 `hi3798mv100-ec6108v9c.dts`，但 `hi3798mv100.dtsi` 里没有 ethernet/mdio 节点，主线也没有 higmac 驱动 |
+
+所以：内核从 U 盘启动后，**屏幕上什么都不会出现（没有 fb 驱动，连 Tux 都画不了），
+网络上也不会出现任何包（没有 MAC 驱动）**——它没有任何可观测信道，
+比 `bootcmd=reset` 的探针还差，因为连"重启循环"都不一定能看出来。
+
+要真正把画面做出来，只有两条路：
+1. 搬 HiSilicon 的 MSP/hifb 图形栈（`source/component` + hifb.ko + libhigo），
+   等于把整个 BSP 的用户态搬过来，不是"最小内核"能干的事；
+2. 串口（`ttyAMA0 115200`），一个 CH340 就能看到 hiboot 的全部打印，最省事。
+
+顺带一个对后续 Debian 有影响的发现：**主线内核移植里没有网口**，
+现在的 Live-USB 起来后大概率是"有 shell 但没网络"。
+要给 Debian 加上 SSH，得先把 higmac 移植进内核（或等主线支持），这件事值得单列。
+
+## 7. 增强探针：TFTP 落地文件
+
+既然唯一能联网的固件是 hiboot，那就让 hiboot 去 PC 上**下载一个文件**——
+下载成功的日志就是最直观的"成功"证据，不需要抓包也不需要看屏幕。
+
+- 包：`mv100-mdmo1g-probe-tftp-*.zip`，`bootcmd=tftp 0x02000000 probe.txt; ping 192.168.3.189; reset`
+- 服务端：`scripts/probe-tftp-server.py`（约 150 行，只实现 RRQ + 512 字节块）
+- 现场：`sudo python3 scripts/probe-tftp-server.py --dir dist/probe-tftp`，等一行
+  `RRQ 'probe.txt' from 192.168.3.240` 出现即为通过
+- 文件只下载到 DDR 的 0x02000000，不写任何存储
