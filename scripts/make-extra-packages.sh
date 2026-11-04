@@ -26,22 +26,50 @@ stderr=serial
 EOF
 python3 scripts/mkbootargs.py "$P/probe.env" "$P/bootargs.bin"
 cat > "$P/README.txt" <<EOF
-EC6108V9C hiboot U-disk probe (no writes)
+EC6108V9C hiboot U-disk probe (zero writes)
 built (UTC): $STAMP
 
-Purpose: verify that the box's hiboot really reads and executes bootargs.bin
-from the USB stick, WITHOUT touching the eMMC.
+Purpose
+  Prove that the box's hiboot really reads bootargs.bin from a USB stick and
+  executes its bootcmd (bootcmd=reset), WITHOUT writing anything to the eMMC.
+  This is the gate for every later step: no flash package should be tried
+  before this probe shows that the U-disk env path works.
 
-How to test:
-  1. Copy bootargs.bin to the root of a FAT32 stick.
-  2. Power off, insert the stick, power on while holding the recovery key.
-  3. If the box reboots immediately / keeps rebooting while the stick is
-     inserted, the stock hiboot DID consume our environment.
-     Remove the stick and power-cycle: it should boot Android normally.
-  4. If the box boots Android as usual, the hiboot ignored the stick
-     (wrong key/timing or a different upgrade path) - do NOT flash.
+Stick
+  - FAT32, MBR, one primary partition (any stick formatted by the OS is fine;
+    the community tool only aligns it to LBA 63, which is cosmetic)
+  - bootargs.bin must sit in the ROOT of that partition
+  - put nothing else on the stick for this test
 
-Nothing is written to eMMC by this package.
+Test
+  1. Unplug power, insert the stick.
+  2. Power on through the upgrade path: short the two upgrade pads (this unit
+     has no serial console, so they are the only reliable entry). If the board
+     revision has a front-panel or remote recovery key, try that as a second
+     attempt - hiboot does contain an IR recovery detector.
+  3. Observe and pick the matching line:
+
+     [A] the box restarts by itself and keeps restarting while the stick stays
+         inserted
+         -> hiboot consumed our environment. PASS. Go on to the next stage.
+     [B] the box boots the normal Android UI / splash as before
+         -> the env was not consumed. Nothing was written. Either the trigger
+            did not fire, or hiboot did not find/accept the file. Retry with
+            the other trigger, and with a freshly formatted stick.
+     [C] the box stays dark, Android never appears
+         -> most likely it sits in the SoC USB download mode (BootROM), which
+            never runs hiboot. That is NOT the U-disk update path. Cut power,
+            retry.
+
+  4. Remove the stick and power-cycle: it must boot Android exactly as before.
+
+Why this is safe
+  - bootcmd=reset only reboots the CPU; it never issues an mmc write.
+  - An env loaded from a file lives in RAM only (otherwise the community
+    U-disk packages would re-flash on every single boot).
+  - p1 (hiboot) is never written by any package of this project.
+
+Reference: docs/007-boot-path-analysis.md section 4, docs/013-no-p1-touch-plan.md
 EOF
 ( cd "$P" && zip -q "mv100-mdmo1g-probe-$STAMP.zip" bootargs.bin README.txt )
 mv "$P/mv100-mdmo1g-probe-$STAMP.zip" "$DIST/"
