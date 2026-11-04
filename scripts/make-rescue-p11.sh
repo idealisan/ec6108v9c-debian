@@ -82,13 +82,15 @@ echo "telnetd on $IP:23 - run 'touch /tmp/committed' within $WATCHDOG s"
 (
   sleep $WATCHDOG
   if [ ! -e /tmp/committed ]; then
-    echo "watchdog: rolling stock p11 back"
     if [ -f /mnt/data/stock_p11.img ]; then
+      echo "watchdog: restoring stock p11"
       dd if=/mnt/data/stock_p11.img of=/dev/mmcblk0p11 bs=65536 2>/dev/null
       sync
       sleep 1
+      reboot -f
+    else
+      echo "watchdog: no rollback image - staying up for telnet"
     fi
-    reboot -f
   fi
 ) &
 while true; do sleep 3600; done
