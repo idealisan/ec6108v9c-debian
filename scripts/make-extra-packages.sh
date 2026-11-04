@@ -74,6 +74,76 @@ EOF
 ( cd "$P" && zip -q "mv100-mdmo1g-probe-$STAMP.zip" bootargs.bin README.txt )
 mv "$P/mv100-mdmo1g-probe-$STAMP.zip" "$DIST/"
 
+# ---------------- probe-net ----------------
+# Same idea as probe, but the result is observed on the LAN instead of on the
+# TV: hiboot brings up the onboard PHY and pings, so the box emits ARP/ICMP
+# frames that tcpdump on a PC in the same LAN can see. No screen, no writes.
+N=build/extra/probe-net
+rm -rf "$N"; mkdir -p "$N"
+cat > "$N/probe.env" <<EOF
+baudrate=115200
+bootdelay=0
+stdin=serial
+stdout=serial
+stderr=serial
+ethaddr=02:00:ec:61:08:01
+ipaddr=192.168.3.240
+netmask=255.255.255.0
+gatewayip=192.168.3.1
+serverip=192.168.3.1
+bootcmd=ping 192.168.3.189; ping 192.168.3.254; reset
+EOF
+python3 scripts/mkbootargs.py "$N/probe.env" "$N/bootargs.bin"
+cat > "$N/README.txt" <<EOF
+EC6108V9C hiboot U-disk probe, network beacon (zero writes)
+built (UTC): $STAMP
+
+Why network instead of the screen
+  The stock hiboot console is UART-only. Its command table has no echo/fb/
+  logo command and the binary has no framebuffer or glyph code at all - the
+  only video path is the boot-logo decoder reading the logo partition. So
+  "print something on the TV" is not available. What hiboot DOES have is
+  ping/tftp/bootp plus the onboard PHY driver, which is what this probe uses.
+
+What the probe does
+  ping 192.168.3.189  -> ARP + ICMP to the capture PC (gets a reply)
+  ping 192.168.3.254   -> ARP broadcast for a host that does not exist
+  reset               -> starts over, so the traffic repeats
+  The box answers to 192.168.3.240 (MAC 02:00:ec:61:08:01) instead of its
+  normal DHCP address, so anything you see from that address is proof.
+
+Prepare
+  1. Put bootargs.bin in the ROOT of a FAT32 stick (nothing else needed).
+  2. On a PC in the SAME LAN, start a capture:
+         sudo tcpdump -n -e -i en16 'arp or icmp'
+     (en16 carries 192.168.3.0/24 on this Mac; check with "ifconfig")
+  3. Insert the stick, power on through the upgrade path (short the pads).
+
+Read the result
+  [A] you see lines with 192.168.3.240 or 02:00:ec:61:08:01, repeating every
+      few seconds
+      -> PASS. hiboot read the U-disk env and ran our bootcmd. The env path
+         works; the repeat is our reset loop.
+  [B] no such traffic, and the box boots Android as usual
+      -> env not consumed (trigger missed, or file/partition not found).
+         Nothing was written; retry.
+  [C] no traffic and no Android, box sits dark
+      -> either it is in SoC USB download mode (BootROM, hiboot never runs) or
+         hiboot hung; cut power and retry.
+
+Notes
+  - Only ARP/ICMP is generated: no storage write of any kind.
+  - If your LAN is not 192.168.3.0/24, edit ipaddr/gatewayip before use and
+    rebuild with scripts/mkbootargs.py.
+  - No reply from the ping target is fine; the ARP request alone is the signal.
+  - If the PHY never links, you see nothing at all - in that case fall back to
+    the plain reset probe (mv100-mdmo1g-probe-*.zip) and judge by the reboot
+    loop instead.
+EOF
+( cd "$N" && zip -q "mv100-mdmo1g-probe-net-$STAMP.zip" bootargs.bin README.txt )
+mv "$N/mv100-mdmo1g-probe-net-$STAMP.zip" "$DIST/"
+
+
 # ---------------- restore ----------------
 R=build/extra/restore
 rm -rf "$R"; mkdir -p "$R"
@@ -156,4 +226,4 @@ EOF
 ( cd "$R" && zip -q "mv100-mdmo1g-stock-restore-$STAMP.zip" bootargs.bin README.txt )
 mv "$R/mv100-mdmo1g-stock-restore-$STAMP.zip" "$DIST/"
 
-ls -l "$DIST"/mv100-mdmo1g-probe-*.zip "$DIST"/mv100-mdmo1g-stock-restore-*.zip
+ls -l "$DIST"/mv100-mdmo1g-probe-*.zip "$DIST"/mv100-mdmo1g-probe-net-*.zip "$DIST"/mv100-mdmo1g-stock-restore-*.zip
