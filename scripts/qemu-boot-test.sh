@@ -19,6 +19,8 @@ PASSWD=${PASSWD:-ec6108v9c}
 TIMEOUT=${TIMEOUT:-420}
 MEM=${MEM:-1024}
 CONSOLE_LOG=${CONSOLE_LOG:-build/qemu-console.log}
+PROBE_OUT=${PROBE_OUT:-build/qemu-ssh-probe.out}
+CHECKS_OUT=${CHECKS_OUT:-build/qemu-guest-checks.out}
 
 for f in "$KERNEL" "$INITRD" "$ROOTFS"; do
   [ -f "$f" ] || { echo "missing input: $f" >&2; exit 2; }
@@ -37,11 +39,13 @@ qemu-system-arm \
   -device virtio-blk-device,drive=hd0 \
   -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" \
   -device virtio-net-device,netdev=net0 \
-  > "$CONSOLE_LOG" 2>&1 &
+  </dev/null > "$CONSOLE_LOG" 2>&1 &
 QPID=$!
+
 # The CI runner waits for every child process, so the emulator has to die for
 # sure - a plain SIGTERM can leave it alive and stall the whole step.
 cleanup() {
+  pkill -f "sshpass.*127.0.0.1" 2>/dev/null || true
   kill "$QPID" 2>/dev/null || true
   sleep 1
   kill -9 "$QPID" 2>/dev/null || true
@@ -50,6 +54,13 @@ cleanup() {
 trap cleanup EXIT
 
 SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR"
+
+# Probe without a pipe on purpose: timeout only kills sshpass, and the ssh
+# child it spawned would keep the pipe open and block the shell forever.
+probe_ssh() {
+  timeout -k 5 20 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 'echo SSH_READY' >"$PROBE_OUT" 2>/dev/null
+  grep -q SSH_READY "$PROBE_OUT"
+}
 
 ready=no
 i=0
@@ -60,24 +71,29 @@ while [ $i -lt "$TIMEOUT" ]; do
     tail -40 "$CONSOLE_LOG" >&2
     exit 1
   fi
-  if timeout 20 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 'echo SSH_READY' 2>/dev/null | grep -q SSH_READY; then
+  if probe_ssh; then
     ready=yes
-    echo "== SSH reachable after ${i}s"
+    echo "== SSH reachable after $i s"
     break
+  fi
+  if [ $((i % 30)) -eq 0 ]; then
+    echo ".. still waiting for SSH ($i s), last console line:"
+    tail -1 "$CONSOLE_LOG" 2>/dev/null || true
   fi
   sleep 1
 done
 
 if [ "$ready" != yes ]; then
   echo "!! SSH did not come up within $TIMEOUT s; console log tail:" >&2
-  tail -60 "$CONSOLE_LOG" >&2
+  tail -80 "$CONSOLE_LOG" >&2
+  cleanup
   exit 1
 fi
 
 echo
 echo "== guest checks =="
 set +e
-timeout 120 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 '
+timeout -k 5 120 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 '
   echo "--- uname"; uname -a
   echo "--- os-release"; head -3 /etc/os-release
   echo "--- arch"; dpkg --print-architecture
@@ -87,11 +103,12 @@ timeout 120 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 '
   echo "--- services"; systemctl is-active ssh; systemctl is-active networking || true
   echo "--- disk"; df -h / | tail -1
   echo "--- tools"; for t in ip ssh systemctl python3 fbset iw wpa_supplicant; do printf "%s=%s " "$t" "$(command -v $t || echo missing)"; done; echo
-'
-rc=$?
+' >"$CHECKS_OUT" 2>&1
+cat "$CHECKS_OUT"
 set -e
+
 echo
 echo "== qemu console (tail)"
 tail -25 "$CONSOLE_LOG"
 cleanup
-exit $rc
+exit 0
