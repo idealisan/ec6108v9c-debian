@@ -6,12 +6,13 @@
 #                 mv100/
 #                   hi_kernel.bin        -> p6  (uImage, LBA 0x7000)
 #                   bootargs.bin         -> p2  (runtime env, LBA 0x800)
-#                   debian-root.ext4     -> p9  (Android sparse, LBA 0x131000)
+#                   debian-root.ext4     -> p8  (Android sparse, LBA 0x31000)
 #                   README.txt
 #                 README.txt / SHA256SUMS.txt
 #
 # p1 (hiboot) is NEVER written. The two-stage OpenWrt relay (p7/p8) is gone:
-# the rootfs is written straight into p9 and p2 points at root=/dev/mmcblk0p9.
+# the rootfs is written straight into the last partition (p8: the 512M
+# backup partition is reclaimed) and p2 points at root=/dev/mmcblk0p8.
 set -eo pipefail
 
 DIST=${DIST:-dist}
@@ -46,7 +47,7 @@ bootargs_512M=mem=512M
 bootargs_768M=mem=768M
 bootargs_1G=mem=1G
 bootargs_2G=mem=2G
-bootargs=model=mv100 console=ttyAMA0,115200 root=/dev/mmcblk0p9 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:1M(boot),1M(bootargs),4M(baseparam),4M(pqparam),4M(logo),20M(kernel),64M(busybox),512M(backup),-(ubuntu)
+bootargs=model=mv100 console=ttyAMA0,115200 root=/dev/mmcblk0p8 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:1M(boot),1M(bootargs),4M(baseparam),4M(pqparam),4M(logo),20M(kernel),64M(busybox),-(debian)
 bootcmd=mmc read 0 0x1FFFFC0 0x7000 0xA000; bootm 0x1FFFFC0
 bootdelay=0
 stdin=serial
@@ -94,7 +95,7 @@ loadfilek=fatload usb 0 0x1000000 mv100/hi_kernel.bin
 loadfiler=fatload usb 0 0x1000000 mv100/debian-root.ext4
 loadfileb=getinfo ddrfree; mw.b 0x1000000 0xFF 0x10000; fatload usb 0 0x1000000 mv100/bootargs.bin; crc32 1000000 10000
 flashpartitionk=mmc write 0 0x1000000 0x7000 $K_HEX
-flashpartitionr=mmc write.ext4sp 0 0x1000000 0x131000 $R_HEX
+flashpartitionr=mmc write.ext4sp 0 0x1000000 0x31000 $R_HEX
 flashpartitionb=mmc write 0 0x1000000 0x800 0x80
 flashkernel=run loadfilek flashpartitionk
 flashrootfs=run loadfiler flashpartitionr
@@ -107,9 +108,10 @@ EC6108V9C Debian USB flash payload (community boot method)
 built (UTC): $STAMP
 
 p1 hiboot is NOT touched by this package. Partitions written:
-  p2 bootargs  LBA 0x800    root=/dev/mmcblk0p9, community 9-partition cmdline
+  p2 bootargs  LBA 0x800    root=/dev/mmcblk0p8, 8-partition cmdline
+                            (512M backup partition reclaimed into rootfs)
   p6 kernel    LBA 0x7000   mainline uImage (zImage + DTB)
-  p9 rootfs    LBA 0x131000 Debian armhf, Android sparse (1 GiB)
+  p8 rootfs    LBA 0x31000  Debian armhf, Android sparse (1 GiB)
 
 First boot grows p9 with resize2fs to the rest of the eMMC.
 EOF

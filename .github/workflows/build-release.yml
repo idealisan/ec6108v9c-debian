@@ -103,8 +103,9 @@ jobs:
           1. Format a USB stick FAT32/MBR, extract the flash zip to its root.
           2. Power off, insert stick, power on with the recovery pads shorted
              (same trigger as the community Ubuntu package).
-          3. hiboot runs bootargs.bin and writes p6 (kernel), p9 (rootfs sparse)
-             and p2 (runtime env), then resets. p1/p3/p4/p5/p7/p8 untouched.
+          3. hiboot runs bootargs.bin and writes p6 (kernel), p8 (rootfs sparse)
+             and p2 (runtime env), then resets. p1/p3/p4/p5/p7 untouched
+             (the 512M backup partition is reclaimed into the rootfs).
           4. First boot: resize2fs grows p9, SSH/telnet come up on DHCP.
 
           Login: ssh root@<ip> / ec6108v9c, or telnet <ip> (plaintext).
