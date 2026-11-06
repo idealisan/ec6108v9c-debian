@@ -1,50 +1,54 @@
-U 盘救援包（社区 Ubuntu 包同款机制）
-====================================
+U 盘救援包（hiboot 阶段，不依赖 recovery / 安卓 / 网络）
+==========================================================
 
-现在的状态：设备反复进 recovery / 进不了安卓。
-原因：misc 分区的 BCB 里写着 boot-recovery，recovery 异常退出后
-没走 finish_recovery()，hiboot 每次读到它就再进 recovery。
-这不是变砖 —— p11 原厂内核没动（68f8c213…），system/data 也没动。
+现状：recovery 反复重启，遥控器进 recovery 也是同一画面。
+p11 原厂内核没动（68f8c213…），system/data 没动 —— 不是变砖。
+坏的是两处：
+  1. misc 里的 BCB 写着 boot-recovery，hiboot 每次都进 recovery；
+  2. p3 里两份 recovery 的 ramdisk 都被我改过，hiboot 有
+     "The recovery verify failed." 的 RSA 校验，两份都起不来。
+所以救援必须：清 BCB + 把 p3 写回原厂。
 
-原理（社区 mv100-mdmo1g-usb-flash.zip 就是这么做的）：
-U 盘根目录放一个 bootargs.bin（64KB，4字节 CRC32 头 + NUL 分隔的
-key=value 环境变量）。hiboot 在 U 盘升级模式里读它，执行 bootcmd：
-    fatload usb 0 0x1000000 <文件>     ; 从 U 盘读到 DDR
-    mmc write 0 0x1000000 <LBA> <扇区数> ; 按 LBA 写 eMMC
-    reset
-不经过 recovery、不验签、不需要安卓、不需要网络。
+!!! 关键：U 盘升级模式不是 recovery !!!
+它发生在 hiboot（比 recovery 更早）。上电时按遥控器触发的是
+hiboot 里的 "forceFlag / force update"（p1 里能查到这两个字符串），
+然后 hiboot 读 U 盘根目录的 bootargs.bin 并执行 bootcmd。
+recovery 坏了不影响这条路 —— 因为压根还没走到 recovery。
 
-【方法 A：先试最省事的，不用短接】
-断电，用你之前进 recovery 的遥控器办法进菜单，选 6. Reboot。
-只要 recovery 这次正常走完，它会清掉 BCB，就能回安卓。
-如果选完 Reboot 还是循环，再用方法 B。
+hiboot 字符串证据：
+  detect forceFlag,force update
+  recoverybootargs / bootargs.bin / bootargs crc failed !
+  The recovery verify failed. / boot from first-recovery / second-recovery
+社区 mv100-mdmo1g-usb-flash.zip 用的就是这套机制。
 
-【方法 B：U 盘救援，需要短接触点进 U 盘升级模式】
+【操作】
 1. U 盘格式化成 FAT32 / MBR。
-2. 把下面文件拷到 U 盘根目录：
-     bootargs.bin      （最小版，只清 BCB）
-     misc_zero.bin     （4KB 全零）
-   如果还想把 recovery 也还原成原厂，另外拷：
-     bootargs-full.bin 改名为 bootargs.bin（覆盖上面那个）
-     p03_stock.img     （原厂 recovery 16MB，来自本机备份）
-3. 断电，插 U 盘，短接触点上电（和社区包刷机同一个入口）。
-4. 等它自动写完并重启（bootcmd 末尾是 reset）。拔掉 U 盘再开机，
-   应该直接回原厂安卓。
+2. 阶段 1：把 bootargs.bin 拷到 U 盘根目录（只需这一个文件）。
+   断电 → 插 U 盘 → 上电，同时按住你平时进 recovery 的那个遥控器键
+   （就是触发 forceFlag 的键，和以前一样，不需要短接触点）。
+   bootcmd 做的事：mw.b 把 DDR 清零 → mmc write 写进 misc 前 4KB
+   抹掉 BCB → reset。之后应该直接回原厂安卓。
+3. 如果阶段 1 之后还是循环：阶段 2，把 bootargs-full.bin 改名为
+   bootargs.bin（覆盖），并把 p03_stock.img（原厂 recovery 16MB）
+   也拷到根目录，同样上电触发。它会清 BCB + 把 p3 写回原厂。
 
-两个版本的区别：
-  最小版  ：只清 BCB，p3 保留我们改过的双公钥（原厂 key + 我们的 key）。
-            以后 recovery 的 U 盘刷机能力仍在，且我们的签名包也能刷。
-  完全恢复：清 BCB + 把 p3 写回原厂镜像，回到刷机前的完全原厂状态。
-            想彻底重来就用这个。
+【为什么分两步】
+阶段 1 只用 hiboot 内置命令，不读 U 盘大文件，最不容易失败；
+阶段 2 的 fatload 若读失败，至少 BCB 已经清掉了，安卓能起。
+p03_stock.img 的 md5 是 96643af0302e2765fabae0eaa322d824，
+就是从这台设备上 dd 出来的原厂 p3。
 
-LBA 依据（原厂 16 分区 layout，512B 扇区）：
-  misc      = 0x19000   （写 8 扇区 = 4KB，覆盖 BCB 的 1088 字节）
-  recovery  = 0x2800    （0x8000 扇区 = 16MB）
-这两个偏移和 docs/006-restore-to-stock.md 里的恢复表一致。
+【LBA 依据】原厂 16 分区 layout，512B 扇区
+  misc     0x19000 （写 8 扇区 = 4KB，覆盖 BCB 的 1088 字节）
+  recovery 0x2800  （0x8000 扇区 = 16MB）
+与 docs/006-restore-to-stock.md 的恢复表一致。
 
-注意：
-  - 不要放 FLASH.txt / ROLLBACK.txt，救援包不涉及它们。
-  - 短接不稳定就多试几次，这是唯一不依赖系统的入口。
-  - 恢复后如果要继续做 Debian，从"双 key + BCB 触发"重新开始，
-    但这次别留 boot-recovery 的 BCB：让 install 成功走完，
-    或在 recovery 菜单里正常选 Reboot 收尾。
+【如果 U 盘这条路也不行】
+那就只剩硬件手段：串口 TTL + HiTool，或短接触点进 BootROM 下载模式。
+这两样你手上都没有，所以先别放弃 U 盘这条路 —— 它不需要短接，
+只需要上电时按遥控器（和以前进 recovery 完全同一个动作）。
+
+【恢复之后】
+别再留 boot-recovery 的 BCB 尾巴。要做 Debian 就走干净的
+"U 盘 bootargs.bin → mmc write" 路线，别再往 misc 里写 BCB，
+也别改 p3 —— 保持 recovery 原厂，它就是你的救援通道。
