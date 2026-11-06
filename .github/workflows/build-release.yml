@@ -158,6 +158,9 @@ jobs:
         run: |
           sudo truncate -s 1024M build/qemu/rootfs.ext4
           sudo mke2fs -q -F -t ext4 -L debian-root -d build/rootfs build/qemu/rootfs.ext4
+          # qemu runs as the normal user and must be able to read the image
+          sudo chown "$(id -u):$(id -g)" build/qemu/rootfs.ext4
+          chmod 644 build/qemu/rootfs.ext4
 
       - name: Boot under QEMU and verify SSH
         run: |
