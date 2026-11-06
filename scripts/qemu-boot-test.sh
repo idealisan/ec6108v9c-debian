@@ -16,7 +16,7 @@ INITRD=${INITRD:-build/qemu/initrd}
 ROOTFS=${ROOTFS:-build/qemu/rootfs.ext4}
 SSH_PORT=${SSH_PORT:-2222}
 PASSWD=${PASSWD:-ec6108v9c}
-TIMEOUT=${TIMEOUT:-600}
+TIMEOUT=${TIMEOUT:-420}
 MEM=${MEM:-1024}
 CONSOLE_LOG=${CONSOLE_LOG:-build/qemu-console.log}
 
@@ -39,7 +39,15 @@ qemu-system-arm \
   -device virtio-net-device,netdev=net0 \
   > "$CONSOLE_LOG" 2>&1 &
 QPID=$!
-trap 'kill "$QPID" 2>/dev/null || true' EXIT
+# The CI runner waits for every child process, so the emulator has to die for
+# sure - a plain SIGTERM can leave it alive and stall the whole step.
+cleanup() {
+  kill "$QPID" 2>/dev/null || true
+  sleep 1
+  kill -9 "$QPID" 2>/dev/null || true
+  wait "$QPID" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
 
@@ -68,6 +76,7 @@ fi
 
 echo
 echo "== guest checks =="
+set +e
 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 '
   echo "--- uname"; uname -a
   echo "--- os-release"; head -3 /etc/os-release
