@@ -1,7 +1,8 @@
 # EC6108V9C Debian 刷机手册（018）
 
 > 适用产物：GitHub Release build-<时间戳> 里的 mv100-mdmo1g-debian-usb-flash-<时间戳>.zip
-> 生成日期：2026-11-06。与产物严格对应：只写 p2 / p6 / p9，**永不写 p1（hiboot）**。
+> 注意：本方案回收了原 512M backup 分区并入 rootfs（root=/dev/mmcblk0p8），与社区 9 分区表不同
+> 生成日期：2026-11-06。与产物严格对应：只写 p2 / p6 / p8，**永不写 p1（hiboot）**。
 
 ---
 
@@ -28,8 +29,7 @@
 | p5 logo | 4M | 开机 logo | 不写 |
 | p6 kernel | 20M | 内核 uImage | 写 |
 | p7 busybox | 64M | 社区救援系统 | 不写（社区两级接力已弃用） |
-| p8 backup | 512M | 备份 | 不写 |
-| p9 ubuntu | 剩余 | rootfs | 写（Debian） |
+| p8 debian | 剩余 | rootfs | 写（Debian，含被回收的 512M backup） |
 
 ### 刷机包 U 盘结构与写入动作
 
@@ -38,14 +38,14 @@
       mv100/
         hi_kernel.bin         → p6  (LBA 0x7000,   mmc write)
         bootargs.bin          → p2  (LBA 0x800,    mmc write)
-        debian-root.ext4      → p9  (LBA 0x131000, mmc write.ext4sp, 1GiB Android sparse)
+        debian-root.ext4      → p8  (LBA 0x31000,  mmc write.ext4sp, 1GiB Android sparse)
         README.txt
       README.txt / SHA256SUMS.txt
 
 hiboot 执行的 bootcmd 序列（已内置，无需手动操作）：
 
     run flashkernel   → fatload usb 0 0x1000000 mv100/hi_kernel.bin;   mmc write 0 0x1000000 0x7000 <扇区数>
-    run flashrootfs   → fatload usb 0 0x1000000 mv100/debian-root.ext4; mmc write.ext4sp 0 0x1000000 0x131000 0x200000
+    run flashrootfs   → fatload usb 0 0x1000000 mv100/debian-root.ext4; mmc write.ext4sp 0 0x1000000 0x31000 0x200000
     run flashbootargs → 校验 mv100/bootargs.bin CRC32 后写 p2
     reset
 
@@ -55,8 +55,10 @@ hiboot 执行的 bootcmd 序列（已内置，无需手动操作）：
 
 1. **p9 会被整个覆盖**。盒子现在是社区 Ubuntu（hinas），上面 /opt/alist、tailscale、各种配置刷完就没了。要保留的东西先在社区系统里备份出来（scp 到电脑或 U 盘）。
 2. **p1 hiboot 永远不写**，所以 U 盘救援通道始终保留，理论上不会因此变砖。
-3. 唯一需要物理操作的一步：**短接触发点**（和当年刷社区 Ubuntu 完全一样的操作）。
-4. WiFi 驱动（rtl8xxxu）是首次真机验证，**先保持网线插着**，SSH 进去验证一切正常后再换 WiFi。
+3. **分区表与社区不同**：原 512M backup（p8）已回收并入 rootfs，rootfs 现在是 mmcblk0p8、起始 LBA 0x31000（约 7.9G 可用）。想回社区 Ubuntu 直接用社区 U 盘包重刷即可（它会重写自己的 p2/p7/p8/p9，自洽）。
+4. p8 里原有的社区 recoverybox 救援系统会被覆盖——不影响 U 盘刷机救援（走 hiboot+U盘，与 p8 无关）。
+5. 唯一需要物理操作的一步：**短接触发点**（和当年刷社区 Ubuntu 完全一样的操作）。
+6. WiFi 驱动（rtl8xxxu）是首次真机验证，**先保持网线插着**，SSH 进去验证一切正常后再换 WiFi。
 
 ---
 
@@ -117,7 +119,7 @@ hiboot 执行的 bootcmd 序列（已内置，无需手动操作）：
     uname -a                       # Linux ... 6.3.0-rc5 ... armv7l
     cat /etc/os-release            # Debian GNU/Linux 12 (bookworm)
     ip -brief addr                 # eth0 有 DHCP 地址
-    lsblk                          # mmcblk0p9 已扩容
+    lsblk                          # mmcblk0p8 已扩容 (~7.9G)
     cat /sys/class/thermal/thermal_zone0/temp   # 毫度, 63000 左右 = 63°C（tsensor 补丁生效）
     ec6108-temp                    # 人性化读温度
     lsmod | grep rtl8xxxu          # WiFi 驱动
@@ -154,7 +156,7 @@ rootfs 更新用 apt；整包更新才需要重新 U 盘刷机。
 | 刷机时毫无反应 | U 盘格式/结构不对（须 MBR+FAT32，文件在根目录）；换 U 盘或 USB 口；确认短接点在**上电前**就已短接 |
 | 刷完不启动、HDMI 无显示 | p6 内核问题概率大，等 SSH：若网络通说明 rootfs 正常，只是显示问题；网络也不通 → 走救援 |
 | SSH 连不上 | 查路由器 DHCP；试 telnet 23；确认网线插好。都不通 → 救援 |
-| 系统起不来 / 想回社区 Ubuntu | 用**社区 Ubuntu 的 U 盘刷机包**重复 §4，会覆盖 p9 回到社区系统（p1/p3/p4/p5/p7/p8 保留） |
+| 系统起不来 / 想回社区 Ubuntu | 用**社区 Ubuntu 的 U 盘刷机包**重复 §4，会覆盖 p9 回到社区系统（它会写入自己的 p2 环境变量，自洽；p1/p3/p4/p5/p7 保留） |
 | 温度读数异常 | tsensor 读数用 SDK 公式，若为负/异常发 dmesg 回来分析 |
 | eMMC 写坏 | p8 (512M backup) 未动，社区救援链（p7+p8）理论可用；极端情况重刷 |
 
