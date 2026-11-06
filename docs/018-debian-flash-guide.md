@@ -127,11 +127,23 @@ hiboot 执行的 bootcmd 序列（已内置，无需手动操作）：
     lsusb                          # 0bda:f179 RTL8188FU
     df -h                          # / 有几十 GB 可用
 
-**HDMI 说明**：当前构建的 framebuffer 节点默认关闭（地址未确认）。开机后屏幕显示的是 hiboot 留下的固定 logo 画面，行为和社区 Ubuntu 一样。点亮文字控制台的做法：
+**HDMI 显示原理与点亮步骤**（重要）：
 
-    ec6108-fbprobe                 # 扫描 VO 寄存器, 找 hiboot 留下的 framebuffer 地址
-    # 把输出里 "FB-like" 的地址发回来 → 填进 CI 的 fb_base 参数重出包
-    # 之后 dd 更新内核即可（见 §7）, HDMI 上就有 fbcon 文字控制台
+社区 Ubuntu 显示图片靠的是 4.4 内核里整套海思 hifb/VO/HDMI 私有驱动（主动驱动显示）。
+我们的 6.x 主线内核没有这套东西，但 **hiboot 已经把 HDMI/VO/显示时钟全部配好并在持续扫描输出**，
+只要内核不去动它，画面就一直挂着。已做的保障：
+
+1. bootargs 加了 **clk_ignore_unused** —— 6.x 的 crg 时钟驱动（默认启用）否则会在启动末期
+   关掉"没人认领"的 VO/HDMI/VDP 时钟导致黑屏；加了之后内核不碰任何时钟。
+2. hiboot 的 logo framebuffer 是运行时从预留内存动态分配的（读 SDK 源码确认，
+   没有固定地址），但 VO 层地址寄存器里存的就是它 —— 刷完 6.x 后：
+
+       ec6108-fbprobe      # 扫描 VO 寄存器区 0xF9000000-0xF90FFFFF + HDMI 0xF8CE0000
+                           # 找 "FB-like" 行 (0x3C-0x40 段 DDR 地址) = framebuffer 物理地址
+
+3. 把 fbprobe 输出发回来 → 填进 CI 的 fb_base 参数重出包 → simplefb + fbcon 生效，
+   HDMI 上有文字控制台。像素格式已从 SDK 源码确认：ARGB8888，stride=7680（1080p）。
+4. 内核更新用 dd（见 §7），不用再刷 U 盘。
 
 ---
 
