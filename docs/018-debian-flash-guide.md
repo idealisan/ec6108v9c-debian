@@ -114,6 +114,24 @@ hiboot 执行的 bootcmd 序列（已内置，无需手动操作）：
 
 ---
 
+## 5.5 内核命令行与内存是怎么来的（重要）
+
+我们的内核用 `CONFIG_ARM_APPENDED_DTB`（DTB 追加在 zImage 后面）启动，这种方式下
+**DTB 里的 /chosen/bootargs 会完全覆盖引导程序传来的命令行**，所以命令行必须完整写在
+DTB 里（`configs/partition-layout.env` 是唯一数据源，内核构建和刷机包脚本共用）：
+
+    model=mv100 clk_ignore_unused console=ttyAMA0,115200 root=mmcblk0p8     rootfstype=ext4 rootwait rw blkdevparts=... mem=1G
+
+两个关键项：
+
+- **mem=1G**：上游板级 DTS 没有 /memory 节点，而 DTB 启动时内核不会再用 ATAGS 的
+  mem=，没有这一项内核会认为整机 0 字节内存直接 panic。补丁已同时加入
+  /memory@0（reg = <0 0x40000000>），两条路径一致。DDR 容量不同的机型要改
+  `configs/partition-layout.env` 的 MEM_SIZE / MEM_SIZE_STR。
+- **clk_ignore_unused**：6.x 的 crg-hi3798 时钟驱动默认开启，内核启动末期会把
+  "没人认领"的时钟关掉——VO/HDMI/VDP 时钟正是这样被关的，表现就是黑屏。
+  这一项禁止内核动任何时钟，hiboot 留下的显示状态原样保留。
+
 ## 6. 刷后验证清单
 
     uname -a                       # Linux ... 6.3.0-rc5 ... armv7l
@@ -143,6 +161,8 @@ hiboot 执行的 bootcmd 序列（已内置，无需手动操作）：
 
 3. 把 fbprobe 输出发回来 → 填进 CI 的 fb_base 参数重出包 → simplefb + fbcon 生效，
    HDMI 上有文字控制台。像素格式已从 SDK 源码确认：ARGB8888，stride=7680（1080p）。
+   fbprobe 每页在子进程里读（未映射的寄存器页会 SIGBUS，不能让整个扫描死掉），
+   输出里 `FB-like reg` 后面就是候选地址，`fb 0x…` 那一行是候选地址的实际内容。
 4. 内核更新用 dd（见 §7），不用再刷 U 盘。
 
 ---

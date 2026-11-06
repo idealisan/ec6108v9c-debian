@@ -3,20 +3,19 @@
 		#size-cells = <1>;
 		ranges;
 
-		fb_mem: framebuffer@EC6108_FB_BASE {
-			compatible = "simple-framebuffer";
+		fb_mem: framebuffer@EC6108_FB_NAME {
 			reg = <EC6108_FB_BASE 0x800000>;
 			no-map;
 			status = EC6108_FB_STATUS;
 		};
 	};
 
-	framebuffer@EC6108_FB_BASE {
+	framebuffer@EC6108_FB_NAME {
 		compatible = "simple-framebuffer";
 		reg = <EC6108_FB_BASE 0x800000>;
 		width = <1920>;
 		height = <1080>;
 		stride = <7680>;
-		format = "a8r8g8b8";  /* HiSilicon PF_8888 = ARGB8888, stride 7680 @1080p */
+		format = "a8r8g8b8";
 		status = EC6108_FB_STATUS;
 	};

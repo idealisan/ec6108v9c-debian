@@ -29,6 +29,14 @@ OUT=${OUT:-$DIST/mv100-mdmo1g-debian-usb-flash-$STAMP.zip}
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT_DIR"
 
+# Shared partition / memory layout (single source of truth with the kernel
+# DTS build).
+if [ -f "$ROOT_DIR/configs/partition-layout.env" ]; then
+  set -a
+  . "$ROOT_DIR/configs/partition-layout.env"
+  set +a
+fi
+
 WORK=build/community-package
 rm -rf "$WORK"
 mkdir -p "$WORK/root" "$WORK/pkg/mv100" "$DIST"
@@ -47,7 +55,11 @@ bootargs_512M=mem=512M
 bootargs_768M=mem=768M
 bootargs_1G=mem=1G
 bootargs_2G=mem=2G
-bootargs=model=mv100 clk_ignore_unused console=ttyAMA0,115200 root=/dev/mmcblk0p8 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:1M(boot),1M(bootargs),4M(baseparam),4M(pqparam),4M(logo),20M(kernel),64M(busybox),-(debian)
+# NOTE: the kernel command line that actually matters is the one baked into
+# the DTB (/chosen/bootargs, see configs/partition-layout.env). It overrides
+# whatever the bootloader hands over, because the kernel is booted with
+# CONFIG_ARM_APPENDED_DTB.
+bootargs=${KERNEL_CMDLINE_NO_MEM}
 bootcmd=mmc read 0 0x1FFFFC0 0x7000 0xA000; bootm 0x1FFFFC0
 bootdelay=0
 stdin=serial

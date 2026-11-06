@@ -1,48 +1,124 @@
-#!/bin/sh
-# Probe hiboot-programmed VO registers to find the HDMI framebuffer address.
-# Run on the 6.x kernel (no VO driver loaded, hiboot values still in registers).
-# Scans VDP region 0xF9000000-0xF90FFFFF + HDMI 0xF8CE0000, catches aborts per page.
-python3 - <<'PYEOF'
-import mmap, os, struct, sys
-f = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+#!/usr/bin/env python3
+"""Find the framebuffer address that hiboot programmed into the VO layer.
+
+Runs on the 6.x kernel, which has no VO driver: the registers still hold
+whatever hiboot wrote at boot, so the GFX layer address register tells us
+where the scan-out buffer lives in DDR.
+
+Every page read runs in a forked child, because an unmapped register page
+raises SIGBUS in the kernel and would otherwise kill the whole scan.
+
+Usage: ec6108-fbprobe [start_hex] [end_hex]
+"""
+import mmap
+import os
+import struct
+import sys
+
+DEV = "/dev/mem"
 PAGE = 0x1000
-def probe_page(base):
-    """Return list of (addr, value) nonzero words, or None if the page aborts."""
-    try:
-        m = mmap.mmap(f, PAGE, mmap.MAP_SHARED, mmap.PROT_READ, offset=base)
-        m.seek(0)
-        vals = [struct.unpack("<I", m.read(4))[0] for _ in range(PAGE // 4)]
-        os.close(m)
-        return vals
-    except Exception:
+FB_LO = 0x10000000
+FB_HI = 0x40000000
+
+RANGES = [
+    ("HDMI", 0xF8CE0000, 0xF8CE1000),
+    ("VDP", 0xF9000000, 0xFA000000),
+]
+
+
+def read_words(base):
+    """Fork a child that reads one page of /dev/mem (None if inaccessible)."""
+    rd, wr = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rd)
+        try:
+            fd = os.open(DEV, os.O_RDWR | os.O_SYNC)
+            mm = mmap.mmap(fd, PAGE, mmap.MAP_SHARED, mmap.PROT_READ, offset=base)
+            mm.seek(0)
+            data = mm.read(PAGE)
+            os.close(fd)
+            vals = [struct.unpack("<I", data[i:i + 4])[0] for i in range(0, len(data), 4)]
+            with os.fdopen(wr, "wb") as f:
+                f.write(struct.pack("<%dI" % len(vals), *vals))
+            os._exit(0)
+        except Exception:
+            os._exit(1)
+    os.close(wr)
+    chunks = []
+    with os.fdopen(rd, "rb") as f:
+        chunks.append(f.read())
+    _, status = os.waitpid(pid, 0)
+    out = b"".join(chunks)
+    if status != 0 or len(out) < PAGE:
         return None
+    return list(struct.unpack("<%dI" % (len(out) // 4), out))
 
-candidates = [(0xF8CE0000 + i * PAGE) for i in range(4)]  # HDMI controller
-candidates += [(0xF9000000 + i * PAGE) for i in range(0xA0)]  # VDP region scan
 
-fb_like = []
-for base in candidates:
-    vals = probe_page(base)
-    if vals is None:
-        print("%08x: ABORT" % base)
-        continue
-    nz = [(base + i * 4, v) for i, v in enumerate(vals) if v]
-    if nz:
-        print("%08x: %d nonzero" % (base, len(nz)))
-        for a, v in nz:
-            # framebuffer address candidates: top-of-DDR 0x3c00_0000-0x4000_0000
-            if 0x3C000000 <= v < 0x40000000 and (v & 0xFFF) == 0:
-                print("   !! FB-like: %08x = 0x%08x" % (a, v))
-                fb_like.append((a, v))
-            elif 0x3C000000 <= v < 0x40000000:
-                print("   ?? ddr-val: %08x = 0x%08x" % (a, v))
+def read_bytes(addr, length=64):
+    """Fork a child that reads arbitrary physical memory (None if it aborts)."""
+    rd, wr = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rd)
+        try:
+            fd = os.open(DEV, os.O_RDWR | os.O_SYNC)
+            mm = mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_READ, offset=addr)
+            mm.seek(0)
+            data = mm.read(length)
+            os.close(fd)
+            with os.fdopen(wr, "wb") as f:
+                f.write(data)
+            os._exit(0)
+        except Exception:
+            os._exit(1)
+    os.close(wr)
+    chunks = []
+    with os.fdopen(rd, "rb") as f:
+        chunks.append(f.read())
+    _, status = os.waitpid(pid, 0)
+    out = b"".join(chunks)
+    if status != 0:
+        return None
+    return out
+
+
+def main():
+    if len(sys.argv) > 2:
+        ranges = [("CUSTOM", int(sys.argv[1], 0), int(sys.argv[2], 0))]
     else:
-        print("%08x: ok-empty" % base)
-os.close(f)
-print("
-=== FB-like registers:")
-for a, v in fb_like:
-    print("  reg 0x%08x -> fb 0x%08x" % (a, v))
-if not fb_like:
-    print("  (none found - widen the scan)")
-PYEOF
+        ranges = RANGES
+
+    candidates = []
+    for name, start, end in ranges:
+        print("== scanning %s 0x%08x-0x%08x" % (name, start, end))
+        base = start
+        while base < end:
+            words = read_words(base)
+            if words is None:
+                base += PAGE
+                continue
+            for i, v in enumerate(words):
+                if not v:
+                    continue
+                addr = base + i * 4
+                if FB_LO <= v < FB_HI and (v & 0xFFF) == 0:
+                    print("   FB-like reg 0x%08x = 0x%08x" % (addr, v))
+                    candidates.append((addr, v))
+            base += PAGE
+
+    print("")
+    print("=== candidates: %d" % len(candidates))
+    for addr, val in candidates:
+        data = read_bytes(val, 64)
+        if data is None:
+            print("  reg 0x%08x -> 0x%08x (unreadable)" % (addr, val))
+            continue
+        nonzero = sum(1 for b in data if b)
+        head = " ".join("%02x" % b for b in data[:16])
+        print("  reg 0x%08x -> fb 0x%08x  nonzero=%d/64  head=%s" % (addr, val, nonzero, head))
+    if not candidates:
+        print("  nothing found - widen RANGES or check /dev/mem access")
+
+
+main()

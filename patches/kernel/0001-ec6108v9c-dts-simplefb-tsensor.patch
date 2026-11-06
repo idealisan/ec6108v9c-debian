@@ -1,22 +1,33 @@
 --- a/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts
 +++ b/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts
-@@ -2,6 +2,9 @@
+@@ -8,6 +8,7 @@
  
- /dts-v1/;
- #include "hi3798mv100.dtsi"
-+
-+#define EC6108_FB_BASE   __FB_BASE__
-+#define EC6108_FB_STATUS __FB_STATUS__
+ 	chosen {
+ 		stdout-path = "serial0:115200n8";
++		bootargs = "__CMDLINE__";
+ 	};
  
- / {
- 	model = "Huawei EC6108V9C";
-@@ -31,6 +34,16 @@
+ 	leds {
+@@ -31,6 +32,29 @@
  			panic-indicator;
  			default-state = "off";
  		};
 +	};
 +
-+/* hiboot leaves an HDMI framebuffer; CI substitutes __FB_BLOCK__ */
++/*
++ * Memory map: DDR starts at physical 0x0 on this board (verified via
++ * /proc/iomem: 00000000-3fffffff System RAM). The kernel command line
++ * (/chosen/bootargs) carries mem=, blkdevparts= and root=, so the tree
++ * stays correct even if the bootloader passes nothing useful.
++ */
++	memory@0 {
++		device_type = "memory";
++		reg = <0x0 __MEM_SIZE__>;
++	};
++
++/* Framebuffer node block injected by scripts/apply-dts-placeholders.py.
++ * It stays empty unless a framebuffer address is confirmed.
++ */
 +__FB_BLOCK__
 +
 +/* on-chip Tsensor (PMC 0xF8A23000) - exposed via thermal_zone */

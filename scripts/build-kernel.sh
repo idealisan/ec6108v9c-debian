@@ -21,6 +21,14 @@ CONFIG_FRAGMENT=${CONFIG_FRAGMENT:-configs/kernel/ec6108v9c.config}
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT_DIR"
 
+# Shared partition / memory layout (also used by the flash package script),
+# so the DTB command line and the p2 runtime env can never drift apart.
+if [ -f "$ROOT_DIR/configs/partition-layout.env" ]; then
+  set -a
+  . "$ROOT_DIR/configs/partition-layout.env"
+  set +a
+fi
+
 rm -rf "$OUT"
 mkdir -p "$OUT" "$DIST"
 
@@ -39,8 +47,8 @@ if [ -n "$FB_BASE" ]; then
 else
   echo "  FB_BASE unset: framebuffer nodes omitted (safe default)"
 fi
-python3 scripts/apply-fb-dts.py "$DTS_FILE" "$PATCH_DIR/simple-framebuffer.dtsi" "$FB_BASE"
-grep -n "tsensor\|simple-framebuffer\|EC6108_FB_BASE" "$DTS_FILE" | head -6
+python3 scripts/apply-dts-placeholders.py "$DTS_FILE" "$PATCH_DIR/simple-framebuffer.dtsi"     "$FB_BASE" "${KERNEL_CMDLINE:-}" "${MEM_SIZE:-0x40000000}"
+grep -n "tsensor\|simple-framebuffer\|memory@0\|bootargs" "$DTS_FILE" | head -8
 
 echo "== kernel: defconfig =="
 make -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="$CROSS" \
