@@ -47,7 +47,7 @@ bootargs_512M=mem=512M
 bootargs_768M=mem=768M
 bootargs_1G=mem=1G
 bootargs_2G=mem=2G
-bootargs=model=mv100 console=ttyAMA0,115200 root=/dev/mmcblk0p8 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:1M(boot),1M(bootargs),4M(baseparam),4M(pqparam),4M(logo),20M(kernel),64M(busybox),-(debian)
+bootargs=model=mv100 clk_ignore_unused console=ttyAMA0,115200 root=/dev/mmcblk0p8 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:1M(boot),1M(bootargs),4M(baseparam),4M(pqparam),4M(logo),20M(kernel),64M(busybox),-(debian)
 bootcmd=mmc read 0 0x1FFFFC0 0x7000 0xA000; bootm 0x1FFFFC0
 bootdelay=0
 stdin=serial

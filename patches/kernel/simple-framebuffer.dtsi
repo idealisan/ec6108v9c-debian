@@ -17,6 +17,6 @@
 		width = <1920>;
 		height = <1080>;
 		stride = <7680>;
-		format = "a8b8g8r8";
+		format = "a8r8g8b8";  /* HiSilicon PF_8888 = ARGB8888, stride 7680 @1080p */
 		status = EC6108_FB_STATUS;
 	};
