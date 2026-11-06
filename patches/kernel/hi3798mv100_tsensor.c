@@ -20,10 +20,10 @@
 #include <linux/thermal.h>
 #include <linux/of.h>
 
-#define PMC10		0x28
-#define PMC12		0x30
-#define PMC_START	0x6005
-#define SAMPLE_COUNT	4
+#define PMC10           0x28
+#define PMC12           0x30
+#define PMC_START       0x6005
+#define SAMPLE_COUNT    4
 
 struct hi3798_tsensor {
 	void __iomem *base;
@@ -72,12 +72,10 @@ static int hi3798_tsensor_probe(struct platform_device *pdev)
 			ts, &hi3798_tsensor_ops, NULL, 0, 1000);
 	if (IS_ERR(ts->tzd))
 		return dev_err_probe(&pdev->dev, PTR_ERR(ts->tzd),
-				     "failed to register thermal zone
-");
+				     "failed to register thermal zone");
 
 	platform_set_drvdata(pdev, ts);
-	dev_info(&pdev->dev, "Hi3798MV100 Tsensor registered
-");
+	dev_info(&pdev->dev, "Hi3798MV100 Tsensor registered");
 	return 0;
 }
 
