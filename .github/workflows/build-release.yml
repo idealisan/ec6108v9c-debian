@@ -6,11 +6,18 @@ on:
       archive_refs:
         description: 'Archive third-party reference snapshots (large, ~2GB)'
         type: boolean
-        default: true
+        default: false
+      fb_base:
+        description: 'hiboot framebuffer physical address (hex). Empty keeps HDMI console disabled.'
+        type: string
+        default: ''
   push:
     branches: [main]
     paths:
       - 'scripts/**'
+      - 'configs/**'
+      - 'patches/**'
+      - 'rootfs/**'
       - '.github/workflows/build-release.yml'
 
 permissions:
@@ -23,7 +30,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -35,31 +42,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf u-boot-tools bc bison flex libssl-dev libelf-dev \
-            lz4 zstd xz-utils cpio rsync unzip file \
+            lz4 zstd xz-utils cpio rsync unzip file device-tree-compiler \
             debootstrap qemu-user-static binfmt-support e2fsprogs zip \
-            mtools dosfstools parted
+            mtools dosfstools parted python3
           sudo apt-get install -y --no-install-recommends libc6:i386 libstdc++6:i386 lib32z1 || true
-
-      - name: Build hiboot from HiSTB SDK
-        run: bash scripts/build-sdk-components.sh
 
       - name: Init kernel submodule (shallow, pinned commit)
         run: git submodule update --init --depth 1 third_party/linux-hi3798mv100
 
-      - name: Build mainline kernel (6.x)
+      - name: Build mainline 6.x kernel with local patches
+        env:
+          FB_BASE: ${{ inputs.fb_base }}
         run: bash scripts/build-kernel.sh
 
-      - name: Build Debian rootfs
+      - name: Build Debian rootfs (SSH + telnet + WiFi firmware + tools)
         run: bash scripts/build-rootfs.sh
 
-      - name: Build live-USB image and eMMC package (p1 untouched)
+      - name: Build community-format U-disk flash package
         run: |
           echo "STAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
-          bash scripts/make-live-usb.sh
-          bash scripts/make-emmc-package.sh
-
-      - name: Build probe and stock-restore packages
-        run: bash scripts/make-extra-packages.sh
+          bash scripts/make-community-flash-package.sh
 
       - name: Archive reference materials
         if: ${{ github.event_name == 'push' || inputs.archive_refs }}
@@ -74,35 +76,40 @@ jobs:
       - name: Write release notes
         run: |
           cat > RELEASE_NOTES.md <<EOF
-          EC6108V9C (Hi3798MV100) Debian armhf build
+          EC6108V9C (Hi3798MV100) Debian armhf - community boot method
 
           - build (UTC): $STAMP
-          - kernel: mainline 6.3.0-rc5 + hi3798mv100 port (loonpn tree, pinned submodule)
-          - hiboot: HiSTB SDK fastboot (fastboot-burn.bin -> p1)
-          - rootfs: Debian 12 bookworm armhf (debootstrap, serial console ttyAMA0)
-          - boot: uImage = zImage + appended DTB, load address 0x2000000
-          - login: root / ec6108v9c (change it after first boot)
+          - boot/flash: community (ECOO) U-disk method, p1 hiboot NOT written
+          - kernel: mainline 6.3.0-rc5 + hi3798mv100 port, with local patches:
+              * simple-framebuffer + fbcon (HDMI console, disabled until FB_BASE set)
+              * Hi3798MV100 on-chip Tsensor -> /sys/class/thermal/thermal_zone0/temp
+              * rtl8xxxu (RTL8188FU USB WiFi, 0bda:f179) built in
+              * ext4/f2fs/btrfs/xfs/squashfs/overlay/exfat/ntfs3/fuse built in
+          - rootfs: Debian 12 bookworm armhf (debootstrap)
+              * SSH enabled (root / ec6108v9c - CHANGE IT), telnet on 23
+              * DHCP on eth0 and wlx8421f1edf583, wpasupplicant + firmware-realtek
+              * lm-sensors, fbset, kbd, console-setup, full CLI toolset
 
           Assets:
-          - hi3798mv100-live-usb-*.img.gz     dd-able live USB (boots Linux from the stick, no eMMC write)
-          - mv100-mdmo1g-debian-emmc-*.zip    install to p11/p16/p2 only (p1 never touched)
-          - mv100-mdmo1g-probe-*.zip          verify hiboot reads the stick (no writes)
-          - mv100-mdmo1g-stock-restore-*.zip  restore factory p2..p15 from the backup stick
-          - hi_kernel.bin                        mainline kernel uImage for the p6 partition
-          - modules.tar.gz                       kernel modules (/lib/modules)
-          - fastboot-burn.bin                    SDK hiboot image for the p1 partition
+          - mv100-mdmo1g-debian-usb-flash-$STAMP.zip   U-disk flash package (community layout)
+          - hi_kernel.bin        uImage = zImage + DTB, load 0x2000000 -> p6 (LBA 0x7000)
+          - zImage-dtb           raw kernel for other boot experiments
+          - modules.tar.gz       kernel modules (/lib/modules)
           - debian-rootfs-armhf-bookworm.tar.gz  plain rootfs tarball (not for flashing)
-          - references-*.tar.gz                  docs + scripts + tools + manifest
-          - snapshot-*.tar.gz                    upstream source snapshots (SDK, guides)
+          - patches/kernel/*     kernel patches applied during the build
           - SHA256SUMS.txt
 
-          Flashing (see docs/001-boot-and-flash-analysis.md for the full analysis):
-          1. Format a USB stick as FAT32, extract the flash zip to its root.
-          2. Power on the box while holding the recovery key so its hiboot
-             picks up bootargs.bin from the stick.
-          3. The script writes p6 (kernel), p9 (rootfs) and p2 (bootargs),
-             then resets. p1/p3/p4/p5/p7/p8 are untouched.
-          4. First boot grows the filesystem; serial console 115200 8N1.
+          Flashing:
+          1. Format a USB stick FAT32/MBR, extract the flash zip to its root.
+          2. Power off, insert stick, power on with the recovery pads shorted
+             (same trigger as the community Ubuntu package).
+          3. hiboot runs bootargs.bin and writes p6 (kernel), p9 (rootfs sparse)
+             and p2 (runtime env), then resets. p1/p3/p4/p5/p7/p8 untouched.
+          4. First boot: resize2fs grows p9, SSH/telnet come up on DHCP.
+
+          Login: ssh root@<ip> / ec6108v9c, or telnet <ip> (plaintext).
+          Serial console ttyAMA0 115200. WiFi: ec6108-wifi <SSID> <password>.
+          Temperature: ec6108-temp (or cat /sys/class/thermal/thermal_zone0/temp).
           EOF
 
       - name: Publish release
@@ -110,6 +117,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "build-$STAMP" \
-            --title "$STAMP · debian12-armhf + linux-6.3.0-rc5 + sdk-hiboot + usb-flash" \
+            --title "$STAMP · debian12-armhf + linux-6.x + community-usb-flash" \
             --notes-file RELEASE_NOTES.md \
             dist/*

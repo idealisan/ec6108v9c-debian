@@ -1,0 +1,22 @@
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		fb_mem: framebuffer@EC6108_FB_BASE {
+			compatible = "simple-framebuffer";
+			reg = <EC6108_FB_BASE 0x800000>;
+			no-map;
+			status = EC6108_FB_STATUS;
+		};
+	};
+
+	framebuffer@EC6108_FB_BASE {
+		compatible = "simple-framebuffer";
+		reg = <EC6108_FB_BASE 0x800000>;
+		width = <1920>;
+		height = <1080>;
+		stride = <7680>;
+		format = "a8b8g8r8";
+		status = EC6108_FB_STATUS;
+	};

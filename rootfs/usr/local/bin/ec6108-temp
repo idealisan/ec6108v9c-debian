@@ -1,0 +1,8 @@
+#!/bin/sh
+# Print the Hi3798MV100 on-chip Tsensor temperature.
+for z in /sys/class/thermal/thermal_zone*/temp; do
+    [ -r "$z" ] || continue
+    t=$(cat "$z")
+    printf '%s: %.1f C (%s mC)
+' "$z" "$(awk -v t=$t 'BEGIN{print t/1000}')" "$t"
+done

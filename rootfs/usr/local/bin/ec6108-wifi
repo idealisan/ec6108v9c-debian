@@ -1,0 +1,19 @@
+#!/bin/sh
+# Connect the RTL8188FU USB WiFi on EC6108V9C (mainline rtl8xxxu).
+# Usage: ec6108-wifi <SSID> <password>
+# DHCP is handled by ifupdown (see /etc/network/interfaces).
+set -e
+SSID=$1
+PASS=$2
+IF=wlx8421f1edf583
+if [ -z "$SSID" ] || [ -z "$PASS" ]; then
+    echo "usage: ec6108-wifi <SSID> <password>" >&2
+    exit 1
+fi
+mkdir -p /etc/wpa_supplicant
+wpa_passphrase "$SSID" "$PASS" > /etc/wpa_supplicant/wpa_supplicant.conf
+chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+ip link set "$IF" up
+ifdown "$IF" 2>/dev/null || true
+ifup "$IF"
+echo "WiFi connecting... check with: ip -brief addr show $IF"

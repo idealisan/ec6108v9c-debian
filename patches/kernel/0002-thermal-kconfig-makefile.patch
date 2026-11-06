@@ -1,0 +1,26 @@
+diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
+index 4cd7ab7..f29b845 100644
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@ -502,4 +502,12 @@ config KHADAS_MCU_FAN_THERMAL
+ 	  If you say yes here you get support for the FAN controlled
+ 	  by the Microcontroller found on the Khadas VIM boards.
+ 
++
++config HI3798MV100_TSENSOR
++	tristate "Hi3798MV100 on-chip Tsensor"
++	depends on OF
++	help
++	  Exposes the Hi3798MV100 on-chip temperature sensor as a standard
++	  thermal zone at /sys/class/thermal/thermal_zone0/temp.
++
+ endif
+diff --git a/drivers/thermal/Makefile b/drivers/thermal/Makefile
+index eed300e..c7e5e3b 100644
+--- a/drivers/thermal/Makefile
++++ b/drivers/thermal/Makefile
+@@ -62,3 +62,4 @@ obj-$(CONFIG_UNIPHIER_THERMAL)	+= uniphier_thermal.o
+ obj-$(CONFIG_AMLOGIC_THERMAL)     += amlogic_thermal.o
+ obj-$(CONFIG_SPRD_THERMAL)	+= sprd_thermal.o
+ obj-$(CONFIG_KHADAS_MCU_FAN_THERMAL)	+= khadas_mcu_fan.o
++obj-$(CONFIG_HI3798MV100_TSENSOR)	+= hi3798mv100_tsensor.o
