@@ -89,7 +89,9 @@ sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 '
   echo "--- tools"; for t in ip ssh systemctl python3 fbset iw wpa_supplicant; do printf "%s=%s " "$t" "$(command -v $t || echo missing)"; done; echo
 '
 rc=$?
+set -e
 echo
 echo "== qemu console (tail)"
 tail -25 "$CONSOLE_LOG"
+cleanup
 exit $rc
