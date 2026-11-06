@@ -49,7 +49,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
+SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR"
 
 ready=no
 i=0
@@ -60,7 +60,7 @@ while [ $i -lt "$TIMEOUT" ]; do
     tail -40 "$CONSOLE_LOG" >&2
     exit 1
   fi
-  if sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 'echo SSH_READY' 2>/dev/null | grep -q SSH_READY; then
+  if timeout 20 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 'echo SSH_READY' 2>/dev/null | grep -q SSH_READY; then
     ready=yes
     echo "== SSH reachable after ${i}s"
     break
