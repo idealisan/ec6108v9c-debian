@@ -77,7 +77,7 @@ fi
 echo
 echo "== guest checks =="
 set +e
-sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 '
+timeout 120 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 '
   echo "--- uname"; uname -a
   echo "--- os-release"; head -3 /etc/os-release
   echo "--- arch"; dpkg --print-architecture
