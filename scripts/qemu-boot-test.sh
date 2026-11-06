@@ -58,26 +58,28 @@ SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/nu
 # Probe without a pipe on purpose: timeout only kills sshpass, and the ssh
 # child it spawned would keep the pipe open and block the shell forever.
 probe_ssh() {
-  timeout -k 5 20 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 'echo SSH_READY' >"$PROBE_OUT" 2>/dev/null
+  timeout -k 3 8 sshpass -p "$PASSWD" ssh $SSH_OPTS root@127.0.0.1 'echo SSH_READY' >"$PROBE_OUT" 2>/dev/null
   grep -q SSH_READY "$PROBE_OUT"
 }
 
+# Wall clock deadline: every failed probe costs a few seconds, so counting
+# iterations would stretch the timeout far beyond the intended limit.
 ready=no
-i=0
-while [ $i -lt "$TIMEOUT" ]; do
-  i=$((i + 1))
+deadline=$((SECONDS + TIMEOUT))
+while [ $SECONDS -lt $deadline ]; do
   if ! kill -0 "$QPID" 2>/dev/null; then
     echo "!! qemu exited early, console log tail:"
     tail -40 "$CONSOLE_LOG" >&2
+    cleanup
     exit 1
   fi
   if probe_ssh; then
     ready=yes
-    echo "== SSH reachable after $i s"
+    echo "== SSH reachable after $((SECONDS)) s"
     break
   fi
-  if [ $((i % 30)) -eq 0 ]; then
-    echo ".. still waiting for SSH ($i s), last console line:"
+  if [ $((SECONDS % 30)) -eq 0 ]; then
+    echo ".. still waiting for SSH ($((SECONDS)) s elapsed), last console line:"
     tail -1 "$CONSOLE_LOG" 2>/dev/null || true
   fi
   sleep 1
