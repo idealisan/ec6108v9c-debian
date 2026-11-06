@@ -64,7 +64,9 @@ jobs:
           bash scripts/make-community-flash-package.sh
 
       - name: Archive reference materials
-        if: ${{ github.event_name == 'push' || inputs.archive_refs }}
+        # Opt-in only: these snapshots are multi-GB and would show up as
+        # oversized assets on every single release.
+        if: ${{ inputs.archive_refs == true }}
         run: bash scripts/make-references-archive.sh
 
       - name: Checksums
@@ -121,3 +123,49 @@ jobs:
             --title "$STAMP · debian12-armhf + linux-6.x + community-usb-flash" \
             --notes-file RELEASE_NOTES.md \
             dist/*
+
+  # Boots the Debian armhf rootfs on an emulated ARM board and checks that
+  # systemd comes up and SSH is reachable. This is the minimum bar before
+  # flashing the real box: if the userspace cannot even boot here, it will
+  # not boot there either.
+  qemu-boot-test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install QEMU and helpers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-arm sshpass debootstrap qemu-user-static binfmt-support e2fsprogs ca-certificates
+
+      - name: Fetch Debian armhf netboot kernel and initrd
+        run: |
+          mkdir -p build/qemu
+          cd build/qemu
+          BASE=https://deb.debian.org/debian/dists/bookworm/main/installer-armhf/current/images/netboot
+          curl -fsSL -o vmlinuz "$BASE/vmlinuz"
+          curl -fsSL -o initrd.gz "$BASE/initrd.gz"
+          gunzip -f initrd.gz
+          ls -l vmlinuz initrd
+
+      - name: Build Debian armhf rootfs
+        run: bash scripts/build-rootfs.sh
+
+      - name: Build raw ext4 image for QEMU
+        run: |
+          sudo truncate -s 1024M build/qemu/rootfs.ext4
+          sudo mke2fs -q -F -t ext4 -L debian-root -d build/rootfs build/qemu/rootfs.ext4
+
+      - name: Boot under QEMU and verify SSH
+        run: |
+          KERNEL=build/qemu/vmlinuz INITRD=build/qemu/initrd ROOTFS=build/qemu/rootfs.ext4 bash scripts/qemu-boot-test.sh
+
+      - name: Upload QEMU console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-console-log
+          path: build/qemu-console.log

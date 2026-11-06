@@ -100,6 +100,14 @@ sudo chroot "$ROOT" /usr/bin/ssh-keygen -A || true
 sudo mkdir -p "$ROOT/etc/systemd/system/multi-user.target.wants"
 sudo ln -sf /lib/systemd/system/ssh.service "$ROOT/etc/systemd/system/multi-user.target.wants/ssh.service"
 
+# ---- networking: ifupdown brings up eth0 (DHCP) ----
+# Without this the box would boot with no IPv4 address at all and SSH would
+# be unreachable, even though sshd is running.
+sudo ln -sf /lib/systemd/system/networking.service "$ROOT/etc/systemd/system/multi-user.target.wants/networking.service"
+# ifupdown only configures interfaces listed in /etc/network/interfaces; make
+# sure eth0 is not blocked and that the loopback is up
+sudo sed -i "s/^allow-hotplug/allow-hotplug/" "$ROOT/etc/network/interfaces"
+
 # ---- telnet (busybox telnetd, standalone, no inetd needed) ----
 sudo tee "$ROOT/etc/systemd/system/telnetd.service" >/dev/null <<'UNIT_EOF'
 [Unit]
