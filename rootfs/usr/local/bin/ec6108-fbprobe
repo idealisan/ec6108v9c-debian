@@ -1,0 +1,48 @@
+#!/bin/sh
+# Probe hiboot-programmed VO registers to find the HDMI framebuffer address.
+# Run on the 6.x kernel (no VO driver loaded, hiboot values still in registers).
+# Scans VDP region 0xF9000000-0xF90FFFFF + HDMI 0xF8CE0000, catches aborts per page.
+python3 - <<'PYEOF'
+import mmap, os, struct, sys
+f = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+PAGE = 0x1000
+def probe_page(base):
+    """Return list of (addr, value) nonzero words, or None if the page aborts."""
+    try:
+        m = mmap.mmap(f, PAGE, mmap.MAP_SHARED, mmap.PROT_READ, offset=base)
+        m.seek(0)
+        vals = [struct.unpack("<I", m.read(4))[0] for _ in range(PAGE // 4)]
+        os.close(m)
+        return vals
+    except Exception:
+        return None
+
+candidates = [(0xF8CE0000 + i * PAGE) for i in range(4)]  # HDMI controller
+candidates += [(0xF9000000 + i * PAGE) for i in range(0xA0)]  # VDP region scan
+
+fb_like = []
+for base in candidates:
+    vals = probe_page(base)
+    if vals is None:
+        print("%08x: ABORT" % base)
+        continue
+    nz = [(base + i * 4, v) for i, v in enumerate(vals) if v]
+    if nz:
+        print("%08x: %d nonzero" % (base, len(nz)))
+        for a, v in nz:
+            # framebuffer address candidates: top-of-DDR 0x3c00_0000-0x4000_0000
+            if 0x3C000000 <= v < 0x40000000 and (v & 0xFFF) == 0:
+                print("   !! FB-like: %08x = 0x%08x" % (a, v))
+                fb_like.append((a, v))
+            elif 0x3C000000 <= v < 0x40000000:
+                print("   ?? ddr-val: %08x = 0x%08x" % (a, v))
+    else:
+        print("%08x: ok-empty" % base)
+os.close(f)
+print("
+=== FB-like registers:")
+for a, v in fb_like:
+    print("  reg 0x%08x -> fb 0x%08x" % (a, v))
+if not fb_like:
+    print("  (none found - widen the scan)")
+PYEOF

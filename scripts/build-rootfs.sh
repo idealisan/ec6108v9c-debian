@@ -29,6 +29,7 @@ PACKAGES=(
   e2fsprogs parted dosfstools util-linux mount findutils coreutils
   usbutils pciutils i2c-tools lsof strace tcpdump
   lm-sensors fbset kbd console-setup
+  python3-minimal python3
   tzdata bash-completion tmux minicom
 )
 # firmware-realtek lives in non-free-firmware in bookworm.
