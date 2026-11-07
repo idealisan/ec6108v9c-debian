@@ -158,42 +158,24 @@ jobs:
       - name: Install QEMU and helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-arm sshpass debootstrap qemu-user-static binfmt-support e2fsprogs ca-certificates
-
-      - name: Fetch Debian armhf kernel and boot initramfs
-        run: |
-          mkdir -p build/qemu/pkg
-          cd build/qemu
-          # NOTE: the *installer* netboot initrd boots the Debian installer
-          # (it asks for a language and never touches our rootfs), so use the
-          # kernel package that ships a normal boot initramfs instead.
-          URL=$(curl -fsSL http://deb.debian.org/debian/dists/bookworm/main/binary-armhf/Packages.gz                 | gunzip                 | awk '/^Package: linux-image-6\.1\..*-armmp$/{p=1} p && /^Filename: /{print $2; exit}')
-          echo "kernel package: $URL"
-          test -n "$URL"
-          curl -fsSL -o kernel.deb "http://deb.debian.org/debian/$URL"
-          dpkg-deb -x kernel.deb pkg
-          cp pkg/boot/vmlinuz-* vmlinuz
-          cp pkg/boot/initrd.img-* initrd
-          ls -l vmlinuz initrd
+          sudo apt-get install -y --no-install-recommends qemu-system-arm sshpass debootstrap qemu-user-static binfmt-support e2fsprogs ca-certificates cpio
 
       - name: Build Debian armhf rootfs
         run: bash scripts/build-rootfs.sh
 
-      - name: Build raw ext4 image for QEMU
-        run: |
-          sudo truncate -s 1024M build/qemu/rootfs.ext4
-          sudo mke2fs -q -F -t ext4 -L debian-root -d build/rootfs build/qemu/rootfs.ext4
-          # qemu runs as the normal user and must be able to read the image
-          sudo chown "$(id -u):$(id -g)" build/qemu/rootfs.ext4
-          chmod 644 build/qemu/rootfs.ext4
-
       - name: Boot under QEMU and verify SSH
+        # Same script as the local test (scripts/qemu-local-test.sh): the
+        # rootfs is booted directly as an initramfs, so no disk image and no
+        # initrd from the Debian kernel package are needed.
         run: |
-          KERNEL=build/qemu/vmlinuz INITRD=build/qemu/initrd ROOTFS=build/qemu/rootfs.ext4 bash scripts/qemu-boot-test.sh
+          ROOTFS_TAR=dist/debian-rootfs-armhf-bookworm.tar.gz \
+          WORK=build/qemu/local \
+          CONSOLE_LOG=build/qemu/local-console.log \
+            bash scripts/qemu-local-test.sh
 
       - name: Upload QEMU console log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: qemu-console-log
-          path: build/qemu-console.log
+          path: build/qemu/local-console.log
