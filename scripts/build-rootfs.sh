@@ -107,24 +107,31 @@ sudo ln -sf /lib/systemd/system/ssh.service "$ROOT/etc/systemd/system/multi-user
 # systemd-networkd waits for the carrier and keeps retrying the DHCP lease,
 # so use it for the wired and the wireless interface.
 sudo mkdir -p "$ROOT/etc/systemd/network"
+# Match by name using a glob, and do not require a carrier before configuring:
+# the internal FEPHY may not report link immediately (or at all if the generic
+# PHY driver is used), and networkd would otherwise wait forever and never
+# request a lease. The kernel cmdline carries net.ifnames=0, so the interface
+# stays eth0 rather than being renamed by udev.
 sudo tee "$ROOT/etc/systemd/network/10-eth0.network" >/dev/null <<'NET_EOF'
 [Match]
-Name=eth0
+Name=eth*
 
 [Network]
-DHCP=yes
+DHCP=ipv4
 IPv6AcceptRA=yes
+ConfigureWithoutCarrier=yes
 
 [DHCP]
 RouteMetric=10
 NET_EOF
 sudo tee "$ROOT/etc/systemd/network/20-wlan.network" >/dev/null <<'NET_EOF'
 [Match]
-Name=wlx*
+Name=wl*
 
 [Network]
-DHCP=yes
+DHCP=ipv4
 IPv6AcceptRA=yes
+ConfigureWithoutCarrier=yes
 NET_EOF
 sudo ln -sf /lib/systemd/system/systemd-networkd.service "$ROOT/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
 # NOTE: no sockets.target.wants/systemd-networkd.socket symlink here - that

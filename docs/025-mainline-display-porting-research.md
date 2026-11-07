@@ -416,3 +416,55 @@ hack-7.4/         本地 only（bring-up 调试工具，990-SS，不提交）
 - `docs/023`：原厂 recovery 逆向 + VO 寄存器偏移 → 与 `910-02` 的 `VO_G0_ADDR`
   注释**独立交叉印证**
 - `docs/024`：启动/显示链路审查 → 本文解释了 simplefb 路线为何不稳
+
+---
+
+## 8. 评估：把 histb 7.4 的显示补丁反向移植到当前 6.3 内核？
+
+**问题**：既然 histb-mainline 已经把 mv100 HDMI 做进主线，能否只把那几个
+显示补丁搬到我们现有的 6.3-rc5 内核上，比整套换 7.4 省事？
+
+**结论：不会更省事，反而更重。** 逐项核对（对象 = `third_party/linux-hi3798mv100`
+的 6.3-rc5 树）：
+
+| 依赖 | 6.3 现状 | 后果 |
+| --- | --- | --- |
+| `DRM_CLIENT_SELECTION` | **不存在** | 600-17 的 `select` 直接失效，需先补该 Kconfig 或改写驱动 |
+| `DRM_BRIDGE_CONNECTOR` | **不存在** | 同上，bridge connector helper 是 7.x 新增 |
+| `DRM_DISPLAY_HELPER` / `DRM_GEM_DMA_HELPER` / `DRM_KMS_HELPER` | 存在 | 这三项没问题 |
+| `drivers/gpu/drm/histb/` | **整个目录不存在** | 要搬 VDP2 的 plane/CRTC/encoder 全套，不是一两个文件 |
+| `drivers/gpu/drm/bridge/hi3798mv100-hdmi.c` | **不存在** | 见下条 |
+| 板级 DTS 引用的 `vpss` / `vdec` / `jpgd` / `media_cma` / `vdp` / `hdmi` | **全部不存在** | 要先搬一批 SoC dtsi 补丁，`910-03` 只是其中一个小补丁 |
+
+几个容易踩的坑：
+
+1. **mv100 用的是外挂 sii9134 transmitter，不是 on-chip HDMI**。`600-17` 新增的
+   `histb-hdmi.c` 是 mv200 的片内发送器；我们板子对应的是
+   `drivers/gpu/drm/bridge/hi3798mv100-hdmi.c`，而 `600-18` 只是在**该文件之上**
+   打补丁（改 `VIDEO_PATH_CTRL` 与按 die revision 写 PHY 0x09）。这个文件的
+   创建补丁不在本地已存的 4 个补丁里，得先从 series 补齐。
+2. **补丁不是独立可挑的几个**。`pending-7.4` 共 154 个，显示链路横跨
+   `600-xx`（DRM）与 `910-xx`（DTS），且互相依赖；只挑 600-17/18/910-02/03
+   会缺 plane 驱动、clock/reset binding、media CMA 等前置件。
+3. **等于把 hiboot 已完成的初始化重做一遍**。`600-18` 处理的
+   "video path 默认关闭 + PHY 按 die revision 配置"正是 bootloader 已经做好的
+   事——用户刷机后能看到 hiboot 画出的 "Debian Linux" logo，就是 VO / HDMI TX /
+   PHY 全部就绪的直接证据。从零起一套 KMS 反而要重新点亮这些寄存器。
+
+### 更省力的现成路线
+
+- **绿带启动标记**（`docs/024` §6.1，已实现）：直接往 hiboot 留下的 framebuffer
+  写像素，证明内核活着，不碰任何 DRM/VO 寄存器。
+- **simplefb 交接**（`hi3798mv100-hdmi-console.c`，已实现）：把同一块显存注册成
+  `simple-framebuffer` 让 fbcon 打日志，同样不需要 KMS。
+- 若刷本版后**绿带出现但没有文字**，说明内核活着、显存地址也对，剩下的只是
+  `fbcon` / `simplefb` 绑定问题（很可能是显存没用 `no-map` 保留 —— workflow
+  已有 `fb_base` 输入可开），修这个比移植整套 DRM 小一两个数量级。
+- 若**绿带都没出现**，问题在内核启动本身（p6 / DTB / `mem=`），此时搬任何显示
+  驱动都不会让屏幕亮起来。
+
+### 什么时候才值得整套换 7.4
+
+只有当「内核能稳定启动 + simplefb 路线无法满足需求（要 KMS 热插拔、多分辨率、
+Wayland、真正由内核驱动 HDMI）」时才划算。在那之前，整套迁移的成本高于收益，
+且用户已明确要求先出可刷产物、暂缓维护（见 `docs/024` §6 与 `docs/026` §3）。
