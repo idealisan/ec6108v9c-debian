@@ -196,6 +196,38 @@ rootfs 更新用 apt；整包更新才需要重新 U 盘刷机。
 
 ---
 
+## 8.5 刷机前先跑 QEMU 验证（本机 / CI 同一脚本）
+
+刷真机之前，先用 `scripts/qemu-local-test.sh` 在 QEMU 的 ARM virt 机器上把
+**我们的 Debian rootfs** 启动一遍并验证 SSH。脚本本机和 CI 共用：
+
+    # 本机 (macOS)
+    CPIO=/opt/homebrew/opt/cpio/bin/cpio \
+    ROOTFS_TAR=build/qemu/rootfs.tar.gz \
+      bash scripts/qemu-local-test.sh
+
+    # CI 里传的是 dist/debian-rootfs-armhf-bookworm.tar.gz，逻辑完全相同
+
+原理与坑（都已固化在脚本里）：
+
+- Debian 的 *installer* netboot initrd 会进安装器界面，内核包又不带 initrd.img，
+  所以**把 rootfs 本身做成 newc cpio initramfs**（root=/dev/ram0），不需要磁盘镜像，
+  也绕开 macOS 没有 mke2fs 的问题。
+- initramfs 里必须有 `/init`（软链到 sbin/init），否则内核坚持挂载 root= 块设备并 panic。
+- Debian 把 virtio_net / virtio_mmio / net_failover / failover 编成模块，
+  用一个 systemd 单元按序 insmod；rootfs 必须装 `kmod` 才有 insmod。
+- 解包 rootfs 时排除 `/dev/*` 设备节点（非 root 主机无法 mknod，systemd 会自己挂 devtmpfs）。
+- 包索引解析不能写 `curl | gunzip | awk ... exit`：awk 提前退出会断管道，
+  curl 报 (23)；改成下载成文件后用 python 解析。
+
+通过标准：`== SSH reachable` + guest checks 里 Debian 12 armhf、eth0 有 DHCP 地址、
+`systemctl is-active ssh` 为 active。2026-11-07 本机与 CI 双双通过。
+
+注意：QEMU 验证的是**用户空间**（systemd / 网络 / SSH / 工具链），
+SoC 专属驱动（HDMI、Tsensor、WiFi、eMMC）只能在真机上验。
+
+---
+
 ## 9. 已知未验证项（诚实清单）
 
 - rtl8xxxu 驱动在 RTL8188FU 上的实际稳定性（代码核对过，未真机验证；不行可回退 vendor 驱动）
