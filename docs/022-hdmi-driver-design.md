@@ -117,6 +117,18 @@ HPD/EDID 路径没有闭环。
   `HI_DISP_GetDisplayInfo`），**不能整目录照搬到 6.x**；
   只取其中的**寄存器写入序列**，用主线 `ioremap/readl/writel` 重写
 
+### 图层配置接口与像素格式（源码确认）
+
+`source/msp/drv/hifb/adp/inc/drv_hifb_adp.h` 的 `HIFB_DRV_OPS_S`：
+`HIFB_DRV_SetLayerAddr(layer, addr)` / `SetLayerDataFmt()` /
+`SetLayerAlpha()` / `UpdataLayerReg()` —— 图层地址/格式/刷新都是这些回调。
+`hi_gfx_layer.c:868` 调 `OPTM_GfxSetLayerAddr(DataId, pPhyAddr[InUsingDispIndex])` 设置显存地址。
+
+`optm_define.h` 的 `VDP_GFX_IFMT_E` 给出格式枚举（24bpp `RGB_888=0x50`、
+ARGB1555/8888 等），`OPTM_VDP_LAYER_GFX0..5` 是图层号。
+这些是**移植时直接照抄的常量与调用顺序**，不需要猜寄存器偏移：
+把 `HDMI_REG_WRITE` / `OPTM_*` 的物理地址访问换成 `ioremap + writel` 即可。
+
 ### 社区系统量到的 fb0 参数（仅供参考，不是目标地址）
 
 | 项 | 值 |
