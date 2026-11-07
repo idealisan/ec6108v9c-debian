@@ -3,26 +3,37 @@
  * HiSilicon Hi3798MV100 HDMI console hand-off driver
  *
  * The vendor bootloader (hiboot) initialises VO / VDP / HDMI TX and leaves a
- * logo framebuffer being scanned out. Mainline 6.x has no Hisilicon VO driver,
- * so this driver does NOT reprogram the display engine (doing so resets the
- * bootloader state and blanks the screen - the same lesson as postmarketOS's
- * "disable display clock controllers" advice). It only:
+ * logo framebuffer being scanned out of layer 0. Mainline 6.x has no Hisilicon
+ * VO driver, so this driver does NOT reprogram the display engine (doing so
+ * resets the bootloader state and blanks the screen - the same lesson as
+ * postmarketOS's "disable display clock controllers" advice). It only:
  *
- *   1. Reads the VO/VDP register banks left by hiboot and finds the physical
- *      address of the scan-out buffer (the same heuristic as ec6108-fbprobe,
- *      but in kernel space where ioremap makes the access safe).
+ *   1. Reads the VO layer registers that hiboot left behind: the surface
+ *      address, the stride and the input resolution of layer 0.
  *   2. Registers a "simple-framebuffer" platform device pointing at that
  *      memory, so the existing fbcon (console=tty0) can draw kernel messages.
  *
- * Register bases come from the HiSTB SDK (drv_reg_proc.h), which explicitly
- * lists CHIP_TYPE_hi3798mv100:
- *   HDMI TX 0xf8ce0000 (SLV0) / 0xf8ce0400 (SLV1) / 0xf8ce0800 (CEC)
- *   HDMI PHY 0xf8ce1800
- *   VO/VDP   0xf9000000 .. 0xfa000000
+ * Register layout, from the HiSTB SDK:
+ *   CONFIG_VDP_REG_BASEADDR = 0xf8cc0000, CONFIG_VDP_SIZE = 0xfff0
+ *     source/msp/drv/hifb/inc/drv_hifb_config.h
+ *   S_VDP_REGS_TYPE, source/common/drv/include/hi3798mv100/hi_reg_vdp.h
+ *     Every member is one u32, so a member's offset is 4 * its index:
+ *       VOCTRL   +0x0000   layer arbitration / global control
+ *       G0_ADDR  +0x0494   layer 0 surface address (physical)
+ *       G0_STRIDE+0x049c   layer 0 stride (16 bit)
+ *       G0_IRESO +0x04a0   layer 0 input resolution, iw[11:0] ih[23:12]
+ *   Cross-checked against the SDK: OPTM_VDP_GFX_SetLayerAddrEX() accesses
+ *   "&pOptmVdpReg->G0_ADDR.u32 + layer * CONFIG_HIFB_GFX_OFFSET" with
+ *   CONFIG_HIFB_GFX_OFFSET = 0x800 for hi3798mv100 (this SoC exposes a single
+ *   GFX layer, so G0 is all we need).
  *
- * All reads use get_kernel_nofault() so an unmapped register page can never
- * oops the kernel. If no framebuffer is found the driver simply steps aside;
- * the pstore console still captures panic logs.
+ * Fallback: if the layer registers do not hold a plausible address, the HDMI
+ * TX bank is scanned for a DDR-sized value, like ec6108-fbprobe does in user
+ * space. All register reads use get_kernel_nofault() so an unmapped page can
+ * never oops the kernel.
+ *
+ * If no framebuffer is found the driver steps aside; the pstore console still
+ * captures panic logs.
  *
  * Built-in only (bool Kconfig): this runs as a subsys_initcall before fbcon
  * picks its console, and it never unloads.
@@ -35,27 +46,34 @@
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/string.h>
 
+/* VO register block (HiSTB SDK CONFIG_VDP_REG_BASEADDR). */
+#define VO_REG_BASE     0xf8cc0000UL
+#define VO_REG_SIZE     0x1000
+#define VO_G0_ADDR      0x0494
+#define VO_G0_STRIDE    0x049c
+#define VO_G0_IRESO     0x04a0
+
+/* HDMI TX bank, only used as a fallback probe. */
 #define HDMI_TX_BASE   0xf8ce0000UL
 #define HDMI_TX_SIZE   0x2000
-#define VDP_BASE       0xf9000000UL
-#define VDP_SIZE       0x10000        /* 64 KiB: layer registers live in the
-				 * first banks; keep the scan small so an
-				 * external-abort page cannot oops us */
+
 #define PAGE_SIZE_4K   0x1000
 
 /* DDR is 1 GiB at physical 0x0 on this board. */
 #define DDR_START      0x00000000UL
 #define DDR_END        0x40000000UL
 
-/* 1920x1080 ARGB8888, one frame. Confirmed by the community kernel's
- * FBIOGET_VSCREENINFO/FSCREENINFO and by the SDK's own 1080p60 table. */
+/* Fallback geometry (SDK 1080p60 table, matches the community kernel's
+ * FBIOGET_VSCREENINFO: 1920x1080 ARGB8888, stride 7680). */
 #define FB_WIDTH       1920
 #define FB_HEIGHT      1080
 #define FB_STRIDE      7680
 #define FB_FORMAT      "a8r8g8b8"
 #define FB_SIZE        0x800000       /* 8 MiB */
 
+static void __iomem *vo_base;
 static struct platform_device *hi3798_simplefb_pdev;
 
 static bool hi3798_valid_fb_addr(u32 val)
@@ -73,27 +91,40 @@ static int hi3798_safe_read32(void __iomem *p, u32 *out)
 	return get_kernel_nofault(*out, src);
 }
 
-/* Scan a register bank for a value that looks like the scan-out buffer. */
-static u32 hi3798_scan_bank(void __iomem *bank, size_t size, const char *name)
+static u32 hi3798_read_vo(u32 off)
 {
+	u32 val;
+
+	if (get_kernel_nofault(val, (const u32 __force *)(vo_base + off)))
+		return 0;
+	return val;
+}
+
+/* Fallback: look for a DDR-sized value in the HDMI TX register bank.
+ * The physical bank must be ioremapped first - casting a physical address
+ * to a __iomem pointer would read an unmapped virtual address. */
+static u32 hi3798_scan_hdmi_tx(void)
+{
+	void __iomem *tx;
 	size_t off;
 	u32 best = 0;
-	unsigned int hits = 0;
 
-	for (off = 0; off + 4 <= size; off += 4) {
+	tx = ioremap(HDMI_TX_BASE, HDMI_TX_SIZE);
+	if (!tx)
+		return 0;
+	for (off = 0; off + 4 <= HDMI_TX_SIZE; off += 4) {
 		u32 val;
-		if (hi3798_safe_read32(bank + off, &val))
-			continue;               /* unmapped page, skip */
+		if (hi3798_safe_read32(tx + off, &val))
+			continue;
 		if (!hi3798_valid_fb_addr(val))
 			continue;
-		hits++;
-		if (!best)
+		if (!best) {
 			best = val;
-		pr_debug("hi3798-fb: %s+0x%04zx = 0x%08x (candidate)\n",
-			 name, off, val);
+			pr_info("hi3798-fb: HDMI TX+0x%04zx holds 0x%08x\n",
+				off, val);
+		}
 	}
-	pr_info("hi3798-fb: %s: %u framebuffer-like address(es), first 0x%08x\n",
-		name, hits, best);
+	iounmap(tx);
 	return best;
 }
 
@@ -118,43 +149,74 @@ static bool hi3798_fb_has_content(phys_addr_t addr)
 
 static int __init hi3798_hdmi_console_init(void)
 {
-	void __iomem *hdmi, *vdp;
 	struct simplefb_platform_data pdata;
 	struct resource res;
-	u32 addr = 0;
+	phys_addr_t fb_phys;
+	u32 addr, stride, ireso;
+	u32 width = FB_WIDTH, height = FB_HEIGHT;
 	int ret;
 
-	hdmi = ioremap(HDMI_TX_BASE, HDMI_TX_SIZE);
-	vdp = ioremap(VDP_BASE, VDP_SIZE);
-	if (!hdmi || !vdp) {
-		pr_warn("hi3798-fb: cannot ioremap display registers\n");
-		ret = -ENOMEM;
-		goto out_unmap;
+	vo_base = ioremap(VO_REG_BASE, VO_REG_SIZE);
+	if (!vo_base) {
+		pr_warn("hi3798-fb: cannot ioremap VO registers\n");
+		return -ENOMEM;
 	}
 
-	/* Prefer the VDP layer registers; fall back to the HDMI TX bank. */
-	addr = hi3798_scan_bank(vdp, VDP_SIZE, "VDP");
-	if (!addr)
-		addr = hi3798_scan_bank(hdmi, HDMI_TX_SIZE, "HDMI");
+	/* Layer 0 registers as programmed by hiboot. */
+	addr   = hi3798_read_vo(VO_G0_ADDR);
+	stride = hi3798_read_vo(VO_G0_STRIDE) & 0xffff;
+	ireso  = hi3798_read_vo(VO_G0_IRESO);
 
-	if (!addr || !hi3798_fb_has_content(addr)) {
-		pr_warn("hi3798-fb: no hiboot framebuffer found; HDMI console "
-			"disabled (pstore logs still available)\n");
-		ret = -ENODEV;
-		goto out_unmap;
+	pr_info("hi3798-fb: VO layer0: addr=0x%08x stride=%u ireso=0x%08x\n",
+		addr, stride, ireso);
+
+	if (hi3798_valid_fb_addr(addr)) {
+		u32 w = ireso & 0xfff;
+		u32 h = (ireso >> 12) & 0xfff;
+
+		if (w >= 320 && w <= 4096 && h >= 200 && h <= 4096) {
+			width = w;
+			height = h;
+		}
+		if (stride >= width * 4 && stride <= width * 8)
+			pdata.stride = stride;
+		else
+			pdata.stride = width * 4;
+	} else {
+		pr_warn("hi3798-fb: layer0 address 0x%08x not usable, "
+			"scanning HDMI TX\n", addr);
+		addr = hi3798_scan_hdmi_tx();
+		if (!addr) {
+			pr_warn("hi3798-fb: no hiboot framebuffer found; HDMI "
+				"console disabled (pstore logs still available)\n");
+			iounmap(vo_base);
+			vo_base = NULL;
+			return -ENODEV;
+		}
+		width = FB_WIDTH;
+		height = FB_HEIGHT;
+		pdata.stride = FB_STRIDE;
 	}
 
-	pr_info("hi3798-fb: hiboot framebuffer at 0x%08x, registering %dx%d %s console\n",
-		addr, FB_WIDTH, FB_HEIGHT, FB_FORMAT);
+	if (!hi3798_fb_has_content(addr)) {
+		pr_warn("hi3798-fb: 0x%08x has no pixel content, skipping\n",
+			addr);
+		iounmap(vo_base);
+		vo_base = NULL;
+		return -ENODEV;
+	}
 
-	pdata.width = FB_WIDTH;
-	pdata.height = FB_HEIGHT;
-	pdata.stride = FB_STRIDE;
+	fb_phys = (phys_addr_t)addr;
+	pr_info("hi3798-fb: hiboot framebuffer at 0x%08x, registering %ux%u console\n",
+		addr, width, height);
+
+	pdata.width = width;
+	pdata.height = height;
 	pdata.format = FB_FORMAT;
 
 	memset(&res, 0, sizeof(res));
-	res.start = (phys_addr_t)addr;
-	res.end = res.start + FB_SIZE - 1;
+	res.start = fb_phys;
+	res.end = fb_phys + FB_SIZE - 1;
 	res.flags = IORESOURCE_MEM;
 	res.name = "hiboot framebuffer";
 
@@ -177,18 +239,18 @@ static int __init hi3798_hdmi_console_init(void)
 		goto out_put;
 	}
 
-	iounmap(vdp);
-	iounmap(hdmi);
+	iounmap(vo_base);
+	vo_base = NULL;
 	return 0;
 
 out_put:
 	platform_device_put(hi3798_simplefb_pdev);
 	hi3798_simplefb_pdev = NULL;
 out_unmap:
-	if (vdp)
-		iounmap(vdp);
-	if (hdmi)
-		iounmap(hdmi);
+	if (vo_base) {
+		iounmap(vo_base);
+		vo_base = NULL;
+	}
 	return ret;
 }
 subsys_initcall(hi3798_hdmi_console_init);

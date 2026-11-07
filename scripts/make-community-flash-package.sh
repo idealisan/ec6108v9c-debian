@@ -19,7 +19,10 @@ DIST=${DIST:-dist}
 KERNEL_IMG=${KERNEL_IMG:-$DIST/hi_kernel.bin}
 MODULES_TAR=${MODULES_TAR:-$DIST/modules.tar.gz}
 ROOTFS_TAR=${ROOTFS_TAR:-$DIST/debian-rootfs-armhf-bookworm.tar.gz}
-IMG_SIZE_MB=${IMG_SIZE_MB:-1024}
+# 384 MiB image: the payload is ~240 MiB after the rootfs is trimmed, and
+# 98 MiB + 384 MiB = 482 MiB stays clear of the community p9 (610 MiB),
+# so a failed flash still leaves the community system bootable.
+IMG_SIZE_MB=${IMG_SIZE_MB:-384}
 ROOT_PASSWD=${ROOT_PASSWD:-ec6108v9c}
 SUDO=${SUDO:-sudo}
 MKFS=${MKFS:-mke2fs}
@@ -104,7 +107,7 @@ stdin=serial
 stdout=serial
 stderr=serial
 loadfilek=fatload usb 0 0x1000000 mv100/hi_kernel.bin
-loadfiler=fatload usb 0 0x1000000 mv100/debian-root.ext4
+loadfiler=getinfo ddrfree; fatload usb 0 0x1000000 mv100/debian-root.ext4
 loadfileb=getinfo ddrfree; mw.b 0x1000000 0xFF 0x10000; fatload usb 0 0x1000000 mv100/bootargs.bin; crc32 1000000 10000
 flashpartitionk=mmc write 0 0x1000000 0x7000 $K_HEX
 flashpartitionr=mmc write.ext4sp 0 0x1000000 0x31000 $R_HEX

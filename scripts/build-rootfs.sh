@@ -190,8 +190,21 @@ echo "== device helper scripts =="
 sudo cp -a "$ROOT_DIR/rootfs/usr/local/bin/." "$ROOT/usr/local/bin/"
 sudo chown root:root "$ROOT"/usr/local/bin/ec6108-*
 echo "== shrink =="
+# The image is written to the box by hiboot's "fatload", so every byte we
+# drop here is a byte we do not have to push through the USB stick. The
+# 1 GiB image with 327 MiB of payload stalled the flash script; keeping the
+# payload lean is what makes the package flashable at all.
 sudo rm -rf "$ROOT/var/lib/apt/lists/"*
 sudo rm -f "$ROOT/usr/bin/qemu-arm-static"
+sudo rm -rf "$ROOT/var/cache/"*
+# docs, man pages and translations are ~84 MiB and useless on an appliance.
+# The C locale is built into glibc and needs no locale files at all, so the
+# whole locale directory can go (a debootstrap tree only ships translations).
+sudo rm -rf "$ROOT/usr/share/doc" "$ROOT/usr/share/man" "$ROOT/usr/share/info"
+sudo rm -rf "$ROOT/usr/share/locale"
+# kernel modules are installed separately (modules.tar.gz)
+sudo rm -rf "$ROOT/lib/modules/"*
+echo "  payload now: $(du -sh "$ROOT" | cut -f1)"
 
 cleanup
 trap - EXIT
