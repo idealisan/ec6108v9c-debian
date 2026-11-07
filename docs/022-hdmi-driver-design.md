@@ -179,6 +179,37 @@ probe:
 
 ---
 
+## 6.1 第一版驱动已落地并编译通过（2026-11-07）
+
+`patches/kernel/hi3798mv100-hdmi-console.c`（194 行，built-in bool 驱动，
+`subsys_initcall`）：
+
+- `ioremap` HDMI TX `0xf8ce0000`/VO `0xf9000000`（VO 只扫前 64 KiB，
+  避免 external-abort 页 oops）
+- `get_kernel_nofault()` 安全读 32-bit 寄存器，找 4 KiB 对齐的 DDR 地址
+  （hiboot 写进 VO 层地址寄存器的显存）
+- `memremap` 校验该地址有像素内容
+- 用 `simplefb_platform_data` + `IORESOURCE_MEM` 动态注册
+  `simple-framebuffer` platform device，fbcon 接管
+- **不重新初始化显示硬件**（会重置 hiboot 状态导致黑屏，
+  postmarketOS 的 display-clock 教训）
+
+挂接：`0003-hdmi-console-kconfig-makefile.patch`（Kconfig bool + Makefile）、
+`CONFIG_FB_HI3798MV100_HDMI_CONSOLE=y`、`build-kernel.sh` 加入补丁列表与 cp。
+已有 `console=tty0` / `CONFIG_FB_SIMPLE` / `FRAMEBUFFER_CONSOLE` / `VT` 直接复用。
+
+**CI 验证**：run `42361378514` 两个 job 全绿，日志确认
+`applied: 0003-...` 和 `CC drivers/video/fbdev/hi3798mv100-hdmi-console.o`，
+release `build-20261107T102931Z` 已产出。
+
+**本机 docker 验证**：OrbStack + `debian:bookworm-slim` +
+`gcc-arm-linux-gnueabihf`，脚本 `TMP/docker-build-check.sh`（源码 read-only 挂载、
+容器内联编）。本机同样能编内核，只是比 CI 慢；CI 作为权威产物。
+
+**注意**：第一版是"保留 hiboot 状态"的最小路径。若真机上扫描不到
+framebuffer 地址，驱动会 warn 后退出（不破坏启动），此时按 §6 走
+自己分配显存 + 按 SDK 序列初始化 HDMI TX 的第二阶段。
+
 ## 7. 验证前提（与刷机流程绑定）
 
 驱动编进内核后要真机验证，必须同时让刷机流程能走完：
