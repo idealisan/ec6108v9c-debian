@@ -4,3 +4,6 @@ RELEASE_NOTES.md
 *.pyc
 __pycache__/
 probe/init
+
+# local scratch space (never commit)
+TMP/
