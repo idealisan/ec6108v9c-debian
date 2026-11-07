@@ -7,3 +7,9 @@ probe/init
 
 # local scratch space (never commit)
 TMP/
+# local working artefacts (never commit, never delete)
+.DS_Store
+GO/
+backup_stock/
+references/
+*.part
