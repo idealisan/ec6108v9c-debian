@@ -127,14 +127,13 @@ DHCP=yes
 IPv6AcceptRA=yes
 NET_EOF
 sudo ln -sf /lib/systemd/system/systemd-networkd.service "$ROOT/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
-sudo ln -sf /lib/systemd/system/systemd-networkd.socket "$ROOT/etc/systemd/system/sockets.target.wants/systemd-networkd.socket"
+# NOTE: no sockets.target.wants/systemd-networkd.socket symlink here - that
+# directory does not exist in a minimal debootstrap tree, and networkd is
+# started directly by the service symlink above.
 # ifupdown must stay out of the way now that networkd owns the interfaces
 sudo ln -sf /dev/null "$ROOT/etc/systemd/system/multi-user.target.wants/networking.service"
 # ... but keep the file for manual "ifup eth0" usage
 sudo sed -i "s/^auto eth0/#auto eth0/; s/^iface eth0 inet dhcp/#iface eth0 inet dhcp/" "$ROOT/etc/network/interfaces"
-# ifupdown only configures interfaces listed in /etc/network/interfaces; make
-# sure eth0 is not blocked and that the loopback is up
-sudo sed -i "s/^allow-hotplug/allow-hotplug/" "$ROOT/etc/network/interfaces"
 
 # ---- telnet (busybox telnetd, standalone, no inetd needed) ----
 sudo tee "$ROOT/etc/systemd/system/telnetd.service" >/dev/null <<'UNIT_EOF'
