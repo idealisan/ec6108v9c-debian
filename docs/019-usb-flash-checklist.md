@@ -49,12 +49,12 @@
       本机工作目录里的社区原版包 mv100-mdmo1g-usb-flash.zip
     (该文件在项目目录之外，按要求没有动它，需要时自行取用)
     用同样的短接触点方法重刷即可恢复成社区 Ubuntu
-  - 恢复后如需定位内核问题：把诊断内核 dd 到 p6 重启，
-    SSH 进社区系统看 dmesg，无需再碰 U盘
+  - 恢复后如需定位内核问题：内核自带 pstore/ramoops 与 HDMI 控制台驱动，
+    重启前会留下启动日志；不再单独提供诊断内核
+    (旧版的 hi_kernel-community-layout.bin 已从 CI 构建中移除)
 
 【附带材料(不放进U盘)】
   ../flash-support/
     hi_kernel.bin                  主内核, 后续 dd 更新用
-    hi_kernel-community-layout.bin 诊断内核(root=p9, 带社区 rootfs 启动)
     SHA256SUMS.txt                 release 级校验
     debian-rootfs-armhf-bookworm.tar.gz / modules.tar.gz (可选)

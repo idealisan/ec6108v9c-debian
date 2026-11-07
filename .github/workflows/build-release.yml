@@ -8,7 +8,7 @@ on:
         type: boolean
         default: false
       fb_base:
-        description: 'hiboot framebuffer physical address (hex). Empty keeps HDMI console disabled.'
+        description: 'static simplefb address (hex). Leave empty - the driver discovers the hiboot framebuffer at runtime.'
         type: string
         default: ''
       fb_width:
@@ -32,16 +32,9 @@ on:
         type: string
         default: '0x800000'
       extra_cmdline:
-        description: 'extra kernel params, e.g. ramoops.mem_address=0x... ramoops.mem_size=0x100000'
+        description: 'extra kernel params appended to /chosen/bootargs'
         type: string
         default: ''
-      layout:
-        description: 'partition layout: merged (p8 rootfs, default) or community (p9 rootfs, diagnostic)'
-        type: choice
-        default: merged
-        options:
-          - merged
-          - community
   push:
     branches: [main]
     paths:
@@ -84,24 +77,7 @@ jobs:
       - name: Build mainline 6.x kernel with local patches
         env:
           FB_BASE: ${{ inputs.fb_base }}
-          LAYOUT_ENV: ${{ inputs.layout == 'community' && 'configs/partition-layout-community.env' || 'configs/partition-layout.env' }}
-          FB_WIDTH: ${{ inputs.fb_width }}
-          FB_HEIGHT: ${{ inputs.fb_height }}
-          FB_STRIDE: ${{ inputs.fb_stride }}
-          FB_FORMAT: ${{ inputs.fb_format }}
-          FB_SIZE: ${{ inputs.fb_size }}
-          EXTRA_CMDLINE: ${{ inputs.extra_cmdline }}
-        run: bash scripts/build-kernel.sh
-
-      - name: Build diagnostic kernel (community layout, boots the community rootfs)
-        # A kernel with the community partition layout can boot the COMMUNITY
-        # rootfs, which gives us SSH access to a box running our 6.x kernel.
-        # That is how we get a boot log (dmesg) without a serial console.
-        env:
-          LAYOUT_ENV: configs/partition-layout-community.env
-          KERNEL_OUT: dist/hi_kernel-community-layout.bin
-          SKIP_MODULES: '1'
-          OUT: build/kernel-diag
+          LAYOUT_ENV: configs/partition-layout.env
           FB_WIDTH: ${{ inputs.fb_width }}
           FB_HEIGHT: ${{ inputs.fb_height }}
           FB_STRIDE: ${{ inputs.fb_stride }}
@@ -138,7 +114,8 @@ jobs:
           - build (UTC): $STAMP
           - boot/flash: community (ECOO) U-disk method, p1 hiboot NOT written
           - kernel: mainline 6.3.0-rc5 + hi3798mv100 port, with local patches:
-              * simple-framebuffer + fbcon (HDMI console, disabled until FB_BASE set)
+              * HDMI console driver hands off the hiboot framebuffer to simplefb/fbcon
+              * pstore/ramoops reserved-memory node captures panic logs
               * Hi3798MV100 on-chip Tsensor -> /sys/class/thermal/thermal_zone0/temp
               * rtl8xxxu (RTL8188FU USB WiFi, 0bda:f179) built in
               * ext4/f2fs/btrfs/xfs/squashfs/overlay/exfat/ntfs3/fuse built in
@@ -163,7 +140,8 @@ jobs:
           3. hiboot runs bootargs.bin and writes p6 (kernel), p8 (rootfs sparse)
              and p2 (runtime env), then resets. p1/p3/p4/p5/p7 untouched
              (the 512M backup partition is reclaimed into the rootfs).
-          4. First boot: resize2fs grows p9, SSH/telnet come up on DHCP.
+          4. First boot: resize2fs grows p8, SSH/telnet come up on DHCP.
+             If HDMI/SSH do not come up, pstore/ramoops keeps the panic log.
 
           Login: ssh root@<ip> / ec6108v9c, or telnet <ip> (plaintext).
           Serial console ttyAMA0 115200. WiFi: ec6108-wifi <SSID> <password>.
