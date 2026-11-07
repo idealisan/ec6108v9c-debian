@@ -9,18 +9,22 @@
 > - 原始笔记：`TMP/stock-rom-research/RESEARCH-NOTES.md`（`TMP/` 已被 `.gitignore` 排除，不入库；本文自包含）
 > - 相关文档：`docs/005`、`docs/013`、`docs/021`、`docs/022`、`docs/023`、`docs/024`、`docs/025`
 >
-> **结论先行**：备份里**没有可复用的显示 `.ko` 模块**，显示栈**编进 3.10 内核**；
-> 配有一整套**专有 Android 用户态 HAL**。因此本备份的价值是「一份真实、可反汇编的一手规格」
-> （实际刷入的 hiboot 二进制 + 生产内核 + 寄存器常量 + API 面 + 参数表），**不是可直接搬的驱动源码**。
-> 源码仍须来自 HiSTB SDK（`TMP/sdk-src/`）或 histb-mainline 补丁（`TMP/histb-ref/`）。
+> **结论先行**：备份里**没有可复用的显示 `.ko` 模块**，显示栈**编进 3.10 内核** ——
+> 移植时**不存在「搬一个 `.ko` 点亮屏幕」这条路**；配有一整套**专有 Android 用户态 HAL**（不可在 mainline 直接复用）。
+> 因此本备份的价值是「一份真实、可反汇编的一手规格」
+> （实际刷入的 hiboot 二进制 + 生产内核 + 寄存器常量 + API 面 + 参数表），**不是可直接搬的驱动源码**；
+> 寄存器初始化序列须从 vmlinux / hiboot 反汇编提取，源码基线仍来自 HiSTB SDK（`TMP/sdk-src/`）
+> 或 histb-mainline 补丁（`TMP/histb-ref/`）。
 
 ---
 
 ## 0. 一句话结论
 
-显示驱动内建、无显示模块；时序来自**运行时 EDID**；hiboot 负责一次性点亮；
-专有 HAL 不可直接复用。这份备份能**交叉验证并补强** `docs/021`–`docs/023` 的寄存器 / 时序 / 初始化序列结论，
-并暴露三处与既有文档需要对齐的差异（见 §5.2）。
+显示驱动内建、无显示模块 —— **移植时不存在「搬一个 `.ko` 点亮屏幕」这条路**，只能从 vmlinux / hiboot
+反汇编提取寄存器初始化序列；时序来自**运行时 EDID**；hiboot 负责一次性点亮；专有 HAL 不可直接复用。
+这份备份能**交叉验证并补强** `docs/021`–`docs/023` 的寄存器 / 时序 / 初始化序列结论，
+并暴露三处与既有文档需要对齐的差异（见 §5.2）——其中 `docs/025` §8「外挂 sii9134」的一条结论
+被 hiboot 里片内 HDMI TX 的证据**直接推翻**，单列于 §6。
 
 ---
 
@@ -75,7 +79,10 @@
   说明「归档内存的就是这个文件」，是**日志 md5 与归档内容对不上**，不是解压损坏。
 - `BACKUP.log` 正文另有 `skip p01_fastboot … skip p12_iptv_data` 十二行，说明 p1–p12 由另一次抓取补入，
   与记 md5 的那次未必同源。
-- → **若用此备份做恢复 / 回滚源，p03 必须先复核**；且须补齐 boot0/boot1（见 §1.3）。
+
+**【存疑点，不下断言】** 上面的「不同源」只是对现象的一种推测，未获证实。本文只记录三项可复现的观测事实
+（p03 的 boot.img 位于 8 MiB 偏移、md5 与日志不符、前 8 MiB 为计数器填充），**不对其成因下断言**。
+→ **若用此备份做恢复 / 回滚源，p03 必须先复核**；且须补齐 boot0/boot1（见 §1.3）。
 
 ---
 
@@ -189,8 +196,9 @@ signature_check=sign:recovery,recovery,0x200000 sign:kernel,kernel,0x700000
   （起始 `0x00017881`，每 4 字节 +1），非零区延伸到约 0x500103，其后到 0x7FFFFF 全 0。
 - `ANDROID!` 出现在 **0x800000**（第 2 个 8 MiB 槽）；内核为 xz 压缩、ramdisk 为 gzip。
   → 16 MiB recovery 分区里，真正可用的 boot.img 在**后半槽**。
-- 结合 §1.4 的 md5 不符与 `BACKUP.log` 的 `skip p01..p12`，最合理解释是
-  **p1–p12 与记 md5 的那次抓取不同源**（recovery 前半被写入过测试 / 填充内容）。恢复前须复核。
+- 结合 §1.4 的 md5 不符与 `BACKUP.log` 的 `skip p01..p12`，**一种推测**是
+  p1–p12 与记 md5 的那次抓取不同源（recovery 前半被写入过测试 / 填充内容）——
+  **此项标为存疑点，不下断言**（详见 §1.4）。恢复前须复核。
 
 p03 @0x800000 的 boot.img 头：
 
@@ -243,7 +251,12 @@ p15 的 `/lib/modules/` 共 **16 个 `.ko`**：
 —— **全是 WiFi / USB / 蓝牙 / 文件系统，零个显示模块**。
 `init.bigfish.rc` 的 `on property:sys.insmod.ko=1` 也只 insmod 这些。
 
-> **结论**：没有可复用的显示 `.ko`；要重写 / 移植驱动必须走源码（SDK / 上游补丁），不能搬二进制模块。
+> **结论（最关键）**：显示驱动全部编进内核、`/lib/modules/` 里 16 个 `.ko` 无一与显示相关。
+> **它的含义**：将来基于原厂安卓移植显示驱动，**不能指望「搬一个 `.ko`」**——根本没有可拷的模块；
+> 唯一可行的路径是从本备份解出的 **vmlinux 与 hiboot 二进制里反汇编提取寄存器初始化序列**
+> （`HDMI_Display()` / `TX_PHY_*` / VO 图层配置），再与 SDK 源码逐字节核对；
+> 专有 Android HAL 是用户态 `.so`，按 pmOS 的结论不可在 mainline 直接复用（`docs/025` §1.2）。
+> 显示侧的源码基线仍须来自 HiSTB SDK（`TMP/sdk-src/`）或 histb-mainline 补丁（`TMP/histb-ref/`）。
 
 ### 4.2 寄存器基址：二进制里的直接证据
 
@@ -397,18 +410,11 @@ siiSetVideoPath            siiGetVideoPath           SiI_DeepColor_{24bit,30bit,
 `PRODUCT_DisplayInit → Logo_Main`）**在这份归档里是真实存在的二进制**，
 可反汇编提取精确寄存器写入序列，不依赖 SDK 源码复现 —— 这是相对既有文档最大的补强。
 
-### 4.9 片内 HDMI TX 与「外挂 sii9134」的一点疑点
+### 4.9 发送器形态（片内 HDMI TX vs 外挂 sii9134）
 
-- 全库检索 `sii9134` 字面量：**0 命中**；`9134` 在 vmlinux 1 次、p15 6 次（疑似无关数字）。
-- 但确有 Silicon Image 痕迹：vmlinux 里 `/proc/msp/sil9293`（SiI9293，偏 HDMI 输入 / 切换）、
-  `SiI_CEC_SetCommand`；hiboot 里 `siiSetVideoPath` / `SiI_DeepColor_*`
-  —— 这些是**片内 HDMI TX IP 的 SiI 系列辅助函数**，对应 `docs/022` §4 的 `siiSetVideoPath() / SetIClk()`。
-- 原厂内核明确是**片内 HDMI TX**（`HI_DRV_HDMI_*`、`HDMI_TX_PHY_BASE_ADDR`、基址 `0xf8ce0000`），
-  用户态 `HI_UNF_HDMI_*` 全套。
-- → `docs/025` §8「mv100 用的是外挂 sii9134 transmitter，不是 on-chip HDMI」与这份原厂备份的
-  直接证据**不完全吻合**（备份支持片内 HDMI TX；`sil9293` 更像 HDMI RX / 开关）。
-  在采用 `500-02 sii9134` / `600-18` 补丁前，**建议先确认 histb 补丁里
-  `hi3798mv100-hdmi.c` 与 sii9134 bridge 各自驱动的是哪一路**，别把输入侧 / 其它板型的发送器当成这块板的输出。
+本节只留指针：原厂 hiboot / 内核显示的是**片内 HDMI TX**（`0xf8ce0000`、`HI_DRV_HDMI_*`、
+`HDMI_TX_PHY_BASE_ADDR`），这一证据与 `docs/025` §8 的「外挂 sii9134」结论冲突，
+且会决定 plan B 选哪套 histb 补丁 —— **单列一节详述，见 §6**。
 
 ---
 
@@ -423,30 +429,86 @@ siiSetVideoPath            siiGetVideoPath           SiI_DeepColor_{24bit,30bit,
 | `docs/021` | 改走驱动移植；SDK 规模；hiboot 显示栈 | p01 里**实见** `PRODUCT_DisplayInit` / `HDMI_Display` / `TX_PHY_*` / `Logo_Main`；vmlinux 内建全部 MPP 显示符号；**无显示 `.ko`** |
 | `docs/022` | HDMI TX `0xf8ce0000`、VO `0xf8cc0000`、EDID 决定时序、SDK 时序表 | 三个基址在二进制里实证；baseparam 全 0 时序 + 空 EDID 缓存**强证**「EDID 运行时读取」；SDK `ClkPara0/1` 常量不在设备里 |
 | `docs/023` | recovery 走 `/dev/graphics/fb0` + `KDSETMODE`、无 surfaceflinger、VO 寄存器偏移 | `/sbin/recovery` strings、`init.rc`、`ueventd.rc` 全部吻合 |
-| `docs/025` | pmOS 方法论、histb-mainline 7.4 已点亮 mv100、simplefb 不稳、改上 DRM | 原厂 env `bootargs_1G` / `verify=n` 与 §5.5.1 引文吻合；**补充**：原厂用户态是专有 HAL，正是 pmOS 所说「搬到 Android userspace、难以复用」的实例 |
+| `docs/025` | pmOS 方法论、histb-mainline 7.4 已点亮 mv100、simplefb 不稳、改上 DRM | 原厂 env `bootargs_1G` / `verify=n` 与 §5.5.1 引文吻合；**补充**：原厂用户态是专有 HAL，正是 pmOS 所说「搬到 Android userspace、难以复用」的实例。**例外**：§8 的 sii9134 结论被推翻（见 §6） |
 | `configs/partition-layout.env` | Debian 8 分区、`mmcblk0p8`、20M kernel | 与原厂 16 分区完全不同，印证「布局整体切换」 |
 
-### 5.2 差异 / 需要对齐
+### 5.2 差异 / 需要对齐（如实保留，不为「好看」隐去）
 
 1. **`docs/005` §9**：记「16 个分区 + eMMC boot0/boot1，共 17 个文件」；归档里**没有 boot0/boot1 镜像**
    （`/proc/partitions` 里存在但未入档）。恢复物料清单需据实修正。
 2. **`docs/023`**：分析对象是 `backup_stock/p3_recovery.img.gz`，与**本归档的 p03 不是同一份镜像**
    （kernel / ramdisk 大小、2016 构建、无 `font.png`、含 `error_text` / `no_command_text` 均不同）。
    定性结论仍成立，数值不可直接互引。
-3. **`docs/025` §8**：「外挂 sii9134 transmitter」判断与备份证据不吻合（见 §4.9），
-   采用 histb 补丁前需先厘清。
+3. **`docs/025` §8**：「mv100 用外挂 sii9134 transmitter，不是 on-chip HDMI」这条结论
+   与本备份的直接证据**冲突，应视为被推翻**（至少不能再作为选补丁依据）；
+   hiboot 里是片内 HDMI TX。详见单列的 §6（含对 plan B 补丁选择的影响）。
 4. **归档自身的数据完整性**：p03 的 md5 与 `BACKUP.log` 不符、boot.img 位于 8 MiB 偏移（§1.4 / §3.2），
    `BACKUP.log` 有 `skip p01..p12` 行 → 恢复 / 回滚前必须复核 p1–p12，并补齐 boot0/boot1。
 
-**总体**：备份**没有推翻**任何核心结论，反而给 `docs/021`–`docs/023` 的
-「寄存器基址 / EDID 时序 / hiboot 初始化序列 / fbdev 画字」补上一手二进制证据；
-需要修正的是上述三处文档差异 + 一处归档完整性提示。
+**总体**：备份给 `docs/021`–`docs/023` 的「寄存器基址 / EDID 时序 / hiboot 初始化序列 / fbdev 画字」
+补上一手二进制证据；**除 §6 指出的 `docs/025` §8 那条结论被推翻外**，其余核心结论均获佐证。
+需要如实保留的是上述三处文档差异 + 一处归档完整性提示。
 
 ---
 
-## 6. 若将来真走「基于原厂安卓重写显示驱动」
+## 6. 片内 HDMI TX vs 外挂 sii9134 尚需厘清（与 `docs/025` §8 的冲突）
 
-### 6.1 关键输入清单
+> 本节单独列出，因为它是本次调研**唯一直接推翻既有文档某条结论**的发现，且直接决定 plan B 选哪套补丁。
+> 结论分两层：**「`docs/025` §8 的外挂 sii9134 结论不成立」是已证实的**；
+> 「这块板的 HDMI 输出最终由哪一路发送器驱动、histb 补丁如何对应」**仍属存疑，需厘清后再定基线**。
+
+### 6.1 原厂备份里的证据（片内 HDMI TX）
+
+| 证据 | 出处 |
+|---|---|
+| `HDMI_Display`、`hdmi_Disp2EncFmt`、`TX_SetHDMIMode`、`SW_ResetHDMITX`、`HW_ResetHDMITX`、`TX_PHY_{4KRisingTime,HighBandwidth,WriteRegister,SwingCtrl}`、`HI_UNF_HDMI_*` / `HI_DRV_HDMI_*` | `p01_fastboot.img`（实际刷入的 hiboot） |
+| `HDMI_TX_PHY_BASE_ADDR`、`DRV_HDMI_*`、`HI_DRV_HDMI_GetSinkCapability`、`hdmi_Create_AVI_Infoframe` | p11 解出的 vmlinux |
+| `0xf8ce0000` 常量 ≥12 处（HDMI TX 基址）、`0xf8cc0000` VO/VDP 基址 | p15_system 二进制（§4.2） |
+| SDK `drv_reg_proc.h` 的条件分支明确含 `CHIP_TYPE_hi3798mv100`，`HDMI_TX_BASE_ADDR=0xf8ce0000` | `docs/022` §3 / `docs/023` §4.4（源码侧） |
+
+另外：全库检索 `sii9134` 字面量 **0 命中**；`9134` 在 vmlinux 1 次、p15 6 次（疑似无关数字）；
+vmlinux 里的 `/proc/msp/sil9293`（SiI9293）与 `SiI_CEC_SetCommand` 更像 **HDMI 输入 / 切换侧**；
+hiboot 里的 `siiSetVideoPath` / `SiI_DeepColor_*` 对应 `docs/022` §4 的 `siiSetVideoPath() / SetIClk()`，
+是**片内 HDMI TX IP 的 Silicon Image 系列辅助函数**，不是外挂 sii9134 芯片驱动。
+
+### 6.2 与 `docs/025` §8 的冲突（该结论被推翻）
+
+`docs/025` §8 写：「**mv100 用的是外挂 sii9134 transmitter，不是 on-chip HDMI**」，
+并据此说 `600-17` 的 `histb-hdmi.c` 是 mv200 的片内发送器、我们板子对应
+`drivers/gpu/drm/bridge/hi3798mv100-hdmi.c`。
+
+本备份的 hiboot + 内核 + 系统二进制一致指向**片内 HDMI TX（0xf8ce0000）**，
+没有任何 `sii9134` 字面证据 → **「mv100 用外挂 sii9134、不是片内 HDMI」这条具体结论被直接推翻**，
+不应再作为选补丁的依据。（`docs/025` 内部对 `600-17` 的定位也自相矛盾：
+§3.4 把它列为「on-chip HDMI transmitter driver」，§8 又说它是 mv200 的。）
+
+### 6.3 但仍「尚需厘清」的部分（不下断言）
+
+- histb 补丁里 `500-02`（`drm/bridge: add the sii9134 hdmi transmitter`）究竟面向哪块板 / 哪一路
+  （HDMI 输入、另一板型、还是本板输出），本地 `TMP/histb-ref/` 只有 4 份补丁，**不含 `500-02` 原文**。
+- `600-18` 所依赖的 `hi3798mv100-hdmi.c` 创建补丁不在本地已存的 4 份里，需从
+  `histb-mainline/patches/series` 补齐后才能判断它是片内 TX 驱动还是 bridge 驱动（`docs/025` §8 已提示）。
+- 是否同板并存片内 TX 与 SiI9293（RX / 开关）两条路径，备份无法排除。
+- → 因此本节**只推翻 §8 那条具体结论**，不对「硬件最终形态」下最终断言。
+
+### 6.4 对 plan B 选补丁的直接影响
+
+| 若输出走 | plan B 应取的补丁路径 | 取错的后果 |
+|---|---|---|
+| **片内 HDMI TX（备份支持）** | 片上发送器链路：`600-17`（`histb-hdmi.c`）/ `600-18`（video path up）+ 补出 `hi3798mv100-hdmi.c` 的创建补丁；配 `910-*` EC6108V9C 板级 DTS 的 `&hdmi status=okay` / `media_cma`、`400-02` CRG 时钟 | 见下 |
+| 外挂 sii9134（§8 的说法） | bridge 链路：`500-02` sii9134 + 对应 dt-binding | 见下 |
+
+**选错的代价**：DRM 驱动绑到不在视频通路里的发送器，`VIDEO_PATH` / PHY 没被正确拉起 →
+「能编译但黑屏」，正是 `docs/025` §2.2 里 odin `0008` 修的那一类坑，也和本项目当前症状同类。
+→ **在锁定 plan B 的补丁基线之前**，先做两件事：
+(1) 读 `histb-mainline/patches/series` 补齐 `hi3798mv100-hdmi.c` 创建补丁与 `500-02` 原文，确认各自 `compatible` 与目标板；
+(2) 用本备份的 `0xf8ce0000` 片内 TX 事实交叉验证，再决定取片上链路还是 bridge 链路。
+
+---
+
+## 7. 若将来真走「基于原厂安卓重写显示驱动」
+
+### 7.1 关键输入清单
 
 **A. 备份里已拿到（本次新增；分析产物在 `TMP/stock-rom-research/`，gitignored 不入库）**
 
@@ -479,20 +541,23 @@ siiSetVideoPath            siiGetVideoPath           SiI_DeepColor_{24bit,30bit,
 4. **HPD / EDID 在 6.x 下的实现**：走 `drm_edid` 还是自写 I2C/DDC，`docs/022` §6 仍是待办。
 5. **时钟名字（crg clock id）**：`docs/025` 的 `400-01` / `400-02` CRG 驱动；
    备份只有 `clk_ignore_unused` 层面的间接证据。
-6. **sii9134 与片内 HDMI TX 的确认**（§4.9），决定采用哪些 histb 补丁。
+6. **片内 HDMI TX vs 外挂 sii9134 的厘清**（§6），决定 plan B 采用哪套 histb 补丁。
 7. **EDID 实际内容**：baseparam 缓存为空，需从显示器读或真机运行时抓。
 8. **真机验证**：本机无串口，只能 SSH / HDMI 观察（`docs/025` §5.5.3 已定「刷机方式不是瓶颈」）。
 9. **恢复源一致性**：p03 的 md5 / 8 MiB 槽异常、boot0/boot1 未入档 —— 回滚前须复核补齐。
 
-### 6.2 建议下一步（提前研究，不阻塞主线）
+### 7.2 建议下一步（提前研究，不阻塞主线）
 
-1. 把 p01_fastboot 与 p11_vmlinux 做 ARM 反汇编，提取 `HDMI_Display()` / `TX_PHY_*` / `PRODUCT_DisplayInit`
-   的寄存器写入序列，与 `TMP/sdk-src/` 的 `hdmi_1_4` / `drv_pdm.c` **逐字节核对**
+1. **反汇编提序列**：把 `p01_fastboot.img` 与 p11 解出的 vmlinux 做 ARM 反汇编，提取
+   `HDMI_Display()` / `TX_PHY_*` / `PRODUCT_DisplayInit` 的寄存器写入序列，
+   与 SDK `hdmi_1_4/hdmi.c` 的 **`HDMI_Display()` 逐字节核对**
    （pmOS / odin 经验：**初始化序列要逐字节来自原厂资产，不要手写猜**，`docs/025` §2.2）。
 2. 用户已拍板主线移植；`histb-mainline` 7.4 的 DRM 驱动（600 / 910 / 400 / 500 系列）是「别人验证过的组合」。
    本备份更适合作为**交叉验证 / 补寄存器细节**的输入，而不是另起炉灶从 Android HAL 重写
    （HAL 是专有 `.so`，pmOS 明确指出不可直接复用，`docs/025` §1.2）。
-3. 若采用 `600-18` / `500-02`，先厘清 sii9134 与片内 HDMI TX 的关系（§4.9）。
+3. **先厘清发送器再定基线**：按 §6 先确认片内 HDMI TX 与 sii9134 各自的适用对象，
+   再决定 plan B 取片上链路（`600-17` / `600-18`）还是 bridge 链路（`500-02`），
+   不要先挑补丁后补证据。
 4. 第一阶段 simplefb 交接（`docs/022` §6.1 / `docs/024`）仍在验证中；
    **仅当真机证明它不足时**才启用本调研对应的「自己初始化显示硬件」第二阶段，
    避免与主线工作抢资源。
@@ -500,7 +565,7 @@ siiSetVideoPath            siiGetVideoPath           SiI_DeepColor_{24bit,30bit,
 
 ---
 
-## 7. 复现与方法
+## 8. 复现与方法
 
 分析全程只用轻量静态手段，产物一律放在 `TMP/stock-rom-research/`（`.gitignore` 排除，不入库）：
 
@@ -511,7 +576,7 @@ siiSetVideoPath            siiGetVideoPath           SiI_DeepColor_{24bit,30bit,
 | `step2_ext4.py` + `step2.log` + `p15_filelist.txt` | 最小只读 ext4 walker（32 位组描述符 / 线性目录 / extents），列出 p15 全树 |
 | `step3_files.py` + `step3.log` + `p15_display_strings.txt` | 抽 HAL / 工具并扫字符串；全库搜 `0xf8cc0000` / `0xf8ce0000` / `0xf9000000` 等常量 |
 | `step4_raw.py` + `step4.log` | 解析 p01–p12 原始分区、U-Boot env、LOGO_TABLE、baseparam 键值 |
-| `RESEARCH-NOTES.md` | 原始完整笔记（本文为其正式归档版） |
+| `RESEARCH-NOTES.md` | 原始完整笔记（本文为其正式归档版，原文保留不动） |
 
 方法与合规说明：
 
@@ -519,5 +584,7 @@ siiSetVideoPath            siiGetVideoPath           SiI_DeepColor_{24bit,30bit,
 - **未**运行 `rm` / `git clean` / 镜像构建（`mke2fs` / `debootstrap` / `img2simg` 等一律未用）。
 - **未**修改任何已跟踪文件、未 `git add` / commit / push / 建分支、未动 git 索引；
   本文为 `docs/` 下新建文件，由主会话统一提交。
-- 描述本地资源一律用仓库内相对路径（如 `TMP/stock-partition-backups/`）；
-  原厂内核里携带的厂商构建机绝对路径 / 构建用户标识已刻意省略，未写入任何文件。
+- 描述本地资源一律用仓库内相对路径（如 `TMP/stock-partition-backups/`）或通用占位；
+  原始抓取介质为**本地外置盘，未入库**，本文不记录其卷名 / 挂载路径 / 任何可识别本机的私有信息。
+- 原厂内核里携带的厂商构建机绝对路径 / 构建用户标识已刻意省略，未写入任何文件。
+- 本文落盘前对「绝对路径 / 本机用户名 / 卷名 / 可识别本机的私有信息」逐项 grep 自查，确认干净。
