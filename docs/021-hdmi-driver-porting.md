@@ -158,4 +158,5 @@ commit `a9f05973129d738e175416dd4a91b2c264ffcdd4`。
   `BOOT_GFX_DisplayLogoWithLayer` 的线索来源
 - `docs/002-mainline-kernel-debian-survey.md`：SDK 版本与"主线无 HDMI 驱动"结论
 - `TMP/sdk-tree.json`：SDK 目录树快照（用于统计与定位源码）
+- `docs/022-hdmi-driver-design.md`：SDK 源码提取结果（寄存器基址、初始化序列、驱动结构）
 - `TMP/fb-report-1.txt`：社区系统 framebuffer 采集报告
