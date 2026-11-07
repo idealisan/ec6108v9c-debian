@@ -1,0 +1,35 @@
+diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
+index ff3646c30..92d683b86 100644
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -2164,6 +2164,18 @@ config FB_HYPERV
+ 	help
+ 	  This framebuffer driver supports Microsoft Hyper-V Synthetic Video.
+ 
++config FB_HI3798MV100_HDMI_CONSOLE
++	bool "Hi3798MV100 hiboot HDMI framebuffer hand-off"
++	depends on FB_SIMPLE && ARM
++	default y if ARCH_HISI
++	help
++	  The HiSilicon bootloader (hiboot) initialises VO/VDP/HDMI and
++	  leaves a logo framebuffer being scanned out. This driver reads
++	  the register banks left by hiboot, finds the scan-out buffer and
++	  registers a simple-framebuffer device so fbcon can show kernel
++	  messages on HDMI. It does not reprogram the display engine,
++	  which would blank the screen. Needs console=tty0.
++
+ config FB_SIMPLE
+ 	tristate "Simple framebuffer support"
+ 	depends on FB
+diff --git a/drivers/video/fbdev/Makefile b/drivers/video/fbdev/Makefile
+index e6b0ae094..da25b8574 100644
+--- a/drivers/video/fbdev/Makefile
++++ b/drivers/video/fbdev/Makefile
+@@ -126,6 +126,7 @@ obj-$(CONFIG_FB_MX3)		  += mx3fb.o
+ obj-$(CONFIG_FB_DA8XX)		  += da8xx-fb.o
+ obj-$(CONFIG_FB_SSD1307)	  += ssd1307fb.o
+ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
++obj-$(CONFIG_FB_HI3798MV100_HDMI_CONSOLE) += hi3798mv100-hdmi-console.o
+ 
+ # the test framebuffer is last
+ obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
