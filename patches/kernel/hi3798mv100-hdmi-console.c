@@ -65,6 +65,17 @@
 #define DDR_START      0x00000000UL
 #define DDR_END        0x40000000UL
 
+/* Diagnostic boot marker. hiboot leaves the p5 logo being scanned out of this
+ * very framebuffer, so the VO/HDMI pipeline is already proven working. Painting
+ * that buffer the moment this driver runs gives an unmistakable "the Linux
+ * kernel booted and reached subsys_initcall" signal that needs no fbcon, no
+ * console=tty0, no network, no rootfs and no serial. If simplefb/fbcon fails
+ * to bind, the colour simply stays on screen - which is exactly the case we
+ * are debugging. Only the top BOOT_MARK_LINES lines are touched: obvious enough
+ * to see, small enough to stay safe if a discovered address is ever wrong. */
+#define BOOT_MARK_LINES 240
+#define BOOT_MARK_COLOR 0xff00ff00u	/* a8r8g8b8 opaque green */
+
 /* Fallback geometry (SDK 1080p60 table, matches the community kernel's
  * FBIOGET_VSCREENINFO: 1920x1080 ARGB8888, stride 7680). */
 #define FB_WIDTH       1920
@@ -147,6 +158,31 @@ static bool hi3798_fb_has_content(phys_addr_t addr)
 	return nonzero > 0;
 }
 
+/* Write a solid green band over the top of the hiboot framebuffer. The
+ * framebuffer is ordinary DDR that the VO scanner reads continuously, so a
+ * cached WB mapping is enough: the 2 MiB of stores evict their own dirty
+ * lines and reach DRAM within milliseconds, with no cache-alias conflict
+ * from a second ioremap of the same physical range. */
+static void hi3798_paint_boot_marker(phys_addr_t addr, u32 stride)
+{
+	size_t len = (size_t)stride * BOOT_MARK_LINES;
+	void *p;
+	u32 *w;
+	size_t i, n;
+
+	p = memremap(addr, len, MEMREMAP_WB);
+	if (!p) {
+		pr_warn("hi3798-fb: cannot map framebuffer for boot marker\n");
+		return;
+	}
+	w = p;
+	for (i = 0, n = len / sizeof(u32); i < n; i++)
+		w[i] = BOOT_MARK_COLOR;
+	memunmap(p);
+	pr_info("hi3798-fb: BOOT MARKER painted (green, %zu bytes) at 0x%08llx"
+		" -- kernel is alive\n", len, (unsigned long long)addr);
+}
+
 static int __init hi3798_hdmi_console_init(void)
 {
 	struct simplefb_platform_data pdata;
@@ -209,6 +245,11 @@ static int __init hi3798_hdmi_console_init(void)
 	fb_phys = (phys_addr_t)addr;
 	pr_info("hi3798-fb: hiboot framebuffer at 0x%08x, registering %ux%u console\n",
 		addr, width, height);
+
+	/* Prove the kernel booted even if fbcon never binds: if simplefb/fbcon
+	 * fails, this green band simply stays on screen; if it succeeds, the
+	 * console text overwrites it, which is an even better outcome. */
+	hi3798_paint_boot_marker(fb_phys, pdata.stride);
 
 	pdata.width = width;
 	pdata.height = height;

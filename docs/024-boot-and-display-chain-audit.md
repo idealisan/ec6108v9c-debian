@@ -202,3 +202,61 @@ bootloader 显存永久排除。我们的显存地址是运行时从寄存器读
 - `scripts/make-community-flash-package.sh` / `scripts/build-kernel.sh`
 - `configs/partition-layout.env` / `configs/kernel/ec6108v9c.config`
 - CI run `42361378514`（verify key options 日志）
+
+---
+
+## 6. 补记（真机刷机后）：为什么「看到 Debian Linux 画面」几乎不能证明什么
+
+刷机包顶层 `bootargs.bin` 里真正执行的命令链是（`scripts/make-community-flash-package.sh`
+的 `flash.env`）：
+
+```text
+bootcmd=run flashkernel; run flashrootfs; run flashbootargs; run flashlogo; reset
+```
+
+**关键事实：U-Boot hush 用 `;` 分隔时，前一条命令失败不会中断后面的命令。**
+所以：
+
+- `flashlogo` 是**最后一步**，看到「Debian Linux」只说明整条链**跑到了末尾**、
+  `reset` 也执行了、hiboot 重启后从 p5 读出了新 logo；
+- 它**不证明** `flashkernel` / `flashrootfs` / `flashbootargs` 的 `fatload` 或
+  `mmc write` 成功写入了有效数据——任何一步报错都会被 `;` 吞掉；
+- 对照组：社区包（已验证能刷成功）把 `flashlogo` 排在**中间**，最大的 rootfs
+  `flashbackup` 排在**最后**。也就是说即便在已知可用的流程里，logo 也不是
+  完成标志。我们把标记放在最后一步，等于选了信息量最弱的位置。
+
+另需澄清分区：本包**从不写 p1（hiboot/fastboot）**，U 盘救援通道始终完好。
+被改写并被 hiboot 画到屏幕上的是 **p5（logo 分区）**。真正决定能否进 Linux 的
+只有 **p6（kernel uImage）** 和 **p8（rootfs）**；p2 的运行时 `bootcmd` 与社区包
+完全一致（`mmc read 0 0x1FFFFC0 0x7000 0xA000; bootm 0x1FFFFC0`），即使 p2
+没写对，引导路径也不会因此改变。
+
+**因此「画面停在 logo、无 IP、无任何内核输出」对应三种互斥可能，此前完全无法区分：**
+
+| 现象 | 含义 |
+| --- | --- |
+| A 内核根本没起来 | p6 写入失败 / uImage 或 DTB 或 `mem=` 问题 / 早期崩溃 |
+| B 内核起来了但显示没接管 | simplefb / fbcon 未绑定，或显存未被 `no-map` 保留 |
+| C 内核起来了但网络/DHCP 没通 | SSH 与路由器列表都看不到，但屏幕本应有 TTY |
+
+### 6.1 破除盲点：内核启动标记
+
+`patches/kernel/hi3798mv100-hdmi-console.c` 在运行时从 VO 的 `G0_ADDR` 读出
+hiboot 留下的显存地址后，**立刻把顶部 240 行刷成纯绿**，再去注册
+`simple-framebuffer`。hiboot 已经在扫描这块显存（它画的 logo 用户看得见），
+所以写入像素一定会显示出来，且不依赖 fbcon、`console=tty0`、网络、rootfs、串口：
+
+- 绿色**留在屏幕上** → 内核确实启动并跑到 `subsys_initcall`，显存地址正确，
+  问题收敛为 `fbcon`/`simplefb` 绑定（→ B）；
+- 绿色被**内核日志覆盖** → 显示链路已通，可直接读日志定位网络（→ C）；
+- **仍是 Debian Linux logo** → 内核没跑到该 initcall（→ A），下一步查 p6 写入
+  与 uImage/DTB，而不是继续调显示。
+
+只刷 240 行是刻意的：足以一眼辨认，又限制住万一地址探测错误时的破坏范围。
+该标记是诊断手段，HDMI 确认可用后应移除。
+
+### 6.2 下一步判据
+
+刷下一版后按上表三选一。若落在 A，则把刷机链改成 `&&` 串联并对每一步写
+独立的 p5 进度 logo（hush 支持 `&&`，`fastboot.bin` 内含 `HUSH_VERSION`），
+把「哪一步失败」也变成可见信息——`;` 串联 + 单末尾 logo 是这轮最大的设计缺陷。
