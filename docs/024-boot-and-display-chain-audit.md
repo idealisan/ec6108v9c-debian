@@ -329,3 +329,51 @@ hiboot 留下的显存地址后，**立刻把顶部 240 行刷成纯绿**，再�
    `apply-dts-placeholders.py` 会注入带 `no-map` 的 `fb_mem` 保留区和静态
    `simple-framebuffer` 节点，从根上消除映射属性冲突。
 3. 再不行才启动 `mainline-porting` 分支的 plan B（见 `MAINLINE-PORTING.md`）。
+
+### 6.5 回归：153551Z 全黑，已回退到 134943Z 刷机链
+
+刷 `build-20261107T153551Z` 后，用户报告**连 hiboot 开机画面都不显示了**——
+比之前「只看到 Debian Linux logo、无内核输出」更糟。这是明确的功能倒退，
+且发生在 **hiboot 阶段、内核启动之前**，所以：
+
+- 它**不是**「内核起来后没有显示驱动」的问题，postmarketOS 式重写驱动
+  修不了这个症状；
+- 唯一影响 hiboot 开机 logo 的改动，就是该版把 `bootcmd` 从 `;` 串联换成
+  `&&` 串联，并让每一步把一张 stage 图写进 p5。
+
+复盘发现两处当时判断过于乐观：
+
+1. **`&&` 支持是推断，不是验证**。当时只因 `fastboot.bin` 里有
+   `HUSH_VERSION` 字符串就认定支持；重新核查该二进制**没有任何 `&&` /
+   `||` 解析痕迹**。这个厂商 hiboot 基于较老的精简 hush，很可能不支持。
+   若 `bootcmd` 解析失败，整条链（含末尾 `reset` 之前的 logo 写入）都不会
+   按预期执行。
+2. **把 p5 当进度板有风险**。若链路中途断开、p5 停在一张 stage 图上，
+   而 hiboot 的 `LOGO_TABLE` / JPEG 解码不认这张图，结果就是**全黑**。
+   `boot-logo-debian.img` 是真机验证过能显示的唯一一张图。
+
+因此 `scripts/make-community-flash-package.sh` 已**回退到 134943Z 的
+已知可显示形态**：
+
+- `bootcmd=run flashkernel; run flashrootfs; run flashbootargs; run flashlogo; reset`
+- 恢复 `loadfile*` / `flashpartition*` 变量与 `run` 两步写法
+- p5 **只写一次** `logo.img`（Debian Linux），stage 图不再打包
+- 两份 README 判据同步改回单 logo 版
+
+**保留**（不影响 hiboot，属于内核/rootfs 侧改进）：绿带启动标记、
+`fbcon=map:0`、`net.ifnames=0`、`CONFIG_HISI_FEMAC` 显式声明、
+DHCP 加固、pstore/ramoops。
+
+**判据回到最简三件套**：`Debian Linux` logo（hiboot 画的，证明刷机执行）
+/ 绿带（内核画的，证明内核启动到驱动）/ 路由器新 IP（网络起来了）。
+三者组合仍能把 A / B / C 分开，只是丢失了「刷机链停在第几步」的粒度。
+
+**教训**：在这台无串口的机器上，任何对 hiboot 命令链的改动都要当成
+高风险操作；`&&`、多张 p5 图这类「看起来更聪明」的设计，在验证之前
+不如用户实测能显示的最朴素版本。`docs/028` §4 从 postmarketOS 方法论
+也印证了这一点——无串口时 framebuffer 就是唯一的 UART 替代品，
+不能拿它做实验。
+
+stage0..3 静态资源仍保留在 `patches/kernel/`，但本版不引用。将来若
+要在真机上验证 `&&` 是否可用，应单独做一次只改 bootcmd、不动 p5 的
+最小实验，而不是和进度图一起上。
