@@ -8,6 +8,7 @@
 			no-map;
 			status = EC6108_FB_STATUS;
 		};
+__RAMOOPS_CHILD__
 	};
 
 	framebuffer@EC6108_FB_NAME {

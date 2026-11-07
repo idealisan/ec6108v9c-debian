@@ -1,0 +1,19 @@
+/* Last-resort log capture: if neither HDMI nor SSH comes up after a failed
+ * boot, the pstore console records the panic here. Reboot into the community
+ * system and read /sys/fs/pstore/ to retrieve it.
+ *
+ * 0x30000000 (768 MiB) is clear of the kernel image (32 MiB), the hiboot
+ * logo framebuffer (~965 MiB) and the rootfs written on eMMC (not DDR).
+ * "no-map" keeps memblock from handing this range out; ramoops maps it
+ * itself. Injected by scripts/apply-dts-placeholders.py into the single
+ * reserved-memory container shared with the simple-framebuffer reservation.
+ */
+		ramoops@30000000 {
+			compatible = "ramoops";
+			reg = <0x30000000 0x100000>;
+			record-size = <0x20000>;
+			console-size = <0x20000>;
+			pmsg-size = <0x20000>;
+			ecc-size = <0>;
+			no-map;
+		};

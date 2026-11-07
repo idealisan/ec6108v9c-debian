@@ -4,8 +4,8 @@
 Usage: apply-dts-placeholders.py DTS_FILE SNIPPET [FB_BASE] [CMDLINE] [MEM_SIZE]
 
 Placeholders:
-  __FB_BLOCK__   standalone line replaced by the simple-framebuffer node
-                 block (removed entirely when FB_BASE is unset)
+  __FB_BLOCK__   standalone line replaced by the pstore ramoops node plus,
+                 when FB_BASE is set, the simple-framebuffer node block
   __FB_BASE__    framebuffer physical address
   __FB_STATUS__  "okay" / "disabled"
   __CMDLINE__    kernel command line (/chosen/bootargs)
@@ -47,6 +47,13 @@ def inject_block(text, body):
     return ''.join(out)
 
 
+# ramoops is always injected: it is the only log channel that survives a
+# boot where neither HDMI nor SSH comes up. The snippet holds just the
+# ramoops child node; both paths place it inside a single reserved-memory
+# container so there is never a duplicate "reserved-memory" node.
+ramoops_snippet = os.path.join(os.path.dirname(snippet), 'ramoops.dtsi')
+ramoops_child = open(ramoops_snippet).read().rstrip(NL) + NL
+
 d = open(dts).read()
 if fb_base:
     body = open(snippet).read()
@@ -55,18 +62,25 @@ if fb_base:
     body = body.replace('EC6108_FB_STATUS', '"okay"')
     for key, val in FB_GEOM.items():
         body = body.replace(key, val)
+    body = body.replace('__RAMOOPS_CHILD__', ramoops_child.rstrip(NL))
     d = inject_block(d, body.rstrip(NL) + NL)
     d = d.replace('__FB_BASE__', fb_base)
     d = d.replace('__FB_STATUS__', '"okay"')
     print('framebuffer enabled at ' + fb_base + ' '
           + FB_GEOM['EC6108_FB_WIDTH'] + 'x' + FB_GEOM['EC6108_FB_HEIGHT']
           + ' stride=' + FB_GEOM['EC6108_FB_STRIDE']
-          + ' format=' + FB_GEOM['EC6108_FB_FORMAT'])
+          + ' format=' + FB_GEOM['EC6108_FB_FORMAT'] + '; ramoops enabled')
 else:
-    d = inject_block(d, '')
+    container = ('\treserved-memory {' + NL +
+                 '\t\t#address-cells = <1>;' + NL +
+                 '\t\t#size-cells = <1>;' + NL +
+                 '\t\tranges;' + NL +
+                 ramoops_child +
+                 '\t};' + NL)
+    d = inject_block(d, container)
     d = d.replace('__FB_BASE__', '0x3d000000')
     d = d.replace('__FB_STATUS__', '"disabled"')
-    print('framebuffer nodes omitted (FB_BASE unset)')
+    print('framebuffer nodes omitted (FB_BASE unset); pstore ramoops enabled')
 
 d = d.replace('__CMDLINE__', cmdline)
 d = d.replace('__MEM_SIZE__', mem_size)
