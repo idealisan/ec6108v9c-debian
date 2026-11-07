@@ -51,25 +51,24 @@ concurrency:
   group: build-release-${{ github.ref }}
   cancel-in-progress: true
 
+# The kernel build and the rootfs build are independent (neither reads the
+# other's output). They run as parallel jobs and hand their dist/ contents to
+# the package job through artifacts - GitHub-internal transfer, no external
+# network involved.
 jobs:
-  build:
+  build-kernel:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
-
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install kernel build dependencies
         run: |
-          sudo dpkg --add-architecture i386 || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf u-boot-tools bc bison flex libssl-dev libelf-dev \
-            lz4 zstd xz-utils cpio rsync unzip file device-tree-compiler \
-            debootstrap qemu-user-static binfmt-support e2fsprogs zip \
-            mtools dosfstools parted python3
-          sudo apt-get install -y --no-install-recommends libc6:i386 libstdc++6:i386 lib32z1 || true
+            lz4 zstd xz-utils cpio rsync unzip file device-tree-compiler python3
 
       - name: Init kernel submodule (shallow, pinned commit)
         run: git submodule update --init --depth 1 third_party/linux-hi3798mv100
@@ -86,8 +85,63 @@ jobs:
           EXTRA_CMDLINE: ${{ inputs.extra_cmdline }}
         run: bash scripts/build-kernel.sh
 
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
+
+  build-rootfs:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rootfs build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap qemu-user-static binfmt-support python3
+
       - name: Build Debian rootfs (SSH + telnet + WiFi firmware + tools)
         run: bash scripts/build-rootfs.sh
+
+      - name: Upload rootfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
+
+  package:
+    needs: [build-kernel, build-rootfs]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            e2fsprogs zip python3 mtools dosfstools parted curl git file
+
+      - name: Download kernel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-dist
+          path: dist/
+
+      - name: Download rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-dist
+          path: dist/
 
       - name: Build community-format U-disk flash package
         run: |
@@ -127,7 +181,6 @@ jobs:
           Assets:
           - mv100-mdmo1g-debian-usb-flash-$STAMP.zip   U-disk flash package (community layout)
           - hi_kernel.bin        uImage = zImage + DTB, load 0x2000000 -> p6 (LBA 0x7000)
-          - zImage-dtb           raw kernel for other boot experiments
           - modules.tar.gz       kernel modules (/lib/modules)
           - debian-rootfs-armhf-bookworm.tar.gz  plain rootfs tarball (not for flashing)
           - patches/kernel/*     kernel patches applied during the build
@@ -160,11 +213,11 @@ jobs:
   # Boots the Debian armhf rootfs on an emulated ARM board and checks that
   # systemd comes up and SSH is reachable. This is the minimum bar before
   # flashing the real box: if the userspace cannot even boot here, it will
-  # not boot there either.
+  # not boot there either. Reuses the rootfs artifact instead of rebuilding it.
   qemu-boot-test:
+    needs: [build-rootfs]
     runs-on: ubuntu-22.04
     timeout-minutes: 60
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -172,10 +225,15 @@ jobs:
       - name: Install QEMU and helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-arm sshpass debootstrap qemu-user-static binfmt-support e2fsprogs ca-certificates cpio
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm sshpass e2fsprogs ca-certificates cpio curl \
+            gzip binutils python3
 
-      - name: Build Debian armhf rootfs
-        run: bash scripts/build-rootfs.sh
+      - name: Download rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-dist
+          path: dist/
 
       - name: Boot under QEMU and verify SSH
         # Same script as the local test (scripts/qemu-local-test.sh): the
