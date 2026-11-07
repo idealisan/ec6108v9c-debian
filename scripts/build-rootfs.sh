@@ -22,7 +22,7 @@ PACKAGES=(
   ca-certificates locales sudo login passwd
   openssh-server openssh-client
   busybox
-  systemd-sysv systemd udev dbus
+  systemd-sysv systemd udev dbus kmod
   ifupdown iproute2 isc-dhcp-client netbase net-tools iputils-ping ethtool
   wpasupplicant wireless-tools wireless-regdb firmware-realtek
   curl wget rsync vim-tiny nano less htop procps psmisc
