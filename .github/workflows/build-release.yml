@@ -11,6 +11,30 @@ on:
         description: 'hiboot framebuffer physical address (hex). Empty keeps HDMI console disabled.'
         type: string
         default: ''
+      fb_width:
+        description: 'framebuffer width, measured on the community system'
+        type: string
+        default: '1920'
+      fb_height:
+        description: 'framebuffer height'
+        type: string
+        default: '1080'
+      fb_stride:
+        description: 'framebuffer stride in bytes'
+        type: string
+        default: '7680'
+      fb_format:
+        description: 'simplefb format string'
+        type: string
+        default: 'a8r8g8b8'
+      fb_size:
+        description: 'framebuffer size in bytes (hex)'
+        type: string
+        default: '0x800000'
+      extra_cmdline:
+        description: 'extra kernel params, e.g. ramoops.mem_address=0x... ramoops.mem_size=0x100000'
+        type: string
+        default: ''
       layout:
         description: 'partition layout: merged (p8 rootfs, default) or community (p9 rootfs, diagnostic)'
         type: choice
@@ -61,6 +85,12 @@ jobs:
         env:
           FB_BASE: ${{ inputs.fb_base }}
           LAYOUT_ENV: ${{ inputs.layout == 'community' && 'configs/partition-layout-community.env' || 'configs/partition-layout.env' }}
+          FB_WIDTH: ${{ inputs.fb_width }}
+          FB_HEIGHT: ${{ inputs.fb_height }}
+          FB_STRIDE: ${{ inputs.fb_stride }}
+          FB_FORMAT: ${{ inputs.fb_format }}
+          FB_SIZE: ${{ inputs.fb_size }}
+          EXTRA_CMDLINE: ${{ inputs.extra_cmdline }}
         run: bash scripts/build-kernel.sh
 
       - name: Build diagnostic kernel (community layout, boots the community rootfs)
@@ -72,6 +102,12 @@ jobs:
           KERNEL_OUT: dist/hi_kernel-community-layout.bin
           SKIP_MODULES: '1'
           OUT: build/kernel-diag
+          FB_WIDTH: ${{ inputs.fb_width }}
+          FB_HEIGHT: ${{ inputs.fb_height }}
+          FB_STRIDE: ${{ inputs.fb_stride }}
+          FB_FORMAT: ${{ inputs.fb_format }}
+          FB_SIZE: ${{ inputs.fb_size }}
+          EXTRA_CMDLINE: ${{ inputs.extra_cmdline }}
         run: bash scripts/build-kernel.sh
 
       - name: Build Debian rootfs (SSH + telnet + WiFi firmware + tools)

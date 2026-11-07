@@ -21,6 +21,14 @@ LOADADDR=0x2000000
 # address is confirmed from the boot log; set FB_BASE=0x3xxxxxxx to enable HDMI
 # console. CI exposes this as a workflow_dispatch input.
 FB_BASE=${FB_BASE:-}
+# Geometry measured on the community system with scripts/probe-framebuffer.sh.
+# Defaults are the SDK-confirmed 1080p ARGB8888 values.
+FB_WIDTH=${FB_WIDTH:-1920}
+FB_HEIGHT=${FB_HEIGHT:-1080}
+FB_STRIDE=${FB_STRIDE:-7680}
+FB_FORMAT=${FB_FORMAT:-a8r8g8b8}
+FB_SIZE=${FB_SIZE:-0x800000}
+export FB_WIDTH FB_HEIGHT FB_STRIDE FB_FORMAT FB_SIZE
 PATCH_DIR=${PATCH_DIR:-patches/kernel}
 CONFIG_FRAGMENT=${CONFIG_FRAGMENT:-configs/kernel/ec6108v9c.config}
 
