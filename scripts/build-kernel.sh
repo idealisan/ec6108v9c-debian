@@ -89,15 +89,23 @@ make -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="$CROSS" \
     -j"$JOBS" zImage dtbs modules
 
 echo "== kernel: wrap zImage + DTB into uImage =="
+# KERNEL_OUT lets a second build (e.g. the diagnostic community-layout
+# kernel) write to its own file instead of overwriting the shipped one.
+KERNEL_OUT=${KERNEL_OUT:-$DIST/hi_kernel.bin}
+mkdir -p "$(dirname "$KERNEL_OUT")"
 cat "$OUT/arch/arm/boot/zImage" "$OUT/arch/arm/boot/dts/$DTS.dtb" > "$OUT/zImage-dtb"
 mkimage -A arm -O linux -T kernel -C none -a $LOADADDR -e $LOADADDR \
-    -n "linux-hi3798mv100" -d "$OUT/zImage-dtb" "$DIST/hi_kernel.bin"
-cp -f "$OUT/zImage-dtb" "$DIST/zImage-dtb"
+    -n "linux-hi3798mv100" -d "$OUT/zImage-dtb" "$KERNEL_OUT"
+cp -f "$OUT/zImage-dtb" "$OUT/zImage-dtb.out"
 
-echo "== kernel: modules =="
-make -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="$CROSS" \
-    INSTALL_MOD_PATH="$ROOT_DIR/$OUT/modules" modules_install
-tar -czf "$DIST/modules.tar.gz" -C "$OUT/modules" lib
+if [ "${SKIP_MODULES:-0}" = "1" ]; then
+  echo "== kernel: modules skipped (diagnostic build) =="
+else
+  echo "== kernel: modules =="
+  make -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="$CROSS" \
+      INSTALL_MOD_PATH="$ROOT_DIR/$OUT/modules" modules_install
+  tar -czf "$DIST/modules.tar.gz" -C "$OUT/modules" lib
+fi
 
 echo "== kernel build results =="
-ls -l "$DIST/hi_kernel.bin" "$DIST/modules.tar.gz"
+ls -l "$KERNEL_OUT"

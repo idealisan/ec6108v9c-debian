@@ -63,6 +63,17 @@ jobs:
           LAYOUT_ENV: ${{ inputs.layout == 'community' && 'configs/partition-layout-community.env' || 'configs/partition-layout.env' }}
         run: bash scripts/build-kernel.sh
 
+      - name: Build diagnostic kernel (community layout, boots the community rootfs)
+        # A kernel with the community partition layout can boot the COMMUNITY
+        # rootfs, which gives us SSH access to a box running our 6.x kernel.
+        # That is how we get a boot log (dmesg) without a serial console.
+        env:
+          LAYOUT_ENV: configs/partition-layout-community.env
+          KERNEL_OUT: dist/hi_kernel-community-layout.bin
+          SKIP_MODULES: '1'
+          OUT: build/kernel-diag
+        run: bash scripts/build-kernel.sh
+
       - name: Build Debian rootfs (SSH + telnet + WiFi firmware + tools)
         run: bash scripts/build-rootfs.sh
 
