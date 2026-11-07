@@ -100,10 +100,38 @@ sudo chroot "$ROOT" /usr/bin/ssh-keygen -A || true
 sudo mkdir -p "$ROOT/etc/systemd/system/multi-user.target.wants"
 sudo ln -sf /lib/systemd/system/ssh.service "$ROOT/etc/systemd/system/multi-user.target.wants/ssh.service"
 
-# ---- networking: ifupdown brings up eth0 (DHCP) ----
-# Without this the box would boot with no IPv4 address at all and SSH would
-# be unreachable, even though sshd is running.
-sudo ln -sf /lib/systemd/system/networking.service "$ROOT/etc/systemd/system/multi-user.target.wants/networking.service"
+# ---- networking ----
+# ifupdown alone is fragile here: at boot the PHY link may not be up yet, so
+# "dhclient" fails once and never retries - the box then boots without an
+# IPv4 address and SSH is unreachable even though sshd is running.
+# systemd-networkd waits for the carrier and keeps retrying the DHCP lease,
+# so use it for the wired and the wireless interface.
+sudo mkdir -p "$ROOT/etc/systemd/network"
+sudo tee "$ROOT/etc/systemd/network/10-eth0.network" >/dev/null <<'NET_EOF'
+[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+
+[DHCP]
+RouteMetric=10
+NET_EOF
+sudo tee "$ROOT/etc/systemd/network/20-wlan.network" >/dev/null <<'NET_EOF'
+[Match]
+Name=wlx*
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+NET_EOF
+sudo ln -sf /lib/systemd/system/systemd-networkd.service "$ROOT/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+sudo ln -sf /lib/systemd/system/systemd-networkd.socket "$ROOT/etc/systemd/system/sockets.target.wants/systemd-networkd.socket"
+# ifupdown must stay out of the way now that networkd owns the interfaces
+sudo ln -sf /dev/null "$ROOT/etc/systemd/system/multi-user.target.wants/networking.service"
+# ... but keep the file for manual "ifup eth0" usage
+sudo sed -i "s/^auto eth0/#auto eth0/; s/^iface eth0 inet dhcp/#iface eth0 inet dhcp/" "$ROOT/etc/network/interfaces"
 # ifupdown only configures interfaces listed in /etc/network/interfaces; make
 # sure eth0 is not blocked and that the loopback is up
 sudo sed -i "s/^allow-hotplug/allow-hotplug/" "$ROOT/etc/network/interfaces"

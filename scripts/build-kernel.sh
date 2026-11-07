@@ -23,9 +23,13 @@ cd "$ROOT_DIR"
 
 # Shared partition / memory layout (also used by the flash package script),
 # so the DTB command line and the p2 runtime env can never drift apart.
-if [ -f "$ROOT_DIR/configs/partition-layout.env" ]; then
+# LAYOUT_ENV selects the partition layout: the merged one we ship by
+# default, or the community one for diagnostic kernels.
+LAYOUT_ENV=${LAYOUT_ENV:-configs/partition-layout.env}
+if [ -f "$ROOT_DIR/$LAYOUT_ENV" ]; then
+  echo "  layout: $LAYOUT_ENV"
   set -a
-  . "$ROOT_DIR/configs/partition-layout.env"
+  . "$ROOT_DIR/$LAYOUT_ENV"
   set +a
 fi
 

@@ -11,6 +11,13 @@ on:
         description: 'hiboot framebuffer physical address (hex). Empty keeps HDMI console disabled.'
         type: string
         default: ''
+      layout:
+        description: 'partition layout: merged (p8 rootfs, default) or community (p9 rootfs, diagnostic)'
+        type: choice
+        default: merged
+        options:
+          - merged
+          - community
   push:
     branches: [main]
     paths:
@@ -53,6 +60,7 @@ jobs:
       - name: Build mainline 6.x kernel with local patches
         env:
           FB_BASE: ${{ inputs.fb_base }}
+          LAYOUT_ENV: ${{ inputs.layout == 'community' && 'configs/partition-layout-community.env' || 'configs/partition-layout.env' }}
         run: bash scripts/build-kernel.sh
 
       - name: Build Debian rootfs (SSH + telnet + WiFi firmware + tools)
@@ -141,14 +149,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-arm sshpass debootstrap qemu-user-static binfmt-support e2fsprogs ca-certificates
 
-      - name: Fetch Debian armhf netboot kernel and initrd
+      - name: Fetch Debian armhf kernel and boot initramfs
         run: |
-          mkdir -p build/qemu
+          mkdir -p build/qemu/pkg
           cd build/qemu
-          BASE=https://deb.debian.org/debian/dists/bookworm/main/installer-armhf/current/images/netboot
-          curl -fsSL -o vmlinuz "$BASE/vmlinuz"
-          curl -fsSL -o initrd.gz "$BASE/initrd.gz"
-          gunzip -f initrd.gz
+          # NOTE: the *installer* netboot initrd boots the Debian installer
+          # (it asks for a language and never touches our rootfs), so use the
+          # kernel package that ships a normal boot initramfs instead.
+          URL=$(curl -fsSL http://deb.debian.org/debian/dists/bookworm/main/binary-armhf/Packages.gz                 | gunzip                 | awk '/^Package: linux-image-6\.1\..*-armmp$/{p=1} p && /^Filename: /{print $2; exit}')
+          echo "kernel package: $URL"
+          test -n "$URL"
+          curl -fsSL -o kernel.deb "http://deb.debian.org/debian/$URL"
+          dpkg-deb -x kernel.deb pkg
+          cp pkg/boot/vmlinuz-* vmlinuz
+          cp pkg/boot/initrd.img-* initrd
           ls -l vmlinuz initrd
 
       - name: Build Debian armhf rootfs
