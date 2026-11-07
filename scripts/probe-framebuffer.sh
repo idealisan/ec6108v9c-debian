@@ -125,38 +125,11 @@ for f in /sys/class/graphics/fb0/*; do
 done
 
 echo
-echo "================ 7. VO register cross-check (needs /dev/mem) ================"
-if command -v python3 >/dev/null 2>&1; then
-python3 - <<'PY'
-import mmap, struct, os
-RANGES = [('HDMI', 0xF8CE0000, 0xF8CE1000), ('VDP', 0xF9000000, 0xF9010000)]
-hits = []
-try:
-    fd = os.open('/dev/mem', os.O_RDONLY | os.O_SYNC)
-except OSError as e:
-    print('  /dev/mem unreadable (%s) - ioctl result above is still authoritative' % e)
-    raise SystemExit(0)
-for name, start, end in RANGES:
-    base = start
-    while base < end:
-        try:
-            mm = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ, offset=base)
-            data = mm[:]
-            mm.close()
-            for i in range(0, len(data), 4):
-                v = struct.unpack_from('<I', data, i)[0]
-                if 0x30000000 <= v < 0x40000000 and (v & 0xFFF) == 0:
-                    hits.append((base + i, v))
-        except Exception:
-            pass
-        base += 0x1000
-os.close(fd)
-print('  DDR-address-like registers: %d' % len(hits))
-for reg, val in hits[:20]:
-    print('    reg 0x%08x -> 0x%08x' % (reg, val))
-PY
-fi
-
+echo "================ 7. VO register cross-check ==============="
+echo "  DISABLED: reading VDP register pages via /dev/mem caused a kernel"
+echo "  external abort and hung the HDMI kernel threads on the community 4.4"
+echo "  kernel. ioctl on /dev/fb0 above is sufficient and side-effect free."
+echo "  Use rootfs/usr/local/bin/ec6108-fbprobe only on the 6.x kernel."
 echo
 echo "================ 8. NEXT STEP ================"
 echo "  Reboot the box and run this script AGAIN. Compare fb_base."
