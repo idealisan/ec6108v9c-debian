@@ -310,3 +310,45 @@ U 盘 `recovery.img` sha256 `ad95e2c5…`、`bootcmd` 不变。
 `7`（U 盘挂载失败，正好解释日志缺失）或 `8`（挂载成功、暂无 manifest）。据此决定：若 `7`
 需先解决内核态 U 盘枚举；若 `8` 则下一版放 `flash.manifest` 用社区包做真正刷写。
 **本版无 manifest、零 eMMC 写入，安全。**
+
+### 10.3 数字版真机结果 = `7`（U 盘 mount 失败）+ 矛盾分析（进行中）
+
+**真机（[观察]）**：点阵数字版短接启动 → 屏幕显示 **`7`** = `udisk_mount()` 的 6 个
+`(dev,fstype)` 候选 `mount()` 全部失败。数字编码按设计生效（用户能精确报告"7"）。
+
+**用户质疑（合理）**：原厂 recovery 明明能读外部存储(U盘)上的刷机包；我们只换了用户态、
+内核一模一样，为什么挂不上？
+
+**本地查证已排除的误判（[观察]）**：
+- 内核 USB host 控制器驱动齐全：kallsyms 里 `ehci`(72)/`ohci`(33)/`xhci`(173)/
+  `usb_hcd`(52)/`hiusb_start_hcd_hi3798mx`/`usb_add_hcd` 全在 → **不是缺 USB 驱动**。
+- `usb_stor_*`(91)、`vfat`/`vfat_fs_type`/`fat_fill_super`/`__initcall_init_vfat_fs6`(29) 全在
+  且 vfat 为内建 → **不是缺 mass-storage / 缺 FAT 文件系统**。
+- 原厂 `p03__init.rc`：`on init` 只 `mkdir /sdcard /system /data /cache` + 挂 tmpfs `/tmp`，
+  **`on init` 根本没挂 `/usb`**；`on early-init start ueventd`；`service recovery /sbin/recovery`。
+
+**由此定位的方向（[推断]，待反汇编定案）**：
+- 原厂能读 U 盘 = **`/sbin/recovery` 进程内部用 `fs_mgr` 主动挂 `/usb`**（`p03__sbin__recovery`
+  字符串含 `/usb`、`/usb/upgrade`、`/dev/block/sda`、`/dev/block/sda1`、`/etc/recovery.fstab`、
+  `/proc/mounts`、`1. Apply update from external storage`、`fs_mgr: Cannot mount filesystem
+  of type %s on %s`、`E:can't open the path /usb`），`recovery.fstab` 写的是
+  `/dev/block/sda1 /usb auto defaults defaults`（fstype=`auto`）。
+- 我们把 `/sbin/recovery` 换成 `flasher` 后，**挂载职责转移到 flasher**；而当前
+  `udisk_mount()` 是"立即尝试 + 3 轮短 delay"，没有 `fs_mgr` 的 `wait_for_file` 等待。短接态
+  `bootm` 交权给内核后 USB 需重新枚举、`/dev/block/sda1` 节点要等 ueventd 建 → **挂得太早 /
+  节点尚未出现** 是首要嫌疑。
+- 次要嫌疑：短接态 hiboot 的 `fatload usb` 用了 USB，内核起来后 host 重新枚举状态、以及
+  `init.rc` 里 `android_usb` gadget(`functions adb`) 是否与 host 模式冲突，导致 sda1 根本不出现。
+
+**已派后台研究（进行中）**：反汇编 `p03__sbin__recovery` 的 `fs_mgr` 挂载流程，确认
+① mount 前是否等待节点出现/等待多久/重试几次；② 具体节点名、fstype(`auto`→实际)、mount flags；
+③ 失败 fallback；④ 短接态 USB 枚举与正常开机的差异、gadget 冲突；⑤ 可直接落地的修复清单。
+REA 约束：三分法、不臆造数值、只读。
+
+**决策**：不靠猜再单独刷一版（若短接态 USB 根本没枚举，单纯加等待无效）。待结论返回后，
+下一版**一次性**把「等待节点 + 正确节点名/fstype/flags」与「社区包 `flash.manifest` 真刷」
+合并修对，不单独为挂载多占一轮。社区包素材已核对：`mv100/` 全套镜像，LBA
+（十六进制扇区）`bootargs 0x800 / baseparam 0x1000 / pq 0x3000 / logo 0x5000 /
+kernel 0x7000 / recoverybox32 0x11000(sparse) / www_ecoo_top 0x31000(sparse)`；
+两个 `.ext4` 为 Android sparse(`0xed26ff3a`)，刷写走 `write_sparse()` 解码（已实现于 `flasher.c`）。
+`p1/fastboot` 不刷（保持随时可经短接流程重刷）。
