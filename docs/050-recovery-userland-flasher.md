@@ -17,6 +17,10 @@
 > **成功进入原厂 recovery、点亮背光、显示 `warning, no file contacts`**，随后自动重启回社区 Ubuntu。
 > → **短接态内核能从零点亮 HDMI、`/dev/graphics/fb0` 可用，整条改造路线成立**（§6 决定性未知① 已定案）。
 > 未看到进度条是预期内：那次跑的是原厂 `/sbin/recovery`（未改镜像），不是我们的 `flasher`。
+>
+> **真机更新 2（第 2 步 PASS，见 §8.5）**：换改造版 `recovery.img` 短接启动 → 用户确认
+> **看到了彩色进度条画面、符合预期**。→ 自定义用户态被 init 拉起、`fb0` 写入生效、显示目标达成。
+> 两阶段 go/no-go 全部通过；此后转入刷机程序迭代（§10 阶段计划）。
 
 ---
 
@@ -222,3 +226,44 @@ eMMC 分区布局确定（§6 ⑤），属显示验证通过后的下一迭代�
 等价验证通道**纳入阶段 0：每完成一步写一行日志，拔盘插回电脑即可读。
 
 （阶段 0/1/2 的完整刷机计划见用户确认的计划：`docs/050 §8` 之后的下一迭代，本节仅记录能力判定。）
+
+### 8.5 第 2 步（改造版）真机结果 — PASS
+
+用户 2026-11-08 换改造版 `recovery.img` 短接启动后确认：**看到了彩色画面（进度条），符合预期描述**。
+→ [观察] 改造 boot.img 被 `bootm` 接受（无签名拦截，§6 ④ 的担忧排除）、`init.rc` 拉起替换后的
+`sbin/recovery`(=flasher)、`fb0` 写入生效。**两阶段 go/no-go 全部通过**：短接态内核点亮 HDMI ✓、
+自定义用户态自动运行并显示 ✓。显示目标达成，转入刷机程序迭代。
+
+---
+
+## 10. 刷机程序迭代计划（用户已确认）
+
+**已定决策**：① 不研究 LK2nd（对本芯片不适用）；② 第一版刷机目标 = **社区 Ubuntu 包**
+（已知能启动，专门验证"刷写链路"，与"Debian 能否启动"分离）；③ 刷完**停在完成画面、不重启**。
+
+| 阶段 | 内容 | 判据 |
+|---|---|---|
+| **0（本次，已装盘）** | `flasher.c` 加 U 盘日志 + 环境探测，**ZERO eMMC 写入**；保留已验证的进度条 | 拔盘插回电脑读到 `/usb/flasher.log` |
+| 1 | 定镜像/LBA；把社区 rootfs 的 Android sparse 还原成 raw（裸写 LBA 不认 sparse） | 镜像/LBA 清单可复现 |
+| 2 | 真正无人值守刷 `flash.manifest` 全部条目 → 进度条走满 → 停在完成画面 | 日志显示每步写入字节数；断电重启进社区 Ubuntu |
+
+### 10.1 阶段 0 落地（本次提交）
+
+`flasher.c` 以 `#define STAGE 0` 编译，进入 `probe()`（不调用 `auto_flash()`）：
+
+- 保留 `fb_init()` + 已验证的进度条动画（用户仍应看到熟悉的彩色条）；
+- `udisk_mount()`：`mkdir /usb` 后按 6 个候选 `(dev, fstype)` 尝试 `mount`（两轮、间插 delay
+  等 ueventd 建节点）——覆盖 `/dev/block/sda1`、`/dev/sda1`、`vfat`/`msdos` 等；
+- 写 `/usb/flasher.log`，逐行 `log_kv()` 记录：fb0 open/mmap/smem_len/stride/rows×cols、
+  mkdir 结果、6 个 mount 的返回码、`/usb/recovery.img` 是否可读（前 4 字节）、
+  `/dev/block/mmcblk0` 与 `/dev/mmcblk0` 是否可 `O_RDWR` 打开（**只 open 随即 close，零字节写**）、
+  by-name 分区节点、`/usb/flash.manifest` 是否存在（阶段 0 忽略）、显式 `eMMC WRITES: NONE`；
+- `fsync` 日志 + `sync()` 刷 FAT 元数据，确保拔盘不丢。
+
+**编译/校验（[观察]）**：ELF32 ARM EABI5 静态、6488 B、NEON/VFP=0、35 个 svc 调用点、
+soft-float；ramdisk 内 `sbin/recovery` 字节 == 新 flasher、内核逐字节未改；`bootargs.bin` CRC 重算匹配。
+产物装 U 盘 `recovery.img`（sha256 `8639a7cc…`），`bootcmd` 不变。
+
+**待用户操作**：短接上电 → 应看到熟悉的彩色进度条 → 断电拔盘插回电脑 → 读 `/usb/flasher.log`
+并发回内容。日志回答三个未定案项：U 盘能否挂载、`mmcblk0` 节点是否存在、`sda1` 命名是否正确——
+据此进阶段 1。**阶段 0 不碰 eMMC，绝对安全。**

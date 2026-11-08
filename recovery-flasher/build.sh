@@ -114,8 +114,8 @@ fi
 [ -f "$COMMUNITY_FB" ] && cp "$COMMUNITY_FB" "$OUT/fastboot.bin"
 
 cat > "$OUT/README.txt" <<'TXT'
-EC6108V9C -- modified-stock-recovery AUTO FLASHER
-=================================================
+EC6108V9C -- modified-stock-recovery AUTO FLASHER  (stage 0 = PROBE)
+=====================================================================
 Boots the STOCK Android recovery kernel (HDMI/hifb drivers included) but with
 /sbin/recovery replaced by our own program. Starts automatically on power-on --
 NO menu, NO key press, NO serial (the box has none).
@@ -123,30 +123,37 @@ NO menu, NO key press, NO serial (the box has none).
 U-disk ROOT must contain:
   fastboot.bin   community carrier loaded by BootROM on a shorted power-on
   bootargs.bin   env; bootcmd = fatload usb 0 0x1000000 recovery.img; bootm 0x1000000
-  recovery.img   the (patched or verify) Android boot.img that bootm boots
+  recovery.img   the patched Android boot.img that bootm boots
 
-TWO-STAGE GO/NO-GO (important -- do this first):
-  1. Put the UNMODIFIED image as recovery.img (build.sh --verify). Short the
-     USB_BOOT contact, power on. If the ORIGINAL recovery UI appears, the stock
-     kernel lights HDMI in the flash branch -> this whole approach is valid.
-     If it stays black, the kernel does NOT init HDMI from zero -> both the
-     recovery and bare-metal routes fail; stop and rethink.
-  2. If step 1 shows a picture, use the PATCHED image (build.sh default) as
-     recovery.img. Our program then draws a progress bar and auto-flashes.
+ALREADY VERIFIED on real hardware:
+  - shorted boot -> stock 3.10 kernel lights HDMI (original recovery UI shown);
+  - patched recovery.img -> our colour progress bar is drawn (custom userland
+    runs, fb0 write works).
+  So the display chain is DONE. This build is STAGE 0 = environment PROBE.
 
-AUTO-FLASH (no interaction):
-  Program mounts the U-disk at /usb and, IF /usb/flash.manifest exists, flashes
-  each line:  <src-full-path> <dest-LBA-hex> <byte-count-hex>
-  writing <src> into /dev/block/mmcblk0 at LBA <dest>, updating the bar per
-  item. NO manifest => NO eMMC writes (pure, harmless display demo). Writes go
-  to the RAW block device by absolute LBA, so partition-table mismatches
-  (stock 16-partition cmdline vs community 9-partition eMMC) do not matter.
-  Example manifest line (paths are full paths as seen in recovery userspace):
-      /usb/mv100/hi_kernel.bin 7000 200000
+WHAT STAGE 0 DOES (no eMMC writes at all -- completely safe):
+  1. keeps the familiar growing colour progress bar on screen;
+  2. mounts the U-disk at /usb and writes /usb/flasher.log, one line per fact:
+       fb0 open / mmap / smem_len / line_length / rows x cols,
+       mkdir /usb result,
+       6 mount candidates (which /dev node + fstype actually works),
+       whether /usb/recovery.img is readable (first 4 bytes),
+       whether /dev/block/mmcblk0 and /dev/mmcblk0 open O_RDWR (node exists),
+       whether a by-name partition node exists,
+       whether /usb/flash.manifest exists (ignored in stage 0),
+       an explicit "eMMC WRITES: NONE" line.
+     It fsync()+sync()s the log so it survives pulling the U-disk.
+
+HOW TO READ THE RESULT (this is the whole point of stage 0):
+  After the shorted boot, power off, move the U-disk back to the PC and open
+  flasher.log. It tells us: U-disk mount OK/FAIL, eMMC node present/name, and
+  that our program really ran -- WITHOUT needing HDMI text or a serial port.
+  Send the log content back; stage 1 (real auto-flash) is built from those facts.
 
 SAFETY:
+  - STAGE 0 performs ZERO eMMC writes (eMMC is only opened then closed).
   - The stock 3.10 kernel is kept BYTE-FOR-BYTE; only the ramdisk userland file
-    sbin/recovery is replaced. No eMMC writes unless flash.manifest is present.
+    sbin/recovery is replaced.
   - Always re-flashable via the same shorted U-disk flow (p1/fastboot untouched).
 TXT
 
