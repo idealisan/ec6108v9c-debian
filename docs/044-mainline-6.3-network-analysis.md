@@ -29,8 +29,8 @@
 | 项 | 值 |
 |---|---|
 | eth0 状态 | `UP`, `LOWER_UP`, carrier=1, 100 Mb/s full duplex |
-| IP | `192.168.3.238/24`，默认路由 `via 192.168.3.1 dev eth0 proto dhcp` |
-| MAC | `00:11:22:33:44:55`（= U 盘 `bootargs.bin` 里 `ethaddr`） |
+| IP | 通过 DHCP 拿到一个 /24 私网地址，默认路由 `proto dhcp`（局域网地址不在本文记录） |
+| MAC | 与 U 盘 `bootargs.bin` 里 `ethaddr` 一致（具体值不记录） |
 | **网卡驱动** | **`hieth`**（`/sys/class/net/eth0/device/uevent`: `DRIVER=hieth`, `OF_COMPATIBLE_0=hisilicon,hieth`, `OF_FULLNAME=/soc/hieth@f9840000`） |
 | DT 节点 | `/proc/device-tree/soc/hieth@f9840000`：compatible=`hisilicon,hieth`，含 `hieth_phy@0`、`phy-handle`、`clocks`、`interrupts` |
 | dmesg | `libphy: himii: probed` → `hi_eth: attached port 0 PHY 1 to driver Generic PHY` → `[28.8s] eth0: Link is Up - 100Mbps/Full` |
