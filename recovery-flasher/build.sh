@@ -114,24 +114,28 @@ fi
 [ -f "$COMMUNITY_FB" ] && cp "$COMMUNITY_FB" "$OUT/fastboot.bin"
 
 cat > "$OUT/README.txt" <<'TXT'
-EC6108V9C -- modified-stock-recovery AUTO FLASHER  (digit status codes)
-========================================================================
+EC6108V9C -- modified-stock-recovery AUTO FLASHER  (number + English status)
+===========================================================================
 Boots the STOCK Android recovery kernel (HDMI/hifb drivers included) but with
 /sbin/recovery replaced by our own program. Starts automatically on power-on --
 NO menu, NO key press, NO serial (the box has none).
 
-SCREEN OUTPUT = ONE BIG DECIMAL NUMBER (dot-matrix), NOT a colour.
-  You only need to tell us WHICH NUMBER is on screen. The last number stays
-  forever (no reboot), so a single flash pinpoints where it stopped.
+SCREEN OUTPUT = a BIG STATE NUMBER + a short ENGLISH line under it.
+  Both use a 5x7 dot-matrix font embedded in the program (digits + A-Z),
+  NO external library, freestanding. Numbers are precise to report; the
+  English line spells out the error. The final status stays forever (no reboot),
+  so a single flash pinpoints where it stopped.
 
-  STATE CODES:
-    1  boot, framebuffer opened        2  mounting U-disk
-    3  U-disk mount OK                 4  flash.manifest found
-    5  flashing                        6  DONE (no reboot)
-    7  U-disk mount FAILED             8  no manifest (display-only, safe)
-    9  eMMC node cannot be opened
-  During flashing (5) the screen shows a growing PERCENT number 0..100; a
-  rising number means it is actively writing. Completion returns to 6.
+  STATE CODES (number + English shown on screen):
+    1  BOOT OK                   2  MOUNT USB...
+    3  USB MOUNT OK             4  MANIFEST OK
+    5  FLASHING                 6  DONE NO REBOOT
+    7  NO USB NODE  -> no U-disk block node ever appeared (USB not enumerated)
+    8  NO MANIFEST  -> mount OK, no flash.manifest (display-only, safe)
+    9  NO EMMC NODE
+    70 NODE HERE MOUNT FAIL -> a node appeared but every mount combo failed
+  During flashing the screen shows a growing PERCENT 0..100 + "FLASHING";
+  a rising number means it is actively writing. Completion returns to 6.
 
 U-disk ROOT must contain:
   fastboot.bin   community carrier loaded by BootROM on a shorted power-on
@@ -141,13 +145,16 @@ U-disk ROOT must contain:
 
 ALREADY VERIFIED on real hardware:
   - shorted boot -> stock 3.10 kernel lights HDMI (original recovery UI shown);
-  - patched recovery.img -> our custom userland ran (colour bar was seen).
-  This build replaces colour-coding with readable DIGITS, and merges in the
-  real flash engine + best-effort U-disk log (no separate diagnostic round).
+  - patched recovery.img -> our custom userland ran (colour bar, then digit 7).
+  Digit 7 last round = U-disk mount failed. This build fixes the mount to
+  mirror the STOCK fs_mgr (reverse-engineered): sleep(5) first, then poll the
+  device node ~12x with sleep(1), try vfat/ext4/ntfs + several node names +
+  flags 0xc04. Adds a 5x7 ASCII font so the screen also prints an ENGLISH
+  error line, and a split code 70 (node seen but mount failed).
 
 WHAT THIS BUILD DOES:
-  - shows the state number at each phase; HOLDS the final number on screen;
-  - tries 6 U-disk (dev,fstype) mount candidates, up to 3 passes;
+  - shows state NUMBER + English one-liner; HOLDS the final status on screen;
+  - U-disk mount mirrors stock fs_mgr: wait for enumeration, many candidates;
   - best-effort writes /usb/flasher.log (fsync+sync) -- if the U-disk mounts;
   - IF /usb/flash.manifest exists: flashes each item to raw /dev/block/mmcblk0
     by absolute LBA, decoding Android sparse images (R=raw, S=sparse).
@@ -155,10 +162,11 @@ WHAT THIS BUILD DOES:
   - flash.manifest line format:  <src-full-path> <lba-hex> <bytes-hex> <R|S>
     (bytes ignored for sparse). Completion = 6, never reboots.
 
-HOW TO REPORT: just say the number you see. Most likely:
-  - 7  = the U-disk did not mount in this kernel (explains the missing log);
-  - 8  = U-disk mounted OK but no manifest yet (ready to flash);
-  - 6  = a flash.manifest was present and flashing completed.
+HOW TO REPORT: say the NUMBER and/or the English line you see. Most likely:
+  - 7  "NO USB NODE"        = no U-disk node appeared (USB not enumerated);
+  - 70 "NODE HERE MOUNT FAIL" = node appeared but all mount combos failed;
+  - 8  "NO MANIFEST"        = mount OK, no manifest yet (ready to flash);
+  - 6  "DONE NO REBOOT"     = a manifest was present and flashing completed.
 
 SAFETY:
   - Without flash.manifest: ZERO eMMC writes (pure display/diagnostic).

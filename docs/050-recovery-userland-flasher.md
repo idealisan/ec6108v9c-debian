@@ -311,7 +311,7 @@ U 盘 `recovery.img` sha256 `ad95e2c5…`、`bootcmd` 不变。
 需先解决内核态 U 盘枚举；若 `8` 则下一版放 `flash.manifest` 用社区包做真正刷写。
 **本版无 manifest、零 eMMC 写入，安全。**
 
-### 10.3 数字版真机结果 = `7`（U 盘 mount 失败）+ 矛盾分析（进行中）
+### 10.3 数字版真机结果 = `7`（U 盘 mount 失败）+ 矛盾分析（已定案，见 §10.4）
 
 **真机（[观察]）**：点阵数字版短接启动 → 屏幕显示 **`7`** = `udisk_mount()` 的 6 个
 `(dev,fstype)` 候选 `mount()` 全部失败。数字编码按设计生效（用户能精确报告"7"）。
@@ -340,15 +340,50 @@ U 盘 `recovery.img` sha256 `ad95e2c5…`、`bootcmd` 不变。
 - 次要嫌疑：短接态 hiboot 的 `fatload usb` 用了 USB，内核起来后 host 重新枚举状态、以及
   `init.rc` 里 `android_usb` gadget(`functions adb`) 是否与 host 模式冲突，导致 sda1 根本不出现。
 
-**已派后台研究（进行中）**：反汇编 `p03__sbin__recovery` 的 `fs_mgr` 挂载流程，确认
-① mount 前是否等待节点出现/等待多久/重试几次；② 具体节点名、fstype(`auto`→实际)、mount flags；
-③ 失败 fallback；④ 短接态 USB 枚举与正常开机的差异、gadget 冲突；⑤ 可直接落地的修复清单。
-REA 约束：三分法、不臆造数值、只读。
+**后台反汇编已定案（成员，`TMP/recovery-repack/`）**：`p03__sbin__recovery`
+`ensure_path_mounted`(0xae0c) 用裸 `mount()`(0x4d0e4, r7=21)；关键是
+`0xae62 movs r0,#5; bl 0x54422` = **先 `sleep(5)`**，再 `wait_for_file` 用 `stat64` 轮询
+节点（`0xa17c sleep(1)` × 10、`0xa180 cmp r4,#0xa`），最多等约 15s；`fstab` 的 `auto`
+不传内核，依次试 `vfat→ext4→ntfs`（`msdos` 全文件 0 命中）；`flags=0xc04`
+(MS_NODEV|MS_NOATIME|MS_NODIRATIME)；挂前 `mkdir(/usb,0755)`、先读 `/proc/mounts` 判已挂；
+备用节点 `sda1→sda`、`mmcblk1p1→mmcblk1`，另有 `opendir("/dev/block")` 动态发现。内核
+`hiusb_*` host 驱动齐全、**gadget 驱动符号 0 命中** → `init.rc` 的 `android_usb` 配置是 no-op，
+不与 host 抢 PHY。[观察] 结论：**我们"立即 mount"挂得太早 + 没等待节点**，这是 `7` 的根因。
 
-**决策**：不靠猜再单独刷一版（若短接态 USB 根本没枚举，单纯加等待无效）。待结论返回后，
-下一版**一次性**把「等待节点 + 正确节点名/fstype/flags」与「社区包 `flash.manifest` 真刷」
-合并修对，不单独为挂载多占一轮。社区包素材已核对：`mv100/` 全套镜像，LBA
-（十六进制扇区）`bootargs 0x800 / baseparam 0x1000 / pq 0x3000 / logo 0x5000 /
-kernel 0x7000 / recoverybox32 0x11000(sparse) / www_ecoo_top 0x31000(sparse)`；
-两个 `.ext4` 为 Android sparse(`0xed26ff3a`)，刷写走 `write_sparse()` 解码（已实现于 `flasher.c`）。
-`p1/fastboot` 不刷（保持随时可经短接流程重刷）。
+---
+
+## 10.4 修复版：内嵌 5×7 ASCII 字模 + 对齐 fs_mgr 的挂载（本次提交）
+
+用户两点要求：①「不要等了，多试试看」→ 把挂载策略铺开一次试够；②「有没有现成的点阵
+字母 C 库，能直接打印报错消息」→ 引入字模。
+
+**① 字模（自包含，零外部库）**：Linux 内核有 `lib/fonts/font_8x16.c` 等、嵌入式常用
+`glcdfont.c`/`font5x7.h`，但本程序是 freestanding 静态 ELF（无 libc、不能链接外部库），
+故把**经典 5×7 ASCII 点阵字模数据**直接内嵌进 `flasher.c` 的 `FONT[44][7]`
+（`0-9 A-Z` 及 ` -.:/%!?`，等价把库的数据编译进程序）。`glyph_index()` 映射字符→字模索引。
+屏幕从上版的"纯数字"升级为**大状态码数字（上）+ 英文短句（下）**：
+`1 BOOT OK` / `2 MOUNT USB...` / `3 USB MOUNT OK` / `4 MANIFEST OK` / `5 FLASHING` /
+`6 DONE NO REBOOT` / `7 NO USB NODE` / `8 NO MANIFEST` / `9 NO EMMC NODE` /
+`70 NODE HERE MOUNT FAIL`。数字仍可精确口述，英文直接打印错误。字形模拟渲染 0-9/A-Z 全部
+可辨认，布局数值模拟确认数字区(底≈559)与文字区(顶≈669)不重叠、所有短句在 1920×1080 内。
+
+**② 挂载按 fs_mgr 重做**（`udisk_mount()`）：
+- 先读 `/proc/mounts` 判 `/usb` 已挂 → 直接成功（避免 EBUSY）；`/usb/recovery.img` 可读也算已挂；
+- **`nanosleep` 先睡 5s**（新增 `NR_nanosleep=162`/`NR_access=33` 与 `sleep_sec()`/`path_exists()`），
+  再 12 轮 `sleep(1)` 轮询 7 个节点：`sda1/sda/mmcblk1p1/mmcblk1/sda1(dev)/sda/mnt`；
+- 每个存在的节点试 8 种 fstype(`vfat/ext4/ntfs/msdos/fat/auto/exfat/fuse`) ×
+  3 种 flags(`0xc04`/`0`/`0xc04|MS_RDONLY`) × 3 种 data(空/`iocharset=utf8`/`utf8,uid=0,gid=0`)；
+- `g_node_seen` 记录是否曾有节点出现 → 失败细分为 `7`（无节点=USB 没枚举）与
+  `70`（节点在但所有 mount 组合失败=fstype/flags 问题）。
+- 刷机引擎（含 `write_sparse()` Android sparse 解码）与 best-effort 日志保持不变；
+  社区包素材/LBA 见 §10.3 末尾，本版**仍未放 `flash.manifest`（零 eMMC 写入、安全）**。
+
+**编译/校验（[观察]）**：ELF32 ARM EABI5 静态、11216 B、NEON/VFP=0、35 个 svc、soft-float；
+ramdisk 内 `sbin/recovery` == 新 flasher、内核逐字节未改；U 盘 `recovery.img`
+sha256 `584864ea…`、`bootcmd` 不变。
+
+**待用户操作**：短接上电 → 屏幕显示**数字 + 英文短句**，报出即可。判定：
+- `70 NODE HERE MOUNT FAIL` 或 `3/8`（挂载成功）→ 挂载已解决，下一版放 `flash.manifest` 真刷；
+- `7 NO USB NODE`（节点始终没出现）→ 短接态内核 USB 未枚举，需另查（触发重新枚举 /
+  用 hiboot 预加载镜像到内存等），不再是挂载参数问题。
+**本版无 manifest、零 eMMC 写入，安全。**

@@ -10,20 +10,22 @@
  *   `service recovery /sbin/recovery` + `class_start default`, so Android init
  *   execs it automatically -- NO menu, NO key, NO interaction.
  *
- * SCREEN OUTPUT = LARGE DOT-MATRIX DIGITS (not colours).
- *   The user cannot describe arbitrary colours precisely, but CAN read a
- *   number. So every state/result is shown as a big centred decimal number
- *   (5x7 font, scaled up). The LAST number stays on screen forever (no reboot),
- *   so a single flash tells us exactly where it stopped.
+ * SCREEN OUTPUT = BIG STATE NUMBER + ENGLISH ONE-LINER (5x7 ASCII font,
+ *   embedded -- NO external library, freestanding). Numbers are precise to
+ *   report; the English line spells out the error directly. Both use the same
+ *   classic 5x7 dot-matrix glyphs (digits + A-Z + " -.:/%!?").
+ *   The LAST status stays on screen forever (no reboot).
  *
- *   STATE CODES (one digit, held on the final one):
- *     1  boot, fb0 opened          2  mounting U-disk
- *     3  U-disk mount OK           4  flash.manifest found
- *     5  flashing                  6  DONE (no reboot)
- *     7  U-disk mount FAILED       8  no manifest (display-only, safe)
- *     9  eMMC node cannot open
- *   While flashing, the screen shows a growing PERCENT number (0..100); a
- *   rising number = actively writing. Completion returns to 6.
+ *   STATE CODES (held on the final one):
+ *     1  BOOT OK                   2  MOUNT USB...
+ *     3  USB MOUNT OK             4  MANIFEST OK
+ *     5  FLASHING                 6  DONE NO REBOOT
+ *     7  NO USB NODE (=no U-disk block node ever appeared / USB not enumerated)
+ *     8  NO MANIFEST (display-only, safe)
+ *     9  NO EMMC NODE
+ *     70 NODE HERE MOUNT FAIL (=node appeared but every mount combo failed)
+ *   While flashing, a growing PERCENT number (0..100) + "FLASHING" is shown;
+ *   a rising number = actively writing. Completion returns to 6.
  *
  * U-DISK LOG (best-effort, merged -- not a separate round): if /usb mounts,
  *   write /usb/flasher.log line-by-line, fsync+sync. If it does not mount, the
@@ -77,12 +79,25 @@ static inline long sc6(long n, long a, long b, long c, long d, long e, long f) {
 #define NR_open      5
 #define NR_close     6
 #define NR_lseek     19
+#define NR_access    33
 #define NR_sync      36
 #define NR_mkdir     39
 #define NR_mount     40
 #define NR_ioctl     54
 #define NR_fsync     118
+#define NR_nanosleep 162
 #define NR_mmap2     192
+
+/* ARM EABI: nanosleep(const struct timespec *req, struct timespec *rem) */
+typedef struct { long tv_sec; long tv_nsec; } timespec_t;
+static void sleep_sec(u32 s) {
+    timespec_t ts; ts.tv_sec = (long)s; ts.tv_nsec = 0;
+    SC2(NR_nanosleep, &ts, 0);
+}
+/* access(path, F_OK) -> 0 if the node exists */
+static int path_exists(const char *p) {
+    return SC2(NR_access, p, 0) >= 0;
+}
 
 #define O_RDONLY     0
 #define O_WRONLY     1
@@ -148,8 +163,11 @@ static unsigned char g_man[8192];
 #define C_BG   0xFF101830u    /* dark background */
 #define C_FG   0xFFFFFFFFu    /* bright white digits */
 
-/* 5x7 dot-matrix font for digits 0..9; each row's low 5 bits, bit4 = leftmost */
-static const unsigned char DIGITS[10][7] = {
+/* Standard 5x7 ASCII dot-matrix font (the classic glcdfont/font5x7 data,
+   embedded here so the freestanding ELF needs NO external library).
+   Index order: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ -.:/%!?"
+   Each row's low 5 bits; bit4 = leftmost dot. */
+static const unsigned char FONT[44][7] = {
     {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, /* 0 */
     {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, /* 1 */
     {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, /* 2 */
@@ -160,9 +178,51 @@ static const unsigned char DIGITS[10][7] = {
     {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, /* 7 */
     {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, /* 8 */
     {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, /* 9 */
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, /* A */
+    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, /* B */
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, /* C */
+    {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}, /* D */
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, /* E */
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}, /* F */
+    {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}, /* G */
+    {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}, /* H */
+    {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}, /* I */
+    {0x07,0x02,0x02,0x02,0x02,0x12,0x0C}, /* J */
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, /* K */
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}, /* L */
+    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, /* M */
+    {0x11,0x19,0x15,0x13,0x11,0x11,0x11}, /* N */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* O */
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}, /* P */
+    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}, /* Q */
+    {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}, /* R */
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, /* S */
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}, /* T */
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, /* U */
+    {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}, /* V */
+    {0x11,0x11,0x11,0x15,0x15,0x1B,0x11}, /* W */
+    {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, /* X */
+    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, /* Y */
+    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}, /* Z */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* space */
+    {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}, /* - */
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}, /* . */
+    {0x00,0x04,0x04,0x00,0x04,0x04,0x00}, /* : */
+    {0x01,0x02,0x02,0x04,0x08,0x08,0x10}, /* / */
+    {0x19,0x1A,0x02,0x04,0x08,0x0B,0x13}, /* % */
+    {0x04,0x04,0x04,0x04,0x04,0x00,0x04}, /* ! */
+    {0x0E,0x11,0x01,0x02,0x04,0x00,0x04}, /* ? */
 };
+#define FONT_ORDER "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ -.:/%!?"
 #define DW 5
 #define DH 7
+
+/* map an ASCII char to a FONT index (uppercase, '?' as fallback) */
+static int glyph_index(char c) {
+    if (c >= 'a' && c <= 'z') c -= 32;
+    for (int i = 0; i < 44; i++) if (FONT_ORDER[i] == c) return i;
+    return 43; /* '?' */
+}
 
 static int fb_init(void) {
     long fd = SC3(NR_open, "/dev/graphics/fb0", O_RDWR, 0);
@@ -215,37 +275,15 @@ static void solid(u32 color) {
     }
 }
 
-/* Show a big centred decimal number `n` on BOTH frames. Digits only, no text.
-   Scale is chosen so the number always fits the framebuffer. If mmap is
-   unavailable we still paint a solid frame (write fallback) so the screen
-   is never black; the digits need the mmap path (already validated on HW). */
-static void show_number(u32 n) {
-    /* decimal digits (most significant first) */
-    unsigned char d[8]; int nd = 0;
-    if (n == 0) { d[nd++] = 0; }
-    else {
-        unsigned char tmp[8]; int k = 0;
-        u32 t = n;
-        while (t && k < 8) { tmp[k++] = (unsigned char)(t % 10); t /= 10; }
-        while (k) d[nd++] = tmp[--k];
-    }
-    u32 gap = 1;                              /* in dots */
-    u32 adv_dots = DW + gap;
-    u32 total_dots = (u32)nd * adv_dots;      /* approximate width in dots */
-    u32 by_h = g_rows / (DH + 2);
-    u32 by_w = (g_cols - 20) / (total_dots + 1);
-    u32 sc = by_h < by_w ? by_h : by_w;
-    if (sc < 2) sc = 2;
-    u32 digit_adv = adv_dots * sc;
-    u32 pic_w = (u32)nd * digit_adv;
-    u32 x0 = (g_cols > pic_w) ? (g_cols - pic_w) / 2 : 0;
-    u32 y0 = (g_rows > DH * sc) ? (g_rows - DH * sc) / 2 : 0;
-
-    solid(C_BG);
-    if (!g_fb) return;                        /* write fallback: solid only */
-    for (int i = 0; i < nd; i++) {
-        const unsigned char *glyph = DIGITS[d[i]];
-        u32 dx = x0 + (u32)i * digit_adv;
+/* Draw one row of glyphs (indices into FONT) at (x0,y0) with dot-scale sc,
+   colour fg, into BOTH frames. Clipped to framebuffer bounds. */
+static void render_row(const unsigned char *idx, int n, u32 x0, u32 y0,
+                       u32 sc, u32 fg) {
+    if (!g_fb) return;
+    u32 adv = (DW + 1) * sc;
+    for (int i = 0; i < n; i++) {
+        const unsigned char *glyph = FONT[idx[i]];
+        u32 dx = x0 + (u32)i * adv;
         for (u32 r = 0; r < DH; r++) {
             unsigned char bits = glyph[r];
             for (u32 c = 0; c < DW; c++) {
@@ -258,7 +296,7 @@ static void show_number(u32 n) {
                         u32 row = Y * g_cols;
                         for (u32 xx = 0; xx < sc; xx++) {
                             u32 X = px + xx; if (X >= g_cols) break;
-                            fr[row + X] = C_FG;
+                            fr[row + X] = fg;
                         }
                     }
                 }
@@ -267,10 +305,57 @@ static void show_number(u32 n) {
     }
 }
 
-/* Hold a state number on screen for a visible moment. */
-static void state(u32 code) { show_number(code); delay(); delay(); }
-/* Final state: keep showing the same number forever (no reboot). */
-static void hold(u32 code) { for (;;) { show_number(code); delay(); delay(); delay(); } }
+/* Show a big centred decimal number (upper area). */
+static void render_big_number(u32 n, u32 y0, u32 sc) {
+    unsigned char d[8]; int nd = 0;
+    if (n == 0) { d[nd++] = 0; }
+    else {
+        unsigned char tmp[8]; int k = 0; u32 t = n;
+        while (t && k < 8) { tmp[k++] = (unsigned char)(t % 10); t /= 10; }
+        while (k) d[nd++] = tmp[--k];
+    }
+    u32 adv = (DW + 1) * sc;
+    u32 pic_w = (u32)nd * adv;
+    u32 x0 = (g_cols > pic_w) ? (g_cols - pic_w) / 2 : 0;
+    render_row(d, nd, x0, y0, sc, C_FG);
+}
+
+/* Show a short UPPERCASE message (lower area), auto-scaled to fit width. */
+static void render_msg(const char *msg, u32 y0) {
+    int len = slen(msg);
+    if (len <= 0) return;
+    unsigned char idx[64];
+    if (len > 64) len = 64;
+    for (int i = 0; i < len; i++) idx[i] = (unsigned char)glyph_index(msg[i]);
+    u32 adv_dots = DW + 1;
+    u32 by_w = (g_cols - 20) / ((u32)len * adv_dots + 1);
+    u32 by_h = (g_rows - y0 - 4) / (DH + 1);
+    u32 sc = by_w < by_h ? by_w : by_h;
+    if (sc < 2) sc = 2;
+    u32 pic_w = (u32)len * adv_dots * sc;
+    u32 x0 = (g_cols > pic_w) ? (g_cols - pic_w) / 2 : 0;
+    (void)adv_dots;
+    render_row(idx, len, x0, y0, sc, C_FG);
+}
+
+/* Full status screen: big state number on top + English one-liner below. */
+static void show_status(u32 code, const char *msg) {
+    solid(C_BG);
+    if (!g_fb) return;                        /* write fallback: solid only */
+    u32 num_sc = g_rows / 16;                /* ~40% screen tall number */
+    if (num_sc < 4) num_sc = 4;
+    render_big_number(code, g_rows / 12, num_sc);   /* top area */
+    render_msg(msg, g_rows * 62 / 100);             /* lower area, clear gap */
+}
+
+/* Hold a state (number + message) on screen for a visible moment. */
+static void state(u32 code, const char *msg) {
+    show_status(code, msg); delay(); delay();
+}
+/* Final state: keep showing the same status forever (no reboot). */
+static void hold(u32 code, const char *msg) {
+    for (;;) { show_status(code, msg); delay(); delay(); delay(); }
+}
 
 /* ---- U-disk log (best-effort) ---- */
 static int g_logfd = -1;
@@ -286,29 +371,88 @@ static void log_hex(long v) {
 }
 static void log_kv(const char *k, long v) { log_str(k); log_hex(v); }
 
-/* ---- U-disk mount candidates ---- */
-typedef struct { const char *src; const char *fs; } mtry_t;
-static const mtry_t g_tries[] = {
-    {"/dev/block/sda1",      "vfat"},
-    {"/dev/block/sda1",      "msdos"},
-    {"/dev/sda1",            "vfat"},
-    {"/dev/block/sda",       "vfat"},
-    {"/mnt/sda/sda1",        "vfat"},
-    {"/dev/block/mmcblk1p1", "vfat"},
+/* ---- U-disk mount, mirroring the STOCK fs_mgr (reverse-engineered) ----
+   Teammate disassembled p03__sbin__recovery ensure_path_mounted():
+     - sleep(5) first, then stat()/access() poll the device node ~10x with
+       sleep(1) between, so USB enumeration / ueventd can create /dev/block/sda1;
+     - fstab "auto" is NOT passed to the kernel: try vfat -> ext4 -> ntfs;
+       mount flags 0xc04 (MS_NODEV|MS_NOATIME|MS_NODIRATIME);
+     - fallback alternate node names sda1->sda, mmcblk1p1->mmcblk1;
+     - read /proc/mounts first to avoid remount; mkdir(mountpoint,0755) before.
+   We do the same, plus a few extra candidate nodes/fstypes ("多试试").
+   g_node_seen tells us whether ANY U-disk block node ever appeared; used to
+   split failure into code 7 (no node / USB not enumerated) vs 70 (node seen
+   but every mount combination failed = fstype/flags problem).
+------------------------------------------------------------------------- */
+static const char *NODES[] = {
+    "/dev/block/sda1", "/dev/block/sda",
+    "/dev/block/mmcblk1p1", "/dev/block/mmcblk1",
+    "/dev/sda1", "/dev/sda",
+    "/mnt/sda/sda1",
 };
-#define NTRIES ((int)(sizeof(g_tries)/sizeof(g_tries[0])))
+#define NNODES ((int)(sizeof(NODES)/sizeof(NODES[0])))
+static const char *FSTYPES[] = {
+    "vfat", "ext4", "ntfs", "msdos", "fat", "auto", "exfat", "fuse"
+};
+#define NFST ((int)(sizeof(FSTYPES)/sizeof(FSTYPES[0])))
+#define MNT_FLAGS 0xc04u      /* MS_NODEV|MS_NOATIME|MS_NODIRATIME */
+static int  g_node_seen = 0;  /* did any candidate node ever appear? */
+static long g_last_mnt_rc = -1;
+
+/* read /proc/mounts to see if /usb is already mounted by someone else */
+static int usb_already_mounted(void) {
+    long fd = SC3(NR_open, "/proc/mounts", O_RDONLY, 0);
+    if (fd < 0) return 0;
+    long n = SC3(NR_read, fd, g_chunk, CHUNK - 1);
+    SC1(NR_close, fd);
+    if (n <= 0) return 0;
+    g_chunk[n] = 0;
+    /* look for " /usb " token */
+    for (long i = 0; i + 5 < n; i++)
+        if (g_chunk[i]==' ' && g_chunk[i+1]=='/' && g_chunk[i+2]=='u' &&
+            g_chunk[i+3]=='s' && g_chunk[i+4]=='b' && g_chunk[i+5]==' ')
+            return 1;
+    return 0;
+}
+
+/* try all fstype/flags/data combos on one node; return 0 on success */
+static long try_mount(const char *node) {
+    static const char *DATA[] = { "", "iocharset=utf8", "utf8,uid=0,gid=0" };
+#define NDATA ((int)(sizeof(DATA)/sizeof(DATA[0])))
+    static const u32 FLAGS[] = { MNT_FLAGS, 0u, 0xc04u | 1u }; /* +MS_RDONLY variant */
+#define NFLAG ((int)(sizeof(FLAGS)/sizeof(FLAGS[0])))
+    for (int f = 0; f < NFST; f++)
+        for (int fl = 0; fl < NFLAG; fl++)
+            for (int dd = 0; dd < NDATA; dd++) {
+                long r = SC5(NR_mount, node, "/usb", FSTYPES[f],
+                             FLAGS[fl], DATA[dd]);
+                if (r >= 0) return 0;
+                g_last_mnt_rc = r;
+            }
+    return -1;
+}
 
 static long udisk_mount(void) {
     SC2(NR_mkdir, "/usb", 0755);
-    long rc = -1;
-    for (int pass = 0; pass < 3 && rc < 0; pass++) {
-        for (int i = 0; i < NTRIES; i++) {
-            long r = SC5(NR_mount, g_tries[i].src, "/usb", g_tries[i].fs, 0, 0);
-            if (r >= 0 && rc < 0) rc = r;
+    /* fast path: already mounted (e.g. by init/fs_mgr) */
+    if (usb_already_mounted()) { g_node_seen = 1; return 0; }
+    if (path_exists("/usb/recovery.img")) { g_node_seen = 1; return 0; }
+
+    /* stock behaviour: wait 5s for USB enumeration before probing nodes */
+    sleep_sec(5);
+
+    /* ~12 passes of stat polling with 1s sleeps, like fs_mgr wait_for_file */
+    for (int pass = 0; pass < 12; pass++) {
+        for (int i = 0; i < NNODES; i++) {
+            if (!path_exists(NODES[i])) continue;
+            g_node_seen = 1;
+            if (try_mount(NODES[i]) >= 0) return 0;
         }
-        if (rc < 0) delay();
+        /* re-check "already mounted" each pass */
+        if (usb_already_mounted()) return 0;
+        sleep_sec(1);
     }
-    return rc;
+    return -1;
 }
 
 /* Write `bytes` raw bytes from `in` to `dev` at LBA `lba`. */
@@ -410,7 +554,7 @@ static int do_flash(void) {
             if (q < le) *q++ = 0;
         }
         u32 pct_before = idx * 100 / total;
-        show_number(pct_before);
+        show_status(pct_before, "FLASHING");
         if (nt >= 2) {
             u32 lba = hexval(tok[1], slen(tok[1]));
             u32 bytes = (nt >= 3) ? hexval(tok[2], slen(tok[2])) : 0;
@@ -427,51 +571,56 @@ static int do_flash(void) {
             }
         }
         idx++;
-        show_number(idx * 100 / total);
+        show_status(idx * 100 / total, "FLASHING");
         delay();
         if (p < end) p++;
     }
     SC1(NR_close, dev);
-    show_number(100);
+    show_status(100, "FLASH DONE");
     return (int)flashed;
 }
 
 void _start(void) {
     fb_init();
-    state(1);                          /* boot, fb0 OK */
+    state(1, "BOOT OK");
 
-    state(2);                          /* mounting U-disk */
+    state(2, "MOUNT USB...");
     long mrc = udisk_mount();
 
     long lfd = SC3(NR_open, "/usb/flasher.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
     g_logfd = (int)lfd;
-    log_str("== recovery-flasher stage1 (digits) ==\n");
+    log_str("== recovery-flasher stage1 (digits+text) ==\n");
     log_kv("fb smem_len = ", (long)g_len);
     log_kv("fb stride   = ", (long)g_stride);
     log_kv("mount /usb  = ", mrc);
+    log_kv("node_seen   = ", g_node_seen);
+    log_kv("last_mnt_rc = ", g_last_mnt_rc);
     log_kv("open log    = ", lfd);
     { long e = SC3(NR_open, "/dev/block/mmcblk0", O_RDONLY, 0);
       log_kv("mmcblk0 node= ", e >= 0 ? 0 : -1);
       if (e >= 0) SC1(NR_close, e); }
 
     u32 final_code;
+    const char *final_msg;
     if (mrc < 0) {
-        final_code = 7;                /* mount FAILED */
-        log_str("RESULT: U-disk mount failed (code 7)\n");
+        if (!g_node_seen) { final_code = 7;  final_msg = "NO USB NODE"; }
+        else              { final_code = 70; final_msg = "NODE HERE MOUNT FAIL"; }
+        log_str("RESULT: U-disk mount failed\n");
     } else {
-        state(3);                      /* mount OK */
+        state(3, "USB MOUNT OK");
         long chk = SC3(NR_open, "/usb/flash.manifest", O_RDONLY, 0);
         if (chk < 0) {
-            final_code = 8;            /* no manifest, display-only */
+            final_code = 8; final_msg = "NO MANIFEST";
             log_str("RESULT: no flash.manifest (code 8)\n");
         } else {
             SC1(NR_close, chk);
-            state(4);                  /* manifest found */
+            state(4, "MANIFEST OK");
             log_str("RESULT: manifest found, flashing\n");
-            state(5);                  /* flashing */
+            state(5, "FLASHING");
             int r = do_flash();
             log_kv("flashed items = ", r);
-            final_code = (r == -2) ? 9 : 6;   /* 9 = eMMC node absent, 6 = DONE */
+            if (r == -2) { final_code = 9; final_msg = "NO EMMC NODE"; }
+            else         { final_code = 6; final_msg = "DONE NO REBOOT"; }
         }
     }
 
@@ -482,6 +631,6 @@ void _start(void) {
     }
     SC0(NR_sync);
 
-    hold(final_code);                  /* keep showing the number, no reboot */
+    hold(final_code, final_msg);       /* number + English message, no reboot */
     SC1(NR_exit, 0);                  /* not reached */
 }
