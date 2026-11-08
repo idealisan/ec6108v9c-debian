@@ -13,6 +13,13 @@
 
 ---
 
+> **真机更新 2026-11-08（决定性，见 §8）**：短接触点 + `--verify` 未改镜像 →
+> **成功进入原厂 recovery、点亮背光、显示 `warning, no file contacts`**，随后自动重启回社区 Ubuntu。
+> → **短接态内核能从零点亮 HDMI、`/dev/graphics/fb0` 可用，整条改造路线成立**（§6 决定性未知① 已定案）。
+> 未看到进度条是预期内：那次跑的是原厂 `/sbin/recovery`（未改镜像），不是我们的 `flasher`。
+
+---
+
 ## 0. 结论先行
 
 | # | 问题 | 结论 | 标注 |
@@ -22,7 +29,7 @@
 | 3 | **短接态怎么加载？** | 社区 `fastboot.bin` 的 `bootm` **直接 boot Android boot.img**：`check_header` 仅 memcmp 8 字节 `ANDROID!`，`get_ramdisk` 反汇编实证把 ramdisk `memcpy` 到 `0x04e00000` 并作 initrd。故 `bootcmd=fatload usb 0 0x1000000 recovery.img; bootm 0x1000000`。无需转 uImage/DTB/单独 ramdisk。 | [观察]（成员反汇编） |
 | 4 | **零交互自动执行？** | `init.rc` 已有 `service recovery /sbin/recovery` + `on early-init start ueventd` + `on boot class_start default`，上电自动拉起；替换后的程序无菜单、无按键依赖。 | [观察] |
 | 5 | **刷机动作？** | 程序挂载 U 盘到 `/usb`（`recovery.fstab` 有 `/dev/block/sda1 → /usb`），若存在 `/usb/flash.manifest` 则按行 `<src> <LBA-hex> <bytes-hex>` 把镜像按**绝对 LBA 裸写** `/dev/block/mmcblk0`，逐项推进进度条；无 manifest 则纯显示、**零 eMMC 写入**。 | [观察]+[推断] |
-| 6 | **真机显示已证实？** | **否**。产物已编译、重打包、逐字节校验通过，但短接态内核能否点亮 HDMI 仍是决定性未知。必须先做 §5 两段式 go/no-go 的第 1 步（boot 未改镜像看原厂 UI）。 | [未知] |
+| 6 | **真机显示已证实？** | **部分证实**：短接态内核点亮 HDMI、显示原厂 recovery UI（§8 第 1 步 PASS）。但**自定义 flasher 的进度条尚未在真机出现**——那次刷的是未改验证镜像。第 2 步（改造版）已装上 U 盘，待下一次刷机验证。 | [观察]+[未知] |
 
 ---
 
@@ -59,9 +66,19 @@
 | `recovery-flasher/build.sh` | 一键：编译 flasher → repack → 生成 `bootargs.bin` → 组装 U 盘三件套（可 `--verify` / `--install`） |
 | `TMP/recovery-flash-out/` | 构建产物（gitignored）：`flasher`/`recovery.img`/`recovery-verify.img`/`recovery-flash-boot.img`/`bootargs.bin`/`README.txt` |
 
-**工具链**：本机 `clang --target=armv7-unknown-linux-gnueabihf -fuse-ld=lld -static -nostdlib`
-即可产出 ELF32 ARM EABI5 静态 EXEC（freestanding syscall 直发 `svc #0`，自制 `__aeabi_uidiv`），
-无需交叉 gcc / libc / sysroot / CI，全量重建 < 1 s。
+**工具链 / 架构（32 位，与原厂对齐）**：本机
+`clang --target=armv7-unknown-linux-gnueabi -fuse-ld=lld -static -nostdlib
+-fno-vectorize -fno-slp-vectorize -mfloat-abi=soft`
+产出 **ELF32 / 小端 / `e_machine=0x28`(ARM，非 AArch64) / EABI5** 静态 EXEC——与原厂
+`/sbin/recovery` 的属性逐项一致（原厂：`ELF 32-bit LSB ARM EABI5 static`）。Hi3798MV100 是
+ARMv7-A 32 位，用户态程序必须 32 位 ARM。freestanding syscall 直发 `svc #0`，自制
+`__aeabi_uidiv`（无 libgcc）。无需交叉 gcc / libc / sysroot / CI，全量重建 < 1 s。
+
+**架构修正（重要）**：初版用 `gnueabi**hf**` + `-O2` 时，clang 把显存填充循环自动向量化，
+产物混入 43 条 NEON 指令（`vld1.32`/`vst1.8`/`vmov`…）。recovery 的 3.10 内核在早期用户态
+未必使能 VFP/NEON（CP10/CP11），一条 NEON 就可能触发未定义指令异常 → 程序崩、屏幕全黑。
+故改为 **soft-float + 禁自动向量化**，反汇编复核 **NEON/VFP = 0 条、纯整数 ARM 592 条**，
+`e_flags` 置 soft-float 位（0x05000200）。这是"32 位"之外必须核对的指令集兼容性。
 
 ## 4. 精确结构与校验（[观察]，均实测）
 
@@ -84,20 +101,21 @@
 
 ## 5. 两段式 go/no-go（用户操作，决定性）
 
-短接态内核是否"从零"点亮 HDMI 仍未定案（社区 4.4 似只继承 hiboot 的 VO 状态，而刷机分支
-hiboot 不初始化显示）。**先分离这个变量，别一上来就刷改造版**：
+**第 1 步已于 2026-11-08 通过（§8）**：短接态内核点亮 HDMI、显示原厂 recovery UI。
+曾担心"短接态内核是否从零点亮 HDMI"（社区 4.4 似只继承 hiboot 的 VO 状态），现已定案 =
+**是**。故直接进入第 2 步。
 
-1. **第 1 步（验证内核）**：`bash recovery-flasher/build.sh --verify --install <U盘目录>`
-   → 把**未改的** `recovery-verify.img` 作为 `recovery.img`。短接 USB_BOOT 上电。
-   - 出现**原厂 recovery 界面/文字** → 内核在刷机态点亮 HDMI、fb0 可用 → 本路线成立，进第 2 步。
-   - 仍**全黑** → 内核也不从零初始化 HDMI → 本路线与裸机路线皆败，需回到 `docs/023 §5.2 第二阶段`
-     或引入 hiboot 正常开机画 logo 后再进 recovery（多一次 reset）。**停止，勿继续堆改造。**
-2. **第 2 步（改造版）**：`bash recovery-flasher/build.sh --install <U盘目录>`（默认，替换 `sbin/recovery`）
-   → 短接上电，应看到进度条；放 `/usb/flash.manifest` 则自动刷机。
+1. ~~**第 1 步（验证内核）**~~ **已完成 ✅**：`--verify` 未改镜像 → 出现原厂 recovery
+   `warning, no file contacts` 界面 → 内核在刷机态点亮 HDMI、fb0 可用 → 本路线成立。
+2. **第 2 步（改造版，已装上 U 盘，待验证）**：`bash recovery-flasher/build.sh --install <U盘目录>`
+   （默认 MODE=flash，替换 `sbin/recovery`）→ 短接上电，应看到**自绘进度条**；放
+   `/usb/flash.manifest` 则自动刷机。U 盘当前 `recovery.img` 已切成改造版
+   （sha256 `45aab097…`）。
 
 ## 6. 仍未定案（[未知]，真机才能定）
 
-1. **决定性**：短接态 3.10 内核是否独立初始化 HDMI/VO（§5 第 1 步）。
+1. ~~**决定性**：短接态 3.10 内核是否独立初始化 HDMI/VO~~ **已定案=是（§8，2026-11-08）**：
+   短接态内核点亮背光、显示原厂 recovery UI。剩余未知是「自定义 flasher 是否真被拉起并显示进度条」。
 2. `bootm` 的 `initrd=`/`root=` 精确合并方式、社区 `bootargs` env 与 boot.img cmdline 的
    `blkdevparts` 冲突（16 分区 vs 当前 eMMC 9 分区）是否影响——按绝对 LBA 裸写可绕开，但内核
    启动阶段 `cmdlinepart` 建立 by-name 节点的具体表现未验证。
@@ -111,3 +129,58 @@ hiboot 不初始化显示）。**先分离这个变量，别一上来就刷改�
 用户态程序，零交互、带进度条。相较 `docs/049` 裸机探针，绕开了 HDMI 初始化难题。
 所有后续迭代（真实刷机 LBA、进度条细化、字体/文字）都局限在 `flasher.c` / ramdisk 用户态，
 内核与 p1/fastboot 一律不动，盒子始终可经同一短接流程重刷。
+
+---
+
+## 8. 真机验证记录（2026-11-08，用户实测）
+
+### 8.1 第 1 步（未改 `--verify` 镜像）— PASS
+
+| 项 | 观察 | 标注 |
+|---|---|---|
+| 引导方式 | 短接 USB_BOOT 触点 + U 盘 | [观察] |
+| 现象 | **成功进入 recovery、点亮背光**；过一段时间显示 `warning, no file contacts` | [观察] |
+| 以往对照 | 该画面**以往只在遥控器方式进入 recovery 时出现**；这次用短接刷机方式也出现 | [观察] |
+| 之后 | 过一段时间**自动重启，进入普通社区 Ubuntu**（正常开机） | [观察] |
+| 进度条 | **未出现**任何自定义进度条/迹象 | [观察] |
+
+`no file contacts`（应为 `no file context` / 无刷机命令之意）是**原厂 `/sbin/recovery`
+找不到刷机包/命令时的自绘界面**——因为这次 `recovery.img` 是 `--verify` 的**未改镜像**，
+跑的是原厂程序，不是我们的 `flasher`。所以"没有进度条"是设计内、预期内，不是失败。
+
+### 8.2 由真机结果得到的定案
+
+- **[观察→结论] 短接态内核能从零点亮 HDMI**：背光亮 + 原厂 recovery UI 显示，证明
+  原厂 3.10 内核在短接刷机分支**独立初始化了 VO/HDMI 并注册了可用的 framebuffer**，
+  不依赖 hiboot 正常开机的 logo 状态。这是此前最大未知（§6 ①）的答案，**改造路线成立**。
+  显示链路可用 → `/dev/graphics/fb0` 存在 → 我们 `flasher.c` 的 `open(fb0)+mmap+写像素`
+  前提成立（具体几何/双缓冲仍需第 2 步验证，§6 ③）。
+- **[观察] 引导链完全打通**：短接 → BootROM 加载 `fastboot.bin` → `bootargs.bin` 的
+  `bootcmd=fatload ... recovery.img; bootm 0x1000000` → `bootm` 直起 Android boot.img →
+  内核 + ramdisk → `init.rc` 拉起 `service recovery`。无按键、无串口、零交互，符合目标。
+- **[观察] 自动重启**：原厂 recovery 无命令后的正常退出/看门狗重启，回到社区 Ubuntu。
+  我们的 `flasher` 是常驻死循环（`for(;;)` 不退出），**不会走这个自动重启**——若第 2 步
+  出现"进度条一闪又重启"，需排查看门狗/内核 panic，而不是把它当成成功。
+- **[推断] 未改镜像能显示 ≠ 改造镜像能显示**：`bootm` 对改过的 boot.img 若有签名校验会
+  拒绝（§6 ④ 未证实）；且我们的 `flasher` 是否真被 init 拉起、`fb0` 写入是否生效，都要
+  第 2 步真机看。**这是当前唯一待验证的决定性未知。**
+
+### 8.3 已就位的第 2 步
+
+U 盘已插回，`recovery.img` 已切成**改造版**（sha256 `45aab097…`，ramdisk 内
+`sbin/recovery` = 禁 NEON 的 `flasher`，内核逐字节未改）。下一次短接上电应看到自绘
+进度条。判定：
+
+| 第 2 步现象 | 结论 / 下一步 |
+|---|---|
+| **持续增长/循环的彩色进度条** | 自定义用户态跑通、fb0 写入生效 → 显示目标达成；随后接 `flash.manifest` 做自动刷机 |
+| 仍是 `warning, no file contacts` 原厂界面 | 改造镜像没被加载（`bootm` 拒绝改过的 img / 或拿了错的 `recovery.img`）→ 查签名校验 §6 ④、确认 U 盘文件名 |
+| 全黑 / 一闪即重启 | `flasher` 崩溃或看门狗 → 用 `recovery-verify.img` 复核，排查 fb0 打开、`svc`、init 拉起 |
+| 花屏/局部色条 | fb0 几何不对（stride/双缓冲）→ 按 `docs/040` 调 `fb_init()` |
+
+### 8.4 关于"自动执行刷机任务、无菜单"
+
+`flasher` 天生零交互：`init.rc` 的 `service recovery` 自动 exec，程序一进入就执行
+`auto_flash()`——挂载 U 盘到 `/usb`、若有 `flash.manifest` 就按 LBA 裸写 eMMC 并推进进度条，
+无 manifest 则纯显示（安全）。**没有菜单、不等待任何输入**。真实刷机的目标 LBA 需按当前
+eMMC 分区布局确定（§6 ⑤），属显示验证通过后的下一迭代。

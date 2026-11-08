@@ -52,8 +52,12 @@ done
 mkdir -p "$OUT"
 
 echo "== 1/4  compile flasher (ARM Linux static ELF) =="
-"$CLANG" --target=armv7-unknown-linux-gnueabihf -fuse-ld=lld \
+# armv7 32-bit, soft-float, NO auto-vectorization: the stock 3.10 recovery
+# kernel may not enable VFP/NEON (CP10/CP11) for early userspace, so a single
+# NEON instruction from -O2 vectorization would trap. Keep it pure integer ARM.
+"$CLANG" --target=armv7-unknown-linux-gnueabi -fuse-ld=lld \
     -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector \
+    -fno-vectorize -fno-slp-vectorize -mfloat-abi=soft \
     -O2 -Wall -Wextra -o "$OUT/flasher" "$SELF_DIR/flasher.c"
 file "$OUT/flasher"
 python3 - "$OUT/flasher" <<'PY'
