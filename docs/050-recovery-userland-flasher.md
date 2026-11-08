@@ -478,3 +478,47 @@ Debian 8 分区下该位置都是 logo 分区，且不碰 p1/fastboot、内核�
 `flasher.log` 里该 item 有 `wrote > 0`；断电正常开机，开机画面变为 "Debian Linux"
 （证明字节写到了正确物理 LBA），且社区 Ubuntu 仍能启动（证明未破坏引导）。
 全量刷机骨架在 example 里以注释给出，核实后再启用。p1 永不写，U 盘兜底始终可用。
+
+---
+
+## 10.7 真机首刷 `6 DONE NO REBOOT`：引擎端到端跑通；画面未变的根因是选错验证素材
+
+**真机（[观察]）**：§10.6 版（manifest = `logo.img → p5@0x5000, 64KB, R`）短接上电：
+- 屏幕显示 **`6 DONE NO REBOOT`**，走完 `1→2→3→4→5→6`，停在完成画面不自动重启 ✓
+- 断电正常开机，社区 Ubuntu 正常启动 ✓（证明只写 p5 logo 未破坏引导）
+- **但开机画面仍是社区版，没有出现 "Debian Linux"**（可视验证未兑现）
+
+**U 盘 `flasher.log`（[观察]，本次首刷完整日志）**：
+```
+mount /usb  = 0x00000000        seen_mask=0x2, ok_node=/dev/block/sda, vfat
+RESULT: manifest found, flashing
+item idx    = 0x00000000
+  src       = /usb/mv100/logo.img
+  lba       = 0x00005000
+  bytes     = 0x00010000
+  kind      = RAW
+  open src  = 0x00000006
+  wrote     = 0x00010000        ← 真的往 eMMC 写了 64KB
+flashed items = 0x00000001
+```
+
+→ [结论] **刷机引擎首次在真机上端到端验证通过**：U 盘挂载（`/dev/block/sda`, vfat,
+一次命中）→ 读 manifest/镜像 → 按绝对 LBA 裸写 eMMC（`wrote=0x10000`）→ 显示状态数字
+→ 停在 `6` 不重启 → 写日志到 U 盘。`NR_mount`、sparse/raw 路径、framebuffer 显示全部成立。
+状态 `6` 不是"没刷"，是"刷成功且按要求不重启"。
+
+**画面未变的根因（[观察]，非刷机失败）**：写进 p5 的 `mv100/logo.img` 哈希
+`cb1a12a7…`，与 `TMP/community-restore/mv100/logo.img`（社区版 logo）**逐字节相同**
+——等于把社区 logo 原样写回 p5，画面当然不变。这是 §10.6 选验证素材时的判断错误：
+误把 U 盘 `mv100/` 当作 Debian 刷机包目录（其 `README.txt` 是 Debian 8 分区说明，
+但 `logo.img` 实际是社区素材）。真正的 Debian 画面 `patches/kernel/boot-logo-debian.img`
+哈希 `16840422…`，两者均为 `LOGO_TABLE` 容器、65536 B，可直接替换。
+
+**修正（本版）**：把 `boot-logo-debian.img` 复制到 U 盘 `mv100/debian-logo.img`
+（不覆盖社区原素材），`flash.manifest` 改指向它，仍写 p5@0x5000、64KB、R。
+新 `flasher.log` 会显示 `src=/usb/mv100/debian-logo.img`。断电开机应看到
+"Debian Linux" 画面 → 同时证明 p5 确实是 hiboot 开机画面来源 + 字节写到正确 LBA。
+`flash.manifest.example` 已同步修正，并记下这次教训。
+
+**安全**：仍只写 p5 的 64KB，p1/fastboot、内核、rootfs 全不碰；社区 Ubuntu 正常启动
+已在上一轮验证。U 盘兜底始终可用。全量刷机映射交由后台逐项核实（不猜 LBA）。

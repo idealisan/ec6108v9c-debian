@@ -26,10 +26,17 @@
 #   （见 docs/050 §10.6）。
 #
 # ===================== 第一次真实刷机（安全 + 可视验证）=====================
-# 只写 p5 logo（64KB RAW），不碰 p1/fastboot、内核、rootfs。logo.img 是刷机包
-# 自带的、已知可被 hiboot 解码的开机画面（"Debian Linux"）。写完后正常断电重启：
+# 只写 p5 logo（64KB RAW），不碰 p1/fastboot、内核、rootfs。写完后正常断电重启：
 # 开机画面改变即证明写入成功；社区 Ubuntu 仍应正常启动（证明未破坏引导）。
-/usb/mv100/logo.img 5000 10000 R
+#
+# [观察/教训] 首版用的是 mv100/logo.img，结果断电开机画面没变。排查发现该文件
+#   sha256(cb1a12a7…) 与 TMP/community-restore/mv100/logo.img（社区版 logo）
+#   完全相同 —— 等于把社区 logo 原样写回 p5，当然看不出变化；不是刷机失败。
+#   真正的 Debian 画面是 patches/kernel/boot-logo-debian.img (16840422…)，
+#   同为 LOGO_TABLE/65536B 容器，可直接替换。
+# 因此本版改用内容确实不同的 debian-logo.img（= boot-logo-debian.img 复制到
+#   U 盘 mv100/ 下，不覆盖社区原素材）。刷机前先确认 U 盘有这个文件。
+/usb/mv100/debian-logo.img 5000 10000 R
 #
 # ===================== 全量社区包（第二次，逐项核实后再启用）=================
 # /usb/mv100/baseparam.img       1000  1800  R
