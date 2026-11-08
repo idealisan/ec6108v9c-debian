@@ -1,0 +1,180 @@
+name: build-histb
+
+# Independent plan-B pipeline (docs/030-histb-build-pipeline.md).
+#
+# Trigger ONLY on the mainline-porting branch. This is the whole point: the
+# branch builds and publishes its own U-disk flash package without ever being
+# merged into main. main keeps its 6.3-rc5 build-release.yml untouched.
+#
+# Kernel = Linux 7.4-rc1 (BASE_SHA in patches/baseline) + histb-mainline/patches
+# quilt series, built by scripts/build-kernel-histb.sh. Rootfs and flash-package
+# scripts are kernel-agnostic and are reused verbatim from main.
+on:
+  push:
+    branches: [mainline-porting]
+    paths:
+      - 'scripts/**'
+      - 'configs/**'
+      - 'rootfs/**'
+      - '.github/workflows/build-histb.yml'
+  workflow_dispatch:
+    inputs:
+      patches_repo:
+        description: 'quilt patch store git URL (fork of histb-mainline/patches)'
+        type: string
+        default: 'https://github.com/idealisan/hisilicon-linux-mainline.git'
+      patches_ref:
+        description: 'patch store branch / ref'
+        type: string
+        default: 'master'
+      kernel_base_sha:
+        description: 'override BASE_SHA (leave empty to read patches/baseline)'
+        type: string
+        default: ''
+      skip_modules:
+        description: 'skip modules.tar.gz packaging (faster smoke build)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  # Separate group from main's build-release-*, so the two branches never
+  # cancel each other.
+  group: build-histb-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-kernel-histb:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabihf u-boot-tools bc bison flex libssl-dev libelf-dev \
+            lz4 zstd xz-utils cpio rsync unzip file device-tree-compiler python3 \
+            quilt git curl ca-certificates aria2
+
+      - name: Build HISTB upstream kernel (7.4-rc1 + quilt series)
+        env:
+          PATCHES_REPO: ${{ inputs.patches_repo || 'https://github.com/idealisan/hisilicon-linux-mainline.git' }}
+          PATCHES_REF: ${{ inputs.patches_ref || 'master' }}
+          KERNEL_BASE_SHA: ${{ inputs.kernel_base_sha }}
+          SKIP_MODULES: ${{ inputs.skip_modules && '1' || '0' }}
+        run: bash scripts/build-kernel-histb.sh
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: histb-kernel-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
+
+  build-rootfs:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rootfs build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap qemu-user-static binfmt-support e2fsprogs \
+            tar gzip xz-utils python3 sudo
+
+      - name: Build Debian armhf rootfs
+        run: bash scripts/build-rootfs.sh
+
+      - name: Upload rootfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: histb-rootfs-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
+
+  package:
+    needs: [build-kernel-histb, build-rootfs]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            e2fsprogs zip python3 mtools dosfstools parted curl git file
+
+      - name: Download kernel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: histb-kernel-dist
+          path: dist/
+
+      - name: Download rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: histb-rootfs-dist
+          path: dist/
+
+      - name: Build community-format U-disk flash package
+        run: |
+          echo "STAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
+          bash scripts/make-community-flash-package.sh
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Write release notes
+        run: |
+          cat > RELEASE_NOTES.md <<'EOF'
+          EC6108V9C (Hi3798MV100) Debian armhf - HISTB UPSTREAM plan-B pipeline
+
+          - branch: mainline-porting (independent from main's 6.3-rc5 builds)
+          - kernel: Linux 7.4-rc1 (BASE_SHA 6628e7d4c6b2) + histb-mainline/patches
+            quilt series (177 patches, --fuzz=0), built with multi_v7_defconfig
+            plus configs/kernel/histb-ec6108v9c.config
+          - display path: DRM VDP2 (32-bit) + SiI9134 bridge, per docs/029
+          - boot: community (ECOO) U-disk hiboot method, p1 hiboot NOT written,
+            uImage = zImage + appended DTB (CONFIG_ARM_APPENDED_DTB),
+            ATAG cmdline via CONFIG_ARM_ATAG_DTB_COMPAT
+          - rootfs: Debian 12 bookworm armhf (debootstrap), SSH + DHCP on eth0
+
+          WARNING: this is the FIRST pipeline pass. The goal is a reproducible
+          build reaching a flashable package, NOT a verified-working display.
+          Treat the artifacts as engineering builds until real hardware is
+          tested. See docs/030-histb-build-pipeline.md for known risks and the
+          iteration plan.
+
+          Assets:
+          - mv100-mdmo1g-debian-usb-flash-<STAMP>.zip  U-disk flash package
+          - hi_kernel.bin        uImage = zImage + DTB, load 0x2000000 -> p6
+          - modules.tar.gz       kernel modules
+          - debian-rootfs-armhf-bookworm.tar.gz  plain rootfs tarball
+          - SHA256SUMS.txt
+
+          Login: ssh root@<ip> / ec6108v9c (CHANGE IT), or telnet <ip>.
+          EOF
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "histb-$STAMP" \
+            --title "$STAMP · debian12-armhf + linux-7.4-rc1-histb + community-usb-flash" \
+            --notes-file RELEASE_NOTES.md \
+            dist/*

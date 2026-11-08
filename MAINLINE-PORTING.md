@@ -2,10 +2,12 @@
 
 > **状态：已启动（2026-11-08）**。用户决定开始走 plan B，本分支成为该项工作的
 > 主工作区。已从 `main` merge 全部调研文档与既有改动（`f85f454`）。
-> `main` 仍保留 6.3-rc5 刷机链，继续按需出 release；两边互不阻塞。
+> `main` 仍保留 6.3-rc5 刷机链（独立 `build-release.yml`），两边互不阻塞。
 >
-> 本分支当前**仍基于 6.3-rc5**，尚未换内核、尚未写新驱动、尚未改 CI。
-> 内核基线的选择见 §4，是启动后第一个待定决策。
+> **基线已定为 B（HISTB 上游 Linux 7.4-rc1 + quilt 补丁集）**，并已新建独立
+> `.github/workflows/build-histb.yml`——只监听本分支，push 即构建、自带
+> `histb-$STAMP` release，无需合并到 main。详见 **`docs/030`**。
+> 首次 CI 验证尚待跑；显示驱动正确性不是这一阶段的目标，先打通链路。
 
 ---
 
@@ -89,7 +91,11 @@ postmarketOS 式移植**作为主线，而不是继续在 hiboot 残留状态上
 `docs/027` §6 曾据 `0xf8ce0000` 误判并"推翻"它，现已撤销（两处均已加更正）。
 plan B 取 bridge 链路，不取 `600-17`。
 
-## 4. 内核基线：启动后第一个待定决策
+## 4. 内核基线：已定为 B（HISTB 上游）
+
+**决策（2026-11-08）**：采用 **基线 B = HISTB 上游**——Linux `7.4-rc1`
+（`BASE_SHA 6628e7d4c6b2`）+ `histb-mainline/patches` 的 177 个 quilt 补丁。
+流水线见 `docs/030`。下面的原候选分析保留作决策依据。
 
 调研（`docs/028` §6）带来的新事实改变了原 §4 的成本排序：
 
@@ -105,12 +111,12 @@ plan B 取 bridge 链路，不取 `600-17`。
 - C. mainline 7.4 + 全量 quilt series：154 个补丁互相依赖，成本最高，
   且用户此前明确要求暂缓维护，暂不优先。
 
-**建议（§5 第 1 步已完成，结论支持 B）**：`docs/029` 厘清了发送器形态，
-显示链是「DRM VDP2 + sii9134 bridge + CRG + 板级 DTS」一整套互相依赖的补丁
-（pending-7.4 显示子集约 20+ 个），逐个反向移植到 6.3 的成本远高于直接采用
-已在同一块 EC6108V9C 点亮 HDMI 的 7.3/7.4 上游树（`docs/025` §8 + `docs/028` §6）。
-→ **倾向 B**。但在真正切内核之前仍需先定基线并搭好源码接入方式（§5 第 2 步），
-不要盲目整套替换；优先复用上游成果而非自己重写驱动。
+**已定 B**：`docs/029` 厘清了发送器形态，显示链是「DRM VDP2 + sii9134 bridge
++ CRG + 板级 DTS」一整套互相依赖的补丁（pending-7.4 显示子集约 20+ 个），
+逐个反向移植到 6.3 的成本远高于直接采用已在同一块 EC6108V9C 点亮 HDMI 的
+7.3/7.4 上游树（`docs/025` §8 + `docs/028` §6）。源码接入方式见 `docs/030`：
+不建内核子模块，CI 按 `BASE_SHA` 拉一次性内核树 + quilt 全量 series。
+`docs/030` §4 列了首次 CI 可能失败的点，按日志迭代，不盲目整套替换。
 
 ## 5. 分阶段计划（启动后执行顺序）
 
@@ -119,9 +125,13 @@ plan B 取 bridge 链路，不取 `600-17`。
    结合既有 `TMP/histb-ref/`，确认 mv100 走 SiI9134 bridge 链路、`0xf8ce0000`
    属 hi3716cv200、`600-17` 片内 TX 属 mv200，撤销 `docs/027` §6 的误判。
    产出：**`docs/029`**（含补丁基线清单与证据链）。
-2. **【当前】确定内核基线**（§4，倾向 B），据此搭建分支上的内核源码接入方式
-   （用户已 fork histb patches 仓库作可选载体），并把 `docs/029` §4 的补丁子集
-   整理成可应用的 series。编译验证交给 CI，本地不构建镜像。
+2. **【已完成 2026-11-08】搭好流水线**：基线定为 B（`docs/030` §1）；新建
+   `.github/workflows/build-histb.yml`（独立触发/独立 tag/独立 concurrency，
+   只监听本分支）、`scripts/build-kernel-histb.sh`、
+   `configs/kernel/histb-ec6108v9c.config`。复用 `build-rootfs.sh` 与
+   `make-community-flash-package.sh`，产出完整 U 盘刷机包。**首次 CI 结果待验证**，
+   失败点清单见 `docs/030` §4，按日志迭代（裁剪 series / 修 config / 修依赖）。
+   编译验证一律交 CI，本地不构建镜像。
 3. **验证闭环**：QEMU 基线 + 绿带 + pstore，改任何驱动前先确认「改坏能看出来」。
    注：153551Z 的教训是 hiboot 命令链改动属高风险，最小实验要一次只改一处。
 4. **提取序列**：反汇编 `p01_fastboot.img` 与 p11 的 `vmlinux`
@@ -171,7 +181,10 @@ plan B 取 bridge 链路，不取 `600-17`。
 | **`docs/027`** | **原厂 Android 显示栈静态逆向（团队成果）；§6 结论已由 029 撤销，见该节顶部更正** |
 | **`docs/028`** | **postmarketOS 主线化工作流调研（含 no-map / clk 外部印证）** |
 | **`docs/029`** | **发送器形态厘清（plan B 第 1 步产出，含补丁基线清单）** |
+| **`docs/030`** | **HISTB 上游构建流水线（plan B 第 2 步产出，独立 workflow / 已知风险 / 迭代清单）** |
 
+> 流水线三件套：`.github/workflows/build-histb.yml`、
+> `scripts/build-kernel-histb.sh`、`configs/kernel/histb-ec6108v9c.config`。
 > 补丁原文（gitignored 不入库）：`TMP/histb-ref/`（既有 4 份）、
 > `TMP/porting-patches/`（本次新增 6 份）、`TMP/histb-pending.json` /
 > `TMP/histb-hack.json`（154+23 项清单）。
