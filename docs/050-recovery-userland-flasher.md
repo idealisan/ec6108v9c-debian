@@ -552,3 +552,82 @@ flashed items = 0x00000001
 **下一步（[未知]，待后台核实）**：全量社区 Ubuntu 包的镜像↔LBA 权威映射由后台从
 原始社区 zip 刷机脚本逐项取证（不猜 LBA），回来后产出可直接落地的全量
 `flash.manifest`；在此之前 U 盘保持当前"只写 p5 logo"的安全状态。
+
+---
+
+## 10.9 全量刷社区 Ubuntu 的镜像↔LBA 权威映射取证 + U 盘装盘
+
+两条独立证据链互相印证，均指向同一张表，全程只读、本地静态校验（不构建镜像）。
+
+**证据一（[观察]，直接取证）**：社区刷机 zip (`mv100-mdmo1g-usb-flash.zip`) 顶层
+`bootargs.bin`（CRC env）的 `flashpartition*` / `loadfile*` 命令，是本方案的权威 LBA 源：
+```
+bootcmd=run flashfastboot; run flashbootargs; run flashbase; run flashpq; \
+        run flashlogo; run flashkernel; run flashrootfs; run flashbackup; reset
+flashpartitionf=mmc write        0x0     0x1000000 0x0      0x0440    ; p1 fastboot
+flashpartitionb=mmc write        0x0     0x1000000 0x800    0x80      ; p2 bootargs
+flashpartitions=mmc write        0x0     0x1000000 0x1000   0xc       ; p3 baseparam
+flashpartitionp=mmc write        0x0     0x1000000 0x3000   0x8b      ; p4 pqparam
+flashpartitionl=mmc write        0x0     0x1000000 0x5000   0x120     ; p5 logo
+flashpartitionk=mmc write        0x0     0x1000000 0x7000   0x7800    ; p6 kernel
+flashpartitionr=mmc write.ext4sp 0x0     0x1000000 0x11000  0x20000   ; p7 recoverybox32.ext4
+flashpartitiont=mmc write.ext4sp 0x0     0x1000000 0x31000  0x100000  ; p8 www_ecoo_top.ext4
+```
+（`mmc write` 末参是扇区数取整上界；raw 镜像应写文件真实字节数，勿照抄扇区数。）
+
+**证据二（[观察]，后台独立复核）**：后台研究员从原版社区顶层 `bootargs.bin`
+（CRC 校验通过）独立解出同一张表，并补充三条关键结论：
+- `recoverybox32.ext4` = p7 OpenWrt/busybox 中继（64M, 959 chunk）；
+  `www_ecoo_top.ext4` = p8 备份暂存（512M, 27 chunk，仅含 `backup-32.gz`）；
+  `debian-root.ext4` 属我方 Debian 8 分区包、与社区 9 分区无关。
+- [未知] **社区 Ubuntu 没有独立 p9 镜像**：docs/016 实证由 p7 `recovery.sh` 首启
+  gunzip p8 `backup-32.gz` 写入 `/dev/mmcblk0p9` 再 `resize2fs`。脚本无 p9
+  `mmc write`，p9 LBA `0x131000` 仅算术可推 —— **禁止写进 manifest，否则写坏设备**。
+- baseparam/pq_param 脚本内有直接 `mmc write`，是必刷项（0x1000 / 0x3000）。
+
+**三方核对（[观察]）**：
+1. 8 个待刷镜像 U 盘 `mv100/` 与社区 zip 原版**逐字节 sha256 一致**
+   （fastboot `3bded87f…` / bootargs `d79610fc…` / baseparam `92127cfb…` /
+   pq_param `37ff404c…` / logo `cb1a12a7…` / hi_kernel `baaa86b4…` /
+   recoverybox32 `273d1b5c…` / www_ecoo_top `d1ccc208…`）。
+2. `hi_kernel.bin` uImage 头合法（`0x27051956`）、name=`Linux-4.4.35_ecoo_81082668`
+   —— 社区内核，非 mainline，刷完能起社区系统这点已确认。
+3. `mv100/bootargs.bin`（写进 p2 的社区运行时 env）与 zip 原版逐字节一致
+   （`d79610fc…`）；U 盘**根** `bootargs.bin` 仍是刷机入口
+   `bootcmd=fatload usb 0 0x1000000 recovery.img; bootm 0x1000000`，未被覆盖。
+4. 两个 sparse 本地几何实证：recoverybox32 展开 `0x20000` 扇区(959 chunk:
+   RAW+DONT_CARE)、www_ecoo_top 展开 `0x100000` 扇区(27 chunk: RAW+DONT_CARE)，
+   展开区间 `0x11000..0x31000` / `0x31000..0x131000` 与脚本
+   `0x11000 0x20000` / `0x31000 0x100000` 完全吻合、chunk 表完整、都在预算内。
+5. 模拟 `do_flash` 解析全量 manifest：7 项 LBA/字节/格式/扇区预算全部 PASS。
+
+**本版 U 盘 `flash.manifest`（7 项，跳过 p1，禁止 p9）**：
+```
+/usb/mv100/bootargs.bin       800    10000   R
+/usb/mv100/baseparam.img      1000   16ac    R
+/usb/mv100/pq_param.bin       3000   114e8   R
+/usb/mv100/logo.img           5000   10000   R
+/usb/mv100/hi_kernel.bin      7000   a5c037  R
+/usb/mv100/recoverybox32.ext4 11000  0       S
+/usb/mv100/www_ecoo_top.ext4  31000  0       S
+```
+R 字节数 = 文件真实大小；S 填 0（sparse 自描述）。p5 用社区原版 `logo.img`
+（忠实复刻社区包，不再用 `debian-logo.img`）—— 刷完开机画面回到社区 logo。
+
+**决策（[推断]，理由充分）**：
+- **跳过 p1 fastboot**：p1 已是社区版 hiboot（能正常开机进社区 Ubuntu 即证）；
+  短接触点兜底走 U 盘根 `fastboot.bin`，不依赖 eMMC p1。重写 p1 幂等无收益、
+  却是正常开机引导链最关键一块，写坏风险不值得冒。项目红线：p1 永不写。
+- **禁止 p9**：无独立镜像，写则损坏社区系统首启释放逻辑。
+- **p2 同名坑**：U 盘根 `bootargs.bin`（刷机入口）≠ `mv100/bootargs.bin`
+  （社区运行时 env），写进 p2 的只能是后者。
+
+**装盘状态（[观察]）**：`recovery.img` 仍为已真机验证版（`4b688503…`，无需重编——
+刷什么完全由文本 `flash.manifest` 决定，程序二进制不动）；新增盘面说明
+`README-COMMUNITY-FULL-FLASH.txt`；`flash.manifest.example` 重写为全量模板。
+
+**待用户真机验证**：短接上电 → 屏幕 `1→…→5 FLASHING`、进度 0..100（p8 294MB
+sparse 展开写 512MB，会停某百分比较久，属正常）→ 停在 `6 DONE NO REBOOT` 不重启;
+`flasher.log` 7 项 `wrote>0` + 两个 S 项的 sparse 统计; 断电正常开机进社区 Ubuntu、
+有 IP、能 SSH = 全量刷机成功。这是**首次真机执行 sparse 写入 + 多分区 + 大镜像**,
+之前只验证过单项 64KB RAW；p1 不碰、U 盘兜底始终可用，任何结果都能重刷救回。
