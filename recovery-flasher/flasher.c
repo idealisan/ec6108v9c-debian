@@ -27,6 +27,10 @@
  *   While flashing, a growing PERCENT number (0..100) + "FLASHING" is shown;
  *   a rising number = actively writing. Completion returns to 6.
  *
+ * HISTORY: real-HW code 70 (node seen, mount failed) was traced to a WRONG
+ *   syscall number: NR_mount was 40 (rmdir) instead of ARM-EABI 21 (mount).
+ *   Fixed. That also explains the earlier missing /usb/flasher.log.
+ *
  * U-DISK LOG (best-effort, merged -- not a separate round): if /usb mounts,
  *   write /usb/flasher.log line-by-line, fsync+sync. If it does not mount, the
  *   on-screen number already carries the diagnosis.
@@ -79,10 +83,10 @@ static inline long sc6(long n, long a, long b, long c, long d, long e, long f) {
 #define NR_open      5
 #define NR_close     6
 #define NR_lseek     19
+#define NR_mount     21   /* ARM EABI syscall.tbl: 21=mount, 40=rmdir (was WRONG -> all mount() calls were rmdir(), always failed) */
 #define NR_access    33
 #define NR_sync      36
 #define NR_mkdir     39
-#define NR_mount     40
 #define NR_ioctl     54
 #define NR_fsync     118
 #define NR_nanosleep 162
@@ -320,6 +324,11 @@ static void render_big_number(u32 n, u32 y0, u32 sc) {
     render_row(d, nd, x0, y0, sc, C_FG);
 }
 
+/* Font scale divisor: user asked to shrink the glyphs to ~1/4 of the previous
+   size. FONT_DIV=4 divides the auto-computed dot-scale in both number & text.
+   A floor keeps glyphs legible on small framebuffers. */
+#define FONT_DIV 4
+
 /* Show a short UPPERCASE message (lower area), auto-scaled to fit width. */
 static void render_msg(const char *msg, u32 y0) {
     int len = slen(msg);
@@ -330,22 +339,25 @@ static void render_msg(const char *msg, u32 y0) {
     u32 adv_dots = DW + 1;
     u32 by_w = (g_cols - 20) / ((u32)len * adv_dots + 1);
     u32 by_h = (g_rows - y0 - 4) / (DH + 1);
-    u32 sc = by_w < by_h ? by_w : by_h;
-    if (sc < 2) sc = 2;
+    u32 sc = (by_w < by_h ? by_w : by_h) / FONT_DIV;
+    if (sc < 2) sc = 2;                      /* legibility floor */
     u32 pic_w = (u32)len * adv_dots * sc;
     u32 x0 = (g_cols > pic_w) ? (g_cols - pic_w) / 2 : 0;
     (void)adv_dots;
     render_row(idx, len, x0, y0, sc, C_FG);
 }
 
-/* Full status screen: big state number on top + English one-liner below. */
+/* Full status screen: state number (top) + English one-liner (below), centred.
+   All glyphs are 1/4 the previous size (FONT_DIV). */
 static void show_status(u32 code, const char *msg) {
     solid(C_BG);
     if (!g_fb) return;                        /* write fallback: solid only */
-    u32 num_sc = g_rows / 16;                /* ~40% screen tall number */
-    if (num_sc < 4) num_sc = 4;
-    render_big_number(code, g_rows / 12, num_sc);   /* top area */
-    render_msg(msg, g_rows * 62 / 100);             /* lower area, clear gap */
+    u32 num_sc = g_rows / (16 * FONT_DIV);   /* ~1/4 of before */
+    if (num_sc < 2) num_sc = 2;
+    /* centre the two rows around the middle of the screen */
+    u32 num_y = g_rows / 2 - (DH * num_sc) - 8;
+    render_big_number(code, num_y, num_sc);
+    render_msg(msg, g_rows / 2 + 8);
 }
 
 /* Hold a state (number + message) on screen for a visible moment. */

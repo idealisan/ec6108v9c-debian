@@ -387,3 +387,43 @@ sha256 `584864ea…`、`bootcmd` 不变。
 - `7 NO USB NODE`（节点始终没出现）→ 短接态内核 USB 未枚举，需另查（触发重新枚举 /
   用 hiboot 预加载镜像到内存等），不再是挂载参数问题。
 **本版无 manifest、零 eMMC 写入，安全。**
+
+---
+
+## 10.5 真机 `70` → 定位到真正的根因：`NR_mount` 系统调用号写错（已修）
+
+**真机（[观察]）**：§10.4 版短接启动 → 屏幕显示 **`70 NODE HERE MOUNT FAIL`**。
+即 `g_node_seen=1`（U 盘块设备节点**确实出现了**），但所有 `mount()` 组合全失败。
+→ [推断] 排除"挂太早 / USB 没枚举 / fstype/flags 不对"，问题在 `mount()` 这个系统调用**本身**。
+
+**根因（[观察]，内核源码 + 原厂反汇编双证）**：`flasher.c` 里把 `NR_mount` 定义成了 **40**，
+而 ARM EABI 的 syscall 表里 **21 才是 `mount`，40 是 `rmdir`**：
+- `third_party/linux-hi3798mv100/arch/arm/tools/syscall.tbl`：
+  `21 common mount sys_mount` / `40 common rmdir sys_rmdir`；
+  其余号全对：`33 access` / `36 sync` / `39 mkdir` / `54 ioctl` / `118 fsync` /
+  `162 nanosleep` / `192 mmap2` / `195 stat64`。
+- 后台反汇编原厂 `p03__sbin__recovery` 的 `mount()` wrapper（`0x4d0e4`）实测
+  `mov r7,#0x15`=**21** = mount（§10.3 已记），与此一致。
+
+→ 之前**所有 `mount(src,"/usb",...)` 实际都调用成了 `rmdir(src)`**（r7=40），对块设备节点
+执行 rmdir 必然返回失败。这**同时解释了**：
+- 上一版状态码 `7`（那时还没轮询到节点就被当失败）与本版 `70`；
+- 更早"彩色画面有、但 U 盘里没有 `flasher.log`"——`/usb` 从未真正挂上，日志写到了
+  ramdisk 的 `/usb` 目录（断电即失），根本没落到 U 盘。
+
+**修复（本次）**：`NR_mount 40 → 21`（`recovery-flasher/flasher.c`）。仅此一处，其余
+挂载等待/多 fstype/flags/节点候选、`fb0` 点阵、刷机引擎、日志逻辑全部不动。修正后
+`mount()` 会真正执行；预期这次能挂上 U 盘 → 状态码 `3/8`（挂载成功、无 manifest），
+`flasher.log` 也会真正落到 U 盘。
+
+**字号（用户要求缩到 1/4）**：加 `FONT_DIV=4`，`show_status()` 的数字 scale
+`g_rows/16 → g_rows/64`、文字 scale `/4`、两者居中排布（数字在上、英文在下、留白）。
+数值模拟（1920×1080）：数字 sc=16/高 112px、英文 sc 3~11、区不重叠、短句全在屏内。
+
+**编译/校验（[观察]）**：ELF32 ARM EABI5 静态、11212 B、NEON/VFP=0、soft-float；
+ramdisk 内 `sbin/recovery` == 新 flasher、内核逐字节未改。`bootcmd` 不变。
+产物在 `TMP/recovery-flash-out/`（U 盘在编译/装盘时未挂载，`--install` 待 U 盘插回执行）。
+
+**待用户操作**：U 盘插回 → `bash recovery-flasher/build.sh --install <U盘目录>` → 短接上电
+→ 报数字+英文。预期 `3 USB MOUNT OK` / `8 NO MANIFEST`（挂载已通）→ 下一版放
+`flash.manifest` 用社区包真刷。本版仍零 eMMC 写入。
