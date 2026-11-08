@@ -27,8 +27,8 @@ on:
         description: 'patch store branch / ref'
         type: string
         default: 'master'
-      kernel_base_sha:
-        description: 'override BASE_SHA (leave empty to read patches/baseline)'
+      kernel_ref:
+        description: 'kernel git ref (tag/branch) to clone; empty = v<KERNEL_VERSION> from patches/baseline'
         type: string
         default: ''
       skip_modules:
@@ -65,7 +65,7 @@ jobs:
         env:
           PATCHES_REPO: ${{ inputs.patches_repo || 'https://github.com/idealisan/hisilicon-linux-mainline.git' }}
           PATCHES_REF: ${{ inputs.patches_ref || 'master' }}
-          KERNEL_BASE_SHA: ${{ inputs.kernel_base_sha }}
+          KERNEL_REF: ${{ inputs.kernel_ref }}
           SKIP_MODULES: ${{ inputs.skip_modules && '1' || '0' }}
         run: bash scripts/build-kernel-histb.sh
 

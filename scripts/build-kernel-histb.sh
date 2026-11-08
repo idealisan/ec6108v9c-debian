@@ -30,10 +30,12 @@ DIST=${DIST:-dist}
 PATCHES_REPO=${PATCHES_REPO:-https://github.com/idealisan/hisilicon-linux-mainline.git}
 PATCHES_REF=${PATCHES_REF:-master}
 
-# Kernel tree source. We fetch the exact BASE_SHA via GitHub's codeload tarball.
-# BASE_SHA is read from $PATCHES_TREE/baseline after clone (single source of truth);
-# KERNEL_BASE_SHA can override it for reproducible pinning.
-KERNEL_TARBALL_BASE=${KERNEL_TARBALL_BASE:-https://codeload.github.com/torvalds/linux/tar.gz}
+# Kernel tree source = the upstream kernel git repository, shallow-cloned at the
+# baseline tag. This is the "clone the repo, then apply patches" flow the patch
+# store README prescribes; it replaces the codeload tarball, which GitHub
+# rate-limits (HTTP 429 on shared CI egress). The tag (v<KERNEL_VERSION>) is
+# derived from $PATCHES_TREE/baseline and can be overridden via KERNEL_REF.
+KERNEL_GIT=${KERNEL_GIT:-https://github.com/torvalds/linux.git}
 
 DTS=${DTS:-hisilicon/hi3798mv100-ec6108v9c}
 DEFCONFIG=${DEFCONFIG:-multi_v7_defconfig}
@@ -63,31 +65,34 @@ git clone --depth 1 --branch "$PATCHES_REF" "$PATCHES_REPO" "$PATCHES_TREE"
 BASELINE="$PATCHES_TREE/baseline"
 KVER=$(grep -E '^KERNEL_VERSION' "$BASELINE" | awk -F':=' '{gsub(/ /,"",$2); print $2}')
 SHA_FROM_BASELINE=$(grep -E '^BASE_SHA' "$BASELINE" | awk -F':=' '{gsub(/ /,"",$2); print $2}')
-KERNEL_BASE_SHA=${KERNEL_BASE_SHA:-$SHA_FROM_BASELINE}
-echo "  KERNEL_VERSION=$KVER  BASE_SHA=$KERNEL_BASE_SHA"
-test -n "$KERNEL_BASE_SHA" || { echo "empty BASE_SHA" >&2; exit 1; }
+# baseline gives a short SHA. We clone by TAG (always advertised, --depth 1
+# dereferences the annotated tag to the commit) and then verify HEAD starts
+# with the baseline short SHA. Fetching a short SHA directly does NOT work
+# ("couldn't find remote ref"), and fetching a full SHA is unreliable on large
+# repos; the tag is the canonical, robust handle.
+KERNEL_REF=${KERNEL_REF:-v$KVER}
+echo "  KERNEL_VERSION=$KVER  BASE_SHA=$SHA_FROM_BASELINE  ref=$KERNEL_REF"
+test -n "$SHA_FROM_BASELINE" || { echo "empty BASE_SHA in baseline" >&2; exit 1; }
 test -f "$PATCHES_TREE/series" || { echo "series file missing" >&2; exit 1; }
 test -f "$PATCHES_TREE/quilt.conf" || { echo "quilt.conf missing" >&2; exit 1; }
 echo "  patches in series: $(grep -c '\.patch' "$PATCHES_TREE/series")"
 
-echo "== [2/7] fetch disposable kernel tree at BASE_SHA =="
-TARBALL="$WORK/linux-$KERNEL_BASE_SHA.tar.gz"
-URL="$KERNEL_TARBALL_BASE/$KERNEL_BASE_SHA"
-# codeload tarballs are generated on the fly: no Content-Length and no Range
-# support. aria2c's multi-connection segmentation (-x/-s) fails on them with
-# exit 22 within seconds (this is exactly what the first CI run hit). Use a
-# SINGLE curl connection with retries; curl is native on the runner, honours
-# any HTTP(S)_PROXY from the environment, and streams the chunked response fine.
-if ! curl -fL --retry 4 --retry-delay 3 --connect-timeout 30 \
-        --max-time 1200 -o "$TARBALL" "$URL"; then
-  echo "kernel tarball download failed: $URL" >&2
-  exit 1
-fi
-test -s "$TARBALL" || { echo "kernel tarball empty: $TARBALL" >&2; exit 1; }
-echo "  downloaded: $(du -sh "$TARBALL" | cut -f1)"
-mkdir -p "$KERNEL_TREE"
-tar -xzf "$TARBALL" -C "$KERNEL_TREE" --strip-components=1
-echo "  extracted: $(du -sh "$KERNEL_TREE" | cut -f1)"
+echo "== [2/7] clone kernel tree at baseline tag =="
+# Clone the upstream kernel repo shallowly at the baseline tag. This is the
+# canonical "clone the repo, then apply patches" flow the patch store README
+# prescribes (git archive BASE_SHA). git smart-HTTP is NOT subject to the
+# codeload tarball rate limit (HTTP 429) that killed both previous runs, and
+# --depth 1 --branch <tag> pulls only one commit, dereferencing any annotated
+# tag to its commit automatically.
+git clone -q --depth 1 --branch "$KERNEL_REF" --single-branch \
+  "$KERNEL_GIT" "$KERNEL_TREE"
+HEAD_SHA=$(git -C "$KERNEL_TREE" rev-parse HEAD)
+echo "  HEAD=$HEAD_SHA (baseline $KERNEL_REF -> $SHA_FROM_BASELINE)"
+case "$HEAD_SHA" in
+  "$SHA_FROM_BASELINE"*) ;;
+  *) echo "kernel HEAD does not match baseline BASE_SHA (tag drifted?)" >&2; exit 1 ;;
+esac
+echo "  checked out: $(du -sh "$KERNEL_TREE" | cut -f1)"
 
 echo "== [3/7] apply quilt series (--fuzz=0, fail-fast) =="
 # quilt.conf derives QUILT_PATCHES from the directory holding QUILTRC and sets
