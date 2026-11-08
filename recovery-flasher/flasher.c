@@ -382,6 +382,7 @@ static void log_hex(long v) {
     if (g_logfd >= 0) SC3(NR_write, g_logfd, b, 11);
 }
 static void log_kv(const char *k, long v) { log_str(k); log_hex(v); }
+static void log_kvs(const char *k, const char *v) { log_str(k); log_str(v); log_str("\n"); }
 
 /* ---- U-disk mount, mirroring the STOCK fs_mgr (reverse-engineered) ----
    Teammate disassembled p03__sbin__recovery ensure_path_mounted():
@@ -410,6 +411,11 @@ static const char *FSTYPES[] = {
 #define MNT_FLAGS 0xc04u      /* MS_NODEV|MS_NOATIME|MS_NODIRATIME */
 static int  g_node_seen = 0;  /* did any candidate node ever appear? */
 static long g_last_mnt_rc = -1;
+/* mount diagnostics: which (node,fstype,flags,data) combination succeeded */
+static int  g_ok_node = -1, g_ok_fst = -1, g_ok_flag = -1, g_ok_data = -1;
+static int  g_ok_pass = -1, g_mount_attempts = 0;
+static int  g_already_mounted = 0;
+static unsigned char g_seen_mask = 0;   /* bitmask of nodes that appeared */
 
 /* read /proc/mounts to see if /usb is already mounted by someone else */
 static int usb_already_mounted(void) {
@@ -427,8 +433,9 @@ static int usb_already_mounted(void) {
     return 0;
 }
 
-/* try all fstype/flags/data combos on one node; return 0 on success */
-static long try_mount(const char *node) {
+/* try all fstype/flags/data combos on one node; record the winning combo.
+   node_idx is the index in NODES[] for diagnostics. */
+static long try_mount(const char *node, int node_idx, int pass) {
     static const char *DATA[] = { "", "iocharset=utf8", "utf8,uid=0,gid=0" };
 #define NDATA ((int)(sizeof(DATA)/sizeof(DATA[0])))
     static const u32 FLAGS[] = { MNT_FLAGS, 0u, 0xc04u | 1u }; /* +MS_RDONLY variant */
@@ -436,9 +443,14 @@ static long try_mount(const char *node) {
     for (int f = 0; f < NFST; f++)
         for (int fl = 0; fl < NFLAG; fl++)
             for (int dd = 0; dd < NDATA; dd++) {
+                g_mount_attempts++;
                 long r = SC5(NR_mount, node, "/usb", FSTYPES[f],
                              FLAGS[fl], DATA[dd]);
-                if (r >= 0) return 0;
+                if (r >= 0) {
+                    g_ok_node = node_idx; g_ok_fst = f;
+                    g_ok_flag = fl; g_ok_data = dd; g_ok_pass = pass;
+                    return 0;
+                }
                 g_last_mnt_rc = r;
             }
     return -1;
@@ -447,8 +459,8 @@ static long try_mount(const char *node) {
 static long udisk_mount(void) {
     SC2(NR_mkdir, "/usb", 0755);
     /* fast path: already mounted (e.g. by init/fs_mgr) */
-    if (usb_already_mounted()) { g_node_seen = 1; return 0; }
-    if (path_exists("/usb/recovery.img")) { g_node_seen = 1; return 0; }
+    if (usb_already_mounted()) { g_node_seen = 1; g_already_mounted = 1; return 0; }
+    if (path_exists("/usb/recovery.img")) { g_node_seen = 1; g_already_mounted = 2; return 0; }
 
     /* stock behaviour: wait 5s for USB enumeration before probing nodes */
     sleep_sec(5);
@@ -458,10 +470,11 @@ static long udisk_mount(void) {
         for (int i = 0; i < NNODES; i++) {
             if (!path_exists(NODES[i])) continue;
             g_node_seen = 1;
-            if (try_mount(NODES[i]) >= 0) return 0;
+            g_seen_mask |= (unsigned char)(1u << i);
+            if (try_mount(NODES[i], i, pass) >= 0) return 0;
         }
         /* re-check "already mounted" each pass */
-        if (usb_already_mounted()) return 0;
+        if (usb_already_mounted()) { g_already_mounted = 3; return 0; }
         sleep_sec(1);
     }
     return -1;
@@ -481,10 +494,17 @@ static u32 write_raw(long dev, long in, u32 lba, u32 bytes) {
     return done;
 }
 
+/* sparse-decode diagnostics (reset at each write_sparse() entry, logged per
+   manifest item in do_flash()). */
+static u32 g_sparse_chunks = 0;   /* chunk headers parsed */
+static u32 g_sparse_raw    = 0;   /* bytes emitted from RAW/FILL chunks */
+static u32 g_sparse_skip   = 0;   /* bytes covered but skipped (DONT_CARE/CRC/etc) */
+
 /* Decode Android sparse from `in`, write to `dev` at LBA `lba`.
    RAW=write payload; FILL=emit repeated dword; DONT_CARE/CRC=skip by lseek.
    Returns logically-covered bytes. */
 static u32 write_sparse(long dev, long in, u32 lba) {
+    g_sparse_chunks = 0; g_sparse_raw = 0; g_sparse_skip = 0;
     unsigned char hdr[28];
     if (SC3(NR_read, in, hdr, 28) != 28) return 0;
     if (rd32(hdr, 0) != SPARSE_MAGIC) return 0;
@@ -495,6 +515,7 @@ static u32 write_sparse(long dev, long in, u32 lba) {
     for (u32 ci = 0; ci < total_chunks; ci++) {
         unsigned char ch[12];
         if (SC3(NR_read, in, ch, 12) != 12) break;
+        g_sparse_chunks++;
         u32 type = (u32)ch[0] | ((u32)ch[1] << 8);
         u32 nblk = rd32(ch, 4);
         u32 tsz  = rd32(ch, 8);
@@ -510,6 +531,7 @@ static u32 write_sparse(long dev, long in, u32 lba) {
                 SC3(NR_write, dev, g_chunk, got);
                 left -= (u32)got;
             }
+            g_sparse_raw += payload;
         } else if (type == CHUNK_FILL) {
             unsigned char fill[4];
             long fr = SC3(NR_read, in, fill, 4);
@@ -524,7 +546,9 @@ static u32 write_sparse(long dev, long in, u32 lba) {
                 SC3(NR_write, dev, g_chunk, take);
                 left -= take;
             }
+            g_sparse_raw += span;
         } else {
+            g_sparse_skip += span;
             if (payload) SC3(NR_lseek, in, (long)payload, SEEK_CUR);
         }
         cur_lba += span / 512;
@@ -567,16 +591,26 @@ static int do_flash(void) {
         }
         u32 pct_before = idx * 100 / total;
         show_status(pct_before, "FLASHING");
+        log_kv("item idx    = ", (long)idx);
+        log_kv("  tokens    = ", (long)nt);
         if (nt >= 2) {
             u32 lba = hexval(tok[1], slen(tok[1]));
             u32 bytes = (nt >= 3) ? hexval(tok[2], slen(tok[2])) : 0;
             char kind = (nt >= 4) ? tok[3][0] : 'R';
+            log_kvs("  src       = ", tok[0]);
+            log_kv ("  lba       = ", (long)lba);
+            log_kv ("  bytes     = ", (long)bytes);
+            log_kvs("  kind      = ", (kind=='S') ? "SPARSE" : "RAW");
             long in = SC3(NR_open, tok[0], O_RDONLY, 0);
+            log_kv("  open src  = ", in);
             if (in >= 0) {
                 u32 wrote;
                 if (kind == 'S') wrote = write_sparse(dev, in, lba);
                 else            wrote = write_raw(dev, in, lba, bytes);
-                log_kv("  wrote bytes = ", (long)wrote);
+                log_kv("  wrote     = ", (long)wrote);
+                log_kv("  sparse_chk= ", (long)g_sparse_chunks);
+                log_kv("  sparse_raw= ", (long)g_sparse_raw);
+                log_kv("  sparse_skip= ", (long)g_sparse_skip);
                 SC1(NR_close, in);
                 SC1(NR_fsync, dev);
                 flashed++;
@@ -611,6 +645,20 @@ void _start(void) {
     { long e = SC3(NR_open, "/dev/block/mmcblk0", O_RDONLY, 0);
       log_kv("mmcblk0 node= ", e >= 0 ? 0 : -1);
       if (e >= 0) SC1(NR_close, e); }
+
+    /* rich diagnostics: how /usb was mounted, or why it was not */
+    log_kv("already_mounted = ", g_already_mounted);
+    log_kv("seen_mask       = ", g_seen_mask);
+    log_kv("mount_attempts  = ", g_mount_attempts);
+    log_kv("ok_node_idx     = ", g_ok_node);
+    log_kv("ok_fstype_idx   = ", g_ok_fst);
+    log_kv("ok_flags_idx    = ", g_ok_flag);
+    log_kv("ok_data_idx     = ", g_ok_data);
+    log_kv("ok_pass         = ", g_ok_pass);
+    if (g_ok_node >= 0) {
+        log_kvs("ok_node_path   = ", NODES[g_ok_node]);
+        if (g_ok_fst >= 0) log_kvs("ok_fstype_name = ", FSTYPES[g_ok_fst]);
+    }
 
     u32 final_code;
     const char *final_msg;

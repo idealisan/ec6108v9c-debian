@@ -1,0 +1,40 @@
+# EC6108V9C recovery-flasher -- flash.manifest 格式与已核实 LBA 表
+# =============================================================================
+# 把本文件复制到 U 盘根目录、命名为 "flash.manifest"，刷机程序才会真正写 eMMC。
+# 没有这个文件 = 纯显示/诊断（状态码 8），零 eMMC 写入。
+#
+# 行格式（每行一项，'#' 开头为注释，空行忽略）：
+#   <设备上镜像的完整路径> <目标LBA(十六进制)> <字节数(十六进制)> <R|S>
+#     R = raw：把 <字节数> 字节原样写到 LBA。字节数应为 512 的倍数（按文件大小
+#         向上取整到扇区）。
+#     S = Android sparse：解析 28B 文件头 + 12B chunk 头；<字节数> 被忽略（写 0）。
+#         支持 RAW/FILL/DONT_CARE/CRC32 chunk。
+#   写入目标是裸 /dev/block/mmcblk0 的绝对 LBA，与 blkdevparts 命令行无关。
+#
+# 已核实 LBA 表（来源 scripts/make-community-flash-package.sh 的 flash.env，
+# 即社区 hiboot "mmc write" 刷机脚本；这些值不要猜）：
+#   p2 bootargs  LBA 0x800    64KB / 0x80 扇区   运行时 env
+#   p5 logo      LBA 0x5000   64KB / 0x80 扇区   hiboot 开机画面
+#   p6 kernel    LBA 0x7000   20M                uImage
+#   p8 rootfs    LBA 0x31000  Android sparse 根文件系统（复用 512M backup 区）
+#   p1 fastboot/hiboot @ 0x0  —— 永不写入（引导链 + U 盘兜底依赖它）
+#
+# [观察] 当前 U 盘 mv100/ 是 Debian 与社区镜像的混合目录；全量 OS 的
+#   src->LBA 对应关系（recoverybox32.ext4 / www_ecoo_top.ext4）尚未逐项核实。
+#   因此这里只启用一条【已验证、安全、幂等】的最小首刷行，用来先证明刷机引擎
+#   真的把字节写到了正确的物理 LBA。全量刷机骨架以注释给出，核实前不要启用
+#   （见 docs/050 §10.6）。
+#
+# ===================== 第一次真实刷机（安全 + 可视验证）=====================
+# 只写 p5 logo（64KB RAW），不碰 p1/fastboot、内核、rootfs。logo.img 是刷机包
+# 自带的、已知可被 hiboot 解码的开机画面（"Debian Linux"）。写完后正常断电重启：
+# 开机画面改变即证明写入成功；社区 Ubuntu 仍应正常启动（证明未破坏引导）。
+/usb/mv100/logo.img 5000 10000 R
+#
+# ===================== 全量社区包（第二次，逐项核实后再启用）=================
+# /usb/mv100/baseparam.img       1000  1800  R
+# /usb/mv100/pq_param.bin        3000  11600 R
+# /usb/mv100/logo.img            5000  10000 R
+# /usb/mv100/hi_kernel.bin       7000  <扇区对齐的字节数hex> R
+# /usb/mv100/recoverybox32.ext4  11000 0     S
+# /usb/mv100/www_ecoo_top.ext4   31000 0     S

@@ -427,3 +427,54 @@ ramdisk 内 `sbin/recovery` == 新 flasher、内核逐字节未改。`bootcmd` �
 **待用户操作**：U 盘插回 → `bash recovery-flasher/build.sh --install <U盘目录>` → 短接上电
 → 报数字+英文。预期 `3 USB MOUNT OK` / `8 NO MANIFEST`（挂载已通）→ 下一版放
 `flash.manifest` 用社区包真刷。本版仍零 eMMC 写入。
+
+---
+
+## 10.6 真机 `8`（挂载成功、日志落盘）+ 更详细日志 + 首次真实刷机准备
+
+**真机（[观察]）**：§10.5 的 `NR_mount=21` 修复版短接启动后，屏幕显示 **`8 NO MANIFEST`**，
+且 U 盘根目录**真的出现了 `flasher.log`**：
+
+```
+== recovery-flasher stage1 (digits+text) ==
+fb smem_len = 0x00708000
+fb stride   = 0x00001400
+mount /usb  = 0x00000000
+node_seen   = 0x00000001
+last_mnt_rc = 0xffffffff
+open log    = 0x00000004
+mmcblk0 node= 0x00000000
+RESULT: no flash.manifest (code 8)
+```
+
+→ [推断] `mount /usb = 0`（成功）、`node_seen=1`、`open log = 4`（有效 fd，日志真落到 U 盘）、
+`mmcblk0 node=0`（eMMC 块设备存在且可打开）。即：**挂载链路、HDMI 点阵显示、U 盘写日志、
+eMMC 可写**这四件前置能力全部在真机上验证通过。之前缺日志确为 `NR_mount` 写错所致。
+
+**本次改动（应"日志能写了就多记点信息"）**：在 `flasher.c` 里补齐更详细日志，全部合并进
+刷机引擎这一版，不单独做"纯日志"一轮：
+- 挂载诊断全局量：`g_already_mounted` / `g_seen_mask` / `g_mount_attempts` /
+  `g_ok_node` / `g_ok_fst` / `g_ok_flag` / `g_ok_data` / `g_ok_pass`，`_start()` 里
+  逐行写入日志（含成功时 `NODES[]`/`FSTYPES[]` 的名字）。
+- sparse 解码统计 `g_sparse_chunks`/`g_sparse_raw`/`g_sparse_skip`（每次 `write_sparse()`
+  入口清零，逐 chunk 累加），`do_flash()` 每个 manifest 项记录
+  `idx/tokens/src/lba/bytes/kind/open src/wrote/sparse_*`。
+- 修掉上次中断留下的编译错误：这三个全局量此前被 `do_flash()` 引用却未定义/未累加。
+
+**编译/校验（[观察]）**：`build.sh` 通过；ELF32 ARM EABI5 静态、14456 B、`svc #0` 存在、
+**NEON/VFP = 0**（`objdump -d` 助记符族计数 0）、soft-float。内核逐字节未改，
+`ramdisk_size` 随新 flasher 更新。`bootcmd` 不变。
+
+**首次真实刷机（[推断]+[未知] 分明，见 `recovery-flasher/flash.manifest.example`）**：
+不直接写全量 OS——U 盘 `mv100/` 混入了 Debian 与社区镜像（`README.txt` 是 Debian 8 分区
+说明），全量 src→LBA 对应尚未逐项核实，猜 LBA 会写坏设备。先用一条**已核实、安全、幂等**
+的最小写入验证引擎：只把 `logo.img`（64KB RAW）写到 **p5 LBA 0x5000**（社区 9 分区与
+Debian 8 分区下该位置都是 logo 分区，且不碰 p1/fastboot、内核、rootfs）。
+
+权威 LBA 表来自 `scripts/make-community-flash-package.sh` 的 `flash.env`：
+`p2 0x800 / p5 0x5000 / p6 0x7000 / p8 0x31000(sparse)`。
+
+验证判据：短接上电 → 屏幕走 `1→2→3→4→5→6`，末态停在 **`6 DONE NO REBOOT`** 不重启；
+`flasher.log` 里该 item 有 `wrote > 0`；断电正常开机，开机画面变为 "Debian Linux"
+（证明字节写到了正确物理 LBA），且社区 Ubuntu 仍能启动（证明未破坏引导）。
+全量刷机骨架在 example 里以注释给出，核实后再启用。p1 永不写，U 盘兜底始终可用。
