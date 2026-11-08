@@ -73,12 +73,18 @@ echo "  patches in series: $(grep -c '\.patch' "$PATCHES_TREE/series")"
 echo "== [2/7] fetch disposable kernel tree at BASE_SHA =="
 TARBALL="$WORK/linux-$KERNEL_BASE_SHA.tar.gz"
 URL="$KERNEL_TARBALL_BASE/$KERNEL_BASE_SHA"
-if command -v aria2c >/dev/null 2>&1; then
-  aria2c -q -x 8 -s 8 -d "$WORK" -o "$(basename "$TARBALL")" "$URL"
-else
-  curl -fsSL --retry 3 -o "$TARBALL" "$URL"
+# codeload tarballs are generated on the fly: no Content-Length and no Range
+# support. aria2c's multi-connection segmentation (-x/-s) fails on them with
+# exit 22 within seconds (this is exactly what the first CI run hit). Use a
+# SINGLE curl connection with retries; curl is native on the runner, honours
+# any HTTP(S)_PROXY from the environment, and streams the chunked response fine.
+if ! curl -fL --retry 4 --retry-delay 3 --connect-timeout 30 \
+        --max-time 1200 -o "$TARBALL" "$URL"; then
+  echo "kernel tarball download failed: $URL" >&2
+  exit 1
 fi
-test -s "$TARBALL" || { echo "kernel tarball empty" >&2; exit 1; }
+test -s "$TARBALL" || { echo "kernel tarball empty: $TARBALL" >&2; exit 1; }
+echo "  downloaded: $(du -sh "$TARBALL" | cut -f1)"
 mkdir -p "$KERNEL_TREE"
 tar -xzf "$TARBALL" -C "$KERNEL_TREE" --strip-components=1
 echo "  extracted: $(du -sh "$KERNEL_TREE" | cut -f1)"

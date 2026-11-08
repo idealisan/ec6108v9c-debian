@@ -59,7 +59,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf u-boot-tools bc bison flex libssl-dev libelf-dev \
             lz4 zstd xz-utils cpio rsync unzip file device-tree-compiler python3 \
-            quilt git curl ca-certificates aria2
+            quilt git curl ca-certificates
 
       - name: Build HISTB upstream kernel (7.4-rc1 + quilt series)
         env:
