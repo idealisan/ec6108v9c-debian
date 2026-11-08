@@ -2,9 +2,9 @@
 
 > 2026-11-08。用户提供 `morluto/rea`（Reverse Engineer Anything）仓库，要求「学习技能、应用到项目中」。
 > 本文记录：学到了什么、本机哪些能力真的可用、以及**如何把方法论施加到正在进行的
-> 原厂 Recovery / hiboot 显示初始化逆向**（`docs/031`、`docs/032`）上。
+> 原厂 Recovery / hiboot 显示初始化逆向**（`docs/031` hiboot 四问、`docs/035` recovery 链路、`docs/032`）上。
 >
-> 相关文档：`docs/032`（recovery 第一突破口研究计划）、`docs/031`（初始化链路逆向）、
+> 相关文档：`docs/032`（recovery 第一突破口研究计划）、`docs/035`（recovery 初始化链路实证）、`docs/031`（hiboot 四问）、
 > `docs/023`（recovery 显示逆向）、`docs/027`（整机备份静态分析）、
 > `docs/029`（发送器形态厘清）、`AGENTS.md`
 
@@ -17,7 +17,7 @@
    Node 是 `22.23.1`，低于 REA 最低要求 `22.23.4`。且 `npx rea-agents setup` 会修改
    项目外的 agent 配置（需用户授权），**本次不安装、不注册 MCP、不装 Ghidra/Java**。
 2. 但 REA 的证据链规范**正好命中本项目此前几次翻车的原因**，应作为
-   `docs/031` 及后续所有逆向文档的强制写作规范（§2）。
+   `docs/031`/`docs/035` 及后续所有逆向文档的强制写作规范（§2）。
 3. REA 的 `raw-binary` 思路（显式给 `architecture` + `entry_point`，不从后缀猜 CPU）
    可以用本机已有的 **capstone 5.0.7** 落地。已实测：recovery vmlinux 按
    `ARM:LE:32:v7` / 链接地址 `0xC0008000` 反汇编，解出标准 ARM Linux `stext`
@@ -59,11 +59,11 @@ REA 只用于「结论依赖已发布二进制 / 包 / 反编译 / 版本比较�
 | 3 | **不靠文件名 / 字符串 / 布局推断行为**：「do not infer behavior from filenames, strings, or layout alone」（主技能 §Plan broader investigations 第 4 步）；「Format matches are inferences, not handler identity or schemas」 | `docs/027` 只做 strings / 4 字节常量扫描就下硬件形态结论 | strings 只能列「证据清单」；硬件行为必须有反汇编 / 交叉引用 / SDK 源码三方之一佐证 |
 | 4 | **用所需证据类型佐证**：「Corroborate a conclusion with the evidence type it requires. Static differences remain candidates, not causal proof」（主技能 §Plan 第 5 步、`native-and-artifacts.md`） | `docs/023 §4` 因解不出 vmlinux，内核侧只能靠 SDK 源码推测 | 结论优先「实际刷入的固件二进制实证」；SDK 推测只作交叉验证，冲突时以固件为准（`docs/032 §3` 已定） |
 | 5 | **Summary-first、不重复**：先最小总览 → 用 `parent_evidence_id` 分页；「Do not repeat an identical analysis or rejected call without a changed input or resolved blocker」（主技能 §Work summary-first） | 多次重复解包 / 重复扫同一批字符串 | 先做区域 / 符号 / 字符串总览，再按具体假设聚焦；记录已做过什么，避免重复 |
-| 6 | **Checklist + finding ledger**：把请求拆成问题清单 → 每条结论链接证据 ID、置信 / 证据类型、搜索边界、剩余未知 → 完成前回查清单，标 `answered` / `partially` / `unresolved`（主技能 §Plan broader investigations） | 之前结论散落在对话与 `TMP/` 笔记里，`docs/027 §7.1 C` 的待办没有逐条销账 | `docs/032 §7` 七条待验证清单即本项目 checklist；`docs/031` 须逐条给结论或标存疑 |
+| 6 | **Checklist + finding ledger**：把请求拆成问题清单 → 每条结论链接证据 ID、置信 / 证据类型、搜索边界、剩余未知 → 完成前回查清单，标 `answered` / `partially` / `unresolved`（主技能 §Plan broader investigations） | 之前结论散落在对话与 `TMP/` 笔记里，`docs/027 §7.1 C` 的待办没有逐条销账 | `docs/032 §7` 七条待验证清单即本项目 checklist；`docs/035` 须逐条给结论或标存疑 |
 | 7 | **Pin the baseline / correctness oracle**：记录 baseline revision、target digest、engine identity、options、host、entrypoint；oracle 独立于被验证的实现（如「独立映射的文件字节」） | 多份 recovery / fastboot 镜像混用，数值互引（见 `docs/027 §3.3`） | 每个结论注明对象 SHA-256（§5）、工具版本、架构 / 链接地址；跨镜像数值不得互引 |
 | 8 | **配置与资源一起看**：「Inspect relevant packaged resources and configuration alongside code」（主技能 §Plan 第 4 步） | 分析 vmlinux 时容易忽略 baseparam / bootargs / ramdisk init.rc | recovery 显示链路必须同时看：`bootargs`（`mmz=`、`console=`）、`p05_baseparam`（DISP 参数 / 空 EDID 缓存）、ramdisk `init*.rc` / `ueventd*.rc`、`/sbin/recovery` 的 fb0 用法 |
 | 9 | **目标路由、不猜**：`raw-binary` 必须显式给 `architecture` + `entry_point`；「REA does not infer the CPU from the file suffix, guess the reset vector, or emulate the target」（`docs/providers/raw-binary.md`） | 旧脚本把 zImage 当 vmlinux、按 gzip 魔数找 xz 内核、见到第一个魔数就认定 | 格式与加载地址一律显式声明并验证（见 §4），不从后缀 / 首字节猜 |
-| 10 | **分解独立问题**（主技能 §Plan 第 6 步） | — | 本课题按用户偏好只保留一名专职研究员做提前研究，不铺开团队并行；但 `docs/031` 内部按 6 个独立问题分节，等价于问题分解 |
+| 10 | **分解独立问题**（主技能 §Plan 第 6 步） | — | 本课题按用户偏好只保留一名专职研究员做提前研究，不铺开团队并行；但 `docs/035` 内部按 7 个独立分节，等价于问题分解 |
 
 ---
 
@@ -121,7 +121,7 @@ PC 相对目标全部落在同一 8 MiB 映像内且指令语义连贯，
 应来自 `__func__` / `EXPORT_SYMBOL` / proc 接口名，**不是符号表条目**。
 → **不能靠「字符串地址」直接定位函数地址**（这正是 §2 第 3 条要防的推断）。
 要拿函数地址，须解析压缩 kallsyms（token 表 + 地址数组）或 `__ksymtab_` 导出符号表，
-或由已知入口沿 `bl` 调用图推。此项列入 `docs/031` 的实证任务。
+或由已知入口沿 `bl` 调用图推。此项列入 `docs/035` 的实证任务（已由压缩 kallsyms 重建完成）。
 
 ---
 
@@ -148,14 +148,14 @@ PC 相对目标全部落在同一 8 MiB 映像内且指令语义连贯，
 
 ## 6. 施加到当前工作的具体动作
 
-1. **`docs/031`（recovery HDMI 初始化链路逆向）**：写作规范升级为 §2 的十条；
+1. **`docs/035`（recovery HDMI 初始化链路逆向）**：写作规范升级为 §2 的十条；
    6 个分节各自保留「观察 / 推断 / 未知」标注与 finding ledger；
    对 `docs/032 §7` 七条待验证清单逐条 `answered` / `partially` / `unresolved`；
    寄存器序列必须标明来自哪份 SHA-256 对象、哪个地址、用什么工具解出。
 2. **`docs/032` 已定**：「固件实证优先于 SDK 推测」（§3）与 §2 第 4 条一致，保持不变。
 3. **`docs/027 §6` 的旧误判**：继续以 `docs/029` 的撤销为准；§2 第 2 条解释了它
    为什么会翻车（把「0 命中」当成「不存在」），不再重复该推理模式。
-4. **地址基准**：`0xC0008000` 与 capstone 片段写进 `docs/031`，作为所有
+4. **地址基准**：`0xC0008000` 与 capstone 片段写进 `docs/035`，作为所有
    `bl` 目标 / 常量交叉引用的统一基准（§4）。
 5. **配置一起看**：分析 HDMI 链路时同时引用 `bootargs`（`mmz=`、`console=`）、
    `p05_baseparam`（DISP 参数 / 空 EDID 缓存）、ramdisk 的 fb0 用法（§2 第 8 条）。
