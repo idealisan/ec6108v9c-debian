@@ -85,6 +85,9 @@ paint_loop:
     cmp  r10, r6
     movhs r10, #0
 
+    @ make the frame writes visible to the VO scan-out engine before idling
+    dsb  sy
+
     @ short busy-wait so the bar is watchable instead of a blur
     ldr  r7, =DELAY
 delay_loop:

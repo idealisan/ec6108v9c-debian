@@ -38,6 +38,13 @@ fatload usb 0 0x01000000 display.bin; go 0x01000000
 `go` 命令存在（fastboot 内 `start application at address 'addr'` help 串实证），偶地址按 ARM 态跳转。
 `display.bin` 链接/加载地址均为 `0x01000000`（16 MiB），远离 `fastboot.bin`（0x00C00000）与其栈。
 
+**env 不精简**：`bootargs.bin` 以社区原版 U 盘根 env 为模板，保留全部非隐私 key
+（尤其 `bootargs_1G=mem=1G mmz=...`、`filename=fastboot.bin`、`partition*`、`bootdelay`），
+**只替换 `bootcmd` 一行**。原因：显存地址 `0x3FBFD000…` 正是按 `mem=1G` 推导的，`docs/048 §2`
+的 `Reserve Memory` 表也对应 `mem=1G`；若 env 里缺 `bootargs_1G` 导致 hiboot 换了 DDR 布局，
+地址就会偏，造成假阴性。刷机专用的 `loadfile*`/`flash*` 变量与网络占位 IP/MAC 一律去掉
+（不被 `run`、且避免隐私），使这份 env 明确「不是刷机包」。
+
 ### 1.2 显存地址为何固定（[观察]+[推断]，推翻此前「地址不可知」）
 多份独立 `mem=1G` 启动日志的 `Reserve Memory` 表完全一致：`Start 0x3FFFE000` /
 `Alloc 0x3FBFD000 0x400000`(4 MiB) / `0x3F8FC000 0x300000`(3 MiB) / `Free 0x3F8FC000`；
@@ -80,9 +87,19 @@ fatload usb 0 0x01000000 display.bin; go 0x01000000
 | 现象 | 结论 | 下一步 |
 |---|---|---|
 | 屏幕出现**增长的绿色进度条/彩条** | 刷机引导阶段 VO 正在扫描这些 DDR 区 → 实时进度显示成立 | 把 `probe.S` 的填色换成真实刷机步骤进度映射；或移植到刷机链 bootcmd 的 `mw.l` 换色，零图片资源 |
-| **全黑、无任何信号** | 该阶段 HDMI/VO 未初始化（无信号，非扫描黑帧） | 第二版：在 `display.bin` 开头加入 `docs/035` 表 A 的 HDMI PHY 7 次静态写 + CRG 复位/时钟 + VO G0 层配置（`docs/048 §1`），再填色 |
 | **花屏 / 局部色块 / 错行** | 地址对了，stride/分辨率/像素格式不对 | 读 VO `G0_STRIDE/G0_IRESO` 或按 `docs/040` 的 1920×1080 ARGB8888 stride 7680 调几何 |
 | 盒子**无法再进社区系统** | 不应发生（本程序不写 eMMC/p1） | 用同一短接流程重刷社区包；检查是否误用了非本目录的 bootargs.bin |
+
+**「全黑」不是单一结论**（REA：别把「没显示」直接归因于「VO 未初始化」）。全黑至少四种可能，需逐项排除：
+
+| 可能 | 判据 / 下一步 |
+|---|---|
+| ① 该阶段 HDMI/VO 根本未初始化（无信号，非扫描黑帧） | 最可能（`docs/036 §4.2` + 刷机分支 boot log 无 GFX 行）。第二版在 `display.bin` 开头加入 `docs/035` 表 A 的 HDMI PHY 7 次静态写 + CRG 复位/时钟 + VO G0 层配置（`docs/048 §1`），再填色 |
+| ② `fatload`/`go` 根本没执行到（env 或 CRC、文件名、加载地址问题） | U 盘根 `bootargs.bin` CRC、`display.bin` 文件名/位置、`go` 是否加载成功均无串口可看；可先用一个**必定可见的极简变体**（如 `probe.S` 改为纯写 `0x1000000` 再另法验证），或改 `bootcmd` 加一条能改变可观察 LED 状态的命令 |
+| ③ 写入落在 write-back DCache 未回写（VO 扫 DDR 看不到） | 程序已加 `dsb sy`；若仍疑似，下一版在开头关 DCache/MMU 或用 `mw.l`（经 hiboot，cache 策略已知）复现 |
+| ④ 4 个候选地址都没命中当前扫描缓冲 | 用真机在线态读 `G0_ADDR`（`docs/040` 方法）标定真实地址后写死；或扩大候选到 `reserve_mem` 全表 |
+
+**关键**：无论哪种，第一版都**不写任何 MMIO、不刷分区、不 reset**，因此盒子永远可重刷、绝不砖。这正是先做「零风险定案」而非一上来就堆完整 HDMI 初始化的原因。
 
 ---
 

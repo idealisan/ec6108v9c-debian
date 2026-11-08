@@ -60,15 +60,31 @@ assert got == want, f"block_table mismatch: {got} vs {want}"
 print(f"    display.bin: {len(d)} bytes, first=0x{first:08x}, block_table OK")
 PY
 
-echo "== 2/4  generate bootargs.bin (bootcmd = load + go, no flash, no reset) =="
+echo "== 2/4  generate bootargs.bin (community env template, bootcmd replaced) =="
+# Keep ALL non-privacy keys from the stock U-disk env (esp. bootargs_1G=mem=1G,
+# filename=fastboot.bin, partition*, bootdelay, std*) so hiboot's early boot
+# behaviour and the mem=1G layout our framebuffer addresses were derived from
+# stay identical to the community package. We ONLY replace bootcmd, and drop
+# the network placeholder + flash/loadfile variables (they are never `run`, and
+# keeping them would make this look like a flash package). No local IP/MAC/paths.
 cat > "$OUT/probe.env" <<ENV
 baudrate=115200
+bootargs_512M=mem=512M mmz=ddr,0,0,48M vmalloc=500M
+bootargs_768M=mem=768M mmz=ddr,0,0,48M vmalloc=500M
+bootargs_1G=mem=1G mmz=ddr,0,0,48M vmalloc=500M
+bootargs_2G=mem=2G mmz=ddr,0,0,48M vmalloc=500M
+bootargs=console=ttyAMA0,115200
+partitionoffset=0x0
+partitionsize=0x800
+partitionbytesize=0x100000
+filename=fastboot.bin
+fill=0x0
+probe=contact-boot-display
+bootcmd=fatload usb 0 $ADDR display.bin; go $ADDR
 bootdelay=0
 stdin=serial
 stdout=serial
 stderr=serial
-probe=contact-boot-display
-bootcmd=fatload usb 0 $ADDR display.bin; go $ADDR
 ENV
 python3 "$ROOT_DIR/scripts/mkbootargs.py" "$OUT/probe.env" "$OUT/bootargs.bin"
 echo "    bootargs.bin: $(wc -c < "$OUT/bootargs.bin" | tr -d ' ') bytes, CRC header recomputed"
@@ -131,10 +147,14 @@ if [ "${1:-}" = "--install" ]; then
     USB="${2:-}"
     [ -n "$USB" ] && [ -d "$USB" ] || { echo "--install needs a mounted U-disk dir" >&2; exit 1; }
 
-    # Back up the existing bootargs.bin (never delete anything).
-    if [ -f "$USB/bootargs.bin" ]; then
+    # Back up the ORIGINAL community bootargs.bin exactly once. On repeat
+    # installs the U-disk already holds our probe env, so we must NOT overwrite
+    # the pristine community backup (it is what restores the flash package).
+    if [ -f "$USB/bootargs.bin" ] && [ ! -f "$OUT/backup-bootargs.bin" ]; then
         cp "$USB/bootargs.bin" "$OUT/backup-bootargs.bin"
-        echo "    backed up existing bootargs.bin -> TMP/display-probe-out/backup-bootargs.bin"
+        echo "    backed up original community bootargs.bin -> TMP/display-probe-out/backup-bootargs.bin"
+    else
+        echo "    keeping existing pristine backup (repeat install)"
     fi
 
     # Keep the U-disk's fastboot.bin if present; only supply it if missing.
