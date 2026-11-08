@@ -64,6 +64,23 @@
    MMZ 显存（`mmz=ddr,0,0,48M`），未必等于 **hiboot 留给 simplefb 的那块**。
    我们主线用的是 `blkdevparts` 8 分区 + 自己的 `mem=1G`，MMZ 布局不同。
    → **不能把 `0x3C55C000` 直接抄进 DTS**，这是 `[推断]` 不是 `[观察]`。
+
+   **本轮追加实证（社区真机 `/proc/msp/pdm` 的 Reserve Mem Info）**：
+   ```
+   HIFB_DispBuf_HD   0x3f6ce000  8298496 B   IsRelease=1   (≈8 MiB 单帧)
+   GFX_ZmeCoef       0x3f6ca000    12288 B   IsRelease=1
+   HIFB_WBC_Buffer   0x3f534000  1658880 B   IsRelease=1
+   HIFB_WBC_Buffer / baseparam 0x3fffb000 / pqparam 0x3ff7a000
+   ```
+   `/proc/iomem` 全区间只有 `00000000-3fffffff : System RAM`（mem=1G）。
+   → **[观察]** 社区 hifb 有**多块不同的物理显存**（`0x3C55C000` 的 fb0 smem 与
+   `0x3f6ce000` 的 DispBuf、`0x3f534000` 的 WBC），且都在 1 GiB DDR 顶端 MMZ 区、
+   标记 `IsRelease=1`。这进一步坐实「地址不能直接抄」：连社区内核自己都有多块，
+   主线内核的 MMZ/CMA 布局更不同。
+   → **[推断]** `HIFB_DispBuf_HD 0x3f6ce000 / 8298496 B` 这一块尺寸正好是一帧
+   （1920×1080×4=8,294,400 向上取整），很可能是 VO 实际扫描的显示缓冲；
+   而 `0x3C55C000` 是 fbdev 的 mmap 基址。两者关系需真机运行时确认，
+   **不据此下结论**。
 4. **`FB_WIDTH/HEIGHT/STRIDE/FORMAT`** 已是对的（1920/1080/7680/a8r8g8b8），
    与 `docs/040` 实证一致，无需改。
 5. **`configs/kernel/histb-ec6108v9c.config` 有个 typo**：`CONFIG_PHYSLIB=y` 应为 `CONFIG_PHYLIB=y`。
