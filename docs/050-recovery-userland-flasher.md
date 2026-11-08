@@ -267,3 +267,46 @@ soft-float；ramdisk 内 `sbin/recovery` 字节 == 新 flasher、内核逐字节
 **待用户操作**：短接上电 → 应看到熟悉的彩色进度条 → 断电拔盘插回电脑 → 读 `/usb/flasher.log`
 并发回内容。日志回答三个未定案项：U 盘能否挂载、`mmcblk0` 节点是否存在、`sda1` 命名是否正确——
 据此进阶段 1。**阶段 0 不碰 eMMC，绝对安全。**
+
+### 10.2 阶段 0 真机结果 + 阶段 1 合并迭代（用户反馈后改为数字编码）
+
+**真机反馈（[观察]）**：换 stage0 版短接启动 → **又看到了彩色画面（进度条正常），但 U 盘里
+没有出现 `flasher.log`**。→ 彩色画面正常 = `fb0`/自定义用户态照常工作；日志缺失 ⇒ [推断]
+短接态 Linux 内核里 **U 盘未挂载成功**（短接时 `fatload` 用的是 hiboot 的 USB 栈，内核起来后
+需重新枚举，`/dev/block/sda1` 节点或 vfat 挂载未就绪）。用户明确：**不要单独为日志再做一轮，
+把它和下一步（刷机）合并推进**。
+
+**关键改进：点阵数字状态码取代颜色编码（用户要求）**。理由：颜色无法精确口述（"除了极简单
+几种颜色，其他说不准"），数字既简单又准确。用户不需要字母，**只要数字编码**。
+`flasher.c` 重写为：`DIGITS[10][7]` 5×7 点阵字体，`show_number(n)` 放大居中画到两帧
+（深色底 + 白色数字），`state(code)` 短显、`hold(code)` 永久停在最终数字（不重启）。
+
+状态码（写进 U 盘 README）：`1` 启动/fb0 OK · `2` 挂载 U 盘 · `3` 挂载成功 ·
+`4` 找到 manifest · `5` 刷写中 · `6` 完成 · `7` 挂载失败 · `8` 无 manifest(仅显示) ·
+`9` eMMC 节点打不开。刷写过程显示增长的百分比数字 0..100（上升 = 正在写）。
+**用户只需报出屏幕上的数字**，即可精确定位卡点。
+
+**合并进同一版的阶段 1 刷机引擎**（不为日志单独迭代）：
+- `flash.manifest` 每行 `<src> <lba-hex> <bytes-hex> <R|S>`；`R` 裸写、`S` 解 Android sparse。
+- 查实社区包两个 `.ext4` 均为 **Android sparse**（magic `0xed26ff3a`，`recoverybox32`/
+  `www_ecoo_top`），故裸写 LBA 前必须解码：`write_sparse()` 处理 28B 文件头 + 12B chunk 头，
+  `RAW`(0xCAC1) 逐块写、`FILL`(0xCAC2) 展开、`DONT_CARE`(0xCAC3)/`CRC32` 用 `lseek` 跳过
+  （不覆盖无关扇区）。`write_raw()` 处理非 sparse 项（fastboot/bootargs/logo/kernel/baseparam/pq）。
+- 全部写入走原始 `/dev/block/mmcblk0` 绝对 LBA，绕开 16 分区 cmdline 与 9 分区 eMMC 的冲突。
+- U 盘日志降级为 best-effort（能挂就写，不挂也有数字诊断）；`NO manifest => ZERO eMMC 写入`。
+- 刷完 `hold(6)` 停在完成数字，不重启（用户选定）。
+
+**U 盘 `mv100/` 现成可用**（[观察]）：社区全套镜像（`hi_kernel.bin`/`logo.img`/`bootargs.bin`/
+`fastboot.bin`/`baseparam.img`/`pq_param.bin`/`recoverybox32.ext4`/`www_ecoo_top.ext4`），
+社区刷机 env 的 LBA：`fastboot 0x0`、`bootargs 0x800`、`baseparam 0x1000`、`pq 0x3000`、
+`logo 0x5000`、`kernel 0x7000`、`recoverybox32 0x11000`、`www_ecoo_top 0x31000`（十六进制扇区）。
+这些是阶段 2 真正刷写 manifest 的素材，本版尚未放入 `flash.manifest`（仍零写入安全）。
+
+**编译/校验（[观察]）**：ELF32 ARM EABI5 静态、8932 B、NEON/VFP=0、39 个 svc、soft-float；
+点阵 0-9 字形模拟渲染可辨认；ramdisk 内 `sbin/recovery` == 新 flasher、内核逐字节未改；
+U 盘 `recovery.img` sha256 `ad95e2c5…`、`bootcmd` 不变。
+
+**待用户操作**：短接上电 → 屏幕会显示**一个大数字** → 报出该数字即可。最可能是
+`7`（U 盘挂载失败，正好解释日志缺失）或 `8`（挂载成功、暂无 manifest）。据此决定：若 `7`
+需先解决内核态 U 盘枚举；若 `8` 则下一版放 `flash.manifest` 用社区包做真正刷写。
+**本版无 manifest、零 eMMC 写入，安全。**

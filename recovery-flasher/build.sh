@@ -114,46 +114,57 @@ fi
 [ -f "$COMMUNITY_FB" ] && cp "$COMMUNITY_FB" "$OUT/fastboot.bin"
 
 cat > "$OUT/README.txt" <<'TXT'
-EC6108V9C -- modified-stock-recovery AUTO FLASHER  (stage 0 = PROBE)
-=====================================================================
+EC6108V9C -- modified-stock-recovery AUTO FLASHER  (digit status codes)
+========================================================================
 Boots the STOCK Android recovery kernel (HDMI/hifb drivers included) but with
 /sbin/recovery replaced by our own program. Starts automatically on power-on --
 NO menu, NO key press, NO serial (the box has none).
+
+SCREEN OUTPUT = ONE BIG DECIMAL NUMBER (dot-matrix), NOT a colour.
+  You only need to tell us WHICH NUMBER is on screen. The last number stays
+  forever (no reboot), so a single flash pinpoints where it stopped.
+
+  STATE CODES:
+    1  boot, framebuffer opened        2  mounting U-disk
+    3  U-disk mount OK                 4  flash.manifest found
+    5  flashing                        6  DONE (no reboot)
+    7  U-disk mount FAILED             8  no manifest (display-only, safe)
+    9  eMMC node cannot be opened
+  During flashing (5) the screen shows a growing PERCENT number 0..100; a
+  rising number means it is actively writing. Completion returns to 6.
 
 U-disk ROOT must contain:
   fastboot.bin   community carrier loaded by BootROM on a shorted power-on
   bootargs.bin   env; bootcmd = fatload usb 0 0x1000000 recovery.img; bootm 0x1000000
   recovery.img   the patched Android boot.img that bootm boots
+  (optional) flash.manifest  -> then it really flashes, else display-only.
 
 ALREADY VERIFIED on real hardware:
   - shorted boot -> stock 3.10 kernel lights HDMI (original recovery UI shown);
-  - patched recovery.img -> our colour progress bar is drawn (custom userland
-    runs, fb0 write works).
-  So the display chain is DONE. This build is STAGE 0 = environment PROBE.
+  - patched recovery.img -> our custom userland ran (colour bar was seen).
+  This build replaces colour-coding with readable DIGITS, and merges in the
+  real flash engine + best-effort U-disk log (no separate diagnostic round).
 
-WHAT STAGE 0 DOES (no eMMC writes at all -- completely safe):
-  1. keeps the familiar growing colour progress bar on screen;
-  2. mounts the U-disk at /usb and writes /usb/flasher.log, one line per fact:
-       fb0 open / mmap / smem_len / line_length / rows x cols,
-       mkdir /usb result,
-       6 mount candidates (which /dev node + fstype actually works),
-       whether /usb/recovery.img is readable (first 4 bytes),
-       whether /dev/block/mmcblk0 and /dev/mmcblk0 open O_RDWR (node exists),
-       whether a by-name partition node exists,
-       whether /usb/flash.manifest exists (ignored in stage 0),
-       an explicit "eMMC WRITES: NONE" line.
-     It fsync()+sync()s the log so it survives pulling the U-disk.
+WHAT THIS BUILD DOES:
+  - shows the state number at each phase; HOLDS the final number on screen;
+  - tries 6 U-disk (dev,fstype) mount candidates, up to 3 passes;
+  - best-effort writes /usb/flasher.log (fsync+sync) -- if the U-disk mounts;
+  - IF /usb/flash.manifest exists: flashes each item to raw /dev/block/mmcblk0
+    by absolute LBA, decoding Android sparse images (R=raw, S=sparse).
+    NO manifest => ZERO eMMC writes.
+  - flash.manifest line format:  <src-full-path> <lba-hex> <bytes-hex> <R|S>
+    (bytes ignored for sparse). Completion = 6, never reboots.
 
-HOW TO READ THE RESULT (this is the whole point of stage 0):
-  After the shorted boot, power off, move the U-disk back to the PC and open
-  flasher.log. It tells us: U-disk mount OK/FAIL, eMMC node present/name, and
-  that our program really ran -- WITHOUT needing HDMI text or a serial port.
-  Send the log content back; stage 1 (real auto-flash) is built from those facts.
+HOW TO REPORT: just say the number you see. Most likely:
+  - 7  = the U-disk did not mount in this kernel (explains the missing log);
+  - 8  = U-disk mounted OK but no manifest yet (ready to flash);
+  - 6  = a flash.manifest was present and flashing completed.
 
 SAFETY:
-  - STAGE 0 performs ZERO eMMC writes (eMMC is only opened then closed).
+  - Without flash.manifest: ZERO eMMC writes (pure display/diagnostic).
   - The stock 3.10 kernel is kept BYTE-FOR-BYTE; only the ramdisk userland file
     sbin/recovery is replaced.
+  - Sparse DONT_CARE chunks are skipped (no zeroing of unrelated sectors).
   - Always re-flashable via the same shorted U-disk flow (p1/fastboot untouched).
 TXT
 
