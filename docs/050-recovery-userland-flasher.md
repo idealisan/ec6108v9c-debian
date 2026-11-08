@@ -61,8 +61,9 @@
 
 | 文件 | 作用 |
 |---|---|
+| `recovery-flasher/stock/recovery-stock.img` | **入库的原厂 recovery boot.img**（3.5 MiB，含无源码的 3.10 内核），方案必需输入，见 `stock/README.md` |
 | `recovery-flasher/flasher.c` | freestanding ARM Linux 静态程序：自动拉起、`fb0` 进度条、manifest 自动刷机、常驻不退出 |
-| `recovery-flasher/repack.py` | 从 `p03_recovery.img` 切 boot.img、cpio newc 手术替换 `sbin/recovery`、重打包、产出验证/改造两镜像 |
+| `recovery-flasher/repack.py` | 读 `stock/recovery-stock.img`、cpio newc 手术替换 `sbin/recovery`、重打包、产出验证/改造两镜像 |
 | `recovery-flasher/build.sh` | 一键：编译 flasher → repack → 生成 `bootargs.bin` → 组装 U 盘三件套（可 `--verify` / `--install`） |
 | `TMP/recovery-flash-out/` | 构建产物（gitignored）：`flasher`/`recovery.img`/`recovery-verify.img`/`recovery-flash-boot.img`/`bootargs.bin`/`README.txt` |
 
@@ -95,9 +96,13 @@ ARMv7-A 32 位，用户态程序必须 32 位 ARM。freestanding syscall 直发 
   一致、ramdisk 偏移 `0x272800` 与文件长度自洽；cpio 53 项 + `TRAILER!!!` 完整；替换进去的
   `sbin/recovery` 字节等于编译产物 flasher；`bootargs.bin` CRC32 头重算匹配。
 
-**隐私/合规**：源码/脚本/文档/commit 无本机绝对路径/IP/用户名/凭据；产物在 `TMP/`（gitignored）；
+**隐私/合规**：源码/脚本/文档/commit 无本机绝对路径/IP/用户名/凭据；构建产物在 `TMP/`（gitignored）；
 不删文件、不用 `rm`/`git clean`；显式 `git add <具体路径>`；`--install` 先备份 U 盘原 `bootargs.bin`。
-内核 blob 未进入 git（只在 `TMP/`）。
+**例外（用户 2026-11-08 明确决定）**：原厂 recovery boot.img（含 3.10 内核 blob）作为**方案必需且
+无源码**的输入，已裁成独立 `recovery-flasher/stock/recovery-stock.img`(3.5 MiB) **入库**，
+见 `stock/README.md`（SHA-256、来源、合法性说明）。此前"内核未入 git"的表述作废。
+`repack.py` 现优先读仓库内这份（头在偏移 0），magic 扫描自适应 16 MiB 分区版（头在 `0x800000`），
+因此 clone 仓库即可复现，不依赖本机备份。
 
 ## 5. 两段式 go/no-go（用户操作，决定性）
 
@@ -184,3 +189,36 @@ U 盘已插回，`recovery.img` 已切成**改造版**（sha256 `45aab097…`，
 `auto_flash()`——挂载 U 盘到 `/usb`、若有 `flash.manifest` 就按 LBA 裸写 eMMC 并推进进度条，
 无 manifest 则纯显示（安全）。**没有菜单、不等待任何输入**。真实刷机的目标 LBA 需按当前
 eMMC 分区布局确定（§6 ⑤），属显示验证通过后的下一迭代。
+
+---
+
+## 9. 后续能力判定：TTY→HDMI 与 U 盘日志（kallsyms 实证）
+
+用户 2026-11-08 两问：① 能否把 TTY 绑到 HDMI 显示日志文字（不行则用颜色进度条）；
+② 既然原厂 recovery 是 Linux，能否写日志文件到 U 盘（可选）。
+用 `TMP/recovery-deep/kallsyms-symbols.json`（recovery 3.10 vmlinux，重建 35,937 符号）
+逐组包含匹配判定，REA 三分法：
+
+| 能力 | 符号命中 | 结论 | 标注 |
+|---|---|---|---|
+| **fbcon / framebuffer console**（`fbcon_*`/`bitblit`/`softcursor`） | **0** | 内核未编 `CONFIG_FRAMEBUFFER_CONSOLE` | [观察] |
+| **VT / 虚拟终端**（`vt_console`/`vc_allocate`/`do_con_write`/`redraw_screen`） | **0** | 无 VT 层 | [观察] |
+| **字体**（`font_*`/`vgacon`/`fbcon_set_font`） | **0** | 无 console 字体 | [观察] |
+| fbdev 核心（`register_framebuffer`/`framebuffer_alloc`/`fb_set_var`） | 22 | 有 `/dev/graphics/fb0`（进度条已用） | [观察] |
+| console 通用（`register_console`/`console_drivers`） | 9 | 仅串口 `ttyAMA0` console | [观察] |
+| printk / kmsg（`printk`/`kmsg_fops`/`log_buf`） | 137 | 内核日志在内存，但无 fbcon 输出到屏 | [观察] |
+| **vfat / fat**（`fat_*`/`vfat`/`msdos`） | 189 | 内核自带 FAT 文件系统 | [观察] |
+| **usb-storage**（`usb_stor_*`） | 92 | 内核自带 U 盘驱动；`recovery.fstab` 有 `/dev/block/sda1 → /usb` | [观察] |
+
+**结论 ①（TTY→HDMI）：不可行（[推断]，基于 0 命中）**。把 `console=tty0` 的文字画到 HDMI
+需要 fbcon + VT + 字体三者，这颗内核全部缺失，且**无源码无法重编加入**。用户判断正确：
+**继续用自绘颜色进度条**显示进度；要"日志文字"只能由 `flasher` 自己用位图字体 blit 到 fb0
+（等价于进度条的像素绘制，非内核 TTY）。
+
+**结论 ②（U 盘日志）：可行（[观察]）**。内核自带 vfat + usb-storage，`fstab` 也声明了 U 盘挂载点。
+`flasher` 作为 Linux 用户态可在 `mount("/dev/block/sda1","/usb","vfat")` 后
+`open/write/fsync` 写 `/usb/flasher.log`。这补上了用户早先"程序写文件到 U 盘记录运行到哪"的诉求
+（当时裸机 `display.bin` 无 FAT 栈做不到，如今 Linux 用户态天然可行），并作为**不依赖 HDMI/串口的
+等价验证通道**纳入阶段 0：每完成一步写一行日志，拔盘插回电脑即可读。
+
+（阶段 0/1/2 的完整刷机计划见用户确认的计划：`docs/050 §8` 之后的下一迭代，本节仅记录能力判定。）

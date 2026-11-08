@@ -38,6 +38,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 EXTRACTED = ROOT / "TMP/stock-rom-research/extracted"
 OUT = ROOT / "TMP/recovery-flash-out"
+# The STOCK recovery boot.img is committed in-repo (user decision: no kernel
+# source is available, so the binary is a required build input). Prefer it;
+# fall back to the full 16 MiB partition dump if present (header lives at
+# 0x800000 there, found by magic scan).
+STOCK = ROOT / "recovery-flasher/stock/recovery-stock.img"
 P03 = EXTRACTED / "p03_recovery.img"
 FLASHER = OUT / "flasher"
 
@@ -115,12 +120,19 @@ def uimage_header(data: bytes, load: int, ep: int, os_: int, arch: int,
 
 
 def main():
-    if not P03.exists() or not FLASHER.exists():
-        raise SystemExit(f"missing {P03} or {FLASHER}")
+    if not FLASHER.exists():
+        raise SystemExit(f"missing {FLASHER} (run build.sh to compile it)")
+    if STOCK.exists():
+        src = STOCK
+    elif P03.exists():
+        src = P03
+    else:
+        raise SystemExit(f"missing both {STOCK} and {P03}")
     OUT.mkdir(parents=True, exist_ok=True)
-    d = P03.read_bytes()
+    d = src.read_bytes()
     base = find_bootimg(d)
-    print(f"[observe] boot.img header @ p03+0x{base:x}")
+    print(f"[observe] source = {src.relative_to(ROOT)}")
+    print(f"[observe] boot.img header @ +0x{base:x}")
 
     hdr = bytearray(d[base:base+0x800])   # full page_size header
     ks, ka, rs, ra, ss, sa, ta, ps = struct.unpack_from("<8I", hdr, 8)

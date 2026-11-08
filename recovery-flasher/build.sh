@@ -31,14 +31,16 @@ set -euo pipefail
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SELF_DIR/.." && pwd)"
 OUT="$ROOT_DIR/TMP/recovery-flash-out"
-STOCK="$ROOT_DIR/TMP/stock-rom-research/extracted/p03_recovery.img"
+# The stock recovery boot.img lives IN the repo (repack.py reads it); the
+# 16 MiB partition dump is only an optional fallback, no longer required.
+STOCK_IMG="$ROOT_DIR/recovery-flasher/stock/recovery-stock.img"
 COMMUNITY_FB="$ROOT_DIR/TMP/community-restore/fastboot.bin"
 
 CLANG="${CLANG:-clang}"
 command -v "$CLANG"   >/dev/null 2>&1 || { echo "need clang" >&2; exit 1; }
 command -v ld.lld     >/dev/null 2>&1 || { echo "need ld.lld" >&2; exit 1; }
 command -v python3    >/dev/null 2>&1 || { echo "need python3" >&2; exit 1; }
-[ -f "$STOCK" ] || { echo "missing $STOCK (unzip the backup first)" >&2; exit 1; }
+[ -f "$STOCK_IMG" ] || { echo "missing $STOCK_IMG (stock recovery boot.img)" >&2; exit 1; }
 
 MODE="flash"
 USB=""
