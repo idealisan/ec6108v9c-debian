@@ -28,9 +28,9 @@ on:
         type: string
         default: 'a8r8g8b8'
       fb_size:
-        description: 'framebuffer size in bytes (hex)'
+        description: 'framebuffer reservation size (hex); covers the double-buffered scan-out region (docs/040)'
         type: string
-        default: '0x800000'
+        default: '0x1000000'
       extra_cmdline:
         description: 'extra kernel params appended to /chosen/bootargs'
         type: string

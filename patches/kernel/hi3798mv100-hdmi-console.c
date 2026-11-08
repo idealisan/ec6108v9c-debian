@@ -82,7 +82,15 @@
 #define FB_HEIGHT      1080
 #define FB_STRIDE      7680
 #define FB_FORMAT      "a8r8g8b8"
-#define FB_SIZE        0x800000       /* 8 MiB */
+
+/* docs/040 measured the community fb0 at 1920x1080 ARGB8888 with TWO frames
+ * (smem_len = 16,588,800 B = 0xFD0000), i.e. the VO scans a double-buffered
+ * region. simplefb/fbcon only ever draws ONE frame (pdata.height = 1080), so
+ * its geometry stays single-frame; but the IORESOURCE_MEM we register must
+ * span both frames, otherwise the kernel can hand the second frame to an
+ * unrelated allocation while VO is still scanning it. */
+#define FB_SIZE        0x1000000      /* 16 MiB: covers two 1080p frames */
+#define FB_ADDR_MARGIN 0x800000      /* one frame, for address sanity only */
 
 static void __iomem *vo_base;
 static struct platform_device *hi3798_simplefb_pdev;
@@ -90,8 +98,12 @@ static struct platform_device *hi3798_simplefb_pdev;
 static bool hi3798_valid_fb_addr(u32 val)
 {
 	/* A framebuffer address is a 4 KiB-aligned DDR address, well inside
-	 * the 1 GiB range, and large enough not to be a random register. */
-	return val >= (DDR_START + 0x100000) && val < (DDR_END - FB_SIZE)
+	 * the 1 GiB range, and large enough not to be a random register.
+	 * Use FB_ADDR_MARGIN (one frame), NOT FB_SIZE (two frames): the latter
+	 * would push the upper bound down to 0x3f000000 and wrongly reject the
+	 * real scan-out buffer at 0x3f6ce000 measured on the community system
+	 * (docs/041 reserve-mem evidence). */
+	return val >= (DDR_START + 0x100000) && val < (DDR_END - FB_ADDR_MARGIN)
 		&& (val & (PAGE_SIZE_4K - 1)) == 0;
 }
 
@@ -258,6 +270,16 @@ static int __init hi3798_hdmi_console_init(void)
 	memset(&res, 0, sizeof(res));
 	res.start = fb_phys;
 	res.end = fb_phys + FB_SIZE - 1;
+	/* FB_SIZE now spans two frames. If hiboot put the scan-out buffer near
+	 * the top of the 1 GiB DDR (the community reserve-mem table in docs/041
+	 * lists buffers up at 0x3f6ce000), the two-frame span would run past
+	 * DDR_END. Clamp the reservation so we never register an out-of-range
+	 * IORESOURCE_MEM; one frame is still enough for simplefb to come up. */
+	if (res.end > DDR_END - 1) {
+		pr_warn("hi3798-fb: 0x%08x + 0x%x exceeds DDR_END, clamping reservation\n",
+			addr, FB_SIZE);
+		res.end = DDR_END - 1;
+	}
 	res.flags = IORESOURCE_MEM;
 	res.name = "hiboot framebuffer";
 
@@ -279,6 +301,15 @@ static int __init hi3798_hdmi_console_init(void)
 		       ret);
 		goto out_put;
 	}
+
+	/* Report the hand-off parameters to pstore (the only log channel on this
+	 * serial-less board). After a black-screen flash these lines tell us
+	 * whether the driver found a usable hiboot framebuffer and what geometry
+	 * fbcon was registered with -- see docs/040/041. */
+	pr_info("hi3798-fb: HANDOFF phys=0x%08llx span=0x%x %ux%u stride=%u "
+		"fmt=%s (double-buffer reserved, single-frame fbcon)\n",
+		(unsigned long long)fb_phys, FB_SIZE, width, height,
+		pdata.stride, FB_FORMAT);
 
 	iounmap(vo_base);
 	vo_base = NULL;

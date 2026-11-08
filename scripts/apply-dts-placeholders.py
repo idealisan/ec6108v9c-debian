@@ -13,7 +13,12 @@ Placeholders:
 
 Framebuffer geometry comes from the environment so it can be set from CI
 inputs once measured on the box (FB_WIDTH / FB_HEIGHT / FB_STRIDE /
-FB_FORMAT / FB_SIZE). Defaults are the SDK-confirmed 1080p ARGB8888 values.
+FB_FORMAT / FB_SIZE). Width/height/stride/format are the SDK-confirmed
+1080p ARGB8888 values (docs/040); FB_SIZE defaults to 0x1000000 (16 MiB) to
+cover the double-buffered scan-out region (two 1080p frames) that the VO
+scans, while the simplefb node still declares a single 1080p frame via
+<height>. The driver's runtime hand-off path (hi3798mv100-hdmi-console.c)
+is independent of this static node and discovers the buffer from VO regs.
 
 Only whole lines are substituted for the block, so a token that also shows up
 inside a comment can never comment out the injected nodes.
@@ -33,7 +38,9 @@ FB_GEOM = {
     'EC6108_FB_HEIGHT': os.environ.get('FB_HEIGHT') or '1080',
     'EC6108_FB_STRIDE': os.environ.get('FB_STRIDE') or '7680',
     'EC6108_FB_FORMAT': os.environ.get('FB_FORMAT') or 'a8r8g8b8',
-    'EC6108_FB_SIZE': os.environ.get('FB_SIZE') or '0x800000',
+    # docs/040: the VO scans a double-buffered region (2 x 1920x1080x4 =
+    # 0xFD0000 B). Reserve both frames; simplefb/fbcon draws one 1080p frame.
+    'EC6108_FB_SIZE': os.environ.get('FB_SIZE') or '0x1000000',
 }
 
 
