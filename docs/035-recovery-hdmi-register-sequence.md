@@ -1,467 +1,382 @@
-# 035 — 原厂 Recovery HDMI 显示初始化链路逆向（固件实证）
+# 035 — recovery vmlinux 真实 MMIO 寄存器写入序列（固件实证）
 
-> 2026-11-08。研究纲领：**以原厂 Recovery 为第一突破口**，逆向还原 HDMI 显示的
-> 完整硬件初始化链路，最终移植到 ARMv7 主线 Linux；**不再以社区版 Linux 为研究基础**。
-> 本文把 `docs/023 §4` 当年「因解不出 vmlinux 只能靠 SDK 推测」的内核侧空白，升级为
-> **实际刷入固件的二进制实证**；hiboot 裸机部分压缩为最后一节，作为同 SDK 显示栈的交叉验证。
+> 2026-11-08。承接 `docs/031`（hiboot 负结果）、`docs/034`（recovery vmlinux 代码可达、
+> 但寄存器写入表仍 `[未知]`）与 `docs/032 §7`（七条待验证清单）。
+> 本文执行 `docs/034 §5.1` 的最高价值一步：**追 `s_stDispCapability+0x258` 的读取点、
+> 还原真实的 MMIO 寄存器写入**，并把 `docs/032 §7` 逐条回销。
 >
-> **编号说明**：`docs/031` 固定为「hiboot / fastboot 裸机显示栈四问」（刷机执行者分析的直接证据，
-> `docs/034` / `docs/036` 引用其 §2/§3/§4）；本文是 recovery 内核侧链路实证，单独编号 `035`。
-> 两者是同一 SDK 显示栈的**内核侧**与**bootloader 侧**对照，不要互引数值。
+> 版本说明：本文件在 HEAD 中曾为上一轮「recovery HDMI 初始化链路逆向」文档
+> （commit `c8ae8ff`）。本轮按主会话指定的同一路径覆写为「寄存器写入序列」；
+> 上一版的方法（§1 kallsyms 重建）与调用链（§3）已在本文中保留并深化，
+> 完整旧文仍在 git 历史中可取回。
 >
-> - 对象基线（SHA-256 见 `docs/033 §5`）：`TMP/recovery-deep/recovery-vmlinux.bin`
->   8,227,512 B / `d91d9104…`；`TMP/rec-zImage` / `a61d35da…`；`TMP/p3_recovery.img` / `a1609a50…`；
->   `TMP/community-restore/fastboot.bin` / `fd5b4ac6…`；`backup_stock/fastboot.img` / `bac0be9f…`。
->   `backup_stock/p01_fastboot_adb.img` 与 `fastboot.img` **SHA-256 相同**，是同一文件的两份拷贝，不作独立样本。
->   `TMP/p3_recovery.img` 的 `0x0` 与 `0x800000` 两个 boot.img 槽是**不同构建**（vmlinux 分别
->   8,227,512 B 与 7,539,320 B），数值不得互引。
-> - 方法：**只读静态反汇编 + 符号/常量/交叉引用扫描**。本机唯一可用 ARM 反汇编器是
->   **capstone 5.0.7**（`Cs(CS_ARCH_ARM, CS_MODE_ARM | CS_MODE_LITTLE_ENDIAN)`，必要时 `skipdata=True`）；
->   Ghidra / IDA / radare2 / binwalk / ELF 工具均不可用，`/usr/bin/objdump` 不支持 ARM。
-> - 地址基准：`0xC0008000`（`PAGE_OFFSET 0xC0000000` + `TEXT_OFFSET 0x8000`），
->   `docs/033 §4` 已由 `stext` 入口反汇编验证，本文所有 `bl` 目标 / 字面量 / 常量交叉引用统一用它。
-> - 写作规范（`docs/033 §2`，逐条落实）：每条结论标 `[观察]` / `[推断]` / `[未知]`；
->   静态分析不写成「运行时执行了…」；「0 命中」只写「在 X 范围内未检索到」；
->   不靠 strings / 文件名 / 布局推断硬件行为；寄存器序列必须附**对象 SHA-256 + 地址 + 工具 + 反汇编片段**；
->   固件实证优先，SDK 推测只作交叉验证；同时看 `bootargs`（`mmz=`/`console=`）、`p05_baseparam`、
->   ramdisk 的 fb0 用法；对 `docs/032 §7` 七条逐条销账。
+> **编号分工**：`docs/031` 固定为「hiboot / fastboot 裸机显示栈四问」（刷机执行者分析的
+> 直接证据，`docs/034` / `docs/036` 引用其 §2/§3/§4）；本文 `docs/035` 是 recovery 内核侧
+> 寄存器序列实证。hiboot 侧的交叉验证结论仍以 `docs/031` 为准，两文不互引数值。
+>
+> - 对象：`TMP/recovery-deep/recovery-vmlinux.bin`，8,227,512 B，
+>   SHA-256 `d91d91049db9893c5a5811826b73a79e58f82330a669729bee58713706ac6e7d`
+>   （由 `TMP/rec-zImage` 的 xz piggy @`0x391f` 解出，见 `docs/032 §6`）。
+>   镜像 VA 覆盖 `0xC0008000 .. 0xC07E0AB8`，**此后的全局在 BSS**（运行时初始化）。
+> - 链接地址 `0xC0008000`（`docs/033 §4` 已验证）；本文所有指令 VA / 全局 VA 均按此。
+> - 工具：**radare2 6.2.4**（`r2 -a arm -b 32 -m 0xC0008000 -q -c 'pd N @ ADDR'`）
+>   + **capstone 5.0.7**（`Cs(CS_ARCH_ARM, CS_MODE_ARM|CS_MODE_LITTLE_ENDIAN)`，`skipdata=True`），
+>   关键片段逐条互验（`docs/033 §2` 第 7 条独立 oracle）；Python 3.14.6。
+> - **额外 oracle**：上一轮已重建本镜像的压缩 kallsyms 表（`TMP/recovery-deep/kallsyms3.py`，
+>   `δ=−2`，`__kstrtab_*` / `__ksymtab_*` 各 **80/80** 验证，`stext=0xC0008000`），
+>   得 **35,937 条精确函数地址**。因此本文**直接按符号表定位函数体**，不依赖字符串地址推断
+>   （这正是 `docs/033 §4` 要求、且比「从指针引用回溯函数边界」更可靠的一条）。
+> - 规范（`docs/033 §2`）：每条结论标 `[观察]` / `[推断]` / `[未知]` / `[存疑]`；
+>   静态分析不写「运行时执行了…」；「0 命中」只写「在 X 范围内未检索到」；
+>   寄存器写入必须附对象 SHA-256、指令 VA、工具与反汇编片段；不编造寄存器值。
 
 ---
 
-## 0. 结论总览
+## 0. 结论先行
 
-| 节 | 最关键一句 | 标记 |
-|---|---|---|
-| §2 HDMI 初始化链路 | [观察] 内核里没有 `HDMI_Display` 这个符号；等价硬件链路由 `hdmi_ProcessCmd` 分发 → `DRV_HDMI_Init` → `SI_HW_ResetHDMITX` → `SI_TX_PHY_INIT`，用 `SI_*` 前缀实现，`docs/023 §4.3` 的 hiboot 线性序列在内核侧**不是 1:1 对应**。 | [观察]+[推断] |
-| §3 VO / Framebuffer | [观察] `DISP_Init` 把物理基址 `0xf8cc0000` 传给 `DISP_HAL_Init`，显存由 `DISP_OS_MMZ_Alloc → HI_DRV_MMZ_Alloc` 从 MMZ 分配，`HIFB_DRV_ModInit` 调 `register_framebuffer` 注册 fb；G0/GP0 层归属未能从本镜像定死。 | [观察]+[未知] |
-| §4 EDID / 时钟 | [观察] EDID 走发射器自带 **MDDC**（`SI_BlockRead_MDDC` + `WriteByte_8BA`，非 GPIO bit-bang）；显示时钟是 `DISP_ResetCRG` 的 CRG 寄存器位操作，**未检索到直接 `bl clk_set_rate` 的调用点**。 | [观察] |
-| §5 基址之辨 | [观察] 内核实际用 `0xF8CE1800`（由 `0x3E338600<<2` 算出）作 HDMI PHY 物理窗口，并经 `+0x05000000` 静态映射；`0xf8cc0000` 作 VO 物理基址。与 `docs/029` 的 `0x8ce0000` 相差 `0xF0000000`，疑为 DT 相对地址与 CPU 物理地址之差。 | [观察]+[推断] |
-| §6 主线差距 | [推断] 主线要独立点亮 HDMI **并显示 TTY**，除复现上述初始化外还差：fbcon/VT 绑定、DRM/KMS 或 simplefb 接管、`reserved-memory`/CMA 对应 MMZ、clk/reset 的 DT 描述与主动 enable —— 原厂 recovery 只有「内核 hifb + 用户态 blit」，没有 fbcon。 | [推断] |
-| §7 hiboot 交叉验证 | [观察] `logo`/`logobak` 不是 U-Boot 命令（是 PDM 参数键），`flashlogo` 只是写分区，刷机链无显示命令 + console 只有 `serial` → 「刷机时背光都不亮」与这两条路径一致。 | [观察] |
-
-### `docs/032 §7` 七条待验证清单销账
-
-| # | 问题 | 状态 | 结论（详见对应节） |
-|---|---|---|---|
-| 1 | `HDMI_DRV_ModInit` 等真实调用链 / 寄存器顺序，与 SDK 序列核对 | **answered** | §2：调用链由 kallsyms 定位；`SI_TX_PHY_INIT` 的 7 次写入有基址+偏移+值+顺序；SDK 线性序列不 1:1 对应 |
-| 2 | `HI_DRV_DISP_Init` / `DISP_HAL_Init` 如何配 VO 图层、G0 还是 GP0 | **partially** | §3：`DISP_Init` 传 `0xf8cc0000` 已实证；`OPTM_GfxSetLayerAddr` 引用 `g_stGfxGPDevice`，但精确寄存器偏移未定，标 [未知] |
-| 3 | hifb 注册 fb0 的显存来源 / 格式 / stride / 分辨率 | **partially** | §3：MMZ 来源与 `register_framebuffer` 调用点实证；格式/stride/分辨率未由本镜像定死（社区内核数值属另一对象，不互引） |
-| 4 | 显示相关 clk 名、`clk_set_rate` 调用点、CRG 寄存器 | **partially** | §4：`DISP_ResetCRG` 位操作与 vendor clk helper 实证；`clk_set_rate` 直接调用点 0 命中；clk 名/CRG 位含义未解析 |
-| 5 | `SI_ReadEDID` 走 DDC 还是 GPIO bit-bang | **answered** | §4：MDDC（发射器自带 DDC），`WriteByte_8BA` 经 MMIO 全局虚基址 4 字节 stride 访问 |
-| 6 | 是否有可继承的 Bootloader framebuffer | **unresolved** | §7：hiboot 有 `LOGO_TABLE` 画 logo 能力，但 U 盘刷机路径不做显示初始化；能否被 simplefb 接管需真机验证 |
-| 7 | `0xf8ce0000` / `0xf8cc0000` / `0xf9000000` 实际用途与 `docs/029` 对齐 | **partially** | §5：前两者有明确代码指向；`0xf9000000` 40 处命中全在数据区、未证实为 ioremap 基址；`0x8ce0000` 与 `0xf8ce0000` 关系标 [推断] |
-
----
-
-## 1. 方法：如何在「无 ELF 符号表」的 vmlinux 里定位 HDMI 函数地址
-
-这是本轮的核心方法突破，单列一节以符合 `docs/033 §2` 第 3、7 条（不把字符串地址当函数地址、pin baseline）。
-
-### 1.1 起点约束（`docs/033 §4` 的观察，复核）
-
-[观察] `TMP/recovery-deep/recovery-vmlinux.bin` 内 `kallsyms_addresses` / `kallsyms_names` /
-`kallsyms_token_table` / `kallsyms_num_syms` / `/proc/kallsyms` 等字面串全部 0 命中；
-`docs/032 §6.3` 扫到的 `HI_DRV_HDMI_Init` 等完整函数名来自 `__func__` / `EXPORT_SYMBOL` /
-proc 接口名，**不是符号表条目**。因此「字符串所在地址」≠「函数地址」，不能直接拿来反汇编。
-
-### 1.2 压缩 kallsyms 重建（脚本 `TMP/recovery-deep/kallsyms3.py`，可复现）
-
-[观察] 在 `d91d9104…` 对象内定位到教科书式的 kallsyms 布局（`0xC0008000` 基准）：
-
-| 结构 | 文件偏移 | 运行地址 | 内容 |
-|---|---|---|---|
-| `kallsyms_addresses[]` | `0x3DB6B8` | `0xC3DB6B8` | 35,935 个递增内核地址，首 `0xC0008000`、末 `0xC085A2F4` |
-| `kallsyms_num_syms` | `0x3FE840` | `0xC3FE840` | `35937` |
-| `kallsyms_names[]` | `0x3FE850` | `0xC3FE850` | 变长压缩名（1 字节 token 数 + token 索引） |
-| `kallsyms_markers[]` | `0x466580` | `0xC466580` | 140 项递增偏移，用于校验 names 起点 |
-| `kallsyms_token_table` | `0x4667C0` | `0xC4667C0` | 256 个 NUL 结尾 token（如 `ad_` `proc` `Get` `__`） |
-| `kallsyms_token_index` | `0x466B40` | `0xC466B40` | 256 个递增 u16（0…891） |
-
-[观察] 解码出 **35,937 条符号名**（如 `Tstext`、`t__create_page_tables`、`TSI_ReadEDID`），
-names 起点由 140 个 markers 逐项校验通过。
-
-[观察] **对齐修正**：`names[i]` ↔ `kallsyms_addresses[i-2]`（δ = −2）。两个独立 oracle 验证：
-`__kstrtab_*` 自名字符串 **80/80** 命中、`__ksymtab_*` 的 `{value,nameptr}` 结构 **80/80** 命中；
-`stext` 恰为 `0xC0008000`。未经此修正时（δ=0）只有 1/80 命中——这正是「不能靠猜」的实例。
-
-### 1.3 定位结果（节选，`d91d9104…` / capstone 5.0.7）
-
-| 函数 | 地址 | 函数 | 地址 |
-|---|---|---|---|
-| `HDMI_DRV_ModInit` | `0xC02E117C` | `HI_DRV_HDMI_Init` | `0xC02DDAA8` |
-| `HDMI_ModeInit` | `0xC02E1058` | `HI_DRV_HDMI_Open` | `0xC02DD670` |
-| `HDMI_DRV_Init` | `0xC02DDAA78` | `hdmi_ProcessCmd` | `0xC02DCD64` |
-| `DRV_HDMI_Init` | `0xC02E54E4` | `SI_HW_ResetHDMITX` | `0xC02E9E24` |
-| `SI_Start_HDMITX` | `0xC02E9910` | `SI_TX_PHY_INIT` | `0xC02ECB70` |
-| `SI_ReadEDID` | `0xC02E8D0C` | `SI_ReadSinkEDID` | `0xC02E8E28` |
-| `HI_DRV_DISP_Init` | `0xC0304464` | `DISP_Init` | `0xC0318078` |
-| `DISP_HAL_Init` | `0xC02F02CC` | `register_framebuffer` | `0xC01D56C0` |
-
-### 1.4 局限（必须保留）
-
-[未知] 静态反汇编只能证明「镜像里存在这些指令 / 调用关系」，**不能证明运行时按此顺序执行**；
-内核用 `HI_DRV_MODULE_Register` / `hdmi_ProcessCmd` 的 ops/ ioctl 分发，运行顺序取决于用户态
-`/sbin/recovery` 下发的命令序列，本文不还原该时间线。
-[未知] `kallsyms_addresses` 末 2 项为 0（对齐填充），本次只使用 `i-2 >= 0` 的符号。
-
----
-
-## 2. HDMI 初始化链路（核心）
-
-### 2.1 由符号表定位后逐函数反汇编得到的调用图（`d91d9104…`）
-
-```
-HDMI_DRV_ModInit (0xC02E117C)
- ├─ HDMI_ModeInit (0xC02E1058)
- │   ├─ hdmi_InitFmtArray / hdmi_Init_PixelClkArray      软件格式表 + 像素时钟表
- │   ├─ HI_DRV_DEV_Register / HI_DRV_PROC_AddModule       注册字符设备与 proc 接口
- │   └─ (无 MMIO 写入)
- ├─ HDMI_DRV_Init (0xC02DDAA78) ── DRV_HDMI_Register(0xC02DDDF74) ── HI_DRV_MODULE_Register
- └─ HI_LogOut / switch_dev_register（错误分支）
-
-HI_DRV_HDMI_Init (0xC02DDAA8, 0x1C B) : 除 mcount 外仅一次 bl HDMI_DRV_Init  ← 薄转发壳，无 MMIO
-HI_DRV_HDMI_Open (0xC02DD670)        : __memzero → hdmi_Open → hdmi_ExtIoctl×3
-hdmi_ExtIoctl (0xC02DD214)           : down_interruptible → hdmi_ProcessCmd → up
-HI_DRV_HDMI_ProcHotPlug (0xC02DD9D4) → hdmi_MCE_ProcHotPlug (0xC02DD7C4)
-hdmi_MCE_ProcHotPlug : DRV_Get_SinkCap / DRV_Get_IsValidSinkCap /
-                       DRV_Get_DefaultOutputMode / hdmi_ExtIoctl×3
-```
-
-[观察] `hdmi_ProcessCmd`（`0xC02DCD64`，0x4B0 B）是 **ioctl 命令分发器**，其 `bl` 目标包括
-`DRV_HDMI_Init`(`0xC02E54E4`)、`DRV_HDMI_DeInit`、`DRV_HDMI_Open`、`DRV_HDMI_Start`、
-`DRV_HDMI_Read_EDID`、`DRV_HDMI_SetFormat`、`DRV_HDMI_ReadEvent` 等。
-→ **内核里不存在名为 `HDMI_Display` 的函数**（在 35,937 条符号中精确检索 0 命中）；
-`docs/023 §4.3` 描述的 `HDMI_Display()` 是 **hiboot (`source/boot/product/driver/hdmi/hdmi_1_4/`)** 的实现，
-内核侧等价功能被拆成 `DRV_HDMI_Init` / `SI_Start_HDMITX` / `SI_SetVideoPath` / `SI_EDIDProcessing` 等 `SI_*` 函数。
-
-### 2.2 真正碰硬件的一段：`DRV_HDMI_Init` → `SI_HW_ResetHDMITX`
-
-[观察] `DRV_HDMI_Init` (`0xC02E54E4`) 的 `bl` 目标（节选，capstone 解析）：
-`DRV_Get_CommAttr`、`DRV_Get_ChnAttr`、`ReadByte_8BA`、`HI_DRV_MODULE_GetFunction`、
-`SI_WriteBlockHDMITXP0`、`SI_HDMI_Setup_INBoot`（boot 态分支）、`DispFormatAdjust`、
-`DRV_HDMI_Disp2UnfFmt`、`SI_Adjust_SwingCtrl`；
-关键分支 `0xC02E5660` 起连续三条：
-
-```
-0xc02e5660  bl  #0xc02e9e24   -> SI_HW_ResetHDMITX
-0xc02e5664  bl  #0xc02e9d18   -> SI_SW_ResetHDMITX
-0xc02e566c  bl  #0xc02ecb14   -> SI_TX_PHY_PowerDown
-```
-
-随后 `SI_OpenHdmiDevice` / `SI_ReadBlockHDMITXP0` / `DRV_HDMI_SetDefaultAttr` /
-`kthread_create_on_node(Hdmi_KThread_Timer)` / `SI_WriteDefaultConfigToEEPROM` / `hdmi_SetAndroidState`。
-
-[观察] `SI_HW_ResetHDMITX` (`0xC02E9E24`) 的 `bl` 序列：
-`SI_HW_ResetCtrl` → `SI_HW_ResetPhy` → `DelayMS` → `SI_HW_ResetPhy` → `DelayMS` →
-`SI_TX_PHY_INIT` → `DelayMS` → `SI_HW_ResetCtrl` → `DelayMS` → `WriteByte_8BA` →
-`DRV_Get_DDCSpeed` → `WriteByte_8BA` → `SI_Encoder_Adjust`。
-`SI_SW_ResetHDMITX` (`0xC02E9D18`) 为
-`SI_AssertHDMITX_SWReset` → `DelayMS` → `SI_ReleaseHDMITX_SWReset` → `DelayMS` → `ReadByte_8BA`。
-
-### 2.3 寄存器写入序列（实证，附对象 / 地址 / 工具）
-
-[观察] `SI_TX_PHY_WriteRegister` (`0xC02EC9E0`) 反汇编（`d91d9104…` / capstone 5.0.7）：
-
-```asm
-0xc02ec9f4  ldr  r3, [pc, #0xc]      ; lit@0xc02eca08 = 0x3e338600
-0xc02ec9f8  add  r3, r0, r3          ; r3 = reg_index + 0x3e338600
-0xc02ec9fc  lsl  r0, r3, #2          ; r0 = 4*(reg_index + 0x3e338600)
-0xc02eca00  bl   #0xc02e6488        ; -> DRV_HDMI_WriteRegister
-```
-
-[观察] `DRV_HDMI_WriteRegister` (`0xC02E6488`) 全文：
-
-```asm
-0xc02e649c  add  r0, r0, #0x5000000
-0xc02e64a0  str  r1, [r0]           ; 唯一的寄存器写
-```
-
-→ 物理窗口 `4 × 0x3E338600 = 0xF8CE1800`；内核以 `+0x05000000` 静态映射为虚拟地址
-`0xFDCE1800`。[推断] 该 `0x05000000` 是本内核 I/O 静态映射偏移（由 `add` 与 `str` 直接得出，
-但 DT `ranges` 未在本文内核中核对，故标推断）。
-
-[观察] `SI_TX_PHY_INIT` (`0xC02ECB70`) 是唯一调用者 (`SI_HW_ResetHDMITX+0x3C`)，
-其 7 次 `SI_TX_PHY_WriteRegister(reg_index, value)` 按出现顺序：
-
-| 序 | reg_index | 物理偏移 | 物理地址 | 虚拟地址 | 写入值 |
-|---|---|---|---|---|---|
-| 1 | 0 | `+0x000` | `0xF8CE1800` | `0xFDCE1800` | 0 |
-| 2 | 2 | `+0x008` | `0xF8CE1808` | `0xFDCE1808` | 2 |
-| 3 | 3 | `+0x00C` | `0xF8CE180C` | `0xFDCE180C` | 2 |
-| 4 | 4 | `+0x010` | `0xF8CE1810` | `0xFDCE1810` | 9 |
-| 5 | 5 | `+0x014` | `0xF8CE1814` | `0xFDCE1814` | 4 |
-| 6 | 6 | `+0x018` | `0xF8CE1818` | `0xFDCE1818` | 0 |
-| 7 | 1 | `+0x004` | `0xF8CE1804` | `0xFDCE1804` | 1 |
-
-反汇编原文（`0xC02ECB84`–`0xC02ECBD4`）：`mov r0,#0; mov r1,r0; bl` / `mov r0,#2; mov r1,r0; bl` /
-`mov r1,#2; mov r0,#3; bl` / `mov r1,#9; mov r0,#4; bl` / `mov r1,#4; mov r0,#5; bl` /
-`mov r1,#0; mov r0,#6; bl` / `mov r0,#1; mov r1,r0; bl`。
-[观察] 这是本镜像里**唯一能完整列出「基址+偏移+值+顺序」的 PHY 初始化序列**；
-其余 `SI_TX_PHY_*` 函数（`SI_Adjust_SwingCtrl`、`SI_TX_PHY_SetDeepColor`、`SI_TX_PHY_PowerDown`、
-`SI_TX_PHY_EnableHdmiOutput`）都调用同一个 `SI_TX_PHY_WriteRegister`，但其值来自参数/状态，
-静态反汇编不能确定运行时取值，**本文不编造**。
-
-[观察] 另一类寄存器访问是发射器 byte 寄存器：`DRV_WriteByte_8BA` (`0xC02E6528`) 与
-`DRV_ReadByte_8BA` (`0xC02E64D4`) 从全局 `g_VirHDMI_PHY_BASE_ADDR` (`0xC0847098`) 取虚拟基址，
-`str r3, [r1, r2, lsl #2]` / `ldr r0, [r3, r2, lsl #2]` —— **4 字节 MMIO stride**；
-设备码 `0x72` / `0x7A`（`0x7A` 时 reg 索引 `+0x100`，即第二 bank 偏移 `+0x400`），
-与 `docs/029` 对 `sii9134.c`「三组 byte 寄存器 bank、4 字节 MMIO stride」的描述一致。
-
-### 2.4 与 `docs/023 §4.3` SDK（hiboot）序列逐条核对
-
-| SDK / hiboot 步骤（`docs/023 §4.3`） | 内核 vmlinux 实证 | 判定 |
-|---|---|---|
-| `HI_UNF_HDMI_Init()` 空壳，只打日志返回 | `HI_DRV_HDMI_Init` (`0xC02DDAA8`) 仅 0x1C B、一次 `bl HDMI_DRV_Init`，无 MMIO | [观察] 方向一致但严格说是**转发壳**，不是空壳；且这是内核函数，与 hiboot 同名函数不是同一实现 |
-| `HI_UNF_HDMI_Open()` → `HDMI_Display()` | 内核无 `HDMI_Display` 符号；`HI_DRV_HDMI_Open` → `hdmi_Open`(0x28 B) + `hdmi_ExtIoctl` → `hdmi_ProcessCmd` | [观察] **不符**：内核走 ioctl 分发，不是单一 `Open→Display` |
-| `GetSinkCapability()` 读 EDID | `SI_EDIDProcessing` → `SI_ReadSinkEDID` → `SI_ReadEDID` → `SI_BlockRead_MDDC`；`SI_ParseEDID` | [观察] 功能证实，函数名不同 |
-| `UpdateTX_656` / `SetIClk(0)` / `WakeUpHDMITX` | 符号 `SI_UpdateTX_656`(`0xC02E758C`)、`SI_SetIClk`(`0xC02E96FC`)、`SI_InteralMclkEnable`(`0xC02E978C`) 存在；`SI_Start_HDMITX` 调 `SI_UpdateTX_656` / `SI_UpdateTX_DE` / `SI_SetDE` | [观察] 步骤存在，但顺序由 `SI_Start_HDMITX` 与 ioctl 决定 |
-| AVI InfoFrame / VIC | `SI_GetAVIInfoFrameVID`、`DRV_HDMI_GetInfoFrame`、`DRV_HDMI_SetInfoFrame`、`hdmi_GetInfoFrame` | [观察] 符号证实；具体 VIC 值未由反汇编定值 |
-| `TX_PHY_HighBandwidth` / `TX_PHY_SwingCtrl` | `SI_TX_PHY_HighBandwidth`、`SI_Adjust_SwingCtrl`（`DRV_HDMI_Init` 调用） | [观察] 证实 |
-| `TX_SetHDMIMode` | `SI_TX_SetHDMIMode`(`0xC02E96A0`)，由 `SI_Start_HDMITX` / `SI_Init_DVITX` 调用 | [观察] 证实 |
-| `TX_PHY_EnableHdmiOutput()` 最后打开输出 | `SI_TX_PHY_EnableHdmiOutput`(`0xC02ECBDC`) → `SI_TX_PHY_ReadRegister` + `SI_TX_PHY_WriteRegister` | [观察] 函数存在；「最后一步」的运行时次序未证实 |
-
-[推断] 两者是**同一套 HiSTB SDK 显示栈在不同软件层（hiboot vs Linux 内核）的实现**：
-硬件步骤大体对应，但内核把它拆成「模块注册 + ioctl 分发 + `SI_*` 驱动」，
-不能把 `docs/023 §4.3` 的线性序列直接当作内核调用顺序抄进主线驱动。
-
----
-
-## 3. 显示控制器 / VO / Framebuffer
-
-### 3.1 DISP 初始化与 VO 基址（实证）
-
-[观察] `HI_DRV_DISP_Init` (`0xC0304464`) → `DISP_Init` (`0xC0318078`)；
-`DISP_Init` 的 `bl` 目标：`DISP_HAL_Init`、`DISP_HAL_GetOperation`、`DISP_HAL_GetVersion`、
-`DISP_DA_Init`、`DispInitDisplay`×2、`DISP_ISR_Init`、`request_threaded_irq`、
-`DispResetHardware`、`DRV_PQ_UpdateVdpPQ`、`DISP_Open`、`DispGetHdmiFunction`。
-
-[观察] `DISP_Init+0x48` 处的两条指令（`d91d9104…` / capstone）：
-
-```asm
-0xc03180c0  ldr  r0, [pc, #0x1a4]   ; lit@0xc031826c = 0xf8cc0000
-0xc03180c4  bl   #0xc02f02cc        ; -> DISP_HAL_Init
-```
-
-→ `0xf8cc0000` 作为**参数**传给 `DISP_HAL_Init`，与 `docs/023 §4.2` 的
-`CONFIG_VDP_REG_BASEADDR = 0xf8cc0000` 一致（固件实证，不再是 SDK 推测）。
-
-[观察] `DISP_HAL_Init` (`0xC02F02CC`) 的 `bl`：`Chip_Specific_DISP_OpenClock`、
-`DISP_OS_MMZ_Alloc`、`DispGetVersion`、`DISP_HAL_InitVDPState`，并把一批 `PF_*`
-函数指针填入全局 `s_stDispCapability` (`0xC084C870`)。
-`DISP_OS_MMZ_Alloc` (`0xC030C458`) → `HI_DRV_MMZ_Alloc` (`0xC02B3EF4`)；
-`hifb_buf_allocmem` 也 3 次调用 `HI_DRV_MMZ_Alloc` → **显存来自 MMZ**。
-
-[观察] VO 寄存器访问机制：`VDP_DRIVER_SetVirtualAddr` (`0xC02F2B1C`) 把 ioremap 后的
-虚拟地址存入全局 `pVdpReg` (`0xC084D030`)；`VDP_RegWrite` (`0xC02F2B5C`) 与
-`OPTM_VDP_RegWrite` (`0xC0325510`) 都只是 `str r1, [r0]`。
-→ 内核热路径**不出现物理基址字面量**，这解释了 §5 里 `0xf8cc0000` 只有 2 处命中。
-
-### 3.2 G0 还是 GP0（部分结论，标未知）
-
-[观察] `HIFB_DRV_SetLayerAddr` / `SetLayerStride` / `UpdataLayerReg` 都是薄封装：
-从全局 `g_stGfxOps` (`0xC0857A40`) 取函数指针（`+0x18` / `+0x1c` / `+0x54`）后间接调用；
-`HIFB_DRV_GfxInit` → `OPTM_GFX_GetOps`。
-[观察] `OPTM_GfxSetLayerAddr` (`0xC032A544`) 引用全局 `g_stGfxGPDevice` (`0xC08564D4`)
-并调用 `OPTM_VDP_GFX_SetLayerAddrEX` (`0xC032912C`) → `OPTM_VDP_RegWrite`；
-符号表另有 `VDP_GFX_SetLayerAddr`、`VDP_GFX_SetLayerNAddr`、`OPTM_VDP_GFX_SetLayerStride` 等。
-
-[未知] 精确图层寄存器偏移（`G0_ADDR +0x494` / `GP0 = G0+0x800`，`docs/023 §4.2`）**未能由本镜像
-反汇编定死**：`OPTM_GfxSetLayerAddr` 中的个别 word 被 capstone 解成可疑的
-`str r1, [r2, #0xa30]`，疑为字面量池/内联数据，未据此下结论。
-`docs/023 §5.3` 的「G0 还是 GP0/WBC」问题维持 **unresolved**，需真机或 SDK 头文件核对。
-
-### 3.3 hifb 注册 fb0（实证）与分辨率（未知）
-
-[观察] `register_framebuffer` (`0xC01D56C0`) 在 vmlinux 中**只有 1 个调用者**：
-`HIFB_DRV_ModInit+0x458` (`0xC0339360`)，其前文 `fb_alloc_cmap`、`hifb_buf_map`、
-`str r0,[r4,#0x230]`（保存映射地址）。ramdisk `/sbin/recovery` 用
-`open("/dev/graphics/fb0")` + `FBIOGET_*SCREENINFO` + `KDSETMODE/KD_GRAPHICS` 直接 blit
-（`docs/023 §3`）；vmlinux 内 `/dev/graphics/fb0`、`KDSETMODE`、`KD_GRAPHICS` 字符串各 1–2 处命中。
-
-[未知] 像素格式 / stride / 分辨率**未由本镜像定死**：`docs/023 §5.1` 的
-`1920x1080 ARGB8888 / stride 7680 / smem_start 0x3c55c000` 来自**社区 Ubuntu 内核**（另一对象），
-按 `docs/033 §2` 第 7 条不得与 `d91d9104…` 互引。主线侧需自行确定或验证。
-
----
-
-## 4. EDID / HPD / 时钟 / 复位
-
-### 4.1 EDID 走发射器自带 MDDC（answered）
-
-[观察] `SI_EDIDProcessing` (`0xC02EBEC0`) 的 `bl` 序列：
-`SI_HPD_Status` → `SI_ReadSinkEDID` → `SI_HPD_Status` → `SI_timer_count` →
-`SI_ParseEDID` → `SI_AssignOutputState`（失败回退 `SI_AssignDefaltOutputState`）。
-
-[观察] `SI_ReadSinkEDID` (`0xC02E8E28`) → `SI_DDC_ResetTV` → `SI_ReadEDID`×2 →
-`GetExtBlockNum` / `BlockCheckSum`；`SI_ReadEDID` (`0xC02E8D0C`) →
-`DRV_Get_IsUserEdid`（用户覆写 EDID 分支 `DRV_Get_UserEdid`）→ `WriteByte_8BA` →
-`SI_BlockRead_MDDC` (`0xC02EBA34`)。
-[观察] `SI_BlockRead_MDDC` 内：`WriteByte_8BA(1, 0x72, 0xF3, 9)`、
-`SI_BlockWriteHDMITXP0(0xED, 7, buf)`、轮询 `ReadByte_8BA(1, 0x72, 0xF2)` 的 bit4、
-`SI_BlockReadMDDCFifo`、`ConvertMDDCStateIntoErrCode`，并写 `0xF3=0xF / 0xA`、`0xEC` 收尾。
-
-→ [观察] **EDID 通过 SiI9134 发射器自带的 Master DDC（MDDC）经 MMIO byte 寄存器读取**，
-不是 GPIO bit-bang I2C。`hi_gpio` 字符串 22 处命中中，字面量交叉引用只定位到
-`GPIO_DRV_ModInit`（通用 GPIO 驱动）；`/dev/hi_i2c` 字符串 1 处命中，
-在本次 capstone 全文件 `ldr[pc]` 扫描范围内**未检索到显示路径对它的引用**。
-[推断] 主线侧对应 `drm_edid` + bridge 的 DDC（或 SiI9134 自带 DDC），
-而不是 `i2c-gpio` bit-bang —— 与 `docs/029`「HDMI block keeps the DDC pins to itself」一致。
-
-### 4.2 HPD（观察）
-
-`SI_HPD_Status`、`hdmi_MCE_ProcHotPlug`、`HI_DRV_HDMI_ProcHotPlug`、`Hdmi_KThread_Timer`
-（由 `DRV_HDMI_Init` 用 `kthread_create_on_node` 创建）、`hdmi_ProcEvent` 均存在于符号表；
-`hdmi_MCE_ProcHotPlug` 通过 `hdmi_ExtIoctl` 下发，并读 `DRV_Get_SinkCap` /
-`DRV_Get_DefaultOutputMode`。[未知] 具体中断/轮询时序未还原。
-
-### 4.3 时钟与复位（partially）
-
-[观察] `DISP_HAL_Init` → `Chip_Specific_DISP_OpenClock` (`0xC02F1E5C`) → `DISP_ResetCRG` (`0xC02F77A4`)；
-后者从全局 `g_pstRegCrg` (`0xC07D1730`) 取基址，对 `[r3, #0xD8]` 做
-`orr #0x7f` / `bfc` / `bfi` / `orr #0x4100000` / `orr #0x40000000` 等位操作后写回
-—— 这是**CRG 寄存器偏移 +0xD8** 的时钟/复位配置（值由运行时状态与位域组合决定，本文不编造最终值）。
-[观察] 其它时钟相关符号：`VDP_VDAC_SetClk`、`VDP_DISP_SetHdmiClk`、`VDP_SelectClk`、
-`VDP_SetClkGateEn`、`VDP_CloseClkResetModule`、`MakePixClkParaInteger`、
-`hdmi_Init_PixelClkArray`、`DRV_Calculate_TMDSCLK`、`SI_SetMCLK` / `SI_SetIClk` /
-`SI_InteralMclkEnable`、`DRV_HDMI_SetPhyAudioClk`；字符串 `mach-hi3798mx/clock.c`、
-`enable clock:%s failed` 各 1 处命中。
-[观察] `clk_set_rate` (`0xC0018190`) 存在于符号表，但在**全文件 raw ARM `bl` 解码**
-（`0xEB……` 指令，逐 word 计算目标）范围内 **0 个直接调用点**；
-`clk_enable` / `clk_disable` 的调用者均为 pl011 / sp804 / hinfc / pm_clk 等通用路径，
-未见显示驱动直接调用。
-
-[推断] 对主线而言，`clk_ignore_unused` 只是「别关掉」的权宜之计，
-**不足以**替代「主动 `clk_get/enable` + CRG reset 描述」；`docs/023 §5.3`、
-`docs/025 §1.3` 的 SDM845 教训同向。需按 `docs/029` 的 `400-01` / `400-02` CRG 驱动
-在 DT 里描述 HDMI ctrl/phy clock 与 base/bus/phy reset。
-[未知] 具体 clk 名与 CRG 位含义未从本镜像解析（需 SDK `clock.c` / CRG 头或 DT 对照）。
-
----
-
-## 5. 基址之辨（与 `docs/029` 对齐）
-
-[观察] 对 `d91d9104…` 全文件做 4 字节小端字面量扫描（`TMP/recovery-deep/mmio_xrefs.py`）：
-
-| 常量 | 命中 | 代码级 `ldr[pc]` 引用位置 | 判定 |
-|---|---|---|---|
-| `0xf8cc0000` | 2 | `PQ_HAL_IsVdpReg+0x18`（`cmp` 比较，判断地址是否 VDP 寄存器区）；`DISP_Init+0x48`（作参数传给 `DISP_HAL_Init`） | [观察] VO/VDP **物理基址**在内核中实证使用 |
-| `0xf8ce0000` | 1 | `HDMI0_Proc+0xF88`（proc/调试转储路径） | [推断] HDMI TX 物理基址经 ioremap 存入全局（如 `g_VirHDMI_PHY_BASE_ADDR`），热路径用虚拟地址 |
-| `0xF8CE1800` | 由 `0x3E338600<<2` 算出 | `SI_TX_PHY_WriteRegister+0x14` → `DRV_HDMI_WriteRegister` | [观察] HDMI PHY 寄存器窗口，7 次写入见 §2.3 |
-| `0xf9000000` | 40 | 多数落在数据区（`initcall` 表、`kern_table`、`hid_usage_table` 等），**本次全文件 `ldr[pc]` 扫描未检索到把它当基址加载的代码** | [未知] 不能据命中数推断为 ioremap 基址 |
-| `0x08ce0000` | 0 | — | 在 `d91d9104…` 全文件字节范围内**未检索到**；按 `docs/033 §2` 第 2 条，不得据此推出「不存在」 |
-| `0xf8ab0000` | 3 | initcall 区（`__con_initcall_*` 别名区间）3 处 `ldr[pc]`，随后 `[r3,#0x84]` 等访问 | [推断] CRG/时钟复位寄存器窗口（与 `g_pstRegCrg` 位操作同向） |
-
-[观察] 内核把 `0xF8CE1800` 经 `+0x05000000` 变为 `0xFDCE1800` 再 `str`（§2.3），
-是「CPU 物理地址 → 内核静态映射虚拟地址」的转换。
-
-[推断] `docs/029` 的 mv100 DT `reg = <0x8ce0000 0x10000>` 与固件里的 `0xF8CE0000` 相差
-**恰好 `0xF0000000`**；这更像「DT 相对地址 + 父总线 `ranges` 基址 = CPU 物理地址」的两种表示，
-而非 `docs/029` 所警惕的「把 hi3716cv200 的地址误当 mv100」。
-本文**不推翻 `docs/029`**（其 bridge 链路结论仍为基线），只把这条算术关系列为待核对项：
-需读 `910-01` 的 `ranges` / `500-01` binding 原文确认，标 [推断]。
-
-[观察] 前缀证据：符号表中 `SI_` 前缀 **157** 个、`SI_TX_PHY` 11 个；
-`SII_` / `SiI_` / `sii` 在符号名中 0 命中；字符串 `sii9134` 在 `d91d9104…` 全文件 0 命中。
-按 `docs/033 §2` 第 2 条，**「`sii9134` 字面量 0 命中」不能推出「没有该 IP」**；
-`SI_ReadEDID` / `SI_BlockRead_MDDC` / `SI_TX_PHY_*` 与 hiboot 的 `siiSetVideoPath` /
-`SiI_DeepColor_*` 共同说明 SDK 用 `SI_`/`SiI_` 前缀封装 Silicon Image 发射器 IP，
-**补强 `docs/029` 的 SiI9134 bridge 结论**，不重复 `docs/027 §6` 那个已撤销的误判。
-
----
-
-## 6. 主线 Linux 要独立点亮 HDMI 并显示 TTY，还差什么
-
-[观察] 原厂 recovery 的「能显示」= 内核 `HIFB_DRV_ModInit` 注册 `fb0`
-+ 用户态 `/sbin/recovery` 直接 blit PNG；**内核侧没有 fbcon/VT**：
-`fbcon` / `console=tty0` / `vt_console` / `fbcon_start` 在 vmlinux 字符串中均 0 命中，
-`register_console` 只有 1 个调用者 `uart_add_one_port`（串口），
-cmdline 痕迹只有 `console=ttyAMA0,115200` 与 `ttyMTD,blackbox`（`docs/032 §6.4`）。
-
-[推断] 因此主线要**独立**点亮 HDMI 且显示控制台文字，除复现 §2–§5 的初始化外，还差：
-
-| 环节 | 原厂做法（实证） | 主线需要补 |
-|---|---|---|
-| 显示引擎 / HDMI TX / PHY | `DISP_Init` + `DRV_HDMI_Init` + `SI_*`（私有驱动，内建） | DRM/KMS 驱动（`docs/029` 的 `500-01/500-02/600-*` bridge 链路）或最小 fbdev 驱动；6.x 无这些私有驱动 |
-| Framebuffer → 文字 | 无 fbcon；用户态 blit | `CONFIG_FB` + `FRAMEBUFFER_CONSOLE` + `VT` + `console=tty0`，并把 framebuffer 绑定到 fbcon（或 DRM fbdev  emulation） |
-| 显存 | `mmz=ddr,0,0,256M/380M` + `HI_DRV_MMZ_Alloc` + `DISP_OS_MMZ_Alloc` + `hifb_buf_allocmem` | `reserved-memory` + `no-map` / CMA（`media_cma`），与 `mmz` 语义对齐；`docs/025 §1.3` 明确 `no-map` 否则 ioremap 会 panic |
-| 时钟 / 复位 | `DISP_ResetCRG` 位操作 + vendor clk helper；未见 `clk_set_rate` 直接调用 | CRG 驱动（`400-01/400-02`）+ DT `clocks`/`resets` + 主动 `clk_get/enable`；`clk_ignore_unused` 不够 |
-| EDID / HPD / DDC | 发射器自带 MDDC（非 GPIO I2C） | bridge 的 DDC / `drm_edid`；`500-02` 的 master DDC 或 `910-02` 的 `i2c-hdmi` 需按固件实证择一 |
-| 基址 | 物理 `0xf8cc0000`(VO) / `0xF8CE1800`(PHY)，`+0x05000000` 静态映射 | 按 `docs/029` 的 DT `reg = <0x8ce0000 0x10000>` 与 `ranges` 核对，不照抄 SDK `0xf8ce0000` |
-| Bootloader 遗留 framebuffer | hiboot 正常开机画 `LOGO_TABLE` logo；**U 盘刷机路径不画**（§7） | simplefb「cont-splash 接管」只在确有遗留帧缓冲时成立；刷机/首次启动路径不能依赖它 |
-
-[推断] 与 `docs/032 §4` 验收标准的对应：主线必须**自己**完成上述初始化并绑定 fbcon，
-不能用 hiboot 静态 logo 冒充 HDMI 输出；无串口硬件下只能用 HDMI 画面 / pstore / SSH 验证。
-
----
-
-## 7. hiboot 交叉验证（同一 HiSTB SDK 显示栈，压缩保留）
-
-[观察] 对象 `backup_stock/fastboot.img`（`bac0be9f…`，与 `p01_fastboot_adb.img` 同文件）
-与 `TMP/community-restore/fastboot.bin`（`fd5b4ac6…`）均为 ARM U-Boot 派生镜像，
-链接基址 `0x00C00000`（向量表 + 1706/1310 个字符串指针命中，见
-`TMP/stock-rom-research/hiboot-disasm/`）。两镜像共用同一套 SDK 显示栈，
-可与内核侧 `SI_*` / `VO` 证据互相印证。
-
-- **`logo` / `logobak` 不是 U-Boot 命令**：[观察] `cmd_tbl_s`（28 B 步长，
-  原厂表 `0x93A2C`、社区表 `0x801EC`）分别含约 45 / 54 个命令
-  （`go` `reset` `bootm` `fatload` `mmc` `run` `crc32` `saveenv` `otp_*` …），
-  **不含 `logo` / `logobak`，也无任何显示命令**；两串在任意对齐位置的 4 字节指针
-  在 4 份构建中均 0 命中。相邻字符串 `LOGO_TABLE` / `LOGO_KEY_FLAG` / `LOGO_KEY_LEN` /
-  `there is no logo param!` / `PDM_ReadLogoParam` 表明它们是 **PDM 参数键**，非命令。
-  → `bootcmd` 里**没有可插入的写法**；`flashlogo=run loadfilel flashpartitionl` 只是
-  `fatload + mmc write` 写 logo 分区，不触发显示。
-- **`PRODUCT_DisplayInit` / `Logo_Main` 调用时机**：[观察] 它们在 hiboot 里是函数名字符串，
-  在 4 份构建中做全量交叉引用（ARM/Thumb 字面量、`movw/movt`、PIC 修正、备用基址、
-  `skipdata=True` 全文件）均为 0 命中 → **调用点未能定位，标 [未知]**，不下断言。
-  [观察] 三份 `bootargs.bin`（CRC 全通过）全部 `stdin=stdout=stderr=serial`、
-  `bootdelay=0`，`bootcmd` 全是 `run flash*` + `fatload/mmc write/crc32/reset`；
-  hiboot 命令表与字符串里 `vidconsole` / `vesa` / `cfb_console` / `lcd` / `nulldev`
-  在检索范围内 0 命中，console 设备注册路径只有 `serial`。
-  → [推断] 用户「刷机时显示器背光都不亮」对应这条 **U 盘 `fastboot.bin` + `bootargs.bin` 路径**：
-  它既不刷新 HDMI，也没有视频 console 入口；用户看到的 "Debian Linux" 画面是
-  logo 分区在（另一次）正常开机路径被画出，不是刷机进度。
-- **与内核侧对照**：[观察] hiboot 含 `HDMI_Display`、`siiSetVideoPath`、`SiI_DeepColor_*`、
-  `ConfigTXVideoMode`、`TX_PHY_*`、`PRODUCT_DisplayInit`、`Logo_Main`、`LOGO_TABLE`，
-  与内核 `SI_ConfigTXVideoMode` / `SI_SetVideoPath` / `SI_TX_PHY_*` / `DISP_Init` 同名同族，
-  印证二者共用 HiSTB SDK 显示栈；hiboot 的 `TX_PHY_*` 与内核 §2.3 的 PHY 序列属同一硬件窗口。
-  [观察] 4 份 hiboot 镜像内 `0x8ce0000` / `0xf8ce0000` / `0xf8cc0000` 的 4 字节字面量
-  在检索范围内均 0 命中 —— 与内核「热路径用 ioremap 后的虚拟地址」同构。
-- **对「bootloader 遗留 framebuffer 能否被主线接管」的结论**：
-  [推断] 只有在「确有 hiboot 画 logo 且留下 VO 图层寄存器的那次开机」才可能用
-  simplefb 交接；**U 盘刷机/首次启动路径不满足该前提**（§7 第二条）。
-  这与 `docs/023 §5.2` 第一阶段「保留 hiboot 状态」的适用边界一致，也解释了为何
-  `patches/kernel/hi3798mv100-hdmi-console.c` 读 `VO_G0_ADDR` 的方案在刷机路径上可能读空。
-
----
-
-## 8. 复现台账、证据边界与合规
-
-| 产物（仓库内相对路径，均 gitignored） | 用途 |
+| 级别 | 结论 |
 |---|---|
-| `TMP/recovery-deep/kallsyms.py` / `kallsyms2.py` / `kallsyms3.py` | 压缩 kallsyms 重建；`kallsyms3.py` 为最终版（δ=−2，双 oracle 验证） |
-| `TMP/recovery-deep/kallsyms-symbols.json` / `kallsyms3.log` | 35,937 条符号（名 + 地址） |
-| `TMP/recovery-deep/disasm.py` | 符号感知 ARM 反汇编（`bl` 目标解析、字面量 / `movw/movt` / `str` 标注） |
-| `TMP/recovery-deep/disasm-hdmi-corrected.log` / `disasm-disp.log` / `disasm-hw.log` / `disasm-regwriters.log` / `disasm-final.log` | 各函数反汇编原文 |
-| `TMP/recovery-deep/mmio_xrefs.py` / `mmio-xrefs.log` / `mmio-xrefs.json` | MMIO 基址字面量与代码级 `ldr[pc]` 交叉引用 |
-| `TMP/recovery-deep/queries.py` / `queries.log` | raw `bl` 调用点扫描、符号前缀、console / DDC / 时钟字符串 |
-| `TMP/stock-rom-research/hiboot-disasm/scan.py` / `scan.log` | hiboot 命令表 / 字符串 / xref（§7） |
+| **[观察]** | **是否拿到可验证的 MMIO 寄存器写入表：是（分层、带边界）。** 拿到「基址来源 → 偏移 → 写入指令 VA → 写入值 / 来源寄存器」表（§2.3），由 capstone 全量 taint + radare2 逐条互验。但**绝大多数写入值是运行时读改写（RMW），不是静态常量**；只有 **HDMI PHY 的 7 次写入**与 **HDMI 复位 CRG 的少数写入**有编译期静态值。本文不把 RMW 伪造成定值。 |
+| **[观察]** | 三条虚拟 MMIO 基址闭环实证：VO `0xfdcc0000`（`0xf8cc0000 + 0x5000000`）、HDMI TX `0xfdce0000`、CRG `0xfda22000`（`g_pstRegCrg` 的 `.data` 静态值）。`docs/034 §3.2` 的「+0x258 缓存虚拟地址」推断被证实并追到了读取者。 |
+| **[观察]** | 显示驱动的**统一写入口**是 `VDP_RegWrite`(`0xc02f2b5c`, `str r1,[r0]`，592 个调用者)、`OPTM_VDP_RegWrite`(`0xc0325510`, 131 个) 与 `DRV_HDMI_WriteRegister`(`0xc02e6488`, 2 个)；地址由调用方用 `*pVdpReg` / `*g_VirHDMI_PHY_BASE_ADDR` / `*g_pstRegCrg` 加偏移算出。这解释了 `docs/034 §2.1`「基址常量只有 1–2 次、不邻接 str」。 |
+| **[观察]** | `clk_set_rate`(`0xc0018190`) 在全文件 raw `bl` 解码范围内 **0 个直接调用点**；显示时钟走 `g_pstRegCrg` 的 CRG 寄存器位操作 + vendor helper。EDID 走发射器自带 MDDC，不是 GPIO bit-bang I2C。 |
+| **[存疑]** | 这份 3.10 内核里 `0xf8ce0000` 被代码使用、`0x08ce0000` 在镜像全文件字节范围内 0 命中，与 `docs/029`「mv100 DT `0x8ce0000`、`0xf8ce0000` 属 hi3716cv200」存在张力。二者相差 `0xF0000000`，疑为 **DT 相对地址 + 父总线 `ranges` = CPU 物理地址**的两种表示（§5.3），但本文**不据此推翻 `docs/029`**——`docs/027 §6` 正因同类推断被撤销。 |
+| **[未知]** | `docs/023 §4.2` 的 `G0_ADDR +0x494` / `G0_STRIDE +0x49c` / `G0_IRESO +0x4a0` 与 GP0/G0 层归属**仍未由本镜像定死**；本镜像的 `VDP_VID_SetLayerEnable` 用的是 `+0x800 + layer*0x800` 的 VID 层块，二者不是同一寄存器组，不得互推。 |
 
-**证据边界（逐条声明）**：
+---
 
-- 本文所有「调用链」「寄存器写入」均来自 `d91d9104…` 的 capstone 5.0.7 反汇编与
-  重建 kallsyms 表，标注了对象 SHA-256、运行地址、工具；**未观察到运行时执行**，
-  「顺序」指镜像中指令/`bl` 的出现顺序（§2.3 的 7 次写入为函数体内顺序）。
-- 「0 命中」一律指「在指定对象 / 指定扫描方式 / 指定范围内未检索到」，
-  不推出「硬件上不存在」；`sii9134` 与 `0x08ce0000` 的 0 命中即按此处理（§5）。
-- 未由本镜像定死的项一律标 `[未知]` / `unresolved`：G0/GP0 精确偏移、fb 格式/stride/分辨率、
-  `clk_set_rate` 间接调用、`0xf9000000` 用途、bootloader framebuffer 可继承性。
-- 跨对象数值不互引：社区 Ubuntu 的 fb 几何（`docs/023 §5.1`）、整机备份的
-  `p05_baseparam`（`docs/027 §4.7`，来自 `TMP/stock-partition-backups/` 分卷，属**另一对象**）
-  仅作背景；`mmz=ddr` / `console=` 在 `d91d9104…` 内的字符串命中为本对象证据。
-- SDK 序列（`docs/023 §4.3`）只作交叉验证；冲突处以固件为准（§2.4）。
+## 1. 方法：函数地址怎么定（以及 lead 给的指针引用点是什么）
 
-**合规**：只读静态分析；不刷机、不改真机、不联网、不构建镜像、不删除文件、
-不用 `rm` / `git clean`、不访问项目外目录；临时产物全在 `TMP/`；
-文档不含本机绝对路径 / 用户名 / 卷名，厂商构建机路径与构建用户标识一律省略；
-只新建 `docs/035-recovery-hdmi-register-sequence.md` 一个文件，未改动任何已跟踪文件，
+### 1.1 kallsyms 重建（上一轮成果，本轮复用并复核）
+
+[观察] 在 `d91d9104…` 内定位 `kallsyms_addresses[]`@`0x3DB6B8`（35,935 项）、
+`kallsyms_num_syms`@`0x3FE840`(35937)、`kallsyms_names[]`@`0x3FE850`、
+`kallsyms_markers[]`@`0x466580`(140 项)、`kallsyms_token_table`@`0x4667C0`、
+`kallsyms_token_index`@`0x466B40`；解码出 35,937 条符号名。
+[观察] 对齐 `names[i] ↔ addresses[i-2]`（δ=−2），双 oracle 各 80/80 命中，`stext=0xC0008000`。
+→ 函数地址是**符号表实测**，不是「字符串地址 = 函数地址」的推断。
+
+### 1.2 lead 给的 4 个指针引用点解析（回答「回溯函数边界」）
+
+[观察] 逐点回读（capstone + 符号表 owner）：
+
+| 字符串 | 引用点（文件偏移 → VA） | 该 VA 的内容 | 判定 |
+|---|---|---|---|
+| `DRV_HDMI_Read_EDID` | `0x2db66c` → `0xc02e366c` | `0xc03d975c`（指向函数名串） | 落在 **`DRV_HDMI_Read_EDID`(0xc02e35c8)+0xa4**，是函数内 `__func__` 字面量池 ✓ |
+| 同上 | `0x3eed3c` → `0xc03f6d3c` | `0xc03d975c` | **数据区的字符串指针表**（邻居全为 `0xc03d97xx` 指针），非函数边界 |
+| `SI_ReadEDID` | `0x2e0e24` → `0xc02e8e24` | `0xc03d9fe8` | 落在 **`SI_ReadEDID`(0xc02e8d0c)+0x118`** ✓ |
+| 同上 | `0x3eedc0` → `0xc03f6dc0` | `0xc03d9fe8` | 同一张数据指针表 |
+| `HI_DRV_DISP_Init` | `0x2fc514` → `0xc0304514` | `0xc03dde6c` | 落在 **`HI_DRV_DISP_Init`(0xc0304464)+0xb0`** ✓ |
+
+[推断] 每对引用的**第一个**是函数内 `__func__` / printk 的字面量池（正好印证 kallsyms 地址），
+**第二个**是 `.rodata` 里的一张函数名指针表（`0xc03f6d3c` 附近连续 7 个 word 都是 `0xc03d9xxx` 指针）。
+两者都**不是**函数入口；真正的入口来自 §1.1 的符号表。这比「从引用点回溯边界」更直接且可验证。
+
+### 1.3 精确函数地址（节选，`d91d9104…` / kallsyms3）
+
+| 函数 | VA | 函数 | VA |
+|---|---|---|---|
+| `DISP_Init` | `0xc0318078` | `DISP_HAL_Init` | `0xc02f02cc` |
+| `DISP_HAL_InitVDPState` | `0xc02f0290` | `VDP_DRIVER_SetVirtualAddr` | `0xc02f2b1c` |
+| `OPTM_GfxInit` | `0xc032e694` | `OPTM_VDP_DRIVER_Initial` | `0xc03254b8` |
+| `HDMI_DRV_Init` | `0xc02dda78` | `HI_DRV_HDMI_Init` | `0xc02ddaa8` |
+| `HI_DRV_HDMI_Open` | `0xc02dd670` | `DRV_HDMI_Init` | `0xc02e54e4` |
+| `hdmi_ProcessCmd` | `0xc02dcd64` | `DRV_HDMI_Read_EDID` | `0xc02e35c8` |
+| `SI_ReadEDID` | `0xc02e8d0c` | `SI_ReadSinkEDID` | `0xc02e8e28` |
+| `SI_EDIDProcessing` | `0xc02ebec0` | `SI_BlockRead_MDDC` | `0xc02eba34` |
+| `SI_TX_PHY_INIT` | `0xc02ecb70` | `SI_TX_PHY_WriteRegister` | `0xc02ec9e0` |
+| `SI_HW_ResetCtrl` | `0xc02e943c` | `SI_HW_ResetPhy` | `0xc02e9484` |
+| `DISP_ResetCRG` | `0xc02f77a4` | `Chip_Specific_DispSetPll` | `0xc02f1d54` |
+| `HIFB_DRV_ModInit` | `0xc0338f08` | `register_framebuffer` | `0xc01d56c0` |
+
+[观察] `HDMI_Display` 在 35,937 条符号中 **0 命中**；其字符串 VA `0xc077228c` 在
+capstone 全文件 `ldr[pc]` 扫描范围内 **0 个字面量加载**。
+→ 与 `docs/031 §2.1` 一致：内核里没有这个函数，等价功能由 `DRV_HDMI_Init` / `SI_Start_HDMITX` /
+`SI_SetVideoPath` / `SI_EDIDProcessing` 分担。
+
+---
+
+## 2. 任务 1：`0xc084c870+0x258` 闭环与真实 MMIO 写入表
+
+### 2.1 基址从物理常量到虚拟地址的完整闭环（capstone + radare2 逐条互验）
+
+[观察] 七步闭环，全部来自 `d91d9104…`：
+
+| 步 | 指令 VA | radare2 / capstone 反汇编 | 结果 |
+|---|---|---|---|
+| 1 | `0xc03180c0` | `ldr r0,[0xc031826c] ; =0xf8cc0000` → `bl 0xc02f02cc` | `DISP_Init` 把 VO **物理**基址传给 `DISP_HAL_Init` |
+| 2 | `0xc02f0308` | `add r6,r6,0x5000000` → `str r6,[r4,0x258]`（r4=`0xc084c870`） | `0xf8cc0000+0x05000000` = **`0xfdcc0000`** 存入 `s_stDispCapability+0x258` |
+| 3 | `0xc02f02a4` | `ldr r3,[0xc02f02c8] ; =0xc084c870` → `ldr r0,[r3,0x258]` → `bl 0xc02f2b1c` | **`DISP_HAL_InitVDPState` 就是 `+0x258` 的读取者**，把值交给 `VDP_DRIVER_SetVirtualAddr` |
+| 4 | `0xc02f2b30` | `ldr r3,[0xc02f2b3c] ; =0xc084d030` → `str r0,[r3]` | 存入全局 **`pVdpReg`** → 之后 592 个 `VDP_RegWrite` 调用者都从这里取基址 |
+| 5 | `0xc032e6c0` | `ldr r0,[0xc032e714] ; =0xfdcc0000` → `bl 0xc03254b8` | `OPTM_GfxInit` 硬编码同一 VO 虚基址；`OPTM_VDP_DRIVER_Initial` 存入 **`pOptmVdpReg`(0xc08564d0)** |
+| 6 | `0xc02dda8c` | `ldr r2,[0xc02ddaa0] ; =0xfdce0000` → `ldr r3,=0xc084708c` → `str r2,[r3,0xc]` | `HDMI_DRV_Init` 把 **HDMI TX 虚基址 `0xfdce0000`** 写入 `0xc084708c+0xc` = **`g_VirHDMI_PHY_BASE_ADDR`(0xc0847098)** |
+| 7 | `.data` | `0xc07d1730` 处 word = `0xfda22000` | 全局 **`g_pstRegCrg` 静态值 = CRG 虚基址 `0xfda22000`**；[未知] 本轮检索范围内未发现覆盖该全局本身的写入，但不排除存在 |
+
+[观察] BSS 边界：`s_stDispCapability`(0xc084c870)、`pVdpReg`(0xc084d030)、
+`g_VirHDMI_PHY_BASE_ADDR`(0xc0847098)、`pOptmVdpReg`(0xc08564d0) 与 `+0x258`(0xc084cac8)
+**都在镜像 VA 上界 `0xC07E0AB8` 之外**，即 BSS，运行时才被写入；`g_pstRegCrg`(0xc07d1730)
+在镜像内，故其静态值可直接读出。这解释了为何 `docs/034 §2.1` 的「指向该 VA 的指针数 0」
+不等于「没人用」——用的是 `ldr[pc]` 字面量 + BSS 全局。
+
+### 2.2 `+0x258` 读取点全表（回答 lead 的第 1 件事）
+
+[观察] 全文件 `ldr/str [rN,#0x258]`（非 `[pc,#0x258]` 字面量）在显示代码区
+`0xc02c0000–0xc0340000` 共 10 处，逐条定性：
+
+| 指令 VA | 函数 | 指令 | 判定 |
+|---|---|---|---|
+| `0xc02f02a8` | `DISP_HAL_InitVDPState` | `ldr r0,[r3,#0x258]` → `bl VDP_DRIVER_SetVirtualAddr` | **[观察] 真正的基址取出点**（§2.1 步 3） |
+| `0xc02f030c` | `DISP_HAL_Init` | `str r6,[r4,#0x258]` | **[观察] 写入点**（§2.1 步 2） |
+| `0xc02f0b58` | `VideoLayer_CreateBlackFrame` | `ldr r3,[r4,#0x258]` → `str r3,[r4,#0x270]` / `add r3,r3,#0x4000` | [推断] 取出 VO 虚基址后写入**同一结构体的其它字段**（黑帧缓冲描述符），非 MMIO |
+| `0xc0304d90` | `DISP_ProcRead` | `ldr r3,[r5,#0x258]` | [推断] `/proc` 打印用 |
+| `0xc02d97e8` / `0xc02d9870` / `0xc02d9940` / `0xc02d995c` | `PQ_MNG_InitZme` / `PQ_MNG_DeInitZme` | `ldr/str [r4,#0x258]` | [观察] PQ 模块自有结构体字段，非 `s_stDispCapability` |
+| `0xc02d3ca8` | `PQ_MNG_SetCSCPictureParam` | `ldreq r1,[r1,#0x258]` | [观察] 同上 |
+| `0xc030f6b4` | `DispCastSetFrameInfo` | `str r3,[ip,#0x258]` | [观察] 同上 |
+
+→ **[观察]** 只有 `DISP_HAL_InitVDPState` 把 `+0x258` 的 VO 虚基址送进 `pVdpReg`；
+其余是 proc 打印或 PQ 结构体字段，**不能算 MMIO 写入**。
+
+### 2.3 可验证的 MMIO 寄存器写入表（核心交付）
+
+[观察] 统一写入口（`d91d9104…`，radare2 互验）：
+
+```asm
+VDP_RegWrite        0xc02f2b70  str r1,[r0]        ; 592 个调用者
+OPTM_VDP_RegWrite   0xc0325524  str r1,[r0]        ; 131 个调用者
+DRV_HDMI_WriteRegister 0xc02e649c  add r0,r0,#0x5000000 ; str r1,[r0]  ; 2 个调用者
+```
+
+[观察] **表 A：HDMI PHY 初始化写入（唯一有完整静态值的序列）**
+来自 `SI_TX_PHY_INIT`(`0xc02ecb70`)，`SI_TX_PHY_WriteRegister`(`0xc02ec9e0`) 计算出
+`r0 = 4*(reg + 0x3e338600) = 0xf8ce1800 + 4*reg`，`DRV_HDMI_WriteRegister` 再 `+0x05000000`
+得到 VA `0xfdce1800 + 4*reg`（`docs/031 §2.3` 已列，radare2 `pd 10 @ 0xc02ecb84` 复核一致）：
+
+| 序 | 指令 VA | 基址寄存器 | 偏移 | 物理地址 / VA | 写入值 | 来源 |
+|---|---|---|---|---|---|---|
+| 1 | `0xc02ecb8c` | r0（由 `SI_TX_PHY_WriteRegister` 计算） | `+0x000` | `0xf8ce1800` / `0xfdce1800` | 0 | `mov r0,#0; mov r1,r0` |
+| 2 | `0xc02ecb98` | 同上 | `+0x008` | `0xf8ce1808` | 2 | `mov r0,#2; mov r1,r0` |
+| 3 | `0xc02ecba4` | 同上 | `+0x00c` | `0xf8ce180c` | 2 | `mov r1,#2; mov r0,#3` |
+| 4 | `0xc02ecbb0` | 同上 | `+0x010` | `0xf8ce1810` | 9 | `mov r1,#9; mov r0,#4` |
+| 5 | `0xc02ecbbc` | 同上 | `+0x014` | `0xf8ce1814` | 4 | `mov r1,#4; mov r0,#5` |
+| 6 | `0xc02ecbc8` | 同上 | `+0x018` | `0xf8ce1818` | 0 | `mov r1,#0; mov r0,#6` |
+| 7 | `0xc02ecbd4` | 同上 | `+0x004` | `0xf8ce1804` | 1 | `mov r0,#1; mov r1,r0` |
+
+[观察] **表 B：HDMI TX byte 寄存器写入**（发射器 3 组 bank，4 字节 stride）
+`DRV_WriteByte_8BA`(`0xc02e6528`) radare2 互验：
+
+```asm
+0xc02e653c  cmp r1,0x72 ; beq 0xc02e6550
+0xc02e6544  cmp r1,0x7a ; addne r2,r2,0x100   ; 0x7A → 第二 bank（+0x400 字节）
+0xc02e6550  ldr r1,[0xc02e6560] ; =0xc0847098 (&g_VirHDMI_PHY_BASE_ADDR)
+0xc02e6554  ldr r1,[r1]          ; r1 = 0xfdce0000
+0xc02e6558  str r3,[r1,r2,lsl 2] ; 写：VA = 0xfdce0000 + 4*(reg|reg+0x100)
+```
+
+| 指令 VA | 基址寄存器 | 偏移 | 写入值 / 来源寄存器 |
+|---|---|---|---|
+| `0xc02e6558` | r1 = `*g_VirHDMI_PHY_BASE_ADDR` = `0xfdce0000` | `4*r2`（r2=寄存器索引；dev `0x7A` 时 `+0x400`） | r3（调用方参数） |
+| `0xc02e66e4` | 同上（`DRV_WriteWord_8BA`） | `4*r2` | ip（调用方参数） |
+
+[观察] `SI_BlockRead_MDDC`(`0xc02eba34`) 用这组写 `WriteByte_8BA(1,0x72,0xF3,9)`、
+`0xF3=0xF/0xA`、`0xEC`，轮询 `0xF2` bit4 —— **EDID 走发射器自带 MDDC**（§4.1）。
+
+[观察] **表 C：HDMI 复位 / CRG 写入（有编译期静态值）**
+`g_pstRegCrg` = `0xfda22000`（§2.1 步 7）。radare2 逐条互验：
+
+| 指令 VA | 函数 | 基址寄存器 | 偏移 | 物理/VA | 写入值 / 来源 |
+|---|---|---|---|---|---|
+| `0xc02e9478` | `SI_HW_ResetCtrl` | r3 = `*g_pstRegCrg` | `+0x10c` | `0xfda2210c` | r0 ∈ {`0x3f`(boot=0), `0x403f`(chip=2), `0x23f`(其它)}，由 `movw r2,0x403f` / `movw r3,0x23f` 定值 |
+| `0xc02e94b0` | `SI_HW_ResetPhy` | r3 | `+0x110` | `0xfda22110` | r0 ∈ {1, `0x10`}（`moveq r0,1` / `movne r0,0x10`） |
+| `0xc02e6e4c` | `SI_PoweDownHdmiDevice` | r1 | `+0x10c` | `0xfda2210c` | RMW：读值 → `bfc` bit0..5 → `orr #0x300` → `bfc` bit12/14 → 写回（**值随运行时状态变**） |
+| `0xc02e6e60` | `SI_PoweDownHdmiDevice` | r2 | `+0x110` | `0xfda22110` | RMW：`bic r3,#0x11` → `orr r3,#0x10` → 写回 |
+
+[观察] **表 D：CRG 时钟 / 复位写入（RMW，偏移确定、值不是常量）**
+基址寄存器均为 `r3/r2/r0/r1 = *g_pstRegCrg` = `0xfda22000`（`ldr rX,=&g_pstRegCrg; ldr rX,[rX]`）。
+radare2 对 `Chip_Specific_DispSetPll` / `DISP_ResetCRG` / `VDP_SetClkGateEn` 逐条互验：
+
+| 指令 VA（示例） | 函数 | 偏移 | 写入值 / 来源寄存器 |
+|---|---|---|---|
+| `0xc02f1d78` | `Chip_Specific_DispSetPll` | `+0x28` | `ip = ldr[r0,#0x28]; bfi ip,r1,#0,#0x1f; str` → RMW |
+| `0xc02f1d88` | `Chip_Specific_DispSetPll` | `+0x2c` | `r1 = ldr[r3,#0x2c]; bfi r1,r2,#0,#0x1b; str` → RMW |
+| `0xc02f77f8` | `DISP_ResetCRG` | `+0xd8` | `r4`：读 `+0xd8` → `orr #0x7f` → `bfc/bfi` 位域 → `orr #0x4100000` → `orr #0x40000000` → 写回；再 `bfc #0x1e,#1` 后于 `0xc02f780c` **第二次写 `+0xd8`** |
+| `0xc02f1d40` / `0xc02f2304` / `0xc02f1e50` | `Chip_Specific_DispSelectPll` / `DispSetChanClk` / `DISP_CloseClock` | `+0xd8` | RMW（读-改-写） |
+| `0xc02f2db8` | `VDP_SetClkGateEn` | `+0x0`（`pVdpReg`） | `r2 = ldr[r3]; bfi r2,r0,#0x1f,#1; mov r0,r3; mov r1,r2; bl VDP_RegWrite` → RMW bit31 |
+| `0xc02f2bc8` | `VDP_VID_SetLayerEnable` | `+0x800 + layer*0x800` | 地址 = `*pVdpReg + 0x800 + (layer<<9)*4`；值 = `ldr` 读回后 `bfi r2,r1,#0x1f,#1` → `bl VDP_RegWrite` |
+| `0xc02e6e24`… | `SI_PoweDownHdmiDevice` | `+0x10c` / `+0x110` | 见表 C |
+
+[观察] **表 E：其它已定位的 CRG 偏移**（由 §2 的 taint 全量扫描 +
+`radare2` 抽样互验；均为 `*g_pstRegCrg` 基址）：
+
+| 偏移 | 涉及函数（示例） | 类型 |
+|---|---|---|
+| `+0x94` | `TdeHalSetClock` / `tde_osr_isr` | RMW 写 |
+| `+0x10c` / `+0x110` | `SI_HW_ResetCtrl` / `SI_HW_ResetPhy` / `SI_PoweDownHdmiDevice` / `SI_IsHDMIResetting` | 静态值 / RMW |
+| `+0x11c` | `VDP_CloseClkResetModule` / `VDP_VDAC_ResetCRG` | RMW 写 |
+| `+0xd8` | `DISP_ResetCRG` / `Chip_Specific_*` / `VDP_SelectClk` / `VDP_DISP_SetHdmiClk` / `PF_SetChnEnable` 等 | RMW 写（最密集） |
+
+### 2.4 明确排除的假阳性（不把结构体写当 MMIO）
+
+[观察] `docs/034 §3.3` 已排除 DISP 代码区 5183 条 `str rX,[fp,#-imm]` 栈帧局部变量。
+本轮 taint 另排除：
+- `PF_DACIsr` 对 `s_stDispCapability+0x120/0x128/0x130` 的 6 次 `str`、
+  `PF_AcquireIntf2`/`PF_ReleaseIntf2` 对 `+0x48/0x4c` 的写 —— **BSS 结构体字段**，非 MMIO；
+- `PQ_HAL_SRZmeRegCfg` 对 `pVdpReg_alt+0x30`、`hdmi_Resume` 对 `suspend_flag+0x10` —— 同类；
+- `PQ_MNG_*` 的 `[rN,#0x258]`（§2.2）—— PQ 结构体字段；
+- `VDP_DRIVER_Initial` 的 4 条 `str [rX,#0]` —— 写的是**全局指针本身**（`pVdpReg` 变量），不是寄存器。
+
+[观察] 全量统计：taint 命中 1515 条「MMIO 相关」指令，其中 **43 条 `str`** 带被跟踪的
+MMIO 基址标签；再按上表排重后，**真正落在 MMIO 窗口的写**集中在表 A–E。
+[未知] `0xf9000000` 的 40 处命中多数在数据区（`initcall` 表、`kern_table`、`hid_usage_table`），
+本次全文件 `ldr[pc]` 扫描**未检索到**把它当基址加载的代码，不能据命中数推断为 ioremap 基址。
+[存疑] `0xf8ab0000` 的 3 处 `ldr[pc]` 加载（`0xc06fb880` / `0xc0769430` / `0xc07694cc`）
+经 radare2 验证是**真实代码**（叶子函数，`ldr r3,[pc]; ldr r2,[r3,#0x84]; … bx lr`），
+但它们与 `g_pstRegCrg=0xfda22000`、显示 MMIO 映射的关系**未建立**，本文不判为 CRG 基址。
+
+---
+
+## 3. 任务 2：HDMI 初始化函数体与调用链
+
+[观察] 由 §1.3 符号表直接给出入口（不再靠字符串猜），`radare2` 复核关键 `bl`：
+
+```
+HDMI_DRV_ModInit (0xc02e117c)
+ ├─ HDMI_ModeInit (0xc02e1058)   : hdmi_InitFmtArray / hdmi_Init_PixelClkArray / HI_DRV_DEV_Register
+ ├─ HDMI_DRV_Init (0xc02dda78)   : 写 g_VirHDMI_PHY_BASE_ADDR=0xfdce0000 (§2.1 步6)
+ │                                → bl DRV_HDMI_Register (0xc02ddf74) → HI_DRV_MODULE_Register
+ └─ HI_LogOut
+HI_DRV_HDMI_Init (0xc02ddaa8, 0x1C B) : 除 mcount 外仅 bl HDMI_DRV_Init（薄转发壳，无 MMIO）
+HI_DRV_HDMI_Open (0xc02dd670)         : __memzero → hdmi_Open(0xc02dcacc, 0x28 B) → hdmi_ExtIoctl×3
+hdmi_ExtIoctl (0xc02dd214)            : down_interruptible → hdmi_ProcessCmd → up
+hdmi_ProcessCmd (0xc02dcd64, 0x4B0 B): ioctl 分发器；bl 目标含 DRV_HDMI_Init(0xc02e54e4)、
+                                       DRV_HDMI_Open / Start / Stop / Read_EDID / SetFormat …
+HI_DRV_HDMI_ProcHotPlug (0xc02dd9d4) → hdmi_MCE_ProcHotPlug (0xc02dd7c4)
+```
+
+[观察] `DRV_HDMI_Init`(`0xc02e54e4`) 是碰硬件的一段，其 `bl` 序列含
+`SI_WriteBlockHDMITXP0`、`SI_HDMI_Setup_INBoot`、`DispFormatAdjust`、
+`DRV_HDMI_Disp2UnfFmt`、`SI_Adjust_SwingCtrl`，分支 `0xc02e5660` 起连续三条：
+`SI_HW_ResetHDMITX` → `SI_SW_ResetHDMITX` → `SI_TX_PHY_PowerDown`；随后
+`SI_OpenHdmiDevice` / `SI_ReadBlockHDMITXP0` / `DRV_HDMI_SetDefaultAttr` /
+`kthread_create_on_node(Hdmi_KThread_Timer)` / `SI_WriteDefaultConfigToEEPROM` /
+`hdmi_SetAndroidState`。`SI_HW_ResetHDMITX` 内再调 `SI_TX_PHY_INIT`（表 A 的 7 次写入）。
+
+[观察] `hdmi_ProcessCmd` 的 `bl` 目标逐条由符号表解析（见 `TMP/recovery-deep/disasm-hdmi-corrected.log`、
+`disasm-final.log`），是「模块注册 + ioctl 分发」结构，**不是** `docs/023 §4.3` 的
+`HI_UNF_HDMI_Open → HDMI_Display` 单一线性链。[推断] 二者是同一 HiSTB SDK 显示栈在
+hiboot 与 Linux 内核的不同软件层实现，硬件步骤大体对应但调用结构不同。
+
+---
+
+## 4. 任务 3：EDID / 时钟 / 复位
+
+### 4.1 EDID：发射器自带 MDDC，非 GPIO bit-bang I2C
+
+[观察] `SI_EDIDProcessing`(`0xc02ebec0`) → `SI_HPD_Status` → `SI_ReadSinkEDID`(`0xc02e8e28`)
+→ `SI_DDC_ResetTV` → `SI_ReadEDID`(`0xc02e8d0c`)×2 → `SI_ParseEDID` → `SI_AssignOutputState`
+（失败 `SI_AssignDefaltOutputState`）。
+[观察] `SI_ReadEDID` → `DRV_Get_IsUserEdid`（用户 EDID 覆写分支 `DRV_Get_UserEdid`）
+→ `WriteByte_8BA` → `SI_BlockRead_MDDC`(`0xc02eba34`)；后者写
+`WriteByte_8BA(1,0x72,0xF3,9)`、`SI_BlockWriteHDMITXP0(0xED,7,buf)`，
+轮询 `ReadByte_8BA(1,0x72,0xF2)` bit4，再 `SI_BlockReadMDDCFifo`、
+`ConvertMDDCStateIntoErrCode`，收尾写 `0xF3=0xF/0xA`、`0xEC`。
+[观察] 字符串交叉引用：`hi_gpio` 的字面量加载只在 `GPIO_DRV_ModInit+0x38`
+（通用 GPIO 驱动）；`MDDCState:I2C_LOW` 只在 `ConvertMDDCStateIntoErrCode+0x30`；
+`/dev/hi_i2c` 字符串 1 处命中，但在全文件 `ldr[pc]` 扫描范围内**未检索到显示路径对它的引用**。
+→ [观察] 在本次扫描范围内，EDID 路径是**发射器内部 MDDC 经 MMIO byte 寄存器**（表 B），
+不是 GPIO bit-bang I2C。对应 `docs/032 §7` 第 5 条 **answered**。
+
+### 4.2 时钟 / 复位：CRG 寄存器位操作，`clk_set_rate` 0 直接调用点
+
+[观察] `clk_set_rate`(`0xc0018190`) 在全文件 raw ARM `bl` 解码（`0xEB……` 逐 word 算目标）
+范围内 **0 个直接调用点**；`clk_get_rate` 的 4 个调用者全在 pl011 / sp804 / timer 通用路径；
+`clk_enable` / `clk_disable` 调用者亦为 pl011 / amba / hinfc / pm_clk 等通用路径。
+字符串 `clk_set_rate` 在镜像内 2 处命中（符号/日志文本），非显示调用。
+[观察] 显示时钟由 `Chip_Specific_DISP_OpenClock`(`0xc02f1e5c`) → 读 `g_pstRegCrg+0xd8`
+（`and r3,#0x40000003; cmp r3,3`）→ 条件调用 `DISP_ResetCRG`(`0xc02f77a4`)；
+`Chip_Specific_DispSetPll`(`0xc02f1d54`) 写 CRG `+0x28`/`+0x2c`（表 D）；
+另有 `VDP_DISP_SetHdmiClk` / `VDP_SelectClk` / `VDP_VDAC_SetClk` /
+`VDP_CloseClkResetModule` / `MakePixClkParaInteger` / `hdmi_Init_PixelClkArray` /
+`SI_SetMCLK` / `SI_SetIClk` / `DRV_Calculate_TMDSCLK` 等 vendor helper。
+[观察] CRG 全局 `g_pstRegCrg` 静态值 `0xfda22000`（§2.1 步 7），
+`+0xd8` 是最密集的时钟/复位寄存器，`+0x10c`/`+0x110` 是 HDMI 复位（表 C）。
+→ [推断] 对主线而言，`clk_ignore_unused` 只是「别关掉」，**不足以**替代
+CRG 的 `clocks`/`resets` DT 描述与主动 `clk_get/enable`（`docs/023 §5.3`、`docs/025 §1.3` 同向）。
+[未知] 具体 clk 名与 CRG 各位含义未从本镜像解析（需 SDK `mach-hi3798mx/clock.c` / CRG 头或 DT 对照）。
+
+---
+
+## 5. 任务 4：`docs/032 §7` 七条回销 + SDK / `docs/029` 对照
+
+### 5.1 七条清单逐条销账
+
+| # | 问题 | 状态 | 结论（本文证据） |
+|---|---|---|---|
+| 1 | `HDMI_DRV_ModInit` 等真实调用链与寄存器顺序，对 SDK 序列 | **answered** | §3 调用链由 kallsyms 直接定位；§2.3 表 A 给出 7 次 PHY 写入「基址+偏移+值+顺序」；SDK 线性序列与内核非 1:1（§3） |
+| 2 | `HI_DRV_DISP_Init`/`DISP_HAL_Init` 如何配 VO 图层、G0 还是 GP0 | **partially** | §2.1 基址闭环、`+0x258` 读取点实证；但 `G0_ADDR+0x494` 等偏移与 G0/GP0 归属未定死（§0 [未知]） |
+| 3 | hifb 注册 fb0 的显存来源 / 格式 / stride / 分辨率 | **partially** | `HIFB_DRV_ModInit`→`register_framebuffer`、`DISP_OS_MMZ_Alloc`→`HI_DRV_MMZ_Alloc`、`hifb_buf_allocmem` 实证；格式/stride/分辨率未由本镜像定死（社区内核数值属另一对象，不互引） |
+| 4 | 显示相关 clk 名、`clk_set_rate` 调用点、CRG 寄存器 | **partially** | §4.2：`clk_set_rate` 0 直接调用点；CRG 基址与 `+0xd8/+0x28/+0x2c/+0x10c/+0x110` 写入实证；clk 名/位含义 [未知] |
+| 5 | `SI_ReadEDID` 走 DDC 还是 GPIO bit-bang I2C | **answered** | §4.1：发射器自带 MDDC，非 GPIO I2C |
+| 6 | 是否有可继承的 Bootloader framebuffer | **unresolved** | 需真机验证；`docs/031 §7` 指出 U 盘刷机路径不做显示初始化 |
+| 7 | `0xf8ce0000`/`0xf8cc0000`/`0xf9000000` 用途与 `docs/029` 对齐 | **partially** | 前两者用途实证（§2.1）；`0xf9000000` [未知]、`0x8ce0000` 关系 [存疑]/[推断]（§5.3） |
+
+### 5.2 与 `docs/023 §4.2 / §4.3` SDK 序列对照
+
+| SDK 项 | 本镜像实证 | 判定 |
+|---|---|---|
+| `CONFIG_VDP_REG_BASEADDR=0xf8cc0000` | `DISP_Init` 传参 + `DISP_HAL_Init` 加 `0x5000000` → `pVdpReg`（§2.1） | **[观察] 固件实证**，不再是 SDK 推测 |
+| `G0_ADDR +0x494` / `G0_STRIDE +0x49c` / `G0_IRESO +0x4a0` | 未检索到把这三者当常量加载的代码；本镜像 `VDP_VID_SetLayerEnable` 用 `+0x800 + layer*0x800`（VID 层块），`OPTM_GfxSetLayerAddr` 引用 `g_stGfxGPDevice` | **[未知]** 仍只有 SDK 推导，本文未验证；两组不是同一寄存器块，不得互推 |
+| `HI_UNF_HDMI_Init()` 空壳 | 内核 `HI_DRV_HDMI_Init` 0x1C B 转发壳（§3） | [观察] 方向一致，但为内核同名函数、非 hiboot 实现 |
+| `HDMI_Display()` → EDID → AVI InfoFrame → `TX_PHY_*` → `TX_SetHDMIMode` | 内核无 `HDMI_Display` 符号；等价步骤分散在 `DRV_HDMI_Init`/`SI_Start_HDMITX`/`SI_EDIDProcessing`（§3、§4.1），`SI_TX_PHY_INIT` 实证 7 次写 | [推断] 同一 SDK 栈不同层，**非 1:1 线性序列** |
+| `HI_DRV_HDMI_Init` 内建 `HDMI_Display` | 0x1C B 仅一次 `bl HDMI_DRV_Init` | [观察] 不符（该说法属 hiboot） |
+
+### 5.3 与 `docs/029` 的张力：**标 [存疑]，不推翻**
+
+[观察] 本 3.10 内核：`0xf8cc0000` 被 `DISP_Init` 用作 VO 物理基址（2 处字面量加载），
+`0xf8ce0000` 在 `/proc/msp/hdmi0` help 函数（`0xc02e21a0`）被加载 1 次；
+代码里硬编码的**虚拟**基址为 `0xfdcc0000`（VO）、`0xfdce0000`（HDMI TX）、
+`0xf8ce1800+4*reg`（PHY，经 `+0x05000000` → `0xfdce1800`）；
+`0x08ce0000` 在 `d91d9104…` 全文件字节范围内 **0 命中**（按规范只写「未检索到」）。
+[推断] `0xf8ce0000 − 0x08ce0000 = 0xF0000000`，更可能是
+「DT 相对地址 + 父总线 `ranges` 基址 = CPU 物理地址」的两种表示，
+或 SDK 多 chip 条件编译常量，而非「mv100 用错地址」。
+[存疑] 本文**不据此推翻 `docs/029`**：`docs/027 §6` 曾因同类
+「0 命中 ⇒ 不存在」的推断被撤销；`SI_*`/`SiI_*` 前缀（符号表中 `SI_` 157 个、
+`sii9134` 字面量 0 命中）恰恰补强 `docs/029` 的 SiI9134 bridge 结论。
+[未知] 需读 `910-01` 的 `ranges` / `500-01` binding 原文确认映射关系；本文不下结论。
+
+---
+
+## 6. 证据边界、复现与合规
+
+**边界（逐条声明）**
+
+- 本文「写入表」是**静态反汇编 + 数据流 taint** 的结果，标注了对象 SHA-256、指令 VA、
+  基址寄存器、偏移、写入值 / 来源寄存器、工具版本；**未观察到运行时执行**，
+  「顺序」仅指函数体内指令 / `bl` 出现顺序。
+- **[观察]** 表 A（7 次 PHY 写）与表 C 部分行（HDMI 复位）有**编译期静态值**；
+  **[观察]** 表 B/D/E 多数是**读-改-写（RMW）**，最终值依赖运行时寄存器原值与参数，
+  **本文不编造定值**，只给出可验证的位操作与来源寄存器。
+- 「0 命中」一律指「在指定对象 / 指定扫描方式 / 指定范围内未检索到」：
+  `HDMI_Display` 符号、`clk_set_rate` 直接 `bl`、`0x08ce0000`、`/dev/hi_i2c` 显示路径引用、
+  `0xf9000000` 的 `ldr[pc]` 基址加载，均按此表述，不推出「不存在」。
+- 未定死项标 `[未知]` / `unresolved`：G0/GP0 精确偏移、fb 格式/stride/分辨率、
+  clk 名与 CRG 位含义、`0xf9000000` 用途、`0xf8ab0000` 三处叶子函数归属、
+  bootloader framebuffer 可继承性。
+- 跨对象不互引：社区 Ubuntu 的 fb 几何（`docs/023 §5.1`）、整机备份 `p05_baseparam`
+  （`docs/027 §4.7`，另一对象）仅作背景；本文常量与写入全部来自 `d91d9104…`。
+
+**复现产物（仓库内相对路径，均 gitignored）**
+
+| 文件 | 用途 |
+|---|---|
+| `TMP/recovery-deep/kallsyms3.py` / `kallsyms-symbols.json` / `kallsyms3.log` | 压缩 kallsyms 重建（δ=−2，双 oracle 80/80），35,937 符号 |
+| `TMP/recovery-deep/track035.py` / `track035-stage1.log` / `track035-stage1.json` | 全局字面量加载与 `[rN,#0x258]` 全量扫描 |
+| `TMP/recovery-deep/track035b.py` / `track035-stage2.log` / `track035-stage2.json` | taint：全局 → 虚基址 → 偏移 → `str` / writer-call，1515 条 |
+| `TMP/recovery-deep/track035c.py` / `track035-stage3.log` | 指针引用点解析、函数地址、`clk`/DDC 字符串 xref |
+| `TMP/recovery-deep/disasm*.log` / `queries.log` / `mmio-xrefs.log` | 上一轮反汇编与交叉引用日志（本轮复用复核） |
+
+**合规**：只读静态分析；不刷机、不改真机、不联网、不构建镜像、**不删除文件**、
+不用 `rm` / `git clean`、不访问项目外目录；临时产物全在 `TMP/recovery-deep/`；
+文档不含本机绝对路径 / 用户名 / 卷名，厂商构建机标识省略；
+**只新建 `docs/035-recovery-hdmi-register-sequence.md` 一个文件**，未改动任何已跟踪文件，
 未执行 `git add` / commit / push / checkout / 建分支 / 动索引，由主会话统一提交。
