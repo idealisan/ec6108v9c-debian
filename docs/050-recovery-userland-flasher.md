@@ -691,3 +691,46 @@ p8(www_ecoo_top, 含 backup-32.gz) 后，社区首启恢复流程（§10.9 后�
 开始/完成进度图。**这是健康信号**：证明刷进去的社区系统被正常引导、按设计自我
 恢复。预期：第二张图出现 → 进 Ubuntu → 路由器看到 IP → 能 SSH = 全量刷机闭环。
 仍以真机最终状态为准，不从单张图片断言成功。
+
+---
+
+## 10.11 显示层改为终端式滚动日志（用户要求；刷机引擎不动）
+
+**用户要求（[观察]）**：显示层应"左对齐、数字在每行最左边、紧跟着同行文本换行，
+像普通日志一样累计换行输出，而不是每到一个新阶段就把前面阶段隐藏掉，相当于
+自己做一个终端"；文字再缩小到约现在的 1/2。用户同时确认：路由器后台能看到社区
+系统 IP = 全量刷机成功；刷机程序本身已足够好；下一步转向 6.x 主线内核刷机包
+（上 GitHub Actions，本机不交叉编译）。并纠正方向：**main 分支本来就是给 6.x
+做 CI 的，不必研究 CI 改动；真正要研究的是"启动过程怎么把画面显示出来"**。
+
+**改动（本次，纯显示层，`recovery-flasher/flasher.c`）**：
+- 删掉居中的 `render_big_number`/`render_msg`/`show_status`(清屏重画)/
+  `FONT_DIV`；新增终端式：累积行表 `g_code[TERM_MAX]/g_msg[TERM_MAX]` +
+  `g_nline`，`term_render()` 每次重绘**全部**历史行。
+- `show_status(code,msg)` 改为"追加一行并整体重绘"：每行 `<数字> <文本>` 左对齐
+  （`TERM_X0=4`），数字在行首、文本紧跟同一行、然后换行。新阶段只 append，
+  **前面所有行永不被清掉**。
+- 统一小字号 `TERM_SC=2`（约为原文字一半；设 1 再减半）；`TERM_MAX=64` 行、
+  `TERM_STR=44` 字/行。`hold()` 保留全部日志常显、不重启。
+- `state()`/`do_flash()`/`_start()` 的调用点**完全没动**，刷机引擎（mount /
+  manifest 解析 / sparse / 裸写 eMMC / 日志）一行未改。
+
+**校验（[观察]，本地轻量）**：clang 编译 ELF32 ARM 静态 15036 B、`svc #0` 在、
+NEON/VFP=0、soft-float；内核逐字节未改；`build.sh --install` 装盘，U 盘
+`recovery.img` 与产物哈希一致 `a5c68842…`。布局仿真：1280×720、`TERM_SC=2`
+行高 16px、每屏 45 行；全流程约 21 行（5 state + 15 刷机进度 + 1 最终）全部
+可见不溢出；最长行 `70 NODE HERE MOUNT FAIL` 占宽 276px < 1280px。
+`build.sh` 的 U 盘 README 模板同步改为终端式说明。
+
+**待用户真机验证**：短接上电看屏幕是不是一行行累积的 `<数字> <文本>` 日志、
+前面阶段不再消失。这是纯显示改动，不影响刷机正确性（引擎已全量验证）。
+真机观感（字是否够小/够清晰、行数是否够）为准，可微调 `TERM_SC`。
+
+**方向纠偏记录**：后台只读调研（Task #29）证实 `.github/workflows/build-release.yml`
+在 main 上已用 4 jobs（build-kernel ∥ build-rootfs → package → release）产出
+「6.3.0-rc5 主线内核 + Debian bookworm rootfs」U 盘刷机包
+`mv100-mdmo1g-debian-usb-flash-$STAMP.zip`，最新 release `build-20261108T084704Z`
+已含现成产物，编译全在 CI、本机零编译。**故 6.x 刷机包无需改 CI、无需本机
+交叉编译，直接取现成 release 即可**。后续真正的技术重点是用户指出的：
+**主线内核启动阶段 HDMI 显示**（mainline 缺 HiSilicon 私有显示栈 hifb/VO/VDP/
+HDMI TX/MMZ，见 docs/048 与 SDK 绘图链、reserve_mem 地址推导）。

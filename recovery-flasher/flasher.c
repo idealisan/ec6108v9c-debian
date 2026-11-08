@@ -10,13 +10,15 @@
  *   `service recovery /sbin/recovery` + `class_start default`, so Android init
  *   execs it automatically -- NO menu, NO key, NO interaction.
  *
- * SCREEN OUTPUT = BIG STATE NUMBER + ENGLISH ONE-LINER (5x7 ASCII font,
- *   embedded -- NO external library, freestanding). Numbers are precise to
- *   report; the English line spells out the error directly. Both use the same
- *   classic 5x7 dot-matrix glyphs (digits + A-Z + " -.:/%!?").
- *   The LAST status stays on screen forever (no reboot).
+ * SCREEN OUTPUT = a TERMINAL-STYLE SCROLLING LOG (5x7 ASCII font, embedded --
+ *   NO external library, freestanding). Each status is ONE left-aligned line
+ *   "<number> <TEXT>": number at the far left, text right after it on the SAME
+ *   line, then a newline. Lines ACCUMULATE downward like a tty -- a new stage
+ *   appends a line and never hides the earlier ones. Small uniform dot scale
+ *   TERM_SC (halve it by setting TERM_SC 1). Digits + A-Z + " -.:/%!?" glyphs.
+ *   The FULL log stays on screen forever (no reboot).
  *
- *   STATE CODES (held on the final one):
+ *   STATE CODES (one per line, the final one appended last):
  *     1  BOOT OK                   2  MOUNT USB...
  *     3  USB MOUNT OK             4  MANIFEST OK
  *     5  FLASHING                 6  DONE NO REBOOT
@@ -309,64 +311,65 @@ static void render_row(const unsigned char *idx, int n, u32 x0, u32 y0,
     }
 }
 
-/* Show a big centred decimal number (upper area). */
-static void render_big_number(u32 n, u32 y0, u32 sc) {
-    unsigned char d[8]; int nd = 0;
-    if (n == 0) { d[nd++] = 0; }
-    else {
-        unsigned char tmp[8]; int k = 0; u32 t = n;
-        while (t && k < 8) { tmp[k++] = (unsigned char)(t % 10); t /= 10; }
-        while (k) d[nd++] = tmp[--k];
-    }
-    u32 adv = (DW + 1) * sc;
-    u32 pic_w = (u32)nd * adv;
-    u32 x0 = (g_cols > pic_w) ? (g_cols - pic_w) / 2 : 0;
-    render_row(d, nd, x0, y0, sc, C_FG);
-}
+/* ---- terminal-style log display -------------------------------------------
+   Console-like view (user request): one line per status, "<number> <TEXT>" left
+   aligned, the number at the far left of each line followed by its text on the
+   SAME line (no wrap), lines accumulating downward. A new stage APPENDS a line
+   and keeps every earlier line visible -- nothing is hidden, like a real tty.
+   Both double-buffer frames are redrawn from the accumulated line list each
+   time. Glyphs use one small uniform scale TERM_SC (set to 1 to halve again),
+   far smaller than the old centred big number; NO external font library. */
+#define TERM_SC   2                  /* dot scale; 1 = half this size */
+#define TERM_X0   4                  /* left margin, pixels */
+#define TERM_MAX  64                 /* max accumulated lines */
+#define TERM_STR  44                 /* max glyphs per line */
 
-/* Font scale divisor: user asked to shrink the glyphs to ~1/4 of the previous
-   size. FONT_DIV=4 divides the auto-computed dot-scale in both number & text.
-   A floor keeps glyphs legible on small framebuffers. */
-#define FONT_DIV 4
+static u32         g_code[TERM_MAX];
+static const char *g_msg[TERM_MAX];
+static int         g_nline = 0;
 
-/* Show a short UPPERCASE message (lower area), auto-scaled to fit width. */
-static void render_msg(const char *msg, u32 y0) {
-    int len = slen(msg);
-    if (len <= 0) return;
-    unsigned char idx[64];
-    if (len > 64) len = 64;
-    for (int i = 0; i < len; i++) idx[i] = (unsigned char)glyph_index(msg[i]);
-    u32 adv_dots = DW + 1;
-    u32 by_w = (g_cols - 20) / ((u32)len * adv_dots + 1);
-    u32 by_h = (g_rows - y0 - 4) / (DH + 1);
-    u32 sc = (by_w < by_h ? by_w : by_h) / FONT_DIV;
-    if (sc < 2) sc = 2;                      /* legibility floor */
-    u32 pic_w = (u32)len * adv_dots * sc;
-    u32 x0 = (g_cols > pic_w) ? (g_cols - pic_w) / 2 : 0;
-    (void)adv_dots;
-    render_row(idx, len, x0, y0, sc, C_FG);
-}
-
-/* Full status screen: state number (top) + English one-liner (below), centred.
-   All glyphs are 1/4 the previous size (FONT_DIV). */
-static void show_status(u32 code, const char *msg) {
+/* Redraw the WHOLE accumulated log (keeps all previous lines on screen). */
+static void term_render(void) {
     solid(C_BG);
-    if (!g_fb) return;                        /* write fallback: solid only */
-    u32 num_sc = g_rows / (16 * FONT_DIV);   /* ~1/4 of before */
-    if (num_sc < 2) num_sc = 2;
-    /* centre the two rows around the middle of the screen */
-    u32 num_y = g_rows / 2 - (DH * num_sc) - 8;
-    render_big_number(code, num_y, num_sc);
-    render_msg(msg, g_rows / 2 + 8);
+    if (!g_fb) return;                       /* write fallback: background only */
+    u32 line_h = (DH + 1) * TERM_SC;
+    for (int ln = 0; ln < g_nline; ln++) {
+        u32 y0 = (u32)ln * line_h;
+        if (y0 + DH * TERM_SC > g_rows) break;            /* screen full */
+        unsigned char idx[TERM_STR]; int n = 0;
+        char d[12]; int nd = 0; u32 v = g_code[ln];
+        if (v == 0) d[nd++] = '0';
+        else {
+            char t[12]; int k = 0;
+            while (v && k < 12) { t[k++] = (char)('0' + v % 10); v /= 10; }
+            while (k) d[nd++] = t[--k];
+        }
+        for (int i = 0; i < nd && n < TERM_STR; i++) idx[n++] = (unsigned char)glyph_index(d[i]);
+        if (n < TERM_STR) idx[n++] = (unsigned char)glyph_index(' ');
+        const char *m = g_msg[ln];
+        for (int i = 0; m && m[i] && n < TERM_STR; i++) idx[n++] = (unsigned char)glyph_index(m[i]);
+        render_row(idx, n, TERM_X0, y0, TERM_SC, C_FG);
+    }
 }
 
-/* Hold a state (number + message) on screen for a visible moment. */
-static void state(u32 code, const char *msg) {
-    show_status(code, msg); delay(); delay();
+/* Append a status line; all earlier lines remain visible. */
+static void show_status(u32 code, const char *msg) {
+    if (g_nline < TERM_MAX) {
+        g_code[g_nline] = code;
+        g_msg[g_nline]  = msg;
+        g_nline++;
+    }
+    term_render();
 }
-/* Final state: keep showing the same status forever (no reboot). */
+
+/* A stage line, held briefly so accumulation is easy to follow. */
+static void state(u32 code, const char *msg) {
+    show_status(code, msg); delay();
+}
+/* Final state: keep the FULL log on screen forever (no reboot). */
 static void hold(u32 code, const char *msg) {
-    for (;;) { show_status(code, msg); delay(); delay(); delay(); }
+    show_status(code, msg);
+    for (;;) { term_render(); delay(); delay(); delay(); }
 }
 
 /* ---- U-disk log (best-effort) ---- */

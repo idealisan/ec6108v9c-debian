@@ -114,19 +114,21 @@ fi
 [ -f "$COMMUNITY_FB" ] && cp "$COMMUNITY_FB" "$OUT/fastboot.bin"
 
 cat > "$OUT/README.txt" <<'TXT'
-EC6108V9C -- modified-stock-recovery AUTO FLASHER  (number + English status)
+EC6108V9C -- modified-stock-recovery AUTO FLASHER  (terminal-style log)
 ===========================================================================
 Boots the STOCK Android recovery kernel (HDMI/hifb drivers included) but with
 /sbin/recovery replaced by our own program. Starts automatically on power-on --
 NO menu, NO key press, NO serial (the box has none).
 
-SCREEN OUTPUT = a BIG STATE NUMBER + a short ENGLISH line under it.
-  Both use a 5x7 dot-matrix font embedded in the program (digits + A-Z),
-  NO external library, freestanding. Numbers are precise to report; the
-  English line spells out the error. The final status stays forever (no reboot),
-  so a single flash pinpoints where it stopped.
+SCREEN OUTPUT = a TERMINAL-STYLE SCROLLING LOG, like a tty. Each status is ONE
+  left-aligned line "<number> <TEXT>": the number at the far left, text right
+  after it on the SAME line, then a newline. Lines ACCUMULATE downward -- a new
+  stage appends a line and NEVER hides the earlier ones, so the whole boot/flash
+  history stays visible like a console. Small uniform 5x7 dot-matrix font
+  (digits + A-Z + " -.:/%!?"), NO external library, freestanding. The full log
+  stays on screen forever (no reboot).
 
-  STATE CODES (number + English shown on screen):
+  STATE CODES (one per line, final one appended last):
     1  BOOT OK                   2  MOUNT USB...
     3  USB MOUNT OK             4  MANIFEST OK
     5  FLASHING                 6  DONE NO REBOOT
@@ -134,8 +136,8 @@ SCREEN OUTPUT = a BIG STATE NUMBER + a short ENGLISH line under it.
     8  NO MANIFEST  -> mount OK, no flash.manifest (display-only, safe)
     9  NO EMMC NODE
     70 NODE HERE MOUNT FAIL -> a node appeared but every mount combo failed
-  During flashing the screen shows a growing PERCENT 0..100 + "FLASHING";
-  a rising number means it is actively writing. Completion returns to 6.
+  During flashing each manifest item appends a PERCENT 0..100 + "FLASHING" line;
+  a rising number means it is actively writing. Completion appends 6.
 
 U-disk ROOT must contain:
   fastboot.bin   community carrier loaded by BootROM on a shorted power-on
@@ -143,17 +145,16 @@ U-disk ROOT must contain:
   recovery.img   the patched Android boot.img that bootm boots
   (optional) flash.manifest  -> then it really flashes, else display-only.
 
-ALREADY VERIFIED on real hardware:
-  - shorted boot -> stock 3.10 kernel lights HDMI (original recovery UI shown);
-  - patched recovery.img -> our custom userland ran (colour bar, then digit 7).
-  Digit 7 last round = U-disk mount failed. This build fixes the mount to
-  mirror the STOCK fs_mgr (reverse-engineered): sleep(5) first, then poll the
-  device node ~12x with sleep(1), try vfat/ext4/ntfs + several node names +
-  flags 0xc04. Adds a 5x7 ASCII font so the screen also prints an ENGLISH
-  error line, and a split code 70 (node seen but mount failed).
+ALREADY VERIFIED on real hardware (see docs/050):
+  - shorted boot -> stock 3.10 kernel lights HDMI; custom userland runs;
+  - U-disk mount (fs_mgr-mirrored), digit status, U-disk flasher.log all work;
+  - p5 logo write shown on screen (Debian Linux boot picture appeared);
+  - FULL community Ubuntu flash (7 partitions + 2 Android sparse) succeeded:
+    flashed items = 7, system boots with an IP on the LAN.
 
 WHAT THIS BUILD DOES:
-  - shows state NUMBER + English one-liner; HOLDS the final status on screen;
+  - terminal-style scrolling status log: left-aligned "<number> <TEXT>" lines
+    accumulate downward, never hidden; full history stays on screen (no reboot);
   - U-disk mount mirrors stock fs_mgr: wait for enumeration, many candidates;
   - best-effort writes /usb/flasher.log (fsync+sync) -- if the U-disk mounts;
   - IF /usb/flash.manifest exists: flashes each item to raw /dev/block/mmcblk0
