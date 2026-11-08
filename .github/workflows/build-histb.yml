@@ -129,6 +129,12 @@ jobs:
           path: dist/
 
       - name: Build community-format U-disk flash package
+        env:
+          # 7.4 multi_v7_defconfig emits ~133 MiB of =m modules for other SoCs;
+          # all board-critical drivers are =y built-in. Keeping them out of the
+          # 384 MiB rootfs image avoids the mke2fs overflow. Modules are still
+          # published as a standalone release asset.
+          SKIP_ROOTFS_MODULES: '1'
         run: |
           echo "STAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
           bash scripts/make-community-flash-package.sh

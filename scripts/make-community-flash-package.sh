@@ -104,7 +104,14 @@ fi
 
 echo "== rootfs ext4 -> Android sparse =="
 $SUDO tar -xzf "$ROOTFS_TAR" -C "$WORK/root" --numeric-owner
-if [ -f "$MODULES_TAR" ]; then
+# The HISTB (7.4) kernel builds multi_v7_defconfig + 177 patches, which emits
+# ~133 MiB of =m modules for OTHER SoCs (sun4i, atmel, lima, ...). Every driver
+# this board actually needs is =y built-in (HISI_FEMAC, DRM_SII9134,
+# FRAMEBUFFER_CONSOLE, EXT4, PSTORE_RAM), so those modules are pure ballast and
+# overflow the 384 MiB rootfs image. SKIP_ROOTFS_MODULES=1 (plan B only; main
+# keeps the default 0) leaves them out of the ext4 while modules.tar.gz is still
+# shipped as a separate release asset for anyone who wants to inspect/insmod.
+if [ "${SKIP_ROOTFS_MODULES:-0}" != "1" ] && [ -f "$MODULES_TAR" ]; then
   $SUDO tar -xzf "$MODULES_TAR" -C "$WORK/root"
 fi
 truncate -s "$((IMG_SIZE_MB * 1024 * 1024))" "$WORK/debian.ext4"
