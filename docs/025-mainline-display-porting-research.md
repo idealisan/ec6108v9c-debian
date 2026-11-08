@@ -438,11 +438,17 @@ hack-7.4/         本地 only（bring-up 调试工具，990-SS，不提交）
 
 几个容易踩的坑：
 
-1. **mv100 用的是外挂 sii9134 transmitter，不是 on-chip HDMI**。`600-17` 新增的
-   `histb-hdmi.c` 是 mv200 的片内发送器；我们板子对应的是
-   `drivers/gpu/drm/bridge/hi3798mv100-hdmi.c`，而 `600-18` 只是在**该文件之上**
-   打补丁（改 `VIDEO_PATH_CTRL` 与按 die revision 写 PHY 0x09）。这个文件的
-   创建补丁不在本地已存的 4 个补丁里，得先从 series 补齐。
+1. ~~**mv100 用的是外挂 sii9134 transmitter，不是 on-chip HDMI**~~
+   **⚠️ 此条已被 `docs/027` §6 推翻，保留仅为记录当时的误判**：原厂整机备份的
+   hiboot + 内核 + 系统二进制一致指向**片内 HDMI TX（`0xf8ce0000`）**，
+   全库 `sii9134` 字面量 0 命中，hiboot 里有 `HDMI_Display` / `TX_PHY_*` /
+   `Logo_Main`。因此「mv100 用外挂 sii9134、不是片内 HDMI」这条具体结论**不成立**，
+   不能再作为选补丁的依据（本文 §3.4 与 §8 自身也自相矛盾）。
+   但「硬件最终由哪一路发送器驱动、histb 补丁如何对应」**仍需厘清**：
+   `500-02`（sii9134 bridge）与 `hi3798mv100-hdmi.c` 的创建补丁都不在本地已存的
+   4 个补丁里，需从 `histb-mainline/patches/series` 补齐、确认各自 `compatible`
+   与目标板后，才能决定 plan B 取片上链路（`600-17`/`600-18`）还是 bridge 链路
+   （`500-02`）。选错会导致「能编译但黑屏」。详见 `docs/027` §6。
 2. **补丁不是独立可挑的几个**。`pending-7.4` 共 154 个，显示链路横跨
    `600-xx`（DRM）与 `910-xx`（DTS），且互相依赖；只挑 600-17/18/910-02/03
    会缺 plane 驱动、clock/reset binding、media CMA 等前置件。

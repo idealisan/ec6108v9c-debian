@@ -276,3 +276,104 @@ hiboot 留下的显存地址后，**立刻把顶部 240 行刷成纯绿**，再�
 的可见信号，刷一次就能把 A / B / C 分开。
 
 网络 / DHCP 侧的独立审计见 `docs/026-network-dhcp-audit.md`。
+
+### 6.3 B 分支根因：离线能排除什么、不能排除什么
+
+刷 `build-20261107T153551Z` 后如果落在 B（绿带出现、但 fbcon 无文字），
+我们离线核对 6.3-rc5 内核源码后**证伪了三个直觉假设**：
+
+| 假设 | 证伪依据 |
+| --- | --- |
+| "FB / fbcon / VT 没编译" | fragment 里 `CONFIG_FB` / `FB_SIMPLE` / `FRAMEBUFFER_CONSOLE` / `VT` / `VT_CONSOLE` 全部 `=y` |
+| "simplefb 只认 DT 节点，运行时注册的设备不 probe" | `simplefb.c` 第 428 行 `dev_get_platdata()` 分支仍在，`simplefb_parse_pd()` 正常处理我们传的 pdata |
+| "传的 `a8r8g8b8` 格式串不合法" | `include/linux/platform_data/simplefb.h` 的 `SIMPLEFB_FORMATS` 含 `a8r8g8b8` |
+
+**剩下两个真实疑点（离线无法确证，需真机判据）：**
+
+1. `fbcon` 绑定层。ARM 的 `arch/arm/include/asm/fb.h` 把
+   `fb_is_primary_device()` 硬编码为返回 0；而 config 开了
+   `CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y`，于是 `do_fb_registered()`
+   里的 `fbcon_select_primary()` 永远不把我们的 simplefb 标为 primary。
+   默认 `con2fb_map_boot[]` 是全 0、`info_idx=-1`、`deferred_takeover` 未开，
+   理论上仍会走 `do_fbcon_takeover(1)` 接管 fb0——但这一层有任何偏差就会
+   表现为"有 fb0 却无文字"。
+2. **显存映射属性冲突（更可疑）**。`simplefb_probe()` 用 `request_mem_region`
+   + `ioremap_wc()`，而 hiboot 留下的显存是 DDR 中的一段普通物理内存，
+   我们**没有用 `reserved-memory` / `no-map` 把它从内核内存里排除**
+   （`FB_BASE` 为空时 `apply-dts-placeholders.py` 只注入 ramoops）。
+   同一物理页同时存在内核的 cacheable 线性映射和 fbdev 的 WC 映射，
+   在 ARM 上可能导致写入不刷新到扫描输出。绿带用的是 `memremap(WB)`，
+   与线性映射一致，所以它能显示而 fbcon 的文字未必——这正好解释 B。
+
+### 6.4 本轮落地：B 分支候选修复（零代码风险，需判据确认）
+
+`configs/partition-layout.env` 的 `KERNEL_CMDLINE_NO_MEM` 增加 `fbcon=map:0`：
+
+- `fbcon.c` 第 492 行有 `__setup("fbcon=", fb_console_setup)`，`map:` 分支
+  把 `con2fb_map_boot[]` 全部钉到 fb0 并调用 `fbcon_map_override()` 设
+  `map_override=1`，使 `fbcon_select_primary()` 的 `!map_override` 条件为假，
+  **整段跳过** ARM 上恒失效的 primary 检测（疑点 1）。
+- 因为 `partition-layout.env` 是 DTB `/chosen/bootargs` 与 p2 运行时 env 的
+  **单一来源**，两处自动同步，不会漂移。
+- 纯 cmdline：不改 kernel config（`olddefconfig` 可能悄悄还原）、不改驱动、
+  不重新编译显示栈。零风险，落在 A 或 C 也无害。
+
+**必须诚实标注：这是候选修复，不是确证修复。** 它排除的是疑点 1；
+如果疑点 2（显存 no-map）才是根因，这一版不会让文字出现。
+
+**若本版仍无文字的下一步（有明确路径，不用再猜）：**
+
+1. 用 pstore/ramoops 读出驱动打印的 `VO layer0: addr=0x...`，
+   拿到 hiboot 显存的真实物理地址。
+2. 把该地址作为 CI 的 `fb_base` 输入（workflow 已有该 input）重新发版：
+   `apply-dts-placeholders.py` 会注入带 `no-map` 的 `fb_mem` 保留区和静态
+   `simple-framebuffer` 节点，从根上消除映射属性冲突。
+3. 再不行才启动 `mainline-porting` 分支的 plan B（见 `MAINLINE-PORTING.md`）。
+
+### 6.5 回归：153551Z 全黑，已回退到 134943Z 刷机链
+
+刷 `build-20261107T153551Z` 后，用户报告**连 hiboot 开机画面都不显示了**——
+比之前「只看到 Debian Linux logo、无内核输出」更糟。这是明确的功能倒退，
+且发生在 **hiboot 阶段、内核启动之前**，所以：
+
+- 它**不是**「内核起来后没有显示驱动」的问题，postmarketOS 式重写驱动
+  修不了这个症状；
+- 唯一影响 hiboot 开机 logo 的改动，就是该版把 `bootcmd` 从 `;` 串联换成
+  `&&` 串联，并让每一步把一张 stage 图写进 p5。
+
+复盘发现两处当时判断过于乐观：
+
+1. **`&&` 支持是推断，不是验证**。当时只因 `fastboot.bin` 里有
+   `HUSH_VERSION` 字符串就认定支持；重新核查该二进制**没有任何 `&&` /
+   `||` 解析痕迹**。这个厂商 hiboot 基于较老的精简 hush，很可能不支持。
+   若 `bootcmd` 解析失败，整条链（含末尾 `reset` 之前的 logo 写入）都不会
+   按预期执行。
+2. **把 p5 当进度板有风险**。若链路中途断开、p5 停在一张 stage 图上，
+   而 hiboot 的 `LOGO_TABLE` / JPEG 解码不认这张图，结果就是**全黑**。
+   `boot-logo-debian.img` 是真机验证过能显示的唯一一张图。
+
+因此 `scripts/make-community-flash-package.sh` 已**回退到 134943Z 的
+已知可显示形态**：
+
+- `bootcmd=run flashkernel; run flashrootfs; run flashbootargs; run flashlogo; reset`
+- 恢复 `loadfile*` / `flashpartition*` 变量与 `run` 两步写法
+- p5 **只写一次** `logo.img`（Debian Linux），stage 图不再打包
+- 两份 README 判据同步改回单 logo 版
+
+**保留**（不影响 hiboot，属于内核/rootfs 侧改进）：绿带启动标记、
+`fbcon=map:0`、`net.ifnames=0`、`CONFIG_HISI_FEMAC` 显式声明、
+DHCP 加固、pstore/ramoops。
+
+**判据回到最简三件套**：`Debian Linux` logo（hiboot 画的，证明刷机执行）
+/ 绿带（内核画的，证明内核启动到驱动）/ 路由器新 IP（网络起来了）。
+三者组合仍能把 A / B / C 分开，只是丢失了「刷机链停在第几步」的粒度。
+
+**教训**：在这台无串口的机器上，任何对 hiboot 命令链的改动都要当成
+高风险操作；`&&`、多张 p5 图这类「看起来更聪明」的设计，在验证之前
+不如用户实测能显示的最朴素版本。`docs/028` §4 从 postmarketOS 方法论
+也印证了这一点——无串口时 framebuffer 就是唯一的 UART 替代品，
+不能拿它做实验。
+
+stage0..3 静态资源仍保留在 `patches/kernel/`，但本版不引用。将来若
+要在真机上验证 `&&` 是否可用，应单独做一次只改 bootcmd、不动 p5 的
+最小实验，而不是和进度图一起上。
