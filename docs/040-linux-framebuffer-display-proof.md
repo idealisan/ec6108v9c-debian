@@ -109,6 +109,31 @@
 → **[推断]** 之前「闪一下」不是被后台清屏，而是 VO 双缓冲 flip 到未写的那一帧。
 → **[未知]** 写入进程退出后画面能保持多久、是否需要持续刷新，本轮未测定（实验脚本内逐秒验证 10–12s 稳定）。
 
+### 3.1 追加实验：用户态渲染「TTY 文字」到 HDMI（2026-11-08）
+
+用户追加目标「要有一个 TTY 绑定到 HDMI，能看到内核启动阶段/报错」，
+据此在社区真机上验证「显示文字」这一能力（详见 `docs/042`）。
+
+只读取证（`docs/042 §1` 的条件核对）：
+- `/proc/kallsyms` 里 `fbcon` 相关符号 **0 命中**；`modules.builtin` 只有
+  `kernel/drivers/video/fbdev/core/fb.ko`，**没有 `fbcon.ko`**；
+  `/sys/class/vtconsole/vtcon0/name = (S) dummy device`、`bind=1`；
+  `/sys/class/tty/console/active = ttyAMA0`；`agetty` 跑在 `tty1` 和 `ttyAMA0`。
+- 没有 `fbset`/`fbterm`/`fbi`/`setfont`/`chvt`/`openvt`，没有 PSF 字体，没有 PIL。
+- → **[观察] 社区 4.4 内核编了 fbdev 核心但完全没编 fbcon，天生不具备 TTY→HDMI 能力**，
+  这正是它只显示静态 logo、不出 TTY 的根因；与 `docs/042 §0` 的判断一致。
+
+但**用户态渲染文字**不依赖 fbcon：本轮用 Python 内置 5×7 点阵字体（无任何外部库）
+把 `LINUX TTY OK` / `MAINLINE HDMI 1920X1080` 渲染成 1920×1080 ARGB8888 像素，
+写满 fb0 双缓冲两帧（16,588,800 B）。
+→ **[观察] 写入成功**（`os.write` 返回 16,588,800 B，无错误）。
+→ **[推断/待用户确认]** 若屏幕出现这两行字，则证明「在 HDMI 上显示可读文字」
+  在真机上是通的，主线内核只要提供一块 framebuffer 并绑定 fbcon（P1，`docs/041`）
+  即可显示 TTY——**能力侧没有障碍，障碍全在配置（`FB_BASE` / `FB_SIZE`）**。
+
+> 区分：用户态渲染文字 ≠ 内核 fbcon TTY 绑定。前者证明「HDMI 能出字」，
+> 后者才是「内核 printk / 登录提示自动上屏」（`docs/042` 的目标）。两者不混同。
+
 ---
 
 ## 4. 对项目此前结论的改写（重要）
