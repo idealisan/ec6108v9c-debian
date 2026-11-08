@@ -451,11 +451,30 @@ siiSetVideoPath            siiGetVideoPath           SiI_DeepColor_{24bit,30bit,
 
 ---
 
-## 6. 片内 HDMI TX vs 外挂 sii9134 尚需厘清（与 `docs/025` §8 的冲突）
+## 6. 片内 HDMI TX vs 外挂 sii9134（本节结论已被 `docs/029` 撤销）
 
-> 本节单独列出，因为它是本次调研**唯一直接推翻既有文档某条结论**的发现，且直接决定 plan B 选哪套补丁。
-> 结论分两层：**「`docs/025` §8 的外挂 sii9134 结论不成立」是已证实的**；
-> 「这块板的 HDMI 输出最终由哪一路发送器驱动、histb 补丁如何对应」**仍属存疑，需厘清后再定基线**。
+> **⚠️ 重要更正（2026-11-08，后续调研）**：本节的**核心结论不成立，已由
+> `docs/029-transmitter-path-resolution.md` 撤销**。当时只有备份二进制、没有
+> histb 补丁原文，把 `0xf8ce0000` 误当成"本板片内 HDMI TX"证据，据此错误地
+> "推翻"了 `docs/025` §8。拉取 `500-01`/`500-02`/`600-17`/`600-18`/`910-01`
+> 补丁原文后的正确结论是：
+> - **mv100（含 EC6108V9C）走 SiI9134 发射器**：`500-02` 明写 "The mv100 board
+>   reaches its panel through a SiI9134 transmitter"，新建 `sii9134.c` +
+>   `hi3798mv100-hdmi.c`；DT 节点 `hdmi@8ce0000`、`hisilicon,hi3798mv100-hdmi`。
+> - **`0xf8ce0000` 属于 hi3716cv200**（见 `500-01` binding 第二个 example），
+>   mv100 是 `0x8ce0000`。备份里出现 `0xf8ce0000` 属 SDK 多 chip 条件编译常量
+>   或 HDMI 输入/RX 侧，不能证明 mv100 **输出**发送器形态。
+> - `600-17` 的片内 TMDS 发送器是 **mv200** 的（commit message 首句明确）。
+> - SiI9134 字面量 0 命中不能反证：驱动以厂商 IP / glue 文件
+>   `hi3798mv100-hdmi.c` 形式存在，板级节点不带该字样。
+>
+> → `docs/025` §8 的"mv100 走 sii9134"**方向正确**（仅"外挂"措辞不精确），
+> 本节的"推翻"是误判。plan B 应取 bridge 链路（`500-01`/`500-02`/`600-18`
+> + VDP2 + 板级 DTS + CRG），不取 `600-17`。
+>
+> **本节以下内容保留作为当时的推理记录与一手证据清单，不再作为结论依据。**
+> 其"先厘清发送器形态再定补丁基线"的方法论要求本身是对的，正是 `docs/029`
+> 完成的工作。
 
 ### 6.1 原厂备份里的证据（片内 HDMI TX）
 
@@ -471,7 +490,7 @@ vmlinux 里的 `/proc/msp/sil9293`（SiI9293）与 `SiI_CEC_SetCommand` 更像 *
 hiboot 里的 `siiSetVideoPath` / `SiI_DeepColor_*` 对应 `docs/022` §4 的 `siiSetVideoPath() / SetIClk()`，
 是**片内 HDMI TX IP 的 Silicon Image 系列辅助函数**，不是外挂 sii9134 芯片驱动。
 
-### 6.2 与 `docs/025` §8 的冲突（该结论被推翻）
+### 6.2 与 `docs/025` §8 的冲突（~~该结论被推翻~~ → 本节推翻有误，见 `docs/029`）
 
 `docs/025` §8 写：「**mv100 用的是外挂 sii9134 transmitter，不是 on-chip HDMI**」，
 并据此说 `600-17` 的 `histb-hdmi.c` 是 mv200 的片内发送器、我们板子对应

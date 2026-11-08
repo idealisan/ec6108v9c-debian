@@ -438,17 +438,21 @@ hack-7.4/         本地 only（bring-up 调试工具，990-SS，不提交）
 
 几个容易踩的坑：
 
-1. ~~**mv100 用的是外挂 sii9134 transmitter，不是 on-chip HDMI**~~
-   **⚠️ 此条已被 `docs/027` §6 推翻，保留仅为记录当时的误判**：原厂整机备份的
-   hiboot + 内核 + 系统二进制一致指向**片内 HDMI TX（`0xf8ce0000`）**，
-   全库 `sii9134` 字面量 0 命中，hiboot 里有 `HDMI_Display` / `TX_PHY_*` /
-   `Logo_Main`。因此「mv100 用外挂 sii9134、不是片内 HDMI」这条具体结论**不成立**，
-   不能再作为选补丁的依据（本文 §3.4 与 §8 自身也自相矛盾）。
-   但「硬件最终由哪一路发送器驱动、histb 补丁如何对应」**仍需厘清**：
-   `500-02`（sii9134 bridge）与 `hi3798mv100-hdmi.c` 的创建补丁都不在本地已存的
-   4 个补丁里，需从 `histb-mainline/patches/series` 补齐、确认各自 `compatible`
-   与目标板后，才能决定 plan B 取片上链路（`600-17`/`600-18`）还是 bridge 链路
-   （`500-02`）。选错会导致「能编译但黑屏」。详见 `docs/027` §6。
+1. **mv100 走 SiI9134 发射器（bridge 链路），`600-17` 的片内 TX 是 mv200 的**。
+   ~~此条曾被 `docs/027` §6 用 `0xf8ce0000` 常量"推翻"，该推翻已由 `docs/029`
+   证实为误判~~：拉取补丁原文后确认——
+   - `500-02` 明写 "The mv100 board reaches its panel through a SiI9134
+     transmitter"，新建 `sii9134.c` + `hi3798mv100-hdmi.c`（mv100 glue）；
+   - `500-01`/`910-01` 的 mv100 HDMI 节点是 `hdmi@8ce0000`，compatible
+     `hisilicon,hi3798mv100-hdmi`；`0xf8ce0000` 是 **hi3716cv200** 的地址，
+     备份里出现它属 SDK 多 chip 条件编译常量，不能作为 mv100 输出形态证据；
+   - `600-17` commit message 首句 "The mv200 part carries the HDMI transmitter
+     on the SoC itself" —— 片内 TX 属 mv200；`600-18` 的 video path up 则打在
+     mv100 的 `hi3798mv100-hdmi.c` 上。
+   措辞修正：SiI9134 是经 SoC 内 MMIO 窗口（`0x8ce0000`）访问的 IP，不是 I2C
+   上挂的独立芯片，所以"外挂"不精确，但"走 sii9134 发射器"的实质判断正确。
+   → plan B 应取 bridge 链路（`500-01`/`500-02`/`600-18` + VDP2 + 板级 DTS +
+   CRG），**不取** `600-17` 的 `histb-hdmi.c`。完整证据链见 **`docs/029`**。
 2. **补丁不是独立可挑的几个**。`pending-7.4` 共 154 个，显示链路横跨
    `600-xx`（DRM）与 `910-xx`（DTS），且互相依赖；只挑 600-17/18/910-02/03
    会缺 plane 驱动、clock/reset binding、media CMA 等前置件。
