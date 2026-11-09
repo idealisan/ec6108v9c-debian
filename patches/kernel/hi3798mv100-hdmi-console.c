@@ -13,19 +13,24 @@
  *   2. Registers a "simple-framebuffer" platform device pointing at that
  *      memory, so the existing fbcon (console=tty0) can draw kernel messages.
  *
- * Register layout, from the HiSTB SDK:
+ * Register layout, from the HiSTB SDK full struct (research/full-disasm/
+ * FINDINGS.md §D, [观察] 三份真内核反汇编 + SDK S_VDP_REGS_TYPE 双 oracle):
  *   CONFIG_VDP_REG_BASEADDR = 0xf8cc0000, CONFIG_VDP_SIZE = 0xfff0
  *     source/msp/drv/hifb/inc/drv_hifb_config.h
- *   S_VDP_REGS_TYPE, source/common/drv/include/hi3798mv100/hi_reg_vdp.h
- *     Every member is one u32, so a member's offset is 4 * its index:
- *       VOCTRL   +0x0000   layer arbitration / global control
- *       G0_ADDR  +0x0494   layer 0 surface address (physical)
- *       G0_STRIDE+0x049c   layer 0 stride (16 bit)
- *       G0_IRESO +0x04a0   layer 0 input resolution, iw[11:0] ih[23:12]
- *   Cross-checked against the SDK: OPTM_VDP_GFX_SetLayerAddrEX() accesses
- *   "&pOptmVdpReg->G0_ADDR.u32 + layer * CONFIG_HIFB_GFX_OFFSET" with
- *   CONFIG_HIFB_GFX_OFFSET = 0x800 for hi3798mv100 (this SoC exposes a single
- *   GFX layer, so G0 is all we need).
+ *   The FULL S_VDP_REGS_TYPE keeps every Reserved_NN[] gap. GFX layer 0 lives
+ *   in the +0x6000 segment (NOT the compact +0x494 view -- that was a
+ *   "605 u32 / 0x974 window" miscalculation; at +0x494 the full struct is
+ *   GP1_PARARD, not G0_ADDR):
+ *       G0_CTRL  +0x6000   layer enable / format
+ *       G0_ADDR  +0x6010   layer 0 surface address (physical)
+ *       G0_STRIDE+0x601c   layer 0 stride (16 bit)
+ *       G0_IRESO +0x6020   layer 0 input resolution, iw[11:0] ih[23:12]
+ *   addr(layer N) = 0xf8cc0000 + 0x6010 + (N<<11), CONFIG_HIFB_GFX_OFFSET
+ *   = 0x800 (drv_hifb_config.h:67 mv100). We only read layer 0 (N=0).
+ *   NOTE: the offsets are settled [观察], but "which register window VO is
+ *   currently scanning / the live MMIO value" is still [未知] (UNKNOWNS §3,
+ *   needs a real-HW read at 0xf8cc6010). This driver only reads via
+ *   get_kernel_nofault and falls back safely; it never writes VO/HDMI regs.
  *
  * Fallback: if the layer registers do not hold a plausible address, the HDMI
  * TX bank is scanned for a DDR-sized value, like ec6108-fbprobe does in user
@@ -48,12 +53,14 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 
-/* VO register block (HiSTB SDK CONFIG_VDP_REG_BASEADDR). */
+/* VO register block (HiSTB SDK CONFIG_VDP_REG_BASEADDR / CONFIG_VDP_SIZE).
+ * Window 0xfff0 covers the full GFX layer segment (G0 @ +0x6010..0x6020,
+ * layer5 up to 0x8820). The old 0x1000 window could not even reach +0x6010. */
 #define VO_REG_BASE     0xf8cc0000UL
-#define VO_REG_SIZE     0x1000
-#define VO_G0_ADDR      0x0494
-#define VO_G0_STRIDE    0x049c
-#define VO_G0_IRESO     0x04a0
+#define VO_REG_SIZE     0xfff0
+#define VO_G0_ADDR      0x6010
+#define VO_G0_STRIDE    0x601c
+#define VO_G0_IRESO     0x6020
 
 /* HDMI TX bank, only used as a fallback probe. */
 #define HDMI_TX_BASE   0xf8ce0000UL
