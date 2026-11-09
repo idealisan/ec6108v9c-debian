@@ -903,3 +903,55 @@ line_length，配合 `FBIOGET_VSCREENINFO` 的 xres/yres/bpp；并 best-effort
 `fb smem_start(phys)` / `VO G0_ADDR` 等行 → 报值 → 用该值填 CI `fb_base`
 重出包装盘 → 再短接刷。探测值测于短接态 recovery 内核、与正常开机 hiboot
 路径 VO 是否同址为 [未知]，作为候选、真机显示为准。
+
+---
+
+## 10.15 真机探测结果：8 NO MANIFEST 正常，但量到的显存地址/几何与正常开机路径双重矛盾
+
+**真机（[观察]）**：短接上电，屏幕停在 `8 NO MANIFEST`（探测模式预期，非失败）；
+断电拔盘插回电脑，`flasher.log` 1045 B（设备无 RTC，时间戳 `Jan 1 1980` 正常），
+探测段完整、在 `RESULT: no flash.manifest (code 8)` 之前、`fsync/sync` 落盘。
+U 盘挂载 `ok_node=/dev/block/sda` vfat、`mmcblk0 node=0` 正常。
+
+**探测实测值（[观察]）**：
+```
+fb smem_start(phys) = 0x0fc54000     (~252 MiB, DDR 中低段)
+fb smem_len         = 0x00708000
+fb line_length      = 0x00001400     (5120)
+fb xres / yres      = 0x500 / 0x2d0  (1280 x 720)
+fb bits_per_pixel   = 0x20           (32)
+probe fb_open/fix_ioctl/var_ioctl = 5 / 0 / 0   (fb0 ioctl 成功)
+probe devmem_open   = 5
+VO G0_ADDR/STRIDE/IRESO (+494/+49c/+4a0) = 0 / 0 / 0
+```
+
+**结论：这个地址不能直接拿去填 `fb_base`（[推断]，两个独立矛盾）**：
+1. **地址量级不符**：`0x0fc54000` 落在 DDR 中段，而正常开机/社区系统记载的
+   显存是 DDR 顶端 reserve 区：`smem_start=0x3C55C000`(docs/021,040)、
+   `VO layer0 fb_phys≈0x3f6ce000`(docs/041,043)、reserve_mem 从
+   `0x3FFFE000` 向下分配(docs/048)。`0x0fc54000` 是 **recovery 3.10 内核
+   自己初始化 hifb 分配的 framebuffer**，不是 hiboot 画 p5 logo 那块。
+   docs/045 早已标注过"smem_start 量级不符"这一坑。
+2. **几何不符**：探测到 1280×720@stride5120，而 CI 默认沿用社区实测的
+   1920×1080@stride7680(build-release.yml:17-25)。两者不是同一块 framebuffer，
+   `fb_width/height/stride` 若照探测值填会与 hiboot 正常开机路径不一致。
+3. **VO G0 寄存器读到 0**：`/dev/mem` 打开成功但 MMIO 全 0（STRICT_DEVMEM
+   或短接路径 VO 未经 hiboot 配置）。这恰恰是主线内核运行时驱动
+   `patches/kernel/hi3798mv100-hdmi-console.c` 在 subsys_initcall 要读的同一组
+   寄存器——**没拿到**。`hi3798_valid_fb_addr()` 要求地址在 DDR 高段且 4KiB
+   对齐，注释明确指向 `0x3f6ce000` 为真实 scan-out buffer。
+
+**研判（[推断]）**：短接态 recovery 内核与正常开机 hiboot 是两套独立的显示
+初始化路径，前者量到的 fb0 不能代表后者。这与 §10.14 标注的 [未知]
+（跨次/跨路径稳定性）一致，且现在有了实测证据。由此可见：
+- "短接量地址"这条路得到的是 recovery 内核自己的 fb，**直接用作主线内核
+  `fb_base` 有指错内存的风险**，暂停该方向；
+- 正常开机路径的显存地址候选仍是文档里的 DDR 顶端值 `0x3f6ce000`
+  （或 `0x3C55C000`/reserve 区），但均未在当前这批 6.x 包上真机验证过；
+- 结合 §10.14 的"无绿带+无 IP"，内核是否启动、以及 hiboot 是否给主线内核
+  留了可被读到的 VO 图层，仍是待解的核心问题。
+
+**待用户决定下一步（不擅自猜地址刷机）**：可选 (a) 用文档记载的 DDR 顶端
+候选值 `0x3f6ce000` + 社区几何 1920×1080@7680 填 `fb_base` 重出包试一次；
+(b) 改进探测，让其读取正常开机路径的 VO 或换用已知可用显存；
+(c) 先集中确认"内核到底起没起"再谈显示。真机结果为准，静态推断不作为成功依据。
