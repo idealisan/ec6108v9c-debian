@@ -15,9 +15,16 @@
 | `source/boot/product/driver/pdm/drv_pdm.c` | `g_stDispTiming`、`ClkPara0=0x912ccccc`/`ClkPara1=0x006d8157`、接口类型 | DISP/VO 硬编码显示时序（1080p60 fallback；实际时序运行时从 EDID） |
 | `source/boot/product/driver/graphic/gfx/hi_gfx_layer.c` | `BOOT_GFX_DisplayLogoWithLayer` 的 `G0_ADDR`/`G0_STRIDE`/`G0_IRESO` 写入序列 | GFX 图层配置（地址/格式/stride/enabled） |
 | `source/boot/product/driver/hdmi/hdmi_1_4/{de,hdmitx,phy,infofrm}.c` | HDMI TX / PHY 寄存器初始化、`HDMI_Display()`、`TX_PHY_WriteRegister` | HDMI 输出点亮 + AVI InfoFrame |
-| `source/msp/drv/{vo,hifb}/` + `hi_reg_vdp.h` | 寄存器结构体定义、偏移交叉验证 | 核对 `G0_ADDR=+0x494` 等（docs/023 §4.2） |
+| `source/msp/drv/{vo,hifb}/` + `hi_reg_vdp.h` | 寄存器结构体定义、偏移交叉验证 | **偏移未定**：docs/023 §4.2 的 `G0_ADDR=+0x494` 系列与近期全量反汇编的 `G0_CTRL=+0x6000 / G0_ADDR=+0x6010 / STRIDE=+0x601c / IRESO=+0x6020`（`layer*0x800`）系列冲突，以研究员本轮 FINDINGS 为准 |
 
 寄存器基址（docs/027 §4.2 二进制实证）：VO/VDP `0xf8cc0000`、HDMI TX `0xf8ce0000`、VDP 备用 `0xf9000000`。
+
+> ⚠ **写驱动前必须先定死寄存器偏移，当前不要在驱动里写死任一组值。**
+> 两套偏移直接冲突：docs/023 §4.2（SDK 推导）`G0_ADDR=+0x494 / STRIDE=+0x49c / IRESO=+0x4a0`、`VO_REG_SIZE=0x1000`，
+> 与上一轮反汇编（SDK `hi_reg_vdp.h` 结构体逐字段算偏移 + 两个真实内核 disasm 出现 `add #0x6000; str ... [r?, lsl #11]`）
+> `G0_CTRL=+0x6000 / G0_ADDR=+0x6010 / STRIDE=+0x601c / IRESO=+0x6020`、`GFX_OFFSET=0x800`、
+> `ioremap` 需 ≥`0x7000`。legacy `patches/kernel/hi3798mv100-hdmi-console.c` 目前仍用旧值、只读不写。
+> 已列入研究员本轮校验点；序列与偏移未由 FINDINGS 一锤定音前，backport 驱动不得落地寄存器写入。
 
 ## 4.4 → 6.3 API 适配点（docs/021 §3/§4）
 - SDK 裸 MMIO → 主线 `ioremap` + `readl/writel`。

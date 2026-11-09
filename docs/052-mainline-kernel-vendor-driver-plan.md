@@ -93,9 +93,14 @@ docs/044 已确认静态配置层齐全；"无 IP"更可能是内核没起来（
   - `build-kernel` job 把 `DISPLAY_DRIVER` 传给 `scripts/build-kernel.sh`。
 - `scripts/build-kernel.sh`：按 `DISPLAY_DRIVER` 分支：
   - `simplefb`（默认）：现有逻辑完全不变 → CI 默认路径不破坏。
-  - `vendor-backport`：应用 `patches/vendor-display/` 补丁、复制 backport 驱动、跳过
-    `apply-dts-placeholders.py` 的 simplefb 占位（chosen bootargs / memory@0 / ramoops 仍保留）。
-    驱动未就绪时明确 fail-fast 并指向 `docs/052` 与 `PORTING.md`，不假装完成。
+  - `vendor-backport`：应用 `patches/vendor-display/` 补丁（Kconfig/Makefile 补丁须用与
+    0001–0003 相同的 apply/already/error 三态检查，不能静默跳过——否则驱动 `.c` 被复制但
+    没进 Makefile，产出一个"看起来成功、其实没编译新驱动"的内核）、复制 backport 驱动，
+    并置 `FB_BASE=""`。**`apply-dts-placeholders.py` 仍会调用**：它必须替换 `__CMDLINE__`/
+    `__MEM_SIZE__` 占位并注入 ramoops；空 FB_BASE 只让它不注入 simplefb 节点，
+    chosen bootargs / memory@0 / ramoops 全部保留。切勿按字面"跳过脚本调用"实现，
+    否则 cmdline 占位符残留、内核拿不到完整启动参数。驱动未就绪时明确 fail-fast
+    并指向 `docs/052` 与 `PORTING.md`，不假装完成。
 - **打出的刷机包结构不变**：`hi_kernel.bin`（换成带新驱动的 6.3 内核）+ Debian rootfs sparse
   + p2 env + p5 logo；`make-community-flash-package.sh` / recovery-flasher 打包机制不变。
 - 产物仍是 `mv100-mdmo1g-*-usb-flash-*.zip`，release `build-$STAMP`。

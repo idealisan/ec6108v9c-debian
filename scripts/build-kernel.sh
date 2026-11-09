@@ -93,7 +93,9 @@ cp "$PATCH_DIR/hi3798mv100-hdmi-console.c" "$KERNEL_SRC/drivers/video/fbdev/"
 # from the full disassembly (TMP/stock-rom-research/full-disasm/, in progress).
 # Until patches/vendor-display/ ships the driver, fail fast instead of
 # pretending the build is the vendor one. The simplefb default never breaks.
-VD_DIR="$PATCH_DIR/vendor-display"
+# vendor-display/ lives directly under patches/, NOT under PATCH_DIR
+# (patches/kernel/). Keep it independent so the two paths cannot drift.
+VD_DIR=${VD_DIR:-patches/vendor-display}
 if [ "$DISPLAY_DRIVER" = "vendor-backport" ]; then
   echo "== display scheme: vendor-backport (docs/052) =="
   if [ ! -f "$VD_DIR/hi3798mv100_vendor_display.c" ] || \
@@ -104,8 +106,22 @@ if [ "$DISPLAY_DRIVER" = "vendor-backport" ]; then
     echo "  (TMP/stock-rom-research/full-disasm/), see $VD_DIR/PORTING.md and docs/052." >&2
     exit 1
   fi
-  if git -C "$KERNEL_SRC" apply --check "$ROOT_DIR/$VD_DIR/0004-vendor-display-kconfig-makefile.patch" 2>/dev/null; then
-    git -C "$KERNEL_SRC" apply "$ROOT_DIR/$VD_DIR/0004-vendor-display-kconfig-makefile.patch"
+  VD_PATCH="$VD_DIR/0004-vendor-display-kconfig-makefile.patch"
+  # Same three-way check as 0001-0003 above: apply / already-applied / hard
+  # error. A silent "check failed -> skip" would leave Kconfig+Makefile
+  # unpatched while the .c is still copied, producing a kernel that builds
+  # but never compiles the vendor driver in -- exactly the "pretend done"
+  # failure docs/052 §3 forbids.
+  if git -C "$KERNEL_SRC" apply --check "$ROOT_DIR/$VD_PATCH" 2>/dev/null; then
+    git -C "$KERNEL_SRC" apply "$ROOT_DIR/$VD_PATCH"
+    echo "  applied: 0004-vendor-display-kconfig-makefile.patch"
+  elif git -C "$KERNEL_SRC" apply --reverse --check "$ROOT_DIR/$VD_PATCH" 2>/dev/null; then
+    echo "  already applied: 0004-vendor-display-kconfig-makefile.patch"
+  else
+    echo "ERROR: cannot apply 0004-vendor-display-kconfig-makefile.patch" >&2
+    echo "  Generate it against the tree AFTER 0001-0003 (fbdev Kconfig/Makefile)." >&2
+    echo "  See patches/vendor-display/PORTING.md and docs/052." >&2
+    exit 1
   fi
   cp "$VD_DIR/hi3798mv100_vendor_display.c" "$KERNEL_SRC/drivers/video/fbdev/"
   # Vendor stack initialises VO/HDMI itself; no simplefb / fb_base handoff.
@@ -144,7 +160,10 @@ while IFS= read -r line; do
     y) "$KERNEL_SRC/scripts/config" --file "$OUT/.config" -e "${key#CONFIG_}" ;;
     m) "$KERNEL_SRC/scripts/config" --file "$OUT/.config" -m "${key#CONFIG_}" ;;
     n) "$KERNEL_SRC/scripts/config" --file "$OUT/.config" -d "${key#CONFIG_}" ;;
-    "*") "$KERNEL_SRC/scripts/config" --file "$OUT/.config" --set-str "${key#CONFIG_}" "${val//\"/}" ;;
+    # Quoted string value, e.g. CONFIG_NLS_DEFAULT="utf8". The old pattern
+    # "*" matched a LITERAL asterisk, so every string option was silently
+    # skipped by the fall-through below -- a real (if minor) config-loss bug.
+    \"*\") "$KERNEL_SRC/scripts/config" --file "$OUT/.config" --set-str "${key#CONFIG_}" "${val//\"/}" ;;
     *) echo "  (skip $line)" ;;
   esac
 done < "$CONFIG_FRAGMENT"
