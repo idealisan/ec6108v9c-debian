@@ -175,6 +175,10 @@ done < "$CONFIG_FRAGMENT"
 # whose Kconfig entry is missing, so this is a safe no-op until 0004 lands.
 if [ "$DISPLAY_DRIVER" = "vendor-backport" ]; then
   "$KERNEL_SRC/scripts/config" --file "$OUT/.config" -e HI3798MV100_VENDOR_DISPLAY
+  # Disable the legacy simplefb hand-off driver: it also registers a
+  # "simple-framebuffer" platform device (id 0) and reads VO G0 at the WRONG
+  # +0x494 offsets. Two drivers would collide on the same pdev/framebuffer.
+  "$KERNEL_SRC/scripts/config" --file "$OUT/.config" -d FB_HI3798MV100_HDMI_CONSOLE
 fi
 "$MAKE" -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="${CROSS:+$CROSS}" $MAKE_EXTRA olddefconfig
 echo "== kernel: verify key options =="
