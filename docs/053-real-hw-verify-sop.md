@@ -23,6 +23,21 @@
 
 **这些只证明"配置没明显错"，不证明内核真的执行到了。** 运行时是/否必须真机。
 
+### 0.1 CI 编译日志实证（2026-11-09，run 42646761948 / release 161503Z）
+从 build-kernel job 日志直接核对，三目标的**内核代码确实编进 uImage**（非仅 config 片段推断）：
+- 引导：`Image Name: linux-hi3798mv100`、uImage 生成、无 `error:`/`undefined reference`；
+  `cmdline:` 打印的 `/chosen/bootargs` 全项与 DTB 一致；`CC hi3798mv100_tsensor.o`。
+- TTY：`CC drivers/video/fbdev/hi3798mv100-hdmi-console.o`（私有显示驱动）、
+  `CC drivers/video/fbdev/core/fbcon.o`、`CC drivers/tty/vt/vt.o` + `consolemap.o` +
+  `keyboard.o` + `vc_screen.o`（VT 全家桶）；`CONFIG_FRAMEBUFFER_CONSOLE=y`、
+  片段 `CONFIG_VT=y`。→ `console=tty0`+`fbcon=map:0` 有真实绑定目标。
+- 连网：`CONFIG_HISI_FEMAC=y`、`MDIO_HISI_FEMAC=y`、`PHY=y`、`NETDEVICES=y`。
+- `verify key options` 段还打印 `CONFIG_FB_SIMPLE=y`、`CONFIG_COMMON_CLK_HI3798=y`、
+  `CONFIG_RESET_HISI=y`、`CONFIG_EXT4_FS=y` 均为 `=y`，无符号被 olddefconfig 丢弃。
+
+**即便如此**：代码编进内核 ≠ 内核跑到 userspace ≠ fbcon 绑上 framebuffer ≠ 网线协商成功。
+这三条链每一环的"是否真的执行/绑定/连通"仍是运行时事件，只能真机 L0/L1/L2 判定。
+
 ## 1. 刷机前（电脑上）
 
 1. U 盘 FAT32/MBR，根目录含：`fastboot.bin`（社区 carrier，**必须保留**）、`bootargs.bin`、
