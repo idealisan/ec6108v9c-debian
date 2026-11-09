@@ -129,7 +129,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            e2fsprogs zip python3 mtools dosfstools parted curl git file
+            e2fsprogs zip python3 clang lld mtools dosfstools parted curl git file
 
       - name: Download kernel artifacts
         uses: actions/download-artifact@v4
@@ -143,10 +143,22 @@ jobs:
           name: rootfs-dist
           path: dist/
 
-      - name: Build community-format U-disk flash package
+      - name: Build community-format U-disk flash package (legacy fallback)
         run: |
-          echo "STAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
-          bash scripts/make-community-flash-package.sh
+          STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
+          STAMP="$STAMP" bash scripts/make-community-flash-package.sh
+
+      - name: Build recovery-flasher mainline U-disk package (recommended)
+        # Reuses the mainline kernel/rootfs images built above, but swaps the
+        # FLASHER PROGRAM: top-level bootargs.bin becomes a recovery entry
+        # (fatload recovery.img; bootm) driven by the patched STOCK recovery
+        # 3.10 kernel + our terminal-style flasher (HDMI progress log), which
+        # writes p2/p5/p6/p8 by ABSOLUTE LBA from flash.manifest. This is the
+        # method already verified on real hardware; no kernel/rootfs rebuild.
+        # clang/lld above compile only the 15KB ARM flasher ELF, not a toolchain
+        # cross-build, so this adds seconds, not minutes, to the package job.
+        run: STAMP="$STAMP" bash scripts/make-recovery-flash-package.sh
 
       - name: Archive reference materials
         # Opt-in only: these snapshots are multi-GB and would show up as
@@ -163,10 +175,13 @@ jobs:
       - name: Write release notes
         run: |
           cat > RELEASE_NOTES.md <<EOF
-          EC6108V9C (Hi3798MV100) Debian armhf - community boot method
+          EC6108V9C (Hi3798MV100) Debian armhf - mainline 6.x
 
           - build (UTC): $STAMP
-          - boot/flash: community (ECOO) U-disk method, p1 hiboot NOT written
+          - flash (RECOMMENDED): recovery-flasher - patched STOCK recovery 3.10
+            kernel + terminal-style flasher, HDMI progress log, writes by
+            absolute LBA from flash.manifest (p2/p5/p6/p8). p1 hiboot NEVER written.
+          - legacy fallback: community (ECOO) hiboot mmc-write U-disk package
           - kernel: mainline 6.3.0-rc5 + hi3798mv100 port, with local patches:
               * HDMI console driver hands off the hiboot framebuffer to simplefb/fbcon
               * pstore/ramoops reserved-memory node captures panic logs
@@ -179,22 +194,36 @@ jobs:
               * lm-sensors, fbset, kbd, console-setup, full CLI toolset
 
           Assets:
-          - mv100-mdmo1g-debian-usb-flash-$STAMP.zip   U-disk flash package (community layout)
+          - mv100-mdmo1g-mainline-recovery-flash-$STAMP.zip  ** RECOMMENDED **
+            recovery-flasher package: patched stock recovery kernel + terminal
+            flasher (HDMI progress log), absolute-LBA flash.manifest.
+          - mv100-mdmo1g-debian-usb-flash-$STAMP.zip   legacy community-format
+            package (hiboot mmc-write script), kept as a known-good fallback.
           - hi_kernel.bin        uImage = zImage + DTB, load 0x2000000 -> p6 (LBA 0x7000)
           - modules.tar.gz       kernel modules (/lib/modules)
           - debian-rootfs-armhf-bookworm.tar.gz  plain rootfs tarball (not for flashing)
           - patches/kernel/*     kernel patches applied during the build
           - SHA256SUMS.txt
 
-          Flashing:
-          1. Format a USB stick FAT32/MBR, extract the flash zip to its root.
-          2. Power off, insert stick, power on with the recovery pads shorted
-             (same trigger as the community Ubuntu package).
-          3. hiboot runs bootargs.bin and writes p6 (kernel), p8 (rootfs sparse)
-             and p2 (runtime env), then resets. p1/p3/p4/p5/p7 untouched
-             (the 512M backup partition is reclaimed into the rootfs).
-          4. First boot: resize2fs grows p8, SSH/telnet come up on DHCP.
-             If HDMI/SSH do not come up, pstore/ramoops keeps the panic log.
+          Flashing (RECOMMENDED recovery-flasher package):
+          1. Format a USB stick FAT32/MBR, extract the recommended zip to root.
+             KEEP the community fastboot.bin at the U-disk root (BootROM loads
+             it on a shorted power-on; this package never writes p1).
+          2. Power off, insert stick, power on with the recovery pads shorted.
+          3. hiboot reads top-level bootargs.bin -> fatload recovery.img; bootm
+             -> patched stock recovery kernel lights HDMI and runs the terminal
+             flasher: a scrolling "<number> <TEXT>" log, then writes p2/p5/p6/p8
+             by absolute LBA. Stops at "6 DONE NO REBOOT".
+          4. Power off, remove stick, boot normally -> mainline 6.x from p6.
+             First boot: resize2fs grows p8, SSH/telnet come up on DHCP.
+
+          BOOT DISPLAY (best effort, NOT verified on real HW): the kernel carries
+          console=tty0 + fbcon=map:0 + clk_ignore_unused + a simplefb/hdmi-console
+          handoff driver + pstore/ramoops. A static simplefb node is intentionally
+          omitted (framebuffer base not measured; not guessed). Judge on HW by:
+          "Debian Linux" logo (hiboot drew p5) / green band (kernel reached HDMI
+          driver) / an IP on the router (network up). If HDMI+SSH both dark,
+          pstore/ramoops keeps the panic log. Flash-stage terminal log is verified.
 
           Login: ssh root@<ip> / ec6108v9c, or telnet <ip> (plaintext).
           Serial console ttyAMA0 115200. WiFi: ec6108-wifi <SSID> <password>.
@@ -206,7 +235,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "build-$STAMP" \
-            --title "$STAMP · debian12-armhf + linux-6.x + community-usb-flash" \
+            --title "$STAMP · debian12-armhf + linux-6.x + recovery-flasher USB" \
             --notes-file RELEASE_NOTES.md \
             dist/*
 

@@ -730,7 +730,65 @@ NEON/VFP=0、soft-float；内核逐字节未改；`build.sh --install` 装盘，
 在 main 上已用 4 jobs（build-kernel ∥ build-rootfs → package → release）产出
 「6.3.0-rc5 主线内核 + Debian bookworm rootfs」U 盘刷机包
 `mv100-mdmo1g-debian-usb-flash-$STAMP.zip`，最新 release `build-20261108T084704Z`
-已含现成产物，编译全在 CI、本机零编译。**故 6.x 刷机包无需改 CI、无需本机
-交叉编译，直接取现成 release 即可**。后续真正的技术重点是用户指出的：
-**主线内核启动阶段 HDMI 显示**（mainline 缺 HiSilicon 私有显示栈 hifb/VO/VDP/
-HDMI TX/MMZ，见 docs/048 与 SDK 绘图链、reserve_mem 地址推导）。
+已含现成产物，编译全在 CI、本机零编译。[修正，见 §10.12] 这里曾误判为"6.x
+刷机包无需改 CI"——用户纠正：CI 的【刷机程序层】仍是旧的社区 hiboot
+`mmc write` 脚本，必须换成验证过的 recovery-flasher 方案。内核/rootfs 编译
+照旧全在 CI，本机零交叉编译。真正的技术重点是用户指出的：**主线内核启动
+阶段 HDMI 显示**（mainline 缺 HiSilicon 私有显示栈 hifb/VO/VDP/HDMI TX/MMZ，
+见 docs/048 与 SDK 绘图链、reserve_mem 地址推导）。
+
+---
+
+## 10.12 构造「recovery-flasher 刷主线 6.x」的 CI 刷机包（阶段目标）
+
+**用户阶段目标（/goal）**：构造一个基于 6.x 主线内核、用 recovery-flasher
+（原版 recovery 内核 + 自研终端式刷机程序）来刷、并**尽量让主线内核启动阶段
+显示终端日志**的 U 盘刷机包。编译全部放 GitHub Actions、本机不交叉编译
+（内核大、rootfs 构造耗时、依赖/网络易出问题，一次约半小时）。
+
+**方向拆解（用户三次纠正）**：
+- main 分支本就是给 6.x 做 CI 的，不用研究/重构 CI 架构；
+- 但【刷机程序那一层】必须换：CI 现产出的是旧社区 hiboot `mmc write` 脚本
+  （刷机阶段黑屏无进度），要换成已真机验证的 recovery-flasher；
+- 研究重点应是"启动过程如何显示"，不是 CI 改动。
+
+**关键事实（[观察]，本地核对）**：主线 8 分区
+(`1M,1M,4M,4M,4M,20M,64M,-(debian)`, configs/partition-layout.env:11) 与社区
+9 分区的前 8 个分区**LBA 完全相同**：p2=0x800 / p5=0x5000 / p6=0x7000 /
+p8=0x31000。recovery-flasher 按绝对 LBA 裸写、与 blkdevparts 无关，故被刷
+内容从"社区 4.4 内核 + 社区 rootfs"换成"主线 6.x uImage(hi_kernel.bin) +
+Debian rootfs(sparse)"后，LBA 与 flash.manifest 格式照用即可。
+
+**实施（本次）**：
+1. 新增 `scripts/make-recovery-flash-package.sh`：复用
+   `make-community-flash-package.sh` 产出的 `build/community-package/pkg/mv100/`
+   主线镜像（p2 runtime env / p5 logo / p6 主线 uImage / p8 Debian rootfs
+   sparse），只替换【刷机程序层】——U 盘根 `bootargs.bin` 从 hiboot mmc-write
+   脚本改为 recovery 入口（`fatload recovery.img; bootm`，由
+   `recovery-flasher/build.sh` 生成），并加入 `recovery.img`（原版 recovery
+   3.10 内核 + 终端式 flasher）与 `flash.manifest`（4 项，LBA 同上，R 字节数
+   取文件真实大小、S 填 0）。p1 fastboot 永不写。产物
+   `mv100-mdmo1g-mainline-recovery-flash-$STAMP.zip`。
+2. 改 `.github/workflows/build-release.yml` 的 `package` job：
+   - 依赖加 `clang lld`（仅编译 15KB ARM flasher ELF，非内核交叉编译）；
+   - 原 community 包降级为 "(legacy fallback)"，其后新增一步构建
+     "(recommended)" recovery-flasher 主线包；
+   - 固定 STAMP 同时显式传给两个脚本（消除 GITHUB_ENV 跨步导致的时间戳
+     错位）；release notes 增加 recommended 包、刷机流程、显示判据，标题更新。
+   - build-kernel / build-rootfs / qemu-boot-test 三个 job 完全不动。
+
+**"启动显示"如实标注（[观察]+[推断]，不猜显存地址）**：刷机阶段的终端日志
+由 recovery-flasher 提供（真机已验证）；主线内核启动阶段的显示是 best-effort、
+未经真机验证。内核已带 `console=tty0 fbcon=map:0 clk_ignore_unused`
+(partition-layout.env:35)、`CONFIG_FB/FB_SIMPLE/FRAMEBUFFER_CONSOLE/VT`
+(ec6108v9c.config:31-38)、simplefb/hdmi-console 交接驱动 + pstore/ramoops。
+后台调研 (Task #30) 证实卡点：静态 simplefb 节点因 `fb_base` 默认空而未生成、
+显存基址跨次不稳定（未知），故本包**不猜地址、不强行填 FB_BASE**，判据三件套
+（logo / 绿带 / IP）见 README 与 release notes；HDMI+SSH 全黑时靠 pstore 兜底。
+
+**校验（[观察]，本机轻量，未编译内核/rootfs/未碰 U 盘/eMMC）**：
+`bash -n`、YAML 解析（4 jobs / package 10 steps 正确）、脚本用假镜像与真实
+主线镜像各跑一遍均 6 步通过；静态校验 recovery 入口 CRC / ANDROID! 头 /
+4 项 LBA / p1 不写；模拟 `do_flash` 解析确认声明 bytes 与文件真实大小一致。
+**待 CI 真机验证**：release 产出 zip 后短接上电 → 终端式 "6 DONE NO REBOOT"
+→ 断电开机看 logo/绿带/IP。CI 全量构建留 GitHub Actions，本机不等待、不取消。
