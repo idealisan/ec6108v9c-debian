@@ -90,6 +90,12 @@ L2 路由器新 IP / SSH: 有/无
 
 ## 6. 仍待真机的 [未知]（不假装已定）
 - VO `0xf8cc6010` 此刻的 MMIO 读值是否等于 `HIFB_DispBuf_HD`(≈0x3f6ce000)、跨次是否稳定。
+- **显存保留隐患**：community fastboot 点亮 HDMI 后留下的 logo 帧缓冲（≈`0x3f6ce000`）
+  在 6.3 DTB 里没有 `reserved-memory` no-map 保留，内核 `mem=1G` 可能把它当普通 RAM 覆盖 →
+  VO 仍在扫描该区 → 花屏/乱码而非干净 TTY。该地址跨次稳定性 [未知]，故**不硬写进 DTB**
+  （不编造地址）。真机若见花屏但 L0 已过，即指向此项：需在线态读 `/proc/msp/pdm` 的
+  `HIFB_DispBuf_HD` 当次实际 PhyAddr、重启 2~3 次比对是否恒定，再决定 DTB no-map 保留还是
+  运行时解析 `pdm_tag`（研究员 UNKNOWNS 优先级 2/4）。
 - EDID / HPD / 显示时序（sink 运行时读）——私有驱动完整点亮 HDMI 序列的前置。
 - 私有驱动（`patches/vendor-display/`）本体需上述运行时数据，序列静态部分已交付
   （`research/full-disasm/reg_init_sequence.md`）。在 L0 确认前不投入完整驱动。
