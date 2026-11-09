@@ -837,3 +837,69 @@ U 盘 `hi_kernel.bin` 身份复核仍为 `linux-hi3798mv100`。U 盘已就绪，
 阶段的 HDMI 显示为 best-effort——看 "Debian Linux" logo（hiboot 画 p5）/ 绿带
 （内核跑到 HDMI 驱动）/ 路由器新 IP（网络起）；若 HDMI+SSH 全黑，靠 pstore/ramoops
 取 panic 日志。静态 simplefb 节点未启用（显存基址未测、不猜）。真机结果为准。
+
+---
+
+## 10.14 真机反馈：启动后只有 logo + 浅蓝细线、无绿带、无 IP；改用"显示环境探测"量显存地址
+
+**真机（[观察]，用户报告）**：主线 6.x 刷机包短接刷写走完（终端式日志、
+`6 DONE NO REBOOT`），断电正常开机后立即出现 "Debian Linux" 画面；但
+- 路由器后台**看不到任何新 IP**，插了有线也没连上网；
+- 屏幕**只有 logo + 上方一条浅蓝细线**（用户指出"似乎一直都有"）；
+- **没有绿带**（内核 boot marker 是屏幕顶部 240 行纯绿粗带，与浅蓝细线完全不同）。
+
+**判断（[观察]+[推断]）**：
+- 浅蓝细线是 p5 logo 图片自带的装饰，一直都在，**不是内核画的**，不是信号。
+  "Debian Linux" logo 同样是 hiboot 在内核启动前画的 p5 静态图，出现它
+  只证明刷机成功 + hiboot 正常，**不能证明 Linux 启动了**。
+- 无绿带 + 无 IP = 内核大概率**没起来或极早期就停了**（没跑到网络/fbcon/
+  显示驱动）。用户列的"TTY 没绑 HDMI / 驱动有问题"都建立在内核已启动的
+  前提上，此刻更靠前，最可能是"Linux 没启动"。
+- 启动链静态核查（真产物）：主线 uImage `load=entry=0x2000000`，
+  p2 runtime env 的 `bootcmd=mmc read 0 0x1FFFFC0 0x7000 0xA000; bootm
+  0x1FFFFC0`，`0x1FFFFC0+0x40(uImage头)=0x2000000` 精确吻合；DTB
+  `/chosen bootargs`（mem=1G、blkdevparts、fbcon=map:0、console=tty0、
+  clk_ignore_unused）与 `/memory@0` 都已注入。**静态无硬伤**，更像运行时
+  早期问题，需早期日志才能定位。
+
+**用户约束（重要）**：明确**不用 pstore**——"不想每次为了看日志重新刷一遍
+社区版系统，太麻烦"。即拒绝 docs/020/021 里"重启进社区系统读
+/sys/fs/pstore"那套工作流。
+
+**根因线索（[观察]，CI 日志）**：这次 build 的 `FB_BASE` 留空 →
+`apply-dts-placeholders.py` 把静态 simplefb 节点置 `disabled`
+（`FB_BASE unset: framebuffer nodes omitted`）；pstore ramoops 节点则是
+注入了的（`pstore ramoops enabled`，ramoops@0x30000000）。所以
+`console=tty0` 指向的 fb0 没有静态来源，只能靠
+`patches/kernel/hi3798mv100-hdmi-console.c` 运行时读 `VO G0_ADDR`
+(0xf8cc0000+0x494) 注册 simplefb + 画绿带；读不到地址就主动放弃
+（`no hiboot framebuffer found`）。显存地址跨次不稳定是 [未知]。
+
+**破局方案（本次实施）**：不靠网络/串口/pstore/重刷社区系统，改为
+**短接进 recovery-flasher 量显存地址**——短接启动时 HDMI 已被原厂
+recovery 3.10 内核点亮，`/dev/graphics/fb0` 的 `FBIOGET_FSCREENINFO`
+能给出 `smem_start`（物理显存地址，即 fb_base 候选）、smem_len、
+line_length，配合 `FBIOGET_VSCREENINFO` 的 xres/yres/bpp；并 best-effort
+通过 `/dev/mem` 读 VO `G0_ADDR/G0_STRIDE/G0_IRESO`（主线运行时驱动读的
+同一组寄存器）。全部写进 U 盘 `flasher.log`，一次短接即可拿到，零 eMMC
+写入。用户把值报回后，用 `workflow_dispatch` 的 `fb_base` 输入重出包，
+让静态 simplefb 节点 `status=okay`、`console=tty0` 能绑定，启动日志即可
+上 HDMI。
+
+**改动（本次）**：
+- `recovery-flasher/flasher.c`：新增 `PROT_READ`、`VO_*` 寄存器宏、
+  `probe_display_env()`（fb0 fix/var ioctl + best-effort /dev/mem 读 VO
+  G0 寄存器，全部 `log_kv` 写入 flasher.log，任何失败仅记录不致命）；
+  `_start()` 在诊断日志之后、`final_code` 之前调用（每次短接都探测，
+  与有无 manifest 无关）。刷机引擎一行未动。
+- 校验（[观察]）：clang 编译 ELF32 ARM 16476 B、`svc` 在、NEON/VFP=0、
+  repack.py 3.10 兼容、recovery.img `ANDROID!` 头、与产物哈希一致。
+- 装盘：探测版 `recovery.img` 装 U 盘；`flash.manifest` **改名保留**为
+  `flash.manifest.armed`（探测模式零 eMMC 写入，不重复刷机）；U 盘
+  `README-DISPLAY-PROBE.txt` 写明操作、要报回的日志行、如何恢复刷机模式。
+  fastboot.bin 保留，顶层 bootargs.bin 仍是 recovery 入口（CRC 有效）。
+
+**待用户真机**：短接一次 → 拔盘插回电脑看 `flasher.log` 的
+`fb smem_start(phys)` / `VO G0_ADDR` 等行 → 报值 → 用该值填 CI `fb_base`
+重出包装盘 → 再短接刷。探测值测于短接态 recovery 内核、与正常开机 hiboot
+路径 VO 是否同址为 [未知]，作为候选、真机显示为准。

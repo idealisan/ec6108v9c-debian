@@ -111,6 +111,7 @@ static int path_exists(const char *p) {
 #define O_CREAT      0x40
 #define O_TRUNC      0x200
 #define PROT_RW      3
+#define PROT_READ    1
 #define MAP_SHARED   1
 #define FBIOGET_VSCREENINFO 0x4600
 #define FBIOGET_FSCREENINFO 0x4602
@@ -387,6 +388,71 @@ static void log_hex(long v) {
 static void log_kv(const char *k, long v) { log_str(k); log_hex(v); }
 static void log_kvs(const char *k, const char *v) { log_str(k); log_str(v); log_str("\n"); }
 
+/* ---- display environment probe (writes fb_base candidates to flasher.log) ----
+   Goal: measure, in the SHORTED-boot stock-recovery kernel (HDMI is already
+   lit here), the physical framebuffer address + geometry + the VO graphics
+   layer-0 registers that hiboot programmed. These are exactly the values the
+   mainline 6.x kernel needs: fb_base for the static simplefb node, and the
+   G0_ADDR/G0_STRIDE/G0_IRESO that patches/kernel/hi3798mv100-hdmi-console.c
+   reads at subsys_initcall to register simplefb + paint the green boot marker.
+   This needs NO network, NO serial, NO pstore, NO re-flash of the community
+   system -- just one shorted power-on with the U-disk inserted. Best-effort:
+   every read is optional; a failure is logged, never fatal.
+   NOTE: measured under the recovery (3.10) kernel, not the normal-boot hiboot
+   path. Whether hiboot leaves the VO at the same address across boots is an
+   [unknown]; treat the value as a candidate, validate on real hardware. */
+#define VO_REG_BASE   0xf8cc0000UL
+#define VO_REG_SIZE   0x1000
+#define VO_G0_ADDR    0x0494
+#define VO_G0_STRIDE  0x049c
+#define VO_G0_IRESO   0x04a0
+
+static void probe_display_env(void) {
+    unsigned char fix[256], var[256];
+    for (int i = 0; i < 256; i++) { fix[i] = 0; var[i] = 0; }
+    long fbfd = SC3(NR_open, "/dev/graphics/fb0", O_RDONLY, 0);
+    if (fbfd < 0) fbfd = SC3(NR_open, "/dev/fb0", O_RDONLY, 0);
+    log_str("-- display env probe (shorted-boot stock recovery kernel) --\n");
+    if (fbfd >= 0) {
+        long rf = SC3(NR_ioctl, fbfd, FBIOGET_FSCREENINFO, fix);
+        long rv = SC3(NR_ioctl, fbfd, FBIOGET_VSCREENINFO, var);
+        log_kv("probe fb_open    = ", fbfd);
+        log_kv("probe fix_ioctl  = ", rf);
+        log_kv("probe var_ioctl  = ", rv);
+        /* struct fb_fix_screeninfo (32-bit ARM): id[16]@0, smem_start@16,
+           smem_len@20, line_length@44 ; fb_var_screeninfo: xres@0,yres@4,bpp@24 */
+        log_kv("fb smem_start(phys) = ", (long)rd32(fix, 16));
+        log_kv("fb smem_len         = ", (long)rd32(fix, 20));
+        log_kv("fb line_length      = ", (long)rd32(fix, 44));
+        log_kv("fb xres             = ", (long)rd32(var, 0));
+        log_kv("fb yres             = ", (long)rd32(var, 4));
+        log_kv("fb bits_per_pixel   = ", (long)rd32(var, 24));
+        SC1(NR_close, fbfd);
+    } else {
+        log_kv("probe fb_open    = ", fbfd);
+        log_str("  (no fb0 node; HDMI may still be driven by hiboot only)\n");
+    }
+    /* Best-effort: map VO registers via /dev/mem and read G0 layer-0 regs.
+       CONFIG_STRICT_DEVMEM may deny MMIO; that is logged, not fatal. */
+    long mfd = SC3(NR_open, "/dev/mem", O_RDONLY, 0);
+    log_kv("probe devmem_open = ", mfd);
+    if (mfd >= 0) {
+        long m = sc6(NR_mmap2, 0, (long)VO_REG_SIZE, PROT_READ, MAP_SHARED,
+                     mfd, (long)(VO_REG_BASE >> 12));
+        if ((u32)m < 0xfffff001u) {
+            volatile u32 *vo = (volatile u32 *)m;
+            log_kv("VO G0_ADDR (+494)   = ", (long)vo[VO_G0_ADDR >> 2]);
+            log_kv("VO G0_STRIDE(+49c) = ", (long)vo[VO_G0_STRIDE >> 2]);
+            log_kv("VO G0_IRESO (+4a0) = ", (long)vo[VO_G0_IRESO >> 2]);
+        } else {
+            log_kv("probe vo_mmap   = ", m);
+            log_str("  (STRICT_DEVMEM denied VO MMIO; fb smem_start above still usable)\n");
+        }
+        SC1(NR_close, mfd);
+    }
+    log_str("-- end display env probe --\n");
+}
+
 /* ---- U-disk mount, mirroring the STOCK fs_mgr (reverse-engineered) ----
    Teammate disassembled p03__sbin__recovery ensure_path_mounted():
      - sleep(5) first, then stat()/access() poll the device node ~10x with
@@ -662,6 +728,11 @@ void _start(void) {
         log_kvs("ok_node_path   = ", NODES[g_ok_node]);
         if (g_ok_fst >= 0) log_kvs("ok_fstype_name = ", FSTYPES[g_ok_fst]);
     }
+
+    /* Measure the display environment on EVERY shorted boot (best-effort,
+       writes into flasher.log). Gives fb_base / VO G0_ADDR candidates for the
+       mainline kernel's simplefb without network / serial / pstore / re-flash. */
+    probe_display_env();
 
     u32 final_code;
     const char *final_msg;
