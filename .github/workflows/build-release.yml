@@ -7,8 +7,15 @@ on:
         description: 'Archive third-party reference snapshots (large, ~2GB)'
         type: boolean
         default: false
+      display_driver:
+        description: 'Display driver scheme (docs/052): simplefb = legacy mainline handoff (default); vendor-backport = 6.3 mainline kernel + backported HiSilicon VO/HDMI/hifb private stack (user wants mainline kernel features, not necessarily mainline drivers).'
+        type: choice
+        default: 'simplefb'
+        options:
+          - 'simplefb'
+          - 'vendor-backport'
       fb_base:
-        description: 'static simplefb address (hex). Leave empty - the driver discovers the hiboot framebuffer at runtime.'
+        description: '[legacy / simplefb only] static simplefb address (hex). Leave empty - the driver discovers the hiboot framebuffer at runtime. Ignored when display_driver=vendor-backport.'
         type: string
         default: ''
       fb_width:
@@ -75,6 +82,7 @@ jobs:
 
       - name: Build mainline 6.x kernel with local patches
         env:
+          DISPLAY_DRIVER: ${{ inputs.display_driver }}
           FB_BASE: ${{ inputs.fb_base }}
           LAYOUT_ENV: configs/partition-layout.env
           FB_WIDTH: ${{ inputs.fb_width }}

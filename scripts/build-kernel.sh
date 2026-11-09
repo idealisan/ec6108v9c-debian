@@ -33,6 +33,15 @@ FB_SIZE=${FB_SIZE:-0x1000000}
 export FB_WIDTH FB_HEIGHT FB_STRIDE FB_FORMAT FB_SIZE
 PATCH_DIR=${PATCH_DIR:-patches/kernel}
 CONFIG_FRAGMENT=${CONFIG_FRAGMENT:-configs/kernel/ec6108v9c.config}
+# Display driver scheme (docs/052):
+#   "simplefb"        = legacy mainline simplefb handoff (DEFAULT; keeps the
+#                       existing CI path byte-for-byte unchanged).
+#   "vendor-backport" = 6.3 mainline kernel + backported HiSilicon private
+#                       VO/HDMI/hifb display stack. User wants mainline KERNEL
+#                       features but does NOT require mainline drivers.
+# The wired NIC (hisi_femac) is shared by both schemes and is NOT switched here.
+# The vendor branch fail-fasts until its driver is ready (see PORTING.md).
+DISPLAY_DRIVER=${DISPLAY_DRIVER:-simplefb}
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT_DIR"
@@ -76,6 +85,32 @@ for p in "$PATCH_DIR/0001-ec6108v9c-dts-simplefb-tsensor.patch" \
 done
 cp "$PATCH_DIR/hi3798mv100_tsensor.c" "$KERNEL_SRC/drivers/thermal/"
 cp "$PATCH_DIR/hi3798mv100-hdmi-console.c" "$KERNEL_SRC/drivers/video/fbdev/"
+
+# ---- display driver scheme (docs/052) --------------------------------------
+# "simplefb" (default) keeps the legacy handoff above unchanged.
+# "vendor-backport" is the new direction: 6.3 mainline kernel + backported
+# HiSilicon private VO/HDMI/hifb stack. It needs the register-init sequence
+# from the full disassembly (TMP/stock-rom-research/full-disasm/, in progress).
+# Until patches/vendor-display/ ships the driver, fail fast instead of
+# pretending the build is the vendor one. The simplefb default never breaks.
+VD_DIR="$PATCH_DIR/vendor-display"
+if [ "$DISPLAY_DRIVER" = "vendor-backport" ]; then
+  echo "== display scheme: vendor-backport (docs/052) =="
+  if [ ! -f "$VD_DIR/hi3798mv100_vendor_display.c" ] || \
+     [ ! -f "$VD_DIR/0004-vendor-display-kconfig-makefile.patch" ]; then
+    echo "ERROR: vendor-display driver not ready." >&2
+    echo "  Need hi3798mv100_vendor_display.c + 0004-...patch in $VD_DIR." >&2
+    echo "  Register-init sequence comes from the full disassembly" >&2
+    echo "  (TMP/stock-rom-research/full-disasm/), see $VD_DIR/PORTING.md and docs/052." >&2
+    exit 1
+  fi
+  if git -C "$KERNEL_SRC" apply --check "$ROOT_DIR/$VD_DIR/0004-vendor-display-kconfig-makefile.patch" 2>/dev/null; then
+    git -C "$KERNEL_SRC" apply "$ROOT_DIR/$VD_DIR/0004-vendor-display-kconfig-makefile.patch"
+  fi
+  cp "$VD_DIR/hi3798mv100_vendor_display.c" "$KERNEL_SRC/drivers/video/fbdev/"
+  # Vendor stack initialises VO/HDMI itself; no simplefb / fb_base handoff.
+  FB_BASE=""
+fi
 
 echo "== kernel: substitute framebuffer base/status in DTS =="
 DTS_FILE="$KERNEL_SRC/arch/arm/boot/dts/$DTS.dts"
