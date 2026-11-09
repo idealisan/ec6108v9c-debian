@@ -118,10 +118,16 @@ SAFETY / RECOVERY:
     fallback in the same release.
   - No flash.manifest => zero eMMC writes (flasher is display/diagnostic only).
 EOF
+# Real-HW verify SOP (docs/053): L0 green band / L1 TTY / L2 IP, so a single
+# flash gives a decidable signal for the next iteration. Best-effort: if the
+# doc is absent the package still builds.
+if [ -f docs/053-real-hw-verify-sop.md ]; then
+  cp docs/053-real-hw-verify-sop.md "$STAGE/README-VERIFY.txt"
+fi
 python3 - "$STAGE" <<'PY'
 import hashlib, os, sys
 s = sys.argv[1]
-files = ["bootargs.bin", "recovery.img", "fastboot.bin", "flash.manifest"]
+files = ["bootargs.bin", "recovery.img", "fastboot.bin", "flash.manifest", "README.txt", "README-VERIFY.txt"]
 files += ["mv100/" + f for f in sorted(os.listdir(os.path.join(s, "mv100")))]
 with open(os.path.join(s, "SHA256SUMS.txt"), "w") as out:
     for f in files:
