@@ -955,3 +955,60 @@ VO G0_ADDR/STRIDE/IRESO (+494/+49c/+4a0) = 0 / 0 / 0
 候选值 `0x3f6ce000` + 社区几何 1920×1080@7680 填 `fb_base` 重出包试一次；
 (b) 改进探测，让其读取正常开机路径的 VO 或换用已知可用显存；
 (c) 先集中确认"内核到底起没起"再谈显示。真机结果为准，静态推断不作为成功依据。
+
+---
+
+## 10.16 用户拍板"直接试多种 fb_base"→离线改 DTB 一次生成 8 个候选内核装 U 盘
+
+**用户指令（[观察]）**：不要再做判断/选择，直接把测出来的几种地址都试几遍；
+并去反编译原厂安卓软件找"bootloader 动态给地址时的交接流程"。据此两条并行。
+
+**关键可行性（[观察]，源码实证）**：`scripts/build-kernel.sh:131` 用
+`cat zImage DTB > zImage-dtb` 拼内核；内核
+`arch/arm/boot/compressed/head.S:283-296,352-368` 从 `_edata` 读
+`OF_DT_MAGIC(0xd00dfeed)`、按 DTB header 的 totalsize 取大小 →
+**appended DTB 起始偏移固定、内容/大小可变是安全的**。因此可离线反编译
+DTB、注入静态 simple-framebuffer 节点、贴回 `hi_kernel.bin`、重算 uImage
+头 size/dcrc/hcrc，毫秒级生成多候选内核，**不必等 CI 重编 20 分钟**。
+
+**实施（本次）**：新增 `scripts/gen-fb-candidates.sh`（离线 dtc/字节拼接），
+对 8 组 (fb_base, 几何) 各生成一个内核：
+```
+A 0x3f6ce000 1920x1080  (docs/041/043 VO layer0，最推荐)
+B 0x3C55C000 1920x1080  (docs/021/040 社区 smem_start)
+C 0x3FBFD000 1920x1080  (docs/048 reserve_mem 4MiB 块)
+D 0x3F8FC000 1920x1080  (docs/048 reserve_mem 3MiB 块)
+E 0x3FFFE000 1920x1080  (docs/048 reserve_mem_start)
+F 0x0fc54000 1280x720   (本次探测 recovery fb0)
+G 0x3f6ce000 1280x720   (A 地址 + 探测几何)
+H 0x0fc54000 1920x1080  (F 地址 + 社区几何)
+```
+每个内核：zImage 前缀 `[0x40,0x6f20e8)` 与发布版**逐字节一致**（8 个候选
+前缀 sha256 全同 `0ddc5ffb…`）、`/chosen bootargs` 不变、仅 appended DTB
+新增 `reserved-memory` 的 framebuffer 段(no-map) + 顶层 `simple-framebuffer`
+节点(status=okay)；uImage 头 size/dcrc/hcrc 重算且自洽；dtc 反解确认
+`simple-framebuffer` 存在。**8 个候选大小一致 0x6f58c0(7297216 B)**。
+
+**装盘（[观察]，U 盘 /Volumes/BOXBAK）**：
+- `mv100/candidates/` 放 8 个 `hi_kernel_*.bin` + CANDIDATES.txt；
+- `mv100/hi_kernel.bin` = 默认候选 A；
+- `flash.manifest` 恢复（4 项），**hi_kernel 的 R bytes 从发布版 `6f5800`
+  修正为候选真实大小 `6f58c0`**（否则少写 192B 会截断新 DTB——关键修复）；
+- `select-candidate.sh`（U 盘根）：在电脑上跑 `bash select-candidate.sh A..H`
+  一键切换候选到 `mv100/hi_kernel.bin`，已实测切 B/切回 A 正常；
+- `README-FB-CANDIDATES.txt` 写明逐个试的流程与判据；
+- p1 fastboot 永不写，`flash.manifest.armed` 作备份保留。
+
+**判据（待真机）**：每个候选短接刷一次（终端日志 `6 DONE NO REBOOT`）、
+断电开机看绿带/启动文字/路由器新 IP；哪个出画面用哪个。**全部无画面 →
+内核很可能没起来，问题在启动链而非显存地址**，转查启动链/反编译结果。
+
+**并行研究**：后台研究员反编译原厂 ROM / p1_fastboot / 社区 4.4 内核，
+找 hiboot 初始化 VO 与显存地址、以及"动态地址交接给内核"的确切机制
+（寄存器/参数块/ATAG/DTB），产出可直接用的 fb_base + 图层寄存器偏移。
+用户明确要"从真实二进制挖出确定性流程"，不再停留于推测。
+
+[未知] 离线注入的静态 simplefb 节点与内核内置运行时驱动
+`hi3798_hdmi_console.c` 都注册名为 `simple-framebuffer` 的设备，可能冲突
+或产生第二个 fb；以及这些 fb_base 是否为正常开机 hiboot 真实显存地址。
+均以真机结果为准，静态推断不作为成功依据。
