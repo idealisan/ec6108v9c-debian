@@ -145,8 +145,8 @@ def main():
     kernel_off = base + ps
     kernel = d[kernel_off:kernel_off + ks]
     assert kernel[:4] == struct.pack(">I", UIMAGE_MAGIC), "kernel blob is not a uImage"
-    print(f"[observe] kernel uImage: {len(kernel)} B, magic OK, name="
-          f"{kernel[32:64].split(b'\x00')[0].decode('ascii','replace')}")
+    kernel_name = kernel[32:64].split(b"\x00")[0].decode("ascii", "replace")
+    print(f"[observe] kernel uImage: {len(kernel)} B, magic OK, name={kernel_name}")
 
     ramdisk_off = kernel_off + ((ks + ps - 1) // ps) * ps
     ramdisk_gz = d[ramdisk_off:ramdisk_off + rs]
