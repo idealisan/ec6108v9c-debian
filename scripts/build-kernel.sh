@@ -167,6 +167,15 @@ while IFS= read -r line; do
     *) echo "  (skip $line)" ;;
   esac
 done < "$CONFIG_FRAGMENT"
+# vendor-backport: enable the private display driver symbol CONDITIONALLY,
+# only on this path. It must NOT go in the shared config fragment above:
+# simplefb builds would then enable a driver whose Kconfig symbol comes from
+# the 0004 patch (absent there), or (once 0004 exists) accidentally pull the
+# vendor driver into the default kernel. olddefconfig drops -e for a symbol
+# whose Kconfig entry is missing, so this is a safe no-op until 0004 lands.
+if [ "$DISPLAY_DRIVER" = "vendor-backport" ]; then
+  "$KERNEL_SRC/scripts/config" --file "$OUT/.config" -e HI3798MV100_VENDOR_DISPLAY
+fi
 "$MAKE" -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="${CROSS:+$CROSS}" $MAKE_EXTRA olddefconfig
 echo "== kernel: verify key options =="
 # The wired MAC is included here on purpose: if any of these ever reads

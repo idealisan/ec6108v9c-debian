@@ -57,8 +57,11 @@
 - `0004-vendor-display-kconfig-makefile.patch`：`drivers/video/fbdev/Kconfig` + `Makefile`
   加 `CONFIG_HI3798MV100_VENDOR_DISPLAY`（或 DRM 路径）。
 - `hi3798mv100_vendor_display.c`：platform driver，`subsys_initcall`/`module_init` 完成初始化；
-  复用已内置的绿带 boot marker 语义（证明内核起来了）。
-- `configs/kernel/` 片段加 `CONFIG_HI3798MV100_VENDOR_DISPLAY=y`。
+  复用已内置的绿带 boot marker 语义（证明内核起来了，属 L0 探针，见 docs/052 §5）。
+- `CONFIG_HI3798MV100_VENDOR_DISPLAY=y` **不要写进共用的 `configs/kernel/ec6108v9c.config`**
+  （simplefb 默认路径也读它，会被污染 / 触发不存在的符号）。已由 `scripts/build-kernel.sh`
+  在 `DISPLAY_DRIVER=vendor-backport` 分支里用 `scripts/config -e` 条件式 enable（在
+  `.config` 合并后、`olddefconfig` 前），符号缺失时 olddefconfig 自动丢弃，对默认路径无害。
 
 ## 接线（已改）
 - `.github/workflows/build-release.yml`：`display_driver` input（`simplefb` 默认 / `vendor-backport`），
