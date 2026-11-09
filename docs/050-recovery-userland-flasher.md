@@ -792,3 +792,48 @@ Debian rootfs(sparse)"后，LBA 与 flash.manifest 格式照用即可。
 4 项 LBA / p1 不写；模拟 `do_flash` 解析确认声明 bytes 与文件真实大小一致。
 **待 CI 真机验证**：release 产出 zip 后短接上电 → 终端式 "6 DONE NO REBOOT"
 → 断电开机看 logo/绿带/IP。CI 全量构建留 GitHub Actions，本机不等待、不取消。
+
+---
+
+## 10.13 CI 实跑：首个失败→修复→成功产出→装盘到 U 盘（真机待验）
+
+**run 42607920085（[观察]，首次 push）→ failure**：build-rootfs / build-kernel /
+qemu-boot-test 三 job 全 success，package job 的 recommended 步失败。根因：
+`recovery-flasher/repack.py:149` 的 f-string 表达式含 `b'\x00'` 反斜杠，本机
+Python 3.14 允许、CI ubuntu-22.04 的 **Python 3.10 报**
+`SyntaxError: f-string expression part cannot include a backslash` →
+`build.sh` 的 repack 挂掉 → 未生成 `recovery.img`。
+修复：把 `kernel_name` 提到 f-string 外（`e092ca6`），并用
+`ast.parse(feature_version=(3,10))` 验证 repack.py / mkbootargs.py /
+img2simg.py / apply-dts-placeholders.py / build.sh 内联块全部 3.10 兼容。
+
+**run 42610661760（[观察]，workflow_dispatch 重跑）→ success**（20m25s）。
+release `build-20261109T115805Z` 产出 3 个 asset，含
+`mv100-mdmo1g-mainline-recovery-flash-20261109T115805Z.zip`（114 MB，recommended）
++ `mv100-mdmo1g-debian-usb-flash-*.zip`（legacy）+ `hi_kernel.bin`。
+
+**zip 内容验证（[观察]）**：顶层 `bootargs.bin` = recovery 入口（CRC 有效、
+含 `recovery.img`/`bootm`、无 `mmc write`）；`recovery.img` = `ANDROID!`；
+`flash.manifest` 4 项（p2 0x800 / p5 0x5000 / p6 0x7000 / p8 0x31000，
+p1 不写，R 字节数=文件真实大小，S 填 0）；`mv100/debian-root.ext4` =
+Android sparse。
+**内核 6.x 主线证据**：uImage name=`linux-hi3798mv100`（build-kernel.sh 给
+主线内核起的名字，不含版本号；无 histb/7.4/ecoo/4.4 标记）；CI build-kernel
+日志含 `6.3.0-` 与 `Kernel: arch/arm/boot/zImage is ready`；zip 内
+`hi_kernel.bin`（7297024 B）= release 独立 `hi_kernel.bin`（7296935 B）的
+逐字节前缀 + 89 B 补零到 512 对齐（make-community-flash-package.sh 的 truncate），
+即同一个 6.3 内核。压缩 zImage 内搜不到明文版本串属正常。
+
+**装盘（[观察]，U 盘 /Volumes/BOXBAK FAT32）**：顶层覆盖 `bootargs.bin` /
+`recovery.img` / `flash.manifest` + 新增 `README-MAINLINE-RECOVERY.txt` /
+`SHA256SUMS-MAINLINE.txt`；`mv100/` 覆盖 4 个主线镜像（bootargs.bin / logo.img /
+hi_kernel.bin / debian-root.ext4）；保留 `fastboot.bin`（community carrier）。
+装盘后 7 个文件与 CI 解压源**逐字节 SHA256 一致**，manifest 无社区 7 项残留，
+U 盘 `hi_kernel.bin` 身份复核仍为 `linux-hi3798mv100`。U 盘已就绪，短接上电即刷。
+
+**[未知，待真机]**：这是 stage 目标里"尽量尝试启动阶段显示终端日志"的唯一未验证
+环节，本机无法证实。判据（README/release notes）：短接刷机阶段终端式滚动日志 +
+停在 `6 DONE NO REBOOT`（该显示已真机验证）；断电正常开机后，主线 6.x 内核启动
+阶段的 HDMI 显示为 best-effort——看 "Debian Linux" logo（hiboot 画 p5）/ 绿带
+（内核跑到 HDMI 驱动）/ 路由器新 IP（网络起）；若 HDMI+SSH 全黑，靠 pstore/ramoops
+取 panic 日志。静态 simplefb 节点未启用（显存基址未测、不猜）。真机结果为准。
