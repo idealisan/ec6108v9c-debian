@@ -1,0 +1,81 @@
+﻿# seq	phase	phys_base	offset	phys_addr	value	value_kind	order	src_func	src_VA	label	note
+# ============================================================================
+# BASE MAP (not writes; reference rows). All [观察] from SDK drv_reg_proc.h + kernel globals.
+# ============================================================================
+B1	BASE	0xf8cc0000	+0x0000	0xf8cc0000	VO/VDP reg window	base	-	DISP_Init	0x805DB2D4	[观察]	SDK drv_reg_proc.h CONFIG_VDP_REG_BASEADDR; DISP_Init does movw/movt 0xf8cc then bl DISP_HAL_Init(0x805A95DC). virtual = phys+0x05000000 = 0xfdcc0000 (DISP_HAL_Init: add r6,r0,#0x5000000; str r6,[r4,#0x258])
+B2	BASE	0xf8ce0000	+0x0000	0xf8ce0000	HDMI TX SLV0 (dev 0x72)	base	-	DRV_WriteByte_8BA	0x80592F64	[观察]	SDK drv_reg_proc.h:24-27 HDMI_TX_SLV0_ADDR_BASE=0xf8ce0000; kernel reads virt base from global 0x8112ff64 (0xfdce0000). str r3,[base,reg<<2]
+B3	BASE	0xf8ce0400	+0x0400	0xf8ce0400	HDMI TX SLV1 (dev 0x7a)	base	-	DRV_WriteByte_8BA	0x80592F64	[观察]	SLV1: add r2,r2,#0x100 then str[base,r2<<2] => +0x400. SDK HDMI_TX_SLV1_ADDR_BASE=0xf8ce0400
+B4	BASE	0xf8ce0800	+0x0800	0xf8ce0800	HDMI TX CEC (dev 0xc0)	base	-	DRV_WriteByte_8BA	0x80592F64	[观察]	CEC: add r2,r2,#0x200 then str[base,r2<<2] => +0x800. SDK HDMI_TX_CEC_ADDR_BASE=0xf8ce0800
+B5	BASE	0xf8ce1800	+0x0000	0xf8ce1800	HDMI PHY	base	-	SI_TX_PHY_WriteRegister	0x805A50CC	[观察]	SDK phy.c:38-43 + drv_reg_proc.h:34 HDMI_TX_PHY_ADDR=0xf8ce1800; kernel builds movw #0x8600/movt #0x3e33 = 0x3e338600; lsl #2 = 0xf8ce1800
+B6	BASE	0xf8a22000	+0x0000	0xf8a22000	CRG (clock/reset)	base	-	SI_HW_ResetCtrl	0x8059AD9C	[观察]	data word @global 0x80FBA6A4 = 0xfda22000 (virt=phys+0x05000000). docs/035 g_pstRegCrg=0xfda22000
+# ============================================================================
+# WRITE LEAF MECHANISMS (how a (addr,val) becomes a real MMIO str). [观察]
+# ============================================================================
+M1	MECH	-	-	-	DRV_HDMI_WriteRegister: r4=r0+0x5000000; str r5,[r4]	leaf	-	DRV_HDMI_WriteRegister	0x8059339C	[观察]	r0=physical addr, r1=value; add 0x05000000 virtual-map offset then str. 1 str in function
+M2	MECH	-	-	-	SI_TX_PHY_WriteRegister: r0=4*(reg+0x3e338600)=0xf8ce1800+4*reg; r1=val; bl DRV_HDMI_WriteRegister	leaf	-	SI_TX_PHY_WriteRegister	0x805A50CC	[观察]	movw r3,#0x8600; movt r3,#0x3e33; add r5,r5,r3; lsl r0,r5,#2
+M3	MECH	-	-	-	DRV_WriteByte_8BA: str r3,[base,reg<<2] (SLV0/SLV1/CEC bank)	leaf	-	DRV_WriteByte_8BA	0x80592F64	[观察]	base=*0x8112ff64=0xfdce0000; 3 cmp on r1 (0x72/0x7a/0xc0); 3 str sites 0x80592F9C/0x80592FB0/0x80592FC8
+M4	MECH	-	-	-	VDP_RegWrite / OPTM_VDP_RegWrite: str r1,[r0]	leaf	-	VDP_RegWrite	0x805AC640	[观察]	unified VO/VDP write entry; addr computed by caller = *pVdpReg + offset. docs/035: 592 callers (VDP_RegWrite), 131 (OPTM_VDP_RegWrite)
+# ============================================================================
+# PHASE 1 — HDMI HW reset / CRG (SI_HW_ResetHDMITX @0x8059BD40). ORDER = source instruction order.
+# CRG base = 0xf8a22000 (phys) / 0xfda22000 (virt). All str are [观察] static or RMW-marked.
+# ============================================================================
+R1	P1-CRG	0xf8a22000	+0x10c	0xf8a2210c	0x23f	static	1	SI_HW_ResetHDMITX	0x8059BD78	[观察]	movw r2,#0x23f; str r2,[r1,#0x10c]. reset ctrl assert (all resets). docs/035 表C r0∈{0x3f,0x403f,0x23f}
+R2	P1-CRG	0xf8a22000	+0x110	0xf8a22110	0x10	static	2	SI_HW_ResetHDMITX	0x8059BD84	[观察]	mov ip,#0x10; str ip,[r3,#0x110]. reset phy. docs/035 表C r0∈{1,0x10}
+R3	P1-CRG	-	-	-	DelayMS(1)	delay	3	SI_HW_ResetHDMITX	0x8059BD88	[观察]	bl DelayMS
+R4	P1-CRG	0xf8a22000	+0x110	0xf8a22110	0x1	static	4	SI_HW_ResetHDMITX	0x8059BD98	[观察]	r5=1; str r5,[r1,#0x110]. deassert phy reset
+R5	P1-CRG	-	-	-	DelayMS(1)	delay	5	SI_HW_ResetHDMITX	0x8059BD9C	[观察]	bl DelayMS
+R6	P1-CRG	-	-	-	bl SI_TX_PHY_INIT	call	6	SI_HW_ResetHDMITX	0x8059BDA0	[观察]	the 7 PHY writes below (Phase 2)
+R7	P1-CRG	-	-	-	DelayMS(1)	delay	7	SI_HW_ResetHDMITX	0x8059BDA8	[观察]	bl DelayMS
+R8	P1-CRG	0xf8a22000	+0x10c	0xf8a2210c	0x3f	static	8	SI_HW_ResetHDMITX	0x8059BDB8	[观察]	mov r2,#0x3f; str r2,[r3,#0x10c]. deassert resets
+R9	P1-CRG	-	-	-	DelayMS(10)	delay	9	SI_HW_ResetHDMITX	0x8059BDBC	[观察]	mov r0,#0xa; bl DelayMS
+R10	P1-TX	0xf8ce0000	+0x7b*4=0x1ec	0xf8ce01ec	0x02	static	10	SI_HW_ResetHDMITX	0x8059BDD0	[观察]	WriteByte_8BA(1,0x72,0x7b,2). SLV0 reg 0x7b = 2
+R11	P1-TX	0xf8ce0000	+0xf6*4=0x3d8	0xf8ce03d8	DDCspeed()	RMW/param	11	SI_HW_ResetHDMITX	0x8059BDE8	[推断]	WriteByte_8BA(1,0x72,0xf6,<DDCspeed>). value from DRV_Get_DDCSpeed (runtime), NOT a static constant
+# ============================================================================
+# PHASE 2 — HDMI PHY init: SI_TX_PHY_INIT @0x805A5438, 7 static writes, ORDER = source order.
+# Each: r0=reg, r1=val, bl SI_TX_PHY_WriteRegister @0x805A50CC -> phys 0xf8ce1800+4*reg.
+# INDEPENDENT ORACLE: docs/035 (recovery 3.10, mainline-porting) 表A gives IDENTICAL 7 pairs.
+# ============================================================================
+P1	P2-PHY	0xf8ce1800	+0x00	0xf8ce1800	0x00	static	1	SI_TX_PHY_INIT	0x805A5454	[观察]	mov r0,#0; mov r1,r0; bl. reg0 OE. docs/035 表A row1
+P2	P2-PHY	0xf8ce1800	+0x08	0xf8ce1808	0x02	static	2	SI_TX_PHY_INIT	0x805A5460	[观察]	mov r0,#2; mov r1,r0; bl. reg2 AUD. docs/035 表A row2
+P3	P2-PHY	0xf8ce1800	+0x0c	0xf8ce180c	0x02	static	3	SI_TX_PHY_INIT	0x805A546C	[观察]	mov r1,#2; mov r0,#3; bl. reg3 PLL1. docs/035 表A row3
+P4	P2-PHY	0xf8ce1800	+0x10	0xf8ce1810	0x09	static	4	SI_TX_PHY_INIT	0x805A5478	[观察]	mov r1,#9; mov r0,#4; bl. reg4 PLL2. docs/035 表A row4
+P5	P2-PHY	0xf8ce1800	+0x14	0xf8ce1814	0x04	static	5	SI_TX_PHY_INIT	0x805A5484	[观察]	mov r1,#4; mov r0,#5; bl. reg5 DRV. docs/035 表A row5. *** SDK phy.c mv100 branch says 0x01 here (source/binary drift); USE BINARY 0x04 per 逐字节来自原厂资产 rule ***
+P6	P2-PHY	0xf8ce1800	+0x18	0xf8ce1818	0x00	static	6	SI_TX_PHY_INIT	0x805A5490	[观察]	mov r1,#0; mov r0,#6; bl. reg6 CLK. docs/035 表A row6
+P7	P2-PHY	0xf8ce1800	+0x04	0xf8ce1804	0x01	static	7	SI_TX_PHY_INIT	0x805A549C	[观察]	mov r0,#1; mov r1,r0; bl. reg1 PWD (power up LAST). docs/035 表A row7
+# ============================================================================
+# PHASE 2b — PHY family RMW helpers (NOT static init; runtime read-modify-write). [观察] mechanism, [推断] value.
+# ============================================================================
+F1	P2b-PHY	0xf8ce1800	+0x00	0xf8ce1800	read|1	RMW	-	SI_TX_PHY_EnableHdmiOutput	0x805A54E0	[推断]	SI_TX_PHY_ReadRegister(0)->orr #1->SI_TX_PHY_WriteRegister(0). value runtime-dependent
+F2	P2b-PHY	0xf8ce1800	+0x04	0xf8ce1804	read&~1 or |1	RMW	-	SI_TX_PHY_PowerDown	0x805A5424	[推断]	SI_TX_PHY_ReadRegister(1)->bic/orr #1->Write(1). value runtime-dependent
+F3	P2b-PHY	0xf8ce1800	+0x10	0xf8ce1810	read&~3|(deepcolor)	RMW	-	SI_TX_PHY_SetDeepColor	0x805A521C	[推断]	reads reg4, modifies per deep-color arg (1/2/0). value runtime-dependent
+# ============================================================================
+# PHASE 3 — HDMI TX byte writes in wake/clock/mode path (I2C-8BA mapped to MMIO).
+# phys = 0xf8ce0000 (0x72) / 0xf8ce0400 (0x7a) + reg*4. Values static where noted.
+# ============================================================================
+T1	P3-TX	0xf8ce0000	+0x08*4=0x20	0xf8ce0020	read|1	RMW	1	SI_WakeUpHDMITX	0x8059B2EC	[推断]	ReadByte_8BA(1,0x72,0x08)->orr #1->WriteByte_8BA. runtime value
+T2	P3-TX	0xf8ce0000	+0x7b*4=0x1ec	0xf8ce01ec	0x02	static	2	SI_WakeUpHDMITX	0x8059B300	[观察]	WriteByte_8BA(1,0x72,0x7b,2)
+T3	P3-TX	0xf8ce0000	+0x48*4=0x120	0xf8ce0120	(read&0xfc)|IClk	RMW	-	SI_SetIClk	0x8059B17C	[推断]	ReadByte(0x48)->and #0xfc->orr IClk(0)->WriteByte. SetIClk(0) in SDK HDMI_Display:375
+T4	P3-TX	0xf8ce0400	+0x2f*4=0xbc	0xf8ce04bc	read|1 (HDMI) or &0xfe (DVI)	RMW	-	SI_TX_SetHDMIMode	0x8059B0FC	[推断]	ReadByte(0x7a,0x2f)->orr #1 / and #0xfe->WriteByte. depends on hdmi_dvi_mode
+T5	P3-TX	0xf8ce0400	+ACR_CTRL_ADDR*4	-	0x04	static	-	HDMI_Display (SDK hdmi.c:421)	-	[观察]	WriteByteHDMITXP1(ACR_CTRL_ADDR,0x04) in SDK (hiboot source); kernel equivalent in hdmi_Open path. byte-level from SDK original asset
+# ============================================================================
+# PHASE 4 — DISP / CRG clock+reset (pre-VO config). Mostly RMW. [观察] offsets, [推断] values.
+# ============================================================================
+C1	P4-CLK	0xf8a22000	+0xd8	0xf8a220d8	read &0x40000003; if !=3 -> DISP_ResetCRG	RMW	1	Chip_Specific_DISP_OpenClock	0x805AB7DC	[推断]	ldr r0,[r1,#0xd8]; and r3,r0,#0x40000003; cmp #3; blne DISP_ResetCRG. runtime-dependent
+C2	P4-CLK	0xf8a22000	+0xd8	0xf8a220d8	RMW (orr #0x7f, #0x4100000, #0x40000000)	RMW	-	DISP_ResetCRG	0x805B11B0	[推断]	docs/035 表D: read +0xd8 -> orr/bfc/bfi -> write. value runtime-dependent
+C3	P4-CLK	0xf8a22000	+0x28	0xf8a22028	bfi(r1,#0,#0x1f) into read	RMW	-	Chip_Specific_DispSetPll	0x805AB6DC	[推断]	ldr ip,[r0,#0x28]; bfi ip,r1,#0,#0x1f; str. PLL param runtime
+C4	P4-CLK	0xf8a22000	+0x2c	0xf8a2202c	bfi(r2,#0,#0x1b) into read	RMW	-	Chip_Specific_DispSetPll	0x805AB6EC	[推断]	ldr r1,[r3,#0x2c]; bfi r1,r2,#0,#0x1b; str. PLL param runtime
+C5	P4-CLK	0xf8a22000	+0x10c	0xf8a2210c	0x3f / 0x403f / 0x23f	static-set	-	SI_HW_ResetCtrl	0x8059ADDC	[观察]	[推断] value selected by boot/chip arg: moveq #0x3f / movw #0x403f / #0x23f; str r0,[r1,#0x10c]
+C6	P4-CLK	0xf8a22000	+0x110	0xf8a22110	0x1 / 0x10	static-set	-	SI_HW_ResetPhy	0x8059AE14	[观察]	[推断] moveq #1 / movne #0x10; str r0,[r3,#0x110]
+# ============================================================================
+# PHASE 5 — VO/VDP GFX layer G0 config (relative VO_base=0xf8cc0000). layer stride layer*0x800.
+# FINDINGS §D 真值: G0_CTRL/ADDR/STRIDE/IRESO = +0x6000/+0x6010/+0x601c/+0x6020.
+# ============================================================================
+G1	P5-G0	0xf8cc0000	+0x6010+layer*0x800	0xf8cc6010	framebuffer phys addr	param	-	VDP_GFX_SetLayerAddr	0x805B6ACC	[观察]	add r1,r1,#0x6000; add r1,r1,#0x10; str ip,[r1,r0,lsl#2]. value = fb base (runtime, from pdm_tag/MMZ)
+G2	P5-G0	0xf8cc0000	+0x601c+layer*0x800	0xf8cc601c	stride low16	param	-	VDP_GFX_SetLayerAddr	0x805B6AEC	[观察]	add r3,ip,#0x1c; ldr; strh (low16); str. 1920*4=7680 for 1080p
+G3	P5-G0	0xf8cc0000	+0x6020+layer*0x800	0xf8cc6020	iw[11:0]/ih[23:12]	param	-	VDP_GFX_SetLayerAddr	0x805B6A84	[推断]	G0_IRESO set via OPTM_GfxSetLayerRect/OPTM_GfxSetGpRect elsewhere; value = width/height (1920/1080)
+G4	P5-G0	0xf8cc0000	+0x6000+layer*0x800	0xf8cc6000	layer enable/format	RMW	-	OPTM_GfxOpenLayer / OPTM_VDP_GFX_SetLayerAddrEX	0x805F4178	[推断]	G0_CTRL surface_en bit + data format; runtime RMW
+# ============================================================================
+# PHASE 6 — EDID / HPD / timing (runtime, NO static register init). [未知]
+# ============================================================================
+E1	P6-EDID	0xf8ce0000	+0xf3*4=0x3cc	0xf8ce03cc	0x09	static	-	SI_BlockRead_MDDC	-	[观察]	docs/035: WriteByte_8BA(1,0x72,0xF3,9) DDC (dev 0x72=SLV0 base 0xf8ce0000); EDID read via TX MDDC, poll 0xF2 bit4. timing from sink EDID, NOT hardcoded
+E2	P6-TIMING	-	-	-	1080p60 / 720p50 from EDID VIC	param	-	hdmi_Disp2EncFmt / GetSinkCapability	-	[未知]	时序运行时由 sink EDID (SinkCap.stPerferTiming) 决定; SDK g_stDispTiming 仅 fallback (docs/023:145). 静态不可定

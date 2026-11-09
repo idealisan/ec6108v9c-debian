@@ -1,0 +1,3303 @@
+# display_funcs_p01.txt -- per-function disasm of p01 functions w/ MMIO literals or display-string xrefs
+# NOTE: full-sweep evidence (engine_p01) found NO VO/HDMI literals and 0 display-string code xrefs.
+#
+
+===== sub_00c6b2b0 @0x00c6b2b0 (MMIO-literal candidate) =====
+  0x00c6b2b0 cmp       r0, #0x11
+  0x00c6b2b4 movgt     r0, #0
+  0x00c6b2b8 bxgt      lr
+  0x00c6b2bc cmp       r0, #5
+  0x00c6b2c0 addne     r0, r0, #0xf8000
+  0x00c6b2c4 addne     r0, r0, #0xb20
+  0x00c6b2c8 ldreq     r0, [pc, #4]
+  0x00c6b2cc lslne     r0, r0, #0xc
+  0x00c6b2d0 bx        lr
+  0x00c6b2d4 .byte     0x00, 0x40, 0x00, 0xf8
+  0x00c6b2d8 push      {r0, r1, r4, r5, r6, lr}
+  0x00c6b2dc mov       r2, #0x80
+  0x00c6b2e0 ldr       r0, [pc, #0x154]
+  0x00c6b2e4 mov       r1, #0
+  0x00c6b2e8 bl        #0xc6c3cc
+  0x00c6b2ec mov       r3, #0xf8000000
+  0x00c6b2f0 ldr       r4, [r3, #0xa8]
+  0x00c6b2f4 cmp       r4, #0
+  0x00c6b2f8 ldreq     r0, [pc, #0x140]
+  0x00c6b2fc beq       #0xc6b310
+  0x00c6b300 ldr       r6, [r3, #0xac]
+  0x00c6b304 cmp       r6, #0
+  0x00c6b308 bne       #0xc6b31c
+  0x00c6b30c ldr       r0, [pc, #0x130]
+  0x00c6b310 add       sp, sp, #8
+  0x00c6b314 pop       {r4, r5, r6, lr}
+  0x00c6b318 b         #0xc1fa7c
+  0x00c6b31c and       r3, r6, #0xff
+  0x00c6b320 ubfx      r2, r6, #8, #8
+  0x00c6b324 cmp       r3, #0xff
+  0x00c6b328 cmpne     r2, #0xff
+  0x00c6b32c ubfx      r5, r6, #0x10, #8
+  0x00c6b330 lsr       r6, r6, #0x18
+  0x00c6b334 bne       #0xc6b34c
+  0x00c6b338 mov       r1, #0x20
+  0x00c6b33c ldr       r2, [pc, #0x104]
+  0x00c6b340 ldr       r0, [pc, #0x104]
+  0x00c6b344 bl        #0xc6df94
+  0x00c6b348 b         #0xc6b360
+  0x00c6b34c str       r2, [sp]
+  0x00c6b350 mov       r1, #0x20
+  0x00c6b354 ldr       r0, [pc, #0xf0]
+  0x00c6b358 ldr       r2, [pc, #0xf0]
+  0x00c6b35c bl        #0xc6df94
+  0x00c6b360 mov       r1, r0
+  0x00c6b364 cmp       r6, #0xff
+  0x00c6b368 cmpne     r5, #0xff
+  0x00c6b36c ldr       r0, [pc, #0xd8]
+  0x00c6b370 add       r0, r0, r1
+  0x00c6b374 rsb       r1, r1, #0x20
+  0x00c6b378 bne       #0xc6b388
+  0x00c6b37c ldr       r2, [pc, #0xd0]
+  0x00c6b380 bl        #0xc6df94
+  0x00c6b384 b         #0xc6b398
+  0x00c6b388 ldr       r2, [pc, #0xc8]
+  0x00c6b38c mov       r3, r5
+  0x00c6b390 str       r6, [sp]
+  0x00c6b394 bl        #0xc6df94
+  0x00c6b398 and       r3, r4, #0x1f
+  0x00c6b39c ubfx      r2, r4, #0x10, #5
+  0x00c6b3a0 mov       r1, #0x20
+  0x00c6b3a4 str       r2, [sp]
+  0x00c6b3a8 ldr       r0, [pc, #0x8c]
+  0x00c6b3ac ldr       r2, [pc, #0xa8]
+
+===== sub_00c94a24 @0x00c94a24 (MMIO-literal candidate) =====
+  0x00c94a24 cmp       r0, #0
+  0x00c94a28 ldr       r3, [pc, #0x1c]
+  0x00c94a2c ldr       r0, [pc, #0x1c]
+  0x00c94a30 moveq     r3, r0
+  0x00c94a34 str       r3, [r1]
+  0x00c94a38 ldr       r3, [pc, #0x14]
+  0x00c94a3c ldr       r1, [pc, #0x14]
+  0x00c94a40 moveq     r3, r1
+  0x00c94a44 str       r3, [r2]
+  0x00c94a48 bx        lr
+  0x00c94a4c .byte     0x00, 0x90, 0xa3, 0xf8
+  0x00c94a50 .byte     0x00, 0x10, 0xa3, 0xf8
+  0x00c94a54 .byte     0x00, 0xe0, 0xa3, 0xf8
+  0x00c94a58 .byte     0x00, 0x80, 0xa3, 0xf8
+  0x00c94a5c bx        lr
+  0x00c94a60 mov       r3, #0xf8000000
+  0x00c94a64 ldr       r0, [r3, #0xa0]
+  0x00c94a68 bx        lr
+  0x00c94a6c ldr       r3, [r0, #0x70]
+  0x00c94a70 orr       r3, r3, #0x100000
+  0x00c94a74 str       r3, [r0, #0x70]
+  0x00c94a78 bic       r3, r3, #0x100000
+  0x00c94a7c str       r3, [r0, #0x70]
+  0x00c94a80 ldr       r3, [r0, #4]
+  0x00c94a84 orr       r3, r3, #0x8000
+  0x00c94a88 str       r3, [r0, #4]
+  0x00c94a8c bic       r3, r3, #0x8000
+  0x00c94a90 str       r3, [r0, #4]
+  0x00c94a94 dsb       sy
+  0x00c94a98 bx        lr
+  0x00c94a9c push      {r4, lr}
+  0x00c94aa0 ldr       ip, [sp, #8]
+  0x00c94aa4 and       r3, r3, #7
+  0x00c94aa8 cmp       ip, #2
+  0x00c94aac bne       #0xc94ac4
+  0x00c94ab0 cmp       r3, #3
+  0x00c94ab4 lsl       r2, r2, #7
+  0x00c94ab8 addls     r2, r2, #0x210
+  0x00c94abc addhi     r2, r2, #0x214
+  0x00c94ac0 b         #0xc94ad4
+  0x00c94ac4 cmp       r3, #3
+  0x00c94ac8 lsl       r2, r2, #7
+  0x00c94acc addls     r2, r2, #0x21c
+  0x00c94ad0 addhi     r2, r2, #0x220
+  0x00c94ad4 and       r3, r3, #3
+  0x00c94ad8 ldr       ip, [r2, r0]
+  0x00c94adc mov       r4, #0xff
+  0x00c94ae0 and       r1, r1, #0x1f
+  0x00c94ae4 lsl       r3, r3, #3
+  0x00c94ae8 bic       ip, ip, r4, lsl r3
+  0x00c94aec orr       r3, ip, r1, lsl r3
+  0x00c94af0 str       r3, [r2, r0]
+  0x00c94af4 pop       {r4, lr}
+  0x00c94af8 b         #0xc94a6c
+  0x00c94afc cmp       r3, #2
+  0x00c94b00 and       r2, r2, #7
+  0x00c94b04 bne       #0xc94b1c
+  0x00c94b08 cmp       r2, #3
+  0x00c94b0c lsl       r1, r1, #7
+  0x00c94b10 addls     r1, r1, #0x210
+  0x00c94b14 addhi     r1, r1, #0x214
+  0x00c94b18 b         #0xc94b2c
+  0x00c94b1c cmp       r2, #3
+  0x00c94b20 lsl       r1, r1, #7
+
+===== sub_00c028cc @0x00c028cc (MMIO-literal candidate) =====
+  0x00c028cc ldr       r3, [pc, #8]
+  0x00c028d0 mov       r2, #0
+  0x00c028d4 str       r2, [r3, #8]
+  0x00c028d8 bx        lr
+  0x00c028dc .byte     0x00, 0x20, 0x00, 0xf8
+  0x00c028e0 ldr       r3, [pc, #8]
+  0x00c028e4 ldr       r0, [r3, #4]
+  0x00c028e8 mvn       r0, r0
+  0x00c028ec bx        lr
+  0x00c028f0 .byte     0x00, 0x20, 0x00, 0xf8
+  0x00c028f4 push      {r4, lr}
+  0x00c028f8 mov       r4, r0
+  0x00c028fc bl        #0xc028a8
+  0x00c02900 mov       r3, #0x18
+  0x00c02904 mul       r4, r3, r4
+  0x00c02908 bl        #0xc028e0
+  0x00c0290c cmp       r0, r4
+  0x00c02910 blo       #0xc02908
+  0x00c02914 pop       {r4, lr}
+  0x00c02918 b         #0xc028cc
+  0x00c0291c ldr       r3, [pc, #0x40]
+  0x00c02920 push      {r4, lr}
+  0x00c02924 ldr       r1, [pc, #0x3c]
+  0x00c02928 ldr       r4, [r3, #0xa0]
+  0x00c0292c bic       r4, r4, #0x300
+  0x00c02930 orr       r0, r4, #0x200
+  0x00c02934 orr       r4, r4, #0x210
+  0x00c02938 bl        #0xc028a0
+  0x00c0293c ldr       r1, [pc, #0x24]
+  0x00c02940 mov       r0, r4
+  0x00c02944 bl        #0xc028a0
+  0x00c02948 mov       r0, #0x3e8
+  0x00c0294c bl        #0xc028f4
+  0x00c02950 bic       r0, r4, #0x10
+  0x00c02954 orr       r0, r0, #3
+  0x00c02958 ldr       r1, [pc, #8]
+  0x00c0295c pop       {r4, lr}
+  0x00c02960 b         #0xc028a0
+  0x00c02964 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c02968 .byte     0xa0, 0x20, 0xa2, 0xf8
+  0x00c0296c push      {r4, r5, r6, lr}
+  0x00c02970 mov       r4, r0
+  0x00c02974 mov       r5, r1
+  0x00c02978 ldr       r0, [pc, #0xd8]
+  0x00c0297c ldr       r1, [pc, #0xd8]
+  0x00c02980 mov       r6, r2
+  0x00c02984 bl        #0xc028a0
+  0x00c02988 mov       r0, r5
+  0x00c0298c ldr       r1, [pc, #0xcc]
+  0x00c02990 bl        #0xc028a0
+  0x00c02994 orr       r0, r4, #0xa0000000
+  0x00c02998 orr       r0, r0, #0x2000
+  0x00c0299c ldr       r1, [pc, #0xc0]
+  0x00c029a0 bl        #0xc028a0
+  0x00c029a4 bl        #0xc028a8
+  0x00c029a8 ldr       r3, [pc, #0xb8]
+  0x00c029ac ldr       r4, [r3, #0x2c]
+  0x00c029b0 cmp       r4, #0
+  0x00c029b4 bge       #0xc029c8
+  0x00c029b8 bl        #0xc028e0
+  0x00c029bc ldr       r3, [pc, #0xa8]
+  0x00c029c0 cmp       r0, r3
+  0x00c029c4 bls       #0xc029a8
+  0x00c029c8 bl        #0xc028cc
+
+===== sub_00c94550 @0x00c94550 (MMIO-literal candidate) =====
+  0x00c94550 push      {r4, r5, r6, lr}
+  0x00c94554 ldr       r5, [pc, #0x490]
+  0x00c94558 ldr       r3, [r0, #8]
+  0x00c9455c sub       sp, sp, #0x50
+  0x00c94560 mov       r4, r0
+  0x00c94564 mov       r1, #2
+  0x00c94568 str       r3, [r5]
+  0x00c9456c ldr       r2, [r0, #0xc]
+  0x00c94570 ldr       r3, [r0, #8]
+  0x00c94574 add       r3, r2, r3
+  0x00c94578 str       r3, [r5, #4]
+  0x00c9457c ldr       r3, [pc, #0x46c]
+  0x00c94580 ldr       r2, [r0, #4]
+  0x00c94584 ldr       r0, [pc, #0x468]
+  0x00c94588 str       r2, [r3]
+  0x00c9458c mov       r3, #0xf8000000
+  0x00c94590 ldr       r3, [r3, #0xd0]
+  0x00c94594 ldr       r2, [pc, #0x45c]
+  0x00c94598 str       r3, [sp]
+  0x00c9459c ldr       r3, [pc, #0x458]
+  0x00c945a0 bl        #0xc94398
+  0x00c945a4 mov       r0, #0
+  0x00c945a8 add       r1, sp, #0x4c
+  0x00c945ac add       r2, sp, #0x48
+  0x00c945b0 bl        #0xc94a24
+  0x00c945b4 ldr       r0, [sp, #0x4c]
+  0x00c945b8 str       r0, [r5, #8]
+  0x00c945bc ldr       r3, [sp, #0x48]
+  0x00c945c0 str       r3, [r5, #0xc]
+  0x00c945c4 bl        #0xc94b44
+  0x00c945c8 str       r0, [r5, #0x10]
+  0x00c945cc ldr       r3, [r4]
+  0x00c945d0 sub       r3, r3, #1
+  0x00c945d4 cmp       r3, #8
+  0x00c945d8 ldrls     pc, [pc, r3, lsl #2]
+  0x00c945dc b         #0xc947b8
+  0x00c945e0 .byte     0x7c, 0x12, 0xff, 0xff
+  0x00c945e4 .byte     0xf8, 0x12, 0xff, 0xff
+  0x00c945e8 .byte     0x40, 0x13, 0xff, 0xff
+  0x00c945ec .byte     0x88, 0x13, 0xff, 0xff
+  0x00c945f0 .byte     0xd0, 0x13, 0xff, 0xff
+  0x00c945f4 .byte     0x8c, 0x12, 0xff, 0xff
+  0x00c945f8 .byte     0x90, 0x14, 0xff, 0xff
+  0x00c945fc .byte     0xa0, 0x14, 0xff, 0xff
+  0x00c94600 .byte     0xb8, 0x14, 0xff, 0xff
+  0x00c94604 ldr       r0, [pc, #0x3f4]
+  0x00c94608 bl        #0xc96848
+  0x00c9460c mov       r4, r0
+  0x00c94610 b         #0xc949bc
+  0x00c94614 mov       r0, #0x10000
+  0x00c94618 bl        #0xc94d98
+  0x00c9461c subs      r4, r0, #0
+  0x00c94620 bne       #0xc94838
+  0x00c94624 add       r5, sp, #0x34
+  0x00c94628 mov       r1, #0x10000
+  0x00c9462c mov       r0, r5
+  0x00c94630 bl        #0xc94e54
+  0x00c94634 mov       r0, r4
+  0x00c94638 bl        #0xc94de0
+  0x00c9463c subs      r6, r0, #0
+  0x00c94640 bne       #0xc949b4
+  0x00c94644 add       r2, sp, #0x4c
+  0x00c94648 add       r1, sp, #0x48
+  0x00c9464c bl        #0xc94a24
+
+===== sub_00c028a8 @0x00c028a8 (MMIO-literal candidate) =====
+  0x00c028a8 ldr       r3, [pc, #0x18]
+  0x00c028ac mov       r2, #0
+  0x00c028b0 str       r2, [r3]
+  0x00c028b4 add       r2, r2, #0xc2
+  0x00c028b8 str       r2, [r3, #8]
+  0x00c028bc mvn       r2, #0
+  0x00c028c0 str       r2, [r3]
+  0x00c028c4 bx        lr
+  0x00c028c8 .byte     0x00, 0x20, 0x00, 0xf8
+  0x00c028cc ldr       r3, [pc, #8]
+  0x00c028d0 mov       r2, #0
+  0x00c028d4 str       r2, [r3, #8]
+  0x00c028d8 bx        lr
+  0x00c028dc .byte     0x00, 0x20, 0x00, 0xf8
+  0x00c028e0 ldr       r3, [pc, #8]
+  0x00c028e4 ldr       r0, [r3, #4]
+  0x00c028e8 mvn       r0, r0
+  0x00c028ec bx        lr
+  0x00c028f0 .byte     0x00, 0x20, 0x00, 0xf8
+  0x00c028f4 push      {r4, lr}
+  0x00c028f8 mov       r4, r0
+  0x00c028fc bl        #0xc028a8
+  0x00c02900 mov       r3, #0x18
+  0x00c02904 mul       r4, r3, r4
+  0x00c02908 bl        #0xc028e0
+  0x00c0290c cmp       r0, r4
+  0x00c02910 blo       #0xc02908
+  0x00c02914 pop       {r4, lr}
+  0x00c02918 b         #0xc028cc
+  0x00c0291c ldr       r3, [pc, #0x40]
+  0x00c02920 push      {r4, lr}
+  0x00c02924 ldr       r1, [pc, #0x3c]
+  0x00c02928 ldr       r4, [r3, #0xa0]
+  0x00c0292c bic       r4, r4, #0x300
+  0x00c02930 orr       r0, r4, #0x200
+  0x00c02934 orr       r4, r4, #0x210
+  0x00c02938 bl        #0xc028a0
+  0x00c0293c ldr       r1, [pc, #0x24]
+  0x00c02940 mov       r0, r4
+  0x00c02944 bl        #0xc028a0
+  0x00c02948 mov       r0, #0x3e8
+  0x00c0294c bl        #0xc028f4
+  0x00c02950 bic       r0, r4, #0x10
+  0x00c02954 orr       r0, r0, #3
+  0x00c02958 ldr       r1, [pc, #8]
+  0x00c0295c pop       {r4, lr}
+  0x00c02960 b         #0xc028a0
+  0x00c02964 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c02968 .byte     0xa0, 0x20, 0xa2, 0xf8
+  0x00c0296c push      {r4, r5, r6, lr}
+  0x00c02970 mov       r4, r0
+  0x00c02974 mov       r5, r1
+  0x00c02978 ldr       r0, [pc, #0xd8]
+  0x00c0297c ldr       r1, [pc, #0xd8]
+  0x00c02980 mov       r6, r2
+  0x00c02984 bl        #0xc028a0
+  0x00c02988 mov       r0, r5
+  0x00c0298c ldr       r1, [pc, #0xcc]
+  0x00c02990 bl        #0xc028a0
+  0x00c02994 orr       r0, r4, #0xa0000000
+  0x00c02998 orr       r0, r0, #0x2000
+  0x00c0299c ldr       r1, [pc, #0xc0]
+  0x00c029a0 bl        #0xc028a0
+  0x00c029a4 bl        #0xc028a8
+
+===== sub_00c032a4 @0x00c032a4 (MMIO-literal candidate) =====
+  0x00c032a4 push      {r3, lr}
+  0x00c032a8 ldr       r3, [pc, #0x34]
+  0x00c032ac mov       r0, #0x3e8
+  0x00c032b0 ldr       r2, [r3, #0x178]
+  0x00c032b4 bic       r2, r2, #0x10
+  0x00c032b8 orr       r2, r2, #1
+  0x00c032bc str       r2, [r3, #0x178]
+  0x00c032c0 bl        #0xc030a8
+  0x00c032c4 ldr       r3, [pc, #0x1c]
+  0x00c032c8 ldr       r2, [pc, #0x1c]
+  0x00c032cc str       r2, [r3, #0xc00]
+  0x00c032d0 mov       r2, #0x100
+  0x00c032d4 str       r2, [r3]
+  0x00c032d8 mov       r2, #3
+  0x00c032dc str       r2, [r3, #8]
+  0x00c032e0 b         #0xc032e0
+  0x00c032e4 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c032e8 .byte     0x00, 0xc0, 0xa2, 0xf8
+  0x00c032ec bne       #0xfff3c838
+  0x00c032f0 ldr       r3, [pc, #0x1c]
+  0x00c032f4 ldr       r2, [r3, #0x84]
+  0x00c032f8 tst       r2, #0x40000
+  0x00c032fc subeq     r3, r3, #0x90000
+  0x00c03300 ldrne     r0, [r3, #0x80]
+  0x00c03304 ldreq     r0, [r3]
+  0x00c03308 andne     r0, r0, #3
+  0x00c0330c ubfxeq    r0, r0, #9, #2
+  0x00c03310 bx        lr
+  0x00c03314 .byte     0x00, 0x00, 0xab, 0xf8
+  0x00c03318 push      {r4, lr}
+  0x00c0331c bl        #0xc032f0
+  0x00c03320 cmp       r0, #2
+  0x00c03324 popne     {r4, pc}
+  0x00c03328 ldr       r0, [pc, #0x3c]
+  0x00c0332c mov       r1, #0
+  0x00c03330 mov       r2, #3
+  0x00c03334 bl        #0xc030c0
+  0x00c03338 ldr       r0, [pc, #0x30]
+  0x00c0333c mov       r1, #0
+  0x00c03340 mov       r2, #1
+  0x00c03344 bl        #0xc030c0
+  0x00c03348 ldr       r0, [pc, #0x24]
+  0x00c0334c mov       r1, #0
+  0x00c03350 mov       r2, #1
+  0x00c03354 bl        #0xc030c0
+  0x00c03358 ldr       r0, [pc, #0x18]
+  0x00c0335c mov       r1, #0
+  0x00c03360 mov       r2, #1
+  0x00c03364 pop       {r4, lr}
+  0x00c03368 b         #0xc030c0
+  0x00c0336c .byte     0x00, 0x10, 0xa2, 0xf8
+  0x00c03370 .byte     0x04, 0x10, 0xa2, 0xf8
+  0x00c03374 .byte     0x08, 0x10, 0xa2, 0xf8
+  0x00c03378 .byte     0x0c, 0x10, 0xa2, 0xf8
+  0x00c0337c ldr       r3, [pc, #0x28]
+  0x00c03380 mov       r2, #0
+  0x00c03384 str       r2, [r3, #0x30]
+  0x00c03388 add       r2, r2, #0x2d
+  0x00c0338c str       r2, [r3, #0x24]
+  0x00c03390 mov       r2, #0xc
+  0x00c03394 str       r2, [r3, #0x28]
+  0x00c03398 movw      r2, #0x70
+  0x00c0339c str       r2, [r3, #0x2c]
+  0x00c033a0 movw      r2, #0x301
+
+===== sub_00c957c4 @0x00c957c4 (MMIO-literal candidate) =====
+  0x00c957c4 push      {r4, r5, r6, r7, r8, lr}
+  0x00c957c8 ldr       r3, [r0, #0x10]
+  0x00c957cc mov       r6, r1
+  0x00c957d0 mov       r5, r2
+  0x00c957d4 cmp       r3, #1
+  0x00c957d8 bne       #0xc9581c
+  0x00c957dc ldr       r4, [pc, #0x64]
+  0x00c957e0 ldr       r7, [r0, #0xc]
+  0x00c957e4 mov       r0, #0
+  0x00c957e8 str       r0, [r4, #0x30]
+  0x00c957ec bl        #0xc95258
+  0x00c957f0 cmp       r0, #0
+  0x00c957f4 bne       #0xc95814
+  0x00c957f8 str       r7, [r4, #0x30]
+  0x00c957fc add       r0, r0, #0x2000
+  0x00c95800 mov       r1, r6
+  0x00c95804 mov       r2, r5
+  0x00c95808 bl        #0xc95258
+  0x00c9580c cmp       r0, #0
+  0x00c95810 popeq     {r4, r5, r6, r7, r8, pc}
+  0x00c95814 mvn       r0, #0
+  0x00c95818 pop       {r4, r5, r6, r7, r8, pc}
+  0x00c9581c cmp       r3, #2
+  0x00c95820 bne       #0xc95830
+  0x00c95824 ldr       r0, [r0, #8]
+  0x00c95828 pop       {r4, r5, r6, r7, r8, lr}
+  0x00c9582c b         #0xc95688
+  0x00c95830 ldr       r0, [pc, #0x14]
+  0x00c95834 mov       r1, #8
+  0x00c95838 ldr       r2, [pc, #0x10]
+  0x00c9583c bl        #0xc94398
+  0x00c95840 mov       r0, #0
+  0x00c95844 pop       {r4, r5, r6, r7, r8, pc}
+  0x00c95848 .byte     0x00, 0x00, 0xa5, 0xf8
+  0x00c9584c .byte     0x40, 0x36, 0xff, 0xff
+  0x00c95850 .byte     0xa3, 0x39, 0xff, 0xff
+  0x00c95854 push      {r4, r5, r6, r7, sb, sl, fp, lr}
+  0x00c95858 sub       sp, sp, #0x20
+  0x00c9585c mov       r6, r0
+  0x00c95860 mov       fp, r3
+  0x00c95864 ldr       ip, [sp, #0x4c]
+  0x00c95868 ldr       r5, [sp, #0x40]
+  0x00c9586c ldr       r4, [sp, #0x44]
+  0x00c95870 ldr       r7, [sp, #0x48]
+  0x00c95874 mov       sb, ip
+  0x00c95878 str       r1, [sp, #0x18]
+  0x00c9587c str       r2, [sp, #0x1c]
+  0x00c95880 ldr       r3, [sp, #0x18]
+  0x00c95884 mov       r2, r4
+  0x00c95888 str       sb, [sp]
+  0x00c9588c rsb       sl, r6, r3
+  0x00c95890 ldr       r0, [r5, #4]
+  0x00c95894 mov       r3, r7
+  0x00c95898 add       sl, r6, sl, lsr #1
+  0x00c9589c mov       r1, sl
+  0x00c958a0 bl        #0xc94a9c
+  0x00c958a4 mov       r0, r5
+  0x00c958a8 mov       r1, r4
+  0x00c958ac mov       r2, r7
+  0x00c958b0 bl        #0xc957c4
+  0x00c958b4 cmp       fp, #2
+  0x00c958b8 beq       #0xc958dc
+  0x00c958bc cmp       fp, #4
+  0x00c958c0 beq       #0xc958f8
+
+===== sub_00c6b1cc @0x00c6b1cc (MMIO-literal candidate) =====
+  0x00c6b1cc push      {r4, lr}
+  0x00c6b1d0 ldr       r3, [r8]
+  0x00c6b1d4 mov       r2, #0x1f40
+  0x00c6b1d8 str       r2, [r3, #0xc]
+  0x00c6b1dc sub       r2, r2, #0x1e40
+  0x00c6b1e0 ldr       r3, [r8]
+  0x00c6b1e4 str       r2, [r3, #0x10]
+  0x00c6b1e8 mov       r3, #0
+  0x00c6b1ec str       r3, [r8, #4]
+  0x00c6b1f0 ldr       r3, [pc, #0x80]
+  0x00c6b1f4 ldr       r0, [r3, #-0xfff]
+  0x00c6b1f8 tst       r0, #1
+  0x00c6b1fc beq       #0xc6b210
+  0x00c6b200 ubfx      r0, r0, #1, #2
+  0x00c6b204 mov       r3, #0x18000000
+  0x00c6b208 lsl       r0, r3, r0
+  0x00c6b20c bl        #0xc05a48
+  0x00c6b210 bl        #0xc05a58
+  0x00c6b214 mov       r2, r0
+  0x00c6b218 mov       r0, #0
+  0x00c6b21c mov       r1, r0
+  0x00c6b220 bl        #0xc71db8
+  0x00c6b224 ldr       r2, [pc, #0x50]
+  0x00c6b228 mov       r4, r0
+  0x00c6b22c mov       r0, #0
+  0x00c6b230 mov       r1, r4
+  0x00c6b234 bl        #0xc058a8
+  0x00c6b238 mov       r0, r4
+  0x00c6b23c ldr       r4, [pc, #0x3c]
+  0x00c6b240 ldr       r1, [pc, #0x3c]
+  0x00c6b244 ldr       r2, [pc, #0x3c]
+  0x00c6b248 bl        #0xc058a8
+  0x00c6b24c ldr       r1, [r4]
+  0x00c6b250 ldr       r2, [pc, #0x34]
+  0x00c6b254 mov       r0, #0xc00000
+  0x00c6b258 bl        #0xc058a8
+  0x00c6b25c ldr       r3, [pc, #0x2c]
+  0x00c6b260 ldr       r0, [r4]
+  0x00c6b264 ldr       r2, [pc, #0x28]
+  0x00c6b268 ldr       r1, [r3]
+  0x00c6b26c bl        #0xc058a8
+  0x00c6b270 mov       r0, #0
+  0x00c6b274 pop       {r4, pc}
+  0x00c6b278 .byte     0xff, 0x5f, 0xa3, 0xf8
+  0x00c6b27c sbceq     ip, r8, sb, lsl #30
+  0x00c6b280 sbceq     r2, r0, r8, asr #11
+  0x00c6b284 subseq    pc, pc, r4, ror pc
+  0x00c6b288 sbceq     ip, r8, r4, lsl pc
+  0x00c6b28c sbceq     ip, r8, sl, lsl pc
+  0x00c6b290 sbceq     r2, r0, r8, asr r0
+  0x00c6b294 sbceq     r3, r8, r7, asr lr
+  0x00c6b298 ldr       r3, [pc, #0xc]
+  0x00c6b29c cmp       r0, #3
+  0x00c6b2a0 movhs     r0, #3
+  0x00c6b2a4 ldr       r0, [r3, r0, lsl #2]
+  0x00c6b2a8 bx        lr
+  0x00c6b2ac strheq    lr, [r7], #0x48
+  0x00c6b2b0 cmp       r0, #0x11
+  0x00c6b2b4 movgt     r0, #0
+  0x00c6b2b8 bxgt      lr
+  0x00c6b2bc cmp       r0, #5
+  0x00c6b2c0 addne     r0, r0, #0xf8000
+  0x00c6b2c4 addne     r0, r0, #0xb20
+  0x00c6b2c8 ldreq     r0, [pc, #4]
+
+===== sub_00c70fe4 @0x00c70fe4 (MMIO-literal candidate) =====
+  0x00c70fe4 ldr       r3, [pc, #0x2c]
+  0x00c70fe8 ldr       r2, [r3, #4]
+  0x00c70fec ldr       r3, [pc, #0x28]
+  0x00c70ff0 ldm       r3, {r0, r1}
+  0x00c70ff4 cmp       r1, r2
+  0x00c70ff8 add       r1, r1, r0
+  0x00c70ffc sublo     r1, r1, #1
+  0x00c71000 rsb       r1, r2, r1
+  0x00c71004 str       r1, [r3]
+  0x00c71008 ldr       r3, [pc, #0xc]
+  0x00c7100c str       r2, [r3, #4]
+  0x00c71010 ldr       r0, [r3]
+  0x00c71014 bx        lr
+  0x00c71018 .byte     0x00, 0x20, 0x00, 0xf8
+  0x00c7101c sbcseq    fp, r0, r0, ror r0
+  0x00c71020 push      {r4, lr}
+  0x00c71024 mov       r4, r0
+  0x00c71028 bl        #0xc70fe4
+  0x00c7102c rsb       r0, r4, r0
+  0x00c71030 pop       {r4, pc}
+  0x00c71034 cmp       r0, #0x3e8
+  0x00c71038 push      {r3, r4, r5, lr}
+  0x00c7103c mov       r3, r0
+  0x00c71040 ldr       r4, [pc, #0x5c]
+  0x00c71044 blo       #0xc71060
+  0x00c71048 mov       r1, #0x3e8
+  0x00c7104c bl        #0xc77bd0
+  0x00c71050 ldr       r3, [r4, #8]
+  0x00c71054 mov       r1, #0x3e8
+  0x00c71058 mul       r0, r3, r0
+  0x00c7105c b         #0xc7106c
+  0x00c71060 ldr       r0, [r4, #8]
+  0x00c71064 ldr       r1, [pc, #0x3c]
+  0x00c71068 mul       r0, r0, r3
+  0x00c7106c bl        #0xc77bd0
+  0x00c71070 mov       r5, r0
+  0x00c71074 mov       r0, #0
+  0x00c71078 bl        #0xc71020
+  0x00c7107c add       r4, r0, r5
+  0x00c71080 add       r3, r4, #1
+  0x00c71084 cmp       r3, r0
+  0x00c71088 bhs       #0xc71094
+  0x00c7108c bl        #0xc70fbc
+  0x00c71090 mov       r4, r5
+  0x00c71094 bl        #0xc70fe4
+  0x00c71098 cmp       r0, r4
+  0x00c7109c blo       #0xc71094
+  0x00c710a0 pop       {r3, r4, r5, pc}
+  0x00c710a4 sbcseq    fp, r0, r0, ror r0
+  0x00c710a8 andeq     r4, pc, r0, asr #4
+  0x00c710ac cmp       r0, #0x3e8
+  0x00c710b0 mov       r3, r0
+  0x00c710b4 push      {r4, lr}
+  0x00c710b8 ldr       r4, [pc, #0x48]
+  0x00c710bc blo       #0xc710d8
+  0x00c710c0 mov       r1, #0x3e8
+  0x00c710c4 bl        #0xc77bd0
+  0x00c710c8 ldr       r3, [r4, #8]
+  0x00c710cc mov       r1, #0x3e8
+  0x00c710d0 mul       r0, r3, r0
+  0x00c710d4 b         #0xc710e4
+  0x00c710d8 ldr       r0, [r4, #8]
+  0x00c710dc ldr       r1, [pc, #0x28]
+  0x00c710e0 mul       r0, r0, r3
+
+===== sub_00c0291c @0x00c0291c (MMIO-literal candidate) =====
+  0x00c0291c ldr       r3, [pc, #0x40]
+  0x00c02920 push      {r4, lr}
+  0x00c02924 ldr       r1, [pc, #0x3c]
+  0x00c02928 ldr       r4, [r3, #0xa0]
+  0x00c0292c bic       r4, r4, #0x300
+  0x00c02930 orr       r0, r4, #0x200
+  0x00c02934 orr       r4, r4, #0x210
+  0x00c02938 bl        #0xc028a0
+  0x00c0293c ldr       r1, [pc, #0x24]
+  0x00c02940 mov       r0, r4
+  0x00c02944 bl        #0xc028a0
+  0x00c02948 mov       r0, #0x3e8
+  0x00c0294c bl        #0xc028f4
+  0x00c02950 bic       r0, r4, #0x10
+  0x00c02954 orr       r0, r0, #3
+  0x00c02958 ldr       r1, [pc, #8]
+  0x00c0295c pop       {r4, lr}
+  0x00c02960 b         #0xc028a0
+  0x00c02964 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c02968 .byte     0xa0, 0x20, 0xa2, 0xf8
+  0x00c0296c push      {r4, r5, r6, lr}
+  0x00c02970 mov       r4, r0
+  0x00c02974 mov       r5, r1
+  0x00c02978 ldr       r0, [pc, #0xd8]
+  0x00c0297c ldr       r1, [pc, #0xd8]
+  0x00c02980 mov       r6, r2
+  0x00c02984 bl        #0xc028a0
+  0x00c02988 mov       r0, r5
+  0x00c0298c ldr       r1, [pc, #0xcc]
+  0x00c02990 bl        #0xc028a0
+  0x00c02994 orr       r0, r4, #0xa0000000
+  0x00c02998 orr       r0, r0, #0x2000
+  0x00c0299c ldr       r1, [pc, #0xc0]
+  0x00c029a0 bl        #0xc028a0
+  0x00c029a4 bl        #0xc028a8
+  0x00c029a8 ldr       r3, [pc, #0xb8]
+  0x00c029ac ldr       r4, [r3, #0x2c]
+  0x00c029b0 cmp       r4, #0
+  0x00c029b4 bge       #0xc029c8
+  0x00c029b8 bl        #0xc028e0
+  0x00c029bc ldr       r3, [pc, #0xa8]
+  0x00c029c0 cmp       r0, r3
+  0x00c029c4 bls       #0xc029a8
+  0x00c029c8 bl        #0xc028cc
+  0x00c029cc cmp       r4, #0
+  0x00c029d0 bge       #0xc029dc
+  0x00c029d4 mov       r0, #1
+  0x00c029d8 bl        #0xc025a0
+  0x00c029dc bl        #0xc028a8
+  0x00c029e0 ldr       r3, [pc, #0x80]
+  0x00c029e4 ldr       r4, [r3, #0x44]
+  0x00c029e8 ands      r4, r4, #4
+  0x00c029ec bne       #0xc02a00
+  0x00c029f0 bl        #0xc028e0
+  0x00c029f4 ldr       r3, [pc, #0x70]
+  0x00c029f8 cmp       r0, r3
+  0x00c029fc bls       #0xc029e0
+  0x00c02a00 bl        #0xc028cc
+  0x00c02a04 cmp       r4, #0
+  0x00c02a08 bne       #0xc02a14
+  0x00c02a0c mov       r0, #2
+  0x00c02a10 bl        #0xc025a0
+  0x00c02a14 cmp       r6, #0
+  0x00c02a18 popeq     {r4, r5, r6, pc}
+
+===== sub_00c170f0 @0x00c170f0 (MMIO-literal candidate) =====
+  0x00c170f0 ldr       r3, [pc, #0x10]
+  0x00c170f4 mov       r1, #1
+  0x00c170f8 ldr       r2, [r3, #0xcc]
+  0x00c170fc bic       r2, r2, r1, lsl r0
+  0x00c17100 str       r2, [r3, #0xcc]
+  0x00c17104 bx        lr
+  0x00c17108 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c1710c push      {r4, lr}
+  0x00c17110 mov       r0, #4
+  0x00c17114 bl        #0xc170f0
+  0x00c17118 mov       r0, #5
+  0x00c1711c bl        #0xc170f0
+  0x00c17120 mov       r0, #0x64
+  0x00c17124 pop       {r4, lr}
+  0x00c17128 b         #0xc6c678
+  0x00c1712c push      {r0, r1, r4, r5, r6, lr}
+  0x00c17130 ldr       r4, [pc, #0x144]
+  0x00c17134 bl        #0xc1710c
+  0x00c17138 bl        #0xc170cc
+  0x00c1713c movw      r0, #0x2710
+  0x00c17140 bl        #0xc6c678
+  0x00c17144 mov       r5, #0
+  0x00c17148 str       r5, [sp, #4]
+  0x00c1714c mov       r0, #0x3e8
+  0x00c17150 str       r5, [sp]
+  0x00c17154 ldr       r6, [r4, #0x168]
+  0x00c17158 orr       r6, r6, #2
+  0x00c1715c str       r6, [r4, #0x168]
+  0x00c17160 bl        #0xc6c678
+  0x00c17164 bic       r6, r6, #2
+  0x00c17168 mov       r0, #0x3e8
+  0x00c1716c str       r6, [r4, #0x168]
+  0x00c17170 bl        #0xc6c678
+  0x00c17174 orr       r6, r6, #2
+  0x00c17178 mov       r0, #0x3e8
+  0x00c1717c str       r6, [r4, #0x168]
+  0x00c17180 bl        #0xc6c678
+  0x00c17184 mov       r0, r5
+  0x00c17188 add       r1, sp, #4
+  0x00c1718c mov       r2, sp
+  0x00c17190 bl        #0xc6b78c
+  0x00c17194 subs      r6, r0, #0
+  0x00c17198 bne       #0xc17218
+  0x00c1719c ldr       r3, [sp, #4]
+  0x00c171a0 cmp       r3, r5
+  0x00c171a4 beq       #0xc17218
+  0x00c171a8 ldrb      r2, [r3, #0x400]
+  0x00c171ac mov       r4, #1
+  0x00c171b0 ldr       r1, [sp]
+  0x00c171b4 add       r5, r5, #4
+  0x00c171b8 add       r0, r0, #0x3e8
+  0x00c171bc orr       r2, r2, r4, lsl r1
+  0x00c171c0 uxtb      r2, r2
+  0x00c171c4 strb      r2, [r3, #0x400]
+  0x00c171c8 ldr       r3, [sp]
+  0x00c171cc ldr       r2, [sp, #4]
+  0x00c171d0 lsl       r1, r5, r3
+  0x00c171d4 lsl       r3, r4, r3
+  0x00c171d8 uxtb      r3, r3
+  0x00c171dc strb      r3, [r1, r2]
+  0x00c171e0 bl        #0xc6c678
+  0x00c171e4 ldm       sp, {r2, r3}
+  0x00c171e8 mov       r0, #0x3e8
+  0x00c171ec lsl       r2, r5, r2
+
+===== sub_00c70e8c @0x00c70e8c (MMIO-literal candidate) =====
+  0x00c70e8c push      {r4, lr}
+  0x00c70e90 popeq     {r4, pc}
+  0x00c70e94 ldr       r1, [r3, #0x14]
+  0x00c70e98 ldr       r2, [r3, #0x10]
+  0x00c70e9c ldr       r0, [pc, #0x10]
+  0x00c70ea0 ldr       r3, [r3, #0x24]
+  0x00c70ea4 bl        #0xc1fa7c
+  0x00c70ea8 ldr       r0, [pc, #8]
+  0x00c70eac pop       {r4, lr}
+  0x00c70eb0 b         #0xc1fa7c
+  0x00c70eb4 sbceq     sp, r8, r2, lsl #13
+  0x00c70eb8 sbceq     sl, r8, sp, lsl #4
+  0x00c70ebc ldr       r3, [pc, #0x60]
+  0x00c70ec0 ldr       r2, [r3, #0x84]
+  0x00c70ec4 tst       r2, #0x40000
+  0x00c70ec8 subeq     r3, r3, #0x90000
+  0x00c70ecc ldrne     r3, [r3, #0x80]
+  0x00c70ed0 ldreq     r3, [r3]
+  0x00c70ed4 andne     r3, r3, #3
+  0x00c70ed8 ubfxeq    r3, r3, #9, #2
+  0x00c70edc cmp       r3, #2
+  0x00c70ee0 ldreq     r2, [pc, #0x40]
+  0x00c70ee4 moveq     r3, #6
+  0x00c70ee8 beq       #0xc70f14
+  0x00c70eec cmp       r3, #3
+  0x00c70ef0 ldreq     r2, [pc, #0x34]
+  0x00c70ef4 moveq     r3, #5
+  0x00c70ef8 beq       #0xc70f14
+  0x00c70efc cmp       r3, #1
+  0x00c70f00 ldr       r2, [pc, #0x28]
+  0x00c70f04 ldr       r3, [pc, #0x28]
+  0x00c70f08 movne     r2, r3
+  0x00c70f0c moveq     r3, #2
+  0x00c70f10 movne     r3, #3
+  0x00c70f14 cmp       r0, #0
+  0x00c70f18 strne     r2, [r0]
+  0x00c70f1c mov       r0, r3
+  0x00c70f20 bx        lr
+  0x00c70f24 .byte     0x00, 0x00, 0xab, 0xf8
+  0x00c70f28 ldrdeq    fp, ip, [r8], #0x86
+  0x00c70f2c sbceq     fp, r8, r8, asr r4
+  0x00c70f30 sbceq     fp, r8, fp, lsl #9
+  0x00c70f34 strheq    sp, [r8], #0x6e
+  0x00c70f38 cmp       r0, #0
+  0x00c70f3c movne     r3, #0
+  0x00c70f40 strne     r3, [r0]
+  0x00c70f44 cmp       r1, #0
+  0x00c70f48 ldrne     r3, [pc, #4]
+  0x00c70f4c strne     r3, [r1]
+  0x00c70f50 bx        lr
+  0x00c70f54 .byte     0x00, 0x36, 0x6e, 0x01
+  0x00c70f58 ldr       r3, [pc, #0x14]
+  0x00c70f5c ldr       r0, [r3, #0x128]
+  0x00c70f60 ldr       r3, [pc, #0x10]
+  0x00c70f64 cmp       r0, r3
+  0x00c70f68 movne     r0, #0
+  0x00c70f6c moveq     r0, #1
+  0x00c70f70 bx        lr
+  0x00c70f74 .byte     0x00, 0x00, 0xab, 0xf8
+  0x00c70f78 mrcvs     p9, #6, lr, c11, c3, #2
+  0x00c70f7c mrc       p15, #0, r0, c0, c0, #5
+  0x00c70f80 and       r0, r0, #3
+  0x00c70f84 bx        lr
+  0x00c70f88 push      {r3, lr}
+
+===== sub_00c94d98 @0x00c94d98 (MMIO-literal candidate) =====
+  0x00c94d98 push      {r0, r1, r2, lr}
+  0x00c94d9c mov       r2, #0xf8000000
+  0x00c94da0 mov       r3, r0
+  0x00c94da4 ldr       r0, [r2, #0xd0]
+  0x00c94da8 ands      r0, r3, r0
+  0x00c94dac beq       #0xc94dd0
+  0x00c94db0 ldr       r2, [r2, #0xd0]
+  0x00c94db4 ldr       r1, [pc, #0x18]
+  0x00c94db8 ldr       r0, [pc, #0x18]
+  0x00c94dbc stm       sp, {r1, r2}
+  0x00c94dc0 mov       r1, #2
+  0x00c94dc4 ldr       r2, [pc, #0x10]
+  0x00c94dc8 bl        #0xc94398
+  0x00c94dcc mov       r0, #1
+  0x00c94dd0 pop       {r1, r2, r3, pc}
+  0x00c94dd4 .byte     0xd0, 0x00, 0x00, 0xf8
+  0x00c94dd8 .byte     0x84, 0x35, 0xff, 0xff
+  0x00c94ddc .byte     0x48, 0x38, 0xff, 0xff
+  0x00c94de0 cmp       r0, #0
+  0x00c94de4 moveq     r0, #1
+  0x00c94de8 movne     r0, #2
+  0x00c94dec b         #0xc94d98
+  0x00c94df0 push      {r0, r1, r4, lr}
+  0x00c94df4 mov       r4, r0
+  0x00c94df8 mov       r0, #0
+  0x00c94dfc bl        #0xc94de0
+  0x00c94e00 cmp       r0, #0
+  0x00c94e04 bne       #0xc94e4c
+  0x00c94e08 mov       r2, sp
+  0x00c94e0c add       r1, sp, #4
+  0x00c94e10 bl        #0xc94a24
+  0x00c94e14 ldr       r2, [r4]
+  0x00c94e18 ldr       r3, [sp, #4]
+  0x00c94e1c str       r2, [r3, #0x108]
+  0x00c94e20 ldr       r3, [sp, #4]
+  0x00c94e24 ldr       r2, [r4, #4]
+  0x00c94e28 str       r2, [r3, #0x28]
+  0x00c94e2c ldr       r3, [sp]
+  0x00c94e30 ldr       r2, [r4, #0xc]
+  0x00c94e34 str       r2, [r3, #0x70]
+  0x00c94e38 ldr       r3, [sp]
+  0x00c94e3c ldr       r2, [r3, #0x2c]
+  0x00c94e40 tst       r2, #0x20
+  0x00c94e44 ldreq     r2, [r4, #0x10]
+  0x00c94e48 streq     r2, [r3, #0x180]
+  0x00c94e4c dsb       sy
+  0x00c94e50 pop       {r2, r3, r4, pc}
+  0x00c94e54 push      {r0, r1, r2, r4, r5, lr}
+  0x00c94e58 mov       r4, r0
+  0x00c94e5c mov       r0, #0
+  0x00c94e60 mov       r5, r1
+  0x00c94e64 bl        #0xc94de0
+  0x00c94e68 cmp       r0, #0
+  0x00c94e6c bne       #0xc94f1c
+  0x00c94e70 add       r1, sp, #4
+  0x00c94e74 mov       r2, sp
+  0x00c94e78 bl        #0xc94a24
+  0x00c94e7c ldr       r3, [sp, #4]
+  0x00c94e80 cmp       r5, #0x100
+  0x00c94e84 ldr       r1, [r3, #0x108]
+  0x00c94e88 str       r1, [r4]
+  0x00c94e8c ldr       r2, [r3, #0x28]
+  0x00c94e90 str       r2, [r4, #4]
+  0x00c94e94 ldr       r2, [r3, #0x50]
+
+===== sub_00c77648 @0x00c77648 (MMIO-literal candidate) =====
+  0x00c77648 push      {r4, r5, r6, r7, r8, lr}
+  0x00c7764c ldr       r3, [r3, #0xd0]
+  0x00c77650 mov       r6, r0
+  0x00c77654 mov       r5, r0
+  0x00c77658 mov       r2, #0
+  0x00c7765c add       r2, r2, #1
+  0x00c77660 mov       r0, #0
+  0x00c77664 cmp       r2, #0x64
+  0x00c77668 str       r0, [r1, #0x20]
+  0x00c7766c add       r1, r1, #0x28
+  0x00c77670 bne       #0xc7765c
+  0x00c77674 ands      r3, r3, #1
+  0x00c77678 bne       #0xc7768c
+  0x00c7767c ldr       r0, [pc, #0x8c]
+  0x00c77680 mov       r2, r6
+  0x00c77684 ldr       r1, [pc, #0x88]
+  0x00c77688 bl        #0xc77260
+  0x00c7768c mov       r3, #0xf8000000
+  0x00c77690 mov       r4, #0
+  0x00c77694 ldr       r7, [r3, #0xd0]
+  0x00c77698 ldr       r1, [r5, #0x20]
+  0x00c7769c cmp       r1, #0
+  0x00c776a0 beq       #0xc776f4
+  0x00c776a4 cmp       r4, #0x31
+  0x00c776a8 movgt     r3, #0
+  0x00c776ac andle     r3, r7, #1
+  0x00c776b0 cmp       r3, #0
+  0x00c776b4 bne       #0xc776f4
+  0x00c776b8 ubfx      r3, r7, #1, #1
+  0x00c776bc cmp       r4, #0x31
+  0x00c776c0 movle     r3, #0
+  0x00c776c4 andgt     r3, r3, #1
+  0x00c776c8 cmp       r3, #0
+  0x00c776cc bne       #0xc776f4
+  0x00c776d0 add       r3, r3, #0x28
+  0x00c776d4 ldr       r0, [pc, #0x3c]
+  0x00c776d8 ldr       r2, [r5, #0x24]
+  0x00c776dc mla       r3, r3, r4, r6
+  0x00c776e0 bl        #0xc1fa7c
+  0x00c776e4 tst       r4, #1
+  0x00c776e8 beq       #0xc776f4
+  0x00c776ec ldr       r0, [pc, #0x28]
+  0x00c776f0 bl        #0xc1fa7c
+  0x00c776f4 add       r4, r4, #1
+  0x00c776f8 add       r5, r5, #0x28
+  0x00c776fc cmp       r4, #0x64
+  0x00c77700 bne       #0xc77698
+  0x00c77704 ldr       r0, [pc, #0x10]
+  0x00c77708 pop       {r4, r5, r6, r7, r8, lr}
+  0x00c7770c b         #0xc1fa7c
+  0x00c77710 .byte     0x00, 0x10, 0xa3, 0xf8
+  0x00c77714 .byte     0x00, 0x80, 0xa3, 0xf8
+  0x00c77718 strdeq    lr, pc, [r8], #0xf7
+  0x00c7771c sbceq     r4, r8, r7, lsl #7
+  0x00c77720 push      {r4, r5, r6, r7, sb, sl, fp, lr}
+  0x00c77724 sub       sp, sp, #0x20
+  0x00c77728 mvn       r6, #0
+  0x00c7772c mov       r4, r2
+  0x00c77730 str       r0, [sp, #0x14]
+  0x00c77734 mov       r5, r3
+  0x00c77738 ldrd      sl, fp, [r0, #0x10]
+  0x00c7773c mvn       r7, #0
+  0x00c77740 ldr       ip, [sp, #0x40]
+  0x00c77744 adds      r6, r6, sl
+
+===== sub_00c923b8 @0x00c923b8 (MMIO-literal candidate) =====
+  0x00c923b8 stmdbvc   r1!, {r0, r2, r5, r6, sl, fp, sp, lr} ^
+  0x00c923bc andvs     r3, r0, #0x4000000f
+  0x00c923c0 rsbvc     r7, r4, #0x18400000
+  0x00c923c4 stcllo    p4, c7, [r5, #-0x184]!
+  0x00c923c8 eorslo    r3, r5, #0x4000000c
+  0x00c923cc strvs     r3, [r0, #-0x30]
+  0x00c923d0 strbtvs   r6, [r1], #-0x874
+  0x00c923d4 eorslo    r7, sp, r4, ror #4
+  0x00c923d8 eorslo    r3, r0, r0, lsr sl
+  0x00c923dc blo       #0x189e4cc
+  0x00c923e0 eorslo    r3, sl, r0, lsr r0
+  0x00c923e4 eorslo    r3, r0, r0, lsr sl
+  0x00c923e8 cmnvs     r0, r0, lsl #18
+  0x00c923ec ldcllo    p4, c6, [r2, #-0x190]!
+  0x00c923f0 mrchs     p9, #1, r3, c2, c1, #1
+  0x00c923f4 mrchs     p6, #1, r3, c8, c1, #1
+  0x00c923f8 eorslo    r2, r1, r1, lsr lr
+  0x00c923fc rsbvc     r7, r5, #0, #6
+  0x00c92400 ldmdbvs   r2!, {r1, r2, r4, r5, r6, r8, sl, sp, lr} ^
+  0x00c92404 ldmdblo   r1!, {r4, r5, r6, r8, sl, fp, ip, sp}
+  0x00c92408 shasxlo   r2, r1, r2
+  0x00c9240c mrchs     p14, #1, r2, c1, c8, #1
+  0x00c92410 strbvs    r0, [lr, #-0x31]!
+  0x00c92414 .byte     0x74, 0x6d, 0x61, 0x73
+  0x00c92418 ldrlo     r3, [r2, #-0xd6b]!
+  0x00c9241c ldrlo     r2, [r2, #-0xe35]!
+  0x00c92420 ldrlo     r2, [r2, #-0xe35]!
+  0x00c92424 eorseq    r2, r0, r5, lsr lr
+  0x00c92428 strbtvc   r6, [pc], #-0xf62
+  0x00c9242c strbvs    r6, [ip, #-0x966]!
+  0x00c92430 ldmdbmi   r5!, {r0, r2, r3, r4, r5, sb, sp} ^
+  0x00c92434 strbvs    r6, [r7, #-0x16d]!
+  0x00c92438 andeq     r0, r0, r2, lsr #32
+  0x00c9243c ldrdeq    r0, r1, [r2], #0xf0
+  0x00c92440 sbceq     r0, r2, r4, asr #31
+  0x00c92444 sbceq     r1, r2, ip, ror r0
+  0x00c92448 sbceq     r0, r2, ip, ror #31
+  0x00c9244c andeq     r0, r0, r5
+  0x00c92450 sbceq     fp, r8, r8, asr r4
+  0x00c92454 ldrdeq    r0, r1, [r2], #0xf0
+  0x00c92458 sbceq     r0, r2, r4, asr #31
+  0x00c9245c sbceq     r1, r2, ip, ror r0
+  0x00c92460 sbceq     r0, r2, ip, ror #31
+  0x00c92464 andeq     r0, r0, r6
+  0x00c92468 ldrdeq    fp, ip, [r8], #0x86
+  0x00c9246c strdeq    r1, r2, [r2], #4
+  0x00c92470 sbceq     r1, r2, r8, ror #1
+  0x00c92474 sbceq     r1, r2, r0, lsr r1
+  0x00c92478 sbceq     r1, r2, r4, asr r2
+  0x00c9247c andeq     r0, r0, r2
+  0x00c92480 sbceq     fp, r8, fp, lsl #9
+  0x00c92484 andeq     r0, r0, r0
+  0x00c92488 andeq     r0, r0, r0
+  0x00c9248c strheq    fp, [r8], #0x84
+  0x00c92490 andeq     r0, r0, r5
+  0x00c92494 strheq    fp, [r8], #0x8f
+  0x00c92498 sbceq     fp, r8, r5, asr #17
+  0x00c9249c andeq     r0, r0, r2
+  0x00c924a0 sbceq     fp, r8, fp, asr #17
+  0x00c924a4 ldrdeq    fp, ip, [r8], #0x82
+  0x00c924a8 andeq     r0, r0, r2, lsl r0
+  0x00c924ac ldrdeq    fp, ip, [r8], #0x89
+  0x00c924b0 ldrdeq    fp, ip, [r8], #0x8f
+  0x00c924b4 andeq     r0, r0, r1, lsl r0
+
+===== sub_00c1712c @0x00c1712c (MMIO-literal candidate) =====
+  0x00c1712c push      {r0, r1, r4, r5, r6, lr}
+  0x00c17130 ldr       r4, [pc, #0x144]
+  0x00c17134 bl        #0xc1710c
+  0x00c17138 bl        #0xc170cc
+  0x00c1713c movw      r0, #0x2710
+  0x00c17140 bl        #0xc6c678
+  0x00c17144 mov       r5, #0
+  0x00c17148 str       r5, [sp, #4]
+  0x00c1714c mov       r0, #0x3e8
+  0x00c17150 str       r5, [sp]
+  0x00c17154 ldr       r6, [r4, #0x168]
+  0x00c17158 orr       r6, r6, #2
+  0x00c1715c str       r6, [r4, #0x168]
+  0x00c17160 bl        #0xc6c678
+  0x00c17164 bic       r6, r6, #2
+  0x00c17168 mov       r0, #0x3e8
+  0x00c1716c str       r6, [r4, #0x168]
+  0x00c17170 bl        #0xc6c678
+  0x00c17174 orr       r6, r6, #2
+  0x00c17178 mov       r0, #0x3e8
+  0x00c1717c str       r6, [r4, #0x168]
+  0x00c17180 bl        #0xc6c678
+  0x00c17184 mov       r0, r5
+  0x00c17188 add       r1, sp, #4
+  0x00c1718c mov       r2, sp
+  0x00c17190 bl        #0xc6b78c
+  0x00c17194 subs      r6, r0, #0
+  0x00c17198 bne       #0xc17218
+  0x00c1719c ldr       r3, [sp, #4]
+  0x00c171a0 cmp       r3, r5
+  0x00c171a4 beq       #0xc17218
+  0x00c171a8 ldrb      r2, [r3, #0x400]
+  0x00c171ac mov       r4, #1
+  0x00c171b0 ldr       r1, [sp]
+  0x00c171b4 add       r5, r5, #4
+  0x00c171b8 add       r0, r0, #0x3e8
+  0x00c171bc orr       r2, r2, r4, lsl r1
+  0x00c171c0 uxtb      r2, r2
+  0x00c171c4 strb      r2, [r3, #0x400]
+  0x00c171c8 ldr       r3, [sp]
+  0x00c171cc ldr       r2, [sp, #4]
+  0x00c171d0 lsl       r1, r5, r3
+  0x00c171d4 lsl       r3, r4, r3
+  0x00c171d8 uxtb      r3, r3
+  0x00c171dc strb      r3, [r1, r2]
+  0x00c171e0 bl        #0xc6c678
+  0x00c171e4 ldm       sp, {r2, r3}
+  0x00c171e8 mov       r0, #0x3e8
+  0x00c171ec lsl       r2, r5, r2
+  0x00c171f0 strb      r6, [r2, r3]
+  0x00c171f4 bl        #0xc6c678
+  0x00c171f8 ldr       r3, [sp]
+  0x00c171fc ldr       r2, [sp, #4]
+  0x00c17200 mov       r0, #0x3e8
+  0x00c17204 lsl       r5, r5, r3
+  0x00c17208 lsl       r3, r4, r3
+  0x00c1720c uxtb      r3, r3
+  0x00c17210 strb      r3, [r5, r2]
+  0x00c17214 bl        #0xc6c678
+  0x00c17218 ldr       r4, [pc, #0x5c]
+  0x00c1721c mov       r2, #8
+  0x00c17220 ldr       r3, [pc, #0x58]
+  0x00c17224 mov       r0, #0xa
+  0x00c17228 str       r2, [r3, #0x844]
+
+===== sub_00c039b8 @0x00c039b8 (MMIO-literal candidate) =====
+  0x00c039b8 push      {r4, r5, r6, lr}
+  0x00c039bc orr       ip, r0, #1
+  0x00c039c0 str       ip, [r1]
+  0x00c039c4 mov       ip, #0
+  0x00c039c8 str       ip, [r1, #4]
+  0x00c039cc dsb       sy
+  0x00c039d0 ldr       r4, [pc, #0xe8]
+  0x00c039d4 add       ip, ip, #1
+  0x00c039d8 movw      r6, #0x3e7
+  0x00c039dc ldr       r5, [r4, #4]
+  0x00c039e0 eor       r1, r5, #1
+  0x00c039e4 cmp       ip, r6
+  0x00c039e8 movhi     r1, #0
+  0x00c039ec andls     r1, r1, #1
+  0x00c039f0 cmp       r1, #0
+  0x00c039f4 bne       #0xc039d0
+  0x00c039f8 cmp       ip, r6
+  0x00c039fc bls       #0xc03a18
+  0x00c03a00 mvn       r2, #0
+  0x00c03a04 mov       r0, #8
+  0x00c03a08 mov       r3, r2
+  0x00c03a0c bl        #0xc037e8
+  0x00c03a10 mvn       r0, #0
+  0x00c03a14 pop       {r4, r5, r6, pc}
+  0x00c03a18 and       r0, r0, #0x300
+  0x00c03a1c cmp       r0, #0x200
+  0x00c03a20 beq       #0xc03ab0
+  0x00c03a24 tst       r5, #2
+  0x00c03a28 bne       #0xc03ab0
+  0x00c03a2c cmn       r2, #1
+  0x00c03a30 beq       #0xc03a78
+  0x00c03a34 ldr       r1, [r4, #0x80]
+  0x00c03a38 add       r0, r2, r3, lsl #3
+  0x00c03a3c mov       ip, #1
+  0x00c03a40 ands      ip, r1, ip, lsl r0
+  0x00c03a44 bne       #0xc03ab8
+  0x00c03a48 cmp       r2, #3
+  0x00c03a4c lsl       r3, r3, #1
+  0x00c03a50 ldr       r0, [pc, #0x6c]
+  0x00c03a54 subgt     r1, r2, #4
+  0x00c03a58 lslle     r1, r2, #3
+  0x00c03a5c add       r2, r3, r2, asr #2
+  0x00c03a60 lslgt     r1, r1, #3
+  0x00c03a64 ldr       r3, [r0, r2, lsl #2]
+  0x00c03a68 mov       r2, #0xff
+  0x00c03a6c ands      r2, r3, r2, lsl r1
+  0x00c03a70 beq       #0xc03ab0
+  0x00c03a74 b         #0xc03ab8
+  0x00c03a78 cmn       r3, #1
+  0x00c03a7c beq       #0xc03ab0
+  0x00c03a80 ldr       r2, [r4, #0x80]
+  0x00c03a84 mov       r1, #0xff
+  0x00c03a88 ands      r1, r2, r1, lsl r3
+  0x00c03a8c bne       #0xc03ab8
+  0x00c03a90 ldr       r2, [pc, #0x2c]
+  0x00c03a94 ldr       r1, [r2, r3, lsl #3]
+  0x00c03a98 lsl       r3, r3, #1
+  0x00c03a9c add       r3, r3, #1
+  0x00c03aa0 ldr       r3, [r2, r3, lsl #2]
+  0x00c03aa4 add       r3, r3, r1
+  0x00c03aa8 cmp       r3, #0
+  0x00c03aac bne       #0xc03ab8
+  0x00c03ab0 mov       r0, #0
+  0x00c03ab4 pop       {r4, r5, r6, pc}
+
+===== sub_00c172e8 @0x00c172e8 (MMIO-literal candidate) =====
+  0x00c172e8 ldr       r3, [pc, #0x10]
+  0x00c172ec ldr       r2, [r3, #0x18]
+  0x00c172f0 tst       r2, #0x20
+  0x00c172f4 bne       #0xc172e8
+  0x00c172f8 str       r0, [r3]
+  0x00c172fc bx        lr
+  0x00c17300 rfeia     #1!
+  0x00c17304 cmp       r0, #0xa
+  0x00c17308 push      {r4, lr}
+  0x00c1730c mov       r4, r0
+  0x00c17310 bne       #0xc1731c
+  0x00c17314 mov       r0, #0xd
+  0x00c17318 bl        #0xc172e8
+  0x00c1731c mov       r0, r4
+  0x00c17320 pop       {r4, lr}
+  0x00c17324 b         #0xc172e8
+  0x00c17328 push      {r3, r4, r5, lr}
+  0x00c1732c mov       r5, r0
+  0x00c17330 mov       r4, #0
+  0x00c17334 b         #0xc1733c
+  0x00c17338 bl        #0xc17304
+  0x00c1733c ldrb      r0, [r5, r4]
+  0x00c17340 add       r4, r4, #1
+  0x00c17344 cmp       r0, #0
+  0x00c17348 bne       #0xc17338
+  0x00c1734c pop       {r3, r4, r5, pc}
+  0x00c17350 b         #0xc172e8
+  0x00c17354 ldr       r3, [pc, #0x1c]
+  0x00c17358 ldr       r2, [r3, #0x18]
+  0x00c1735c tst       r2, #0x10
+  0x00c17360 bne       #0xc17354
+  0x00c17364 ldr       r0, [r3]
+  0x00c17368 bics      r2, r0, #0xff
+  0x00c1736c mvnne     r0, #0
+  0x00c17370 strne     r0, [r3, #4]
+  0x00c17374 bx        lr
+  0x00c17378 rfeia     #1!
+  0x00c1737c mov       r3, #0xf8000000
+  0x00c17380 ldr       r0, [r3, #0x88]
+  0x00c17384 cmp       r0, #3
+  0x00c17388 moveq     r0, #3
+  0x00c1738c movne     r0, #0
+  0x00c17390 bx        lr
+  0x00c17394 push      {r3, r4, r5, r6, r7, lr}
+  0x00c17398 mov       r3, #0xf8000000
+  0x00c1739c ldr       r3, [r3, #0x88]
+  0x00c173a0 mov       r6, r0
+  0x00c173a4 mov       r4, r1
+  0x00c173a8 cmp       r3, #3
+  0x00c173ac bne       #0xc17414
+  0x00c173b0 bl        #0xc26b3c
+  0x00c173b4 subs      r5, r0, #0
+  0x00c173b8 bne       #0xc17414
+  0x00c173bc mov       r0, r6
+  0x00c173c0 mov       r1, r4
+  0x00c173c4 mov       r2, r5
+  0x00c173c8 mov       r3, r5
+  0x00c173cc bl        #0xc26adc
+  0x00c173d0 cmp       r0, #4
+  0x00c173d4 mov       r6, r0
+  0x00c173d8 ble       #0xc17414
+  0x00c173dc add       r3, r0, r4
+  0x00c173e0 sub       r2, r6, #4
+  0x00c173e4 mov       r0, r5
+
+===== sub_00c95258 @0x00c95258 (MMIO-literal candidate) =====
+  0x00c95258 ldr       ip, [pc, #0x118]
+  0x00c9525c orr       r3, r0, #1
+  0x00c95260 push      {r4, r5, r6, lr}
+  0x00c95264 str       r3, [ip]
+  0x00c95268 mov       r3, #0
+  0x00c9526c str       r3, [ip, #4]
+  0x00c95270 dsb       sy
+  0x00c95274 ldr       ip, [pc, #0xfc]
+  0x00c95278 add       r3, r3, #1
+  0x00c9527c movw      r6, #0x3e7
+  0x00c95280 ldr       r5, [ip, #4]
+  0x00c95284 eor       r4, r5, #1
+  0x00c95288 cmp       r3, r6
+  0x00c9528c movhi     r4, #0
+  0x00c95290 andls     r4, r4, #1
+  0x00c95294 cmp       r4, #0
+  0x00c95298 bne       #0xc95274
+  0x00c9529c cmp       r3, r6
+  0x00c952a0 bls       #0xc952d0
+  0x00c952a4 ldr       r0, [pc, #0xd0]
+  0x00c952a8 mov       r1, #0x10
+  0x00c952ac ldr       r2, [pc, #0xcc]
+  0x00c952b0 bl        #0xc94398
+  0x00c952b4 mvn       r2, #0
+  0x00c952b8 mov       r0, #8
+  0x00c952bc mov       r1, r4
+  0x00c952c0 mov       r3, r2
+  0x00c952c4 bl        #0xc94fe4
+  0x00c952c8 mvn       r0, #0
+  0x00c952cc pop       {r4, r5, r6, pc}
+  0x00c952d0 and       r0, r0, #0x300
+  0x00c952d4 cmp       r0, #0x200
+  0x00c952d8 beq       #0xc95368
+  0x00c952dc tst       r5, #2
+  0x00c952e0 bne       #0xc95368
+  0x00c952e4 cmn       r2, #1
+  0x00c952e8 beq       #0xc95330
+  0x00c952ec ldr       r3, [ip, #0x80]
+  0x00c952f0 add       r0, r2, r1, lsl #3
+  0x00c952f4 mov       ip, #1
+  0x00c952f8 ands      ip, r3, ip, lsl r0
+  0x00c952fc bne       #0xc95370
+  0x00c95300 cmp       r2, #3
+  0x00c95304 lsl       r1, r1, #1
+  0x00c95308 ldr       r0, [pc, #0x74]
+  0x00c9530c subgt     r3, r2, #4
+  0x00c95310 lslle     r3, r2, #3
+  0x00c95314 add       r2, r1, r2, asr #2
+  0x00c95318 lslgt     r3, r3, #3
+  0x00c9531c mov       r1, #0xff
+  0x00c95320 ldr       r2, [r0, r2, lsl #2]
+  0x00c95324 ands      r1, r2, r1, lsl r3
+  0x00c95328 beq       #0xc95368
+  0x00c9532c b         #0xc95370
+  0x00c95330 cmn       r1, #1
+  0x00c95334 beq       #0xc95368
+  0x00c95338 ldr       r3, [ip, #0x80]
+  0x00c9533c mov       r2, #0xff
+  0x00c95340 ands      r2, r3, r2, lsl r1
+  0x00c95344 bne       #0xc95370
+  0x00c95348 ldr       r3, [pc, #0x34]
+  0x00c9534c ldr       r2, [r3, r1, lsl #3]
+  0x00c95350 lsl       r1, r1, #1
+  0x00c95354 add       r1, r1, #1
+
+===== sub_00c94080 @0x00c94080 (MMIO-literal candidate) =====
+  0x00c94080 ldr       r1, [pc, #0x24]
+  0x00c94084 b         #0xc9409c
+  0x00c94088 ldr       r3, [r1, #0x18]
+  0x00c9408c tst       r3, #0x20
+  0x00c94090 bne       #0xc94088
+  0x00c94094 str       r2, [r1]
+  0x00c94098 add       r0, r0, #1
+  0x00c9409c ldrb      r2, [r0]
+  0x00c940a0 cmp       r2, #0
+  0x00c940a4 bne       #0xc94088
+  0x00c940a8 bx        lr
+  0x00c940ac rfeia     #1!
+  0x00c940b0 ldr       r1, [pc, #0x38]
+  0x00c940b4 mov       r2, #0x1c
+  0x00c940b8 ldr       r3, [r1, #0x18]
+  0x00c940bc tst       r3, #0x20
+  0x00c940c0 bne       #0xc940b8
+  0x00c940c4 mov       r3, #0xf
+  0x00c940c8 and       r3, r3, r0, lsr r2
+  0x00c940cc cmp       r3, #9
+  0x00c940d0 addle     r3, r3, #0x30
+  0x00c940d4 addgt     r3, r3, #0x37
+  0x00c940d8 str       r3, [r1]
+  0x00c940dc cmp       r2, #0
+  0x00c940e0 beq       #0xc940ec
+  0x00c940e4 sub       r2, r2, #4
+  0x00c940e8 b         #0xc940b8
+  0x00c940ec bx        lr
+  0x00c940f0 rfeia     #1!
+  0x00c940f4 ldr       r1, [pc, #0x10]
+  0x00c940f8 ldr       r3, [r1, #0x18]
+  0x00c940fc tst       r3, #0x20
+  0x00c94100 bne       #0xc940f8
+  0x00c94104 str       r0, [r1]
+  0x00c94108 bx        lr
+  0x00c9410c rfeia     #1!
+  0x00c94110 bx        lr
+  0x00c94114 bx        lr
+  0x00c94118 bx        lr
+  0x00c9411c push      {r3, r4, r5, r6, r7, lr}
+  0x00c94120 ldr       r3, [pc, #0x17c]
+  0x00c94124 ldr       r4, [pc, #0x17c]
+  0x00c94128 mov       r6, r0
+  0x00c9412c ldr       r5, [r3, #0x108]
+  0x00c94130 bl        #0xc94394
+  0x00c94134 ldr       r3, [r4, #8]
+  0x00c94138 tst       r3, #0x20
+  0x00c9413c beq       #0xc94168
+  0x00c94140 ldr       r0, [pc, #0x164]
+  0x00c94144 mov       r1, #0x10
+  0x00c94148 ldr       r2, [pc, #0x160]
+  0x00c9414c mov       r3, r4
+  0x00c94150 bl        #0xc94398
+  0x00c94154 mvn       r2, #0
+  0x00c94158 mov       r0, #2
+  0x00c9415c mov       r1, r4
+  0x00c94160 mov       r3, r2
+  0x00c94164 bl        #0xc94fe4
+  0x00c94168 mov       r0, #0x10
+  0x00c9416c bl        #0xc94d98
+  0x00c94170 cmp       r0, #0
+  0x00c94174 movne     r4, #0
+  0x00c94178 bne       #0xc941a0
+  0x00c9417c ldr       r7, [pc, #0x120]
+
+===== sub_00c10b78 @0x00c10b78 (MMIO-literal candidate) =====
+  0x00c10b78 ldr       r3, [r0, #8]
+  0x00c10b7c mvn       r2, #0xf0000000
+  0x00c10b80 cmp       r1, #0
+  0x00c10b84 str       r2, [r3, #0xd0]
+  0x00c10b88 movne     r1, #0x700
+  0x00c10b8c ldr       r3, [pc, #0x14]
+  0x00c10b90 moveq     r1, #0x400
+  0x00c10b94 ldr       r2, [r3, #0x60]
+  0x00c10b98 bic       r2, r2, #0x700
+  0x00c10b9c orr       r2, r1, r2
+  0x00c10ba0 str       r2, [r3, #0x60]
+  0x00c10ba4 bx        lr
+  0x00c10ba8 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c10bac ldr       r3, [r0, #0xf4]
+  0x00c10bb0 tst       r3, #0x10
+  0x00c10bb4 beq       #0xc10be0
+  0x00c10bb8 cmp       r2, #0
+  0x00c10bbc ldr       r3, [r0, #0x2c]
+  0x00c10bc0 ldr       r2, [r0, #0x28]
+  0x00c10bc4 orrne     r3, r3, #0x4000
+  0x00c10bc8 biceq     r3, r3, #0x4000
+  0x00c10bcc orrne     r2, r2, #0x4000
+  0x00c10bd0 biceq     r2, r2, #0x4000
+  0x00c10bd4 strne     r2, [r0, #0x28]
+  0x00c10bd8 streq     r2, [r0, #0x28]
+  0x00c10bdc str       r3, [r0, #0x2c]
+  0x00c10be0 cmp       r1, #0
+  0x00c10be4 ldr       r2, [r0, #8]
+  0x00c10be8 ldrne     r3, [r0, #0x28]
+  0x00c10bec ldreq     r3, [r0, #0x2c]
+  0x00c10bf0 mov       r0, #0
+  0x00c10bf4 str       r3, [r2]
+  0x00c10bf8 bx        lr
+  0x00c10bfc mov       r0, #1
+  0x00c10c00 bx        lr
+  0x00c10c04 ldr       r2, [r0, #0xa0]
+  0x00c10c08 ldr       r3, [r2, #0x124]
+  0x00c10c0c ldr       ip, [r3, #0x18]
+  0x00c10c10 cmp       ip, #0x70
+  0x00c10c14 ldreq     r3, [r2]
+  0x00c10c18 ldrbeq    r0, [r3]
+  0x00c10c1c bxeq      lr
+  0x00c10c20 cmp       ip, #0x90
+  0x00c10c24 ldr       r0, [r3, #0x14]
+  0x00c10c28 ldrne     r2, [r3, #0x44]
+  0x00c10c2c add       r1, r0, #1
+  0x00c10c30 str       r1, [r3, #0x14]
+  0x00c10c34 subne     r2, r2, #1
+  0x00c10c38 ldreq     r3, [r2]
+  0x00c10c3c ldrne     r3, [r3, #0x60]
+  0x00c10c40 addne     r1, r2, r1
+  0x00c10c44 ldrbeq    r0, [r0, r3]
+  0x00c10c48 ldrbne    r0, [r1, r3]
+  0x00c10c4c bx        lr
+  0x00c10c50 ldr       r3, [r0, #0xa0]
+  0x00c10c54 ldr       r3, [r3, #0x124]
+  0x00c10c58 ldr       r2, [r3, #0x14]
+  0x00c10c5c ldr       r1, [r3, #0x44]
+  0x00c10c60 add       r2, r2, #2
+  0x00c10c64 str       r2, [r3, #0x14]
+  0x00c10c68 sub       r1, r1, #2
+  0x00c10c6c ldr       r3, [r3, #0x60]
+  0x00c10c70 add       r2, r1, r2
+  0x00c10c74 ldrh      r0, [r2, r3]
+
+===== sub_00c172d0 @0x00c172d0 (MMIO-literal candidate) =====
+  0x00c172d0 ldr       r3, [pc, #0xc]
+  0x00c172d4 ldr       r0, [r3, #0x18]
+  0x00c172d8 eor       r0, r0, #0x10
+  0x00c172dc ubfx      r0, r0, #4, #1
+  0x00c172e0 bx        lr
+  0x00c172e4 rfeia     #1!
+  0x00c172e8 ldr       r3, [pc, #0x10]
+  0x00c172ec ldr       r2, [r3, #0x18]
+  0x00c172f0 tst       r2, #0x20
+  0x00c172f4 bne       #0xc172e8
+  0x00c172f8 str       r0, [r3]
+  0x00c172fc bx        lr
+  0x00c17300 rfeia     #1!
+  0x00c17304 cmp       r0, #0xa
+  0x00c17308 push      {r4, lr}
+  0x00c1730c mov       r4, r0
+  0x00c17310 bne       #0xc1731c
+  0x00c17314 mov       r0, #0xd
+  0x00c17318 bl        #0xc172e8
+  0x00c1731c mov       r0, r4
+  0x00c17320 pop       {r4, lr}
+  0x00c17324 b         #0xc172e8
+  0x00c17328 push      {r3, r4, r5, lr}
+  0x00c1732c mov       r5, r0
+  0x00c17330 mov       r4, #0
+  0x00c17334 b         #0xc1733c
+  0x00c17338 bl        #0xc17304
+  0x00c1733c ldrb      r0, [r5, r4]
+  0x00c17340 add       r4, r4, #1
+  0x00c17344 cmp       r0, #0
+  0x00c17348 bne       #0xc17338
+  0x00c1734c pop       {r3, r4, r5, pc}
+  0x00c17350 b         #0xc172e8
+  0x00c17354 ldr       r3, [pc, #0x1c]
+  0x00c17358 ldr       r2, [r3, #0x18]
+  0x00c1735c tst       r2, #0x10
+  0x00c17360 bne       #0xc17354
+  0x00c17364 ldr       r0, [r3]
+  0x00c17368 bics      r2, r0, #0xff
+  0x00c1736c mvnne     r0, #0
+  0x00c17370 strne     r0, [r3, #4]
+  0x00c17374 bx        lr
+  0x00c17378 rfeia     #1!
+  0x00c1737c mov       r3, #0xf8000000
+  0x00c17380 ldr       r0, [r3, #0x88]
+  0x00c17384 cmp       r0, #3
+  0x00c17388 moveq     r0, #3
+  0x00c1738c movne     r0, #0
+  0x00c17390 bx        lr
+  0x00c17394 push      {r3, r4, r5, r6, r7, lr}
+  0x00c17398 mov       r3, #0xf8000000
+  0x00c1739c ldr       r3, [r3, #0x88]
+  0x00c173a0 mov       r6, r0
+  0x00c173a4 mov       r4, r1
+  0x00c173a8 cmp       r3, #3
+  0x00c173ac bne       #0xc17414
+  0x00c173b0 bl        #0xc26b3c
+  0x00c173b4 subs      r5, r0, #0
+  0x00c173b8 bne       #0xc17414
+  0x00c173bc mov       r0, r6
+  0x00c173c0 mov       r1, r4
+  0x00c173c4 mov       r2, r5
+  0x00c173c8 mov       r3, r5
+  0x00c173cc bl        #0xc26adc
+
+===== sub_00c02920 @0x00c02920 (MMIO-literal candidate) =====
+  0x00c02920 push      {r4, lr}
+  0x00c02924 ldr       r1, [pc, #0x3c]
+  0x00c02928 ldr       r4, [r3, #0xa0]
+  0x00c0292c bic       r4, r4, #0x300
+  0x00c02930 orr       r0, r4, #0x200
+  0x00c02934 orr       r4, r4, #0x210
+  0x00c02938 bl        #0xc028a0
+  0x00c0293c ldr       r1, [pc, #0x24]
+  0x00c02940 mov       r0, r4
+  0x00c02944 bl        #0xc028a0
+  0x00c02948 mov       r0, #0x3e8
+  0x00c0294c bl        #0xc028f4
+  0x00c02950 bic       r0, r4, #0x10
+  0x00c02954 orr       r0, r0, #3
+  0x00c02958 ldr       r1, [pc, #8]
+  0x00c0295c pop       {r4, lr}
+  0x00c02960 b         #0xc028a0
+  0x00c02964 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c02968 .byte     0xa0, 0x20, 0xa2, 0xf8
+  0x00c0296c push      {r4, r5, r6, lr}
+  0x00c02970 mov       r4, r0
+  0x00c02974 mov       r5, r1
+  0x00c02978 ldr       r0, [pc, #0xd8]
+  0x00c0297c ldr       r1, [pc, #0xd8]
+  0x00c02980 mov       r6, r2
+  0x00c02984 bl        #0xc028a0
+  0x00c02988 mov       r0, r5
+  0x00c0298c ldr       r1, [pc, #0xcc]
+  0x00c02990 bl        #0xc028a0
+  0x00c02994 orr       r0, r4, #0xa0000000
+  0x00c02998 orr       r0, r0, #0x2000
+  0x00c0299c ldr       r1, [pc, #0xc0]
+  0x00c029a0 bl        #0xc028a0
+  0x00c029a4 bl        #0xc028a8
+  0x00c029a8 ldr       r3, [pc, #0xb8]
+  0x00c029ac ldr       r4, [r3, #0x2c]
+  0x00c029b0 cmp       r4, #0
+  0x00c029b4 bge       #0xc029c8
+  0x00c029b8 bl        #0xc028e0
+  0x00c029bc ldr       r3, [pc, #0xa8]
+  0x00c029c0 cmp       r0, r3
+  0x00c029c4 bls       #0xc029a8
+  0x00c029c8 bl        #0xc028cc
+  0x00c029cc cmp       r4, #0
+  0x00c029d0 bge       #0xc029dc
+  0x00c029d4 mov       r0, #1
+  0x00c029d8 bl        #0xc025a0
+  0x00c029dc bl        #0xc028a8
+  0x00c029e0 ldr       r3, [pc, #0x80]
+  0x00c029e4 ldr       r4, [r3, #0x44]
+  0x00c029e8 ands      r4, r4, #4
+  0x00c029ec bne       #0xc02a00
+  0x00c029f0 bl        #0xc028e0
+  0x00c029f4 ldr       r3, [pc, #0x70]
+  0x00c029f8 cmp       r0, r3
+  0x00c029fc bls       #0xc029e0
+  0x00c02a00 bl        #0xc028cc
+  0x00c02a04 cmp       r4, #0
+  0x00c02a08 bne       #0xc02a14
+  0x00c02a0c mov       r0, #2
+  0x00c02a10 bl        #0xc025a0
+  0x00c02a14 cmp       r6, #0
+  0x00c02a18 popeq     {r4, r5, r6, pc}
+  0x00c02a1c bl        #0xc028a8
+
+===== sub_00c04178 @0x00c04178 (MMIO-literal candidate) =====
+  0x00c04178 push      {r4, r5, r6, r7, r8, lr}
+  0x00c0417c ldr       r3, [r0, #0x10]
+  0x00c04180 mov       r6, r1
+  0x00c04184 mov       r5, r2
+  0x00c04188 cmp       r3, #1
+  0x00c0418c bne       #0xc041d0
+  0x00c04190 ldr       r4, [pc, #0x50]
+  0x00c04194 ldr       r7, [r0, #0xc]
+  0x00c04198 mov       r0, #0
+  0x00c0419c str       r0, [r4, #0x30]
+  0x00c041a0 bl        #0xc039b0
+  0x00c041a4 cmp       r0, #0
+  0x00c041a8 bne       #0xc041c8
+  0x00c041ac str       r7, [r4, #0x30]
+  0x00c041b0 add       r0, r0, #0x2000
+  0x00c041b4 mov       r1, r6
+  0x00c041b8 mov       r2, r5
+  0x00c041bc bl        #0xc039b0
+  0x00c041c0 cmp       r0, #0
+  0x00c041c4 popeq     {r4, r5, r6, r7, r8, pc}
+  0x00c041c8 mvn       r0, #0
+  0x00c041cc pop       {r4, r5, r6, r7, r8, pc}
+  0x00c041d0 cmp       r3, #2
+  0x00c041d4 movne     r0, #0
+  0x00c041d8 popne     {r4, r5, r6, r7, r8, pc}
+  0x00c041dc ldr       r0, [r0, #8]
+  0x00c041e0 pop       {r4, r5, r6, r7, r8, lr}
+  0x00c041e4 b         #0xc04094
+  0x00c041e8 .byte     0x00, 0x00, 0xa5, 0xf8
+  0x00c041ec push      {r4, r5, r6, r7, sb, sl, fp, lr}
+  0x00c041f0 sub       sp, sp, #0x20
+  0x00c041f4 mov       r6, r0
+  0x00c041f8 mov       fp, r3
+  0x00c041fc ldr       ip, [sp, #0x4c]
+  0x00c04200 ldr       r5, [sp, #0x40]
+  0x00c04204 ldr       r4, [sp, #0x44]
+  0x00c04208 ldr       r7, [sp, #0x48]
+  0x00c0420c mov       sb, ip
+  0x00c04210 str       r1, [sp, #0x18]
+  0x00c04214 str       r2, [sp, #0x1c]
+  0x00c04218 ldr       r3, [sp, #0x18]
+  0x00c0421c mov       r2, r4
+  0x00c04220 str       sb, [sp]
+  0x00c04224 rsb       sl, r6, r3
+  0x00c04228 ldr       r0, [r5, #4]
+  0x00c0422c mov       r3, r7
+  0x00c04230 add       sl, r6, sl, lsr #1
+  0x00c04234 mov       r1, sl
+  0x00c04238 bl        #0xc03494
+  0x00c0423c mov       r0, r5
+  0x00c04240 mov       r1, r4
+  0x00c04244 mov       r2, r7
+  0x00c04248 bl        #0xc04178
+  0x00c0424c cmp       fp, #2
+  0x00c04250 beq       #0xc04274
+  0x00c04254 cmp       fp, #4
+  0x00c04258 beq       #0xc04290
+  0x00c0425c cmp       fp, #1
+  0x00c04260 moveq     ip, #6
+  0x00c04264 movne     ip, #0
+  0x00c04268 cmp       r0, #0
+  0x00c0426c bne       #0xc042cc
+  0x00c04270 b         #0xc042c0
+  0x00c04274 cmp       r0, #0
+
+===== sub_00c033b0 @0x00c033b0 (MMIO-literal candidate) =====
+  0x00c033b0 ldr       r1, [pc, #0x24]
+  0x00c033b4 b         #0xc033cc
+  0x00c033b8 ldr       r3, [r1, #0x18]
+  0x00c033bc tst       r3, #0x20
+  0x00c033c0 bne       #0xc033b8
+  0x00c033c4 str       r2, [r1]
+  0x00c033c8 add       r0, r0, #1
+  0x00c033cc ldrb      r2, [r0]
+  0x00c033d0 cmp       r2, #0
+  0x00c033d4 bne       #0xc033b8
+  0x00c033d8 bx        lr
+  0x00c033dc rfeia     #1!
+  0x00c033e0 ldr       r1, [pc, #0x38]
+  0x00c033e4 mov       r2, #0x1c
+  0x00c033e8 ldr       r3, [r1, #0x18]
+  0x00c033ec tst       r3, #0x20
+  0x00c033f0 bne       #0xc033e8
+  0x00c033f4 mov       r3, #0xf
+  0x00c033f8 and       r3, r3, r0, lsr r2
+  0x00c033fc cmp       r3, #9
+  0x00c03400 addle     r3, r3, #0x30
+  0x00c03404 addgt     r3, r3, #0x37
+  0x00c03408 str       r3, [r1]
+  0x00c0340c cmp       r2, #0
+  0x00c03410 beq       #0xc0341c
+  0x00c03414 sub       r2, r2, #4
+  0x00c03418 b         #0xc033e8
+  0x00c0341c bx        lr
+  0x00c03420 rfeia     #1!
+  0x00c03424 ldr       r1, [pc, #0x10]
+  0x00c03428 ldr       r3, [r1, #0x18]
+  0x00c0342c tst       r3, #0x20
+  0x00c03430 bne       #0xc03428
+  0x00c03434 str       r0, [r1]
+  0x00c03438 bx        lr
+  0x00c0343c rfeia     #1!
+  0x00c03440 mov       r3, #0xf8000000
+  0x00c03444 ldr       r3, [r3, #0xd0]
+  0x00c03448 tst       r0, r3
+  0x00c0344c moveq     r0, #0
+  0x00c03450 movne     r0, #1
+  0x00c03454 bx        lr
+  0x00c03458 mov       r3, #0xf8000000
+  0x00c0345c ldr       r0, [r3, #0xa0]
+  0x00c03460 bx        lr
+  0x00c03464 ldr       r3, [r0, #0x70]
+  0x00c03468 orr       r3, r3, #0x100000
+  0x00c0346c str       r3, [r0, #0x70]
+  0x00c03470 bic       r3, r3, #0x100000
+  0x00c03474 str       r3, [r0, #0x70]
+  0x00c03478 ldr       r3, [r0, #4]
+  0x00c0347c orr       r3, r3, #0x8000
+  0x00c03480 str       r3, [r0, #4]
+  0x00c03484 bic       r3, r3, #0x8000
+  0x00c03488 str       r3, [r0, #4]
+  0x00c0348c dsb       sy
+  0x00c03490 bx        lr
+  0x00c03494 push      {r4, lr}
+  0x00c03498 ldr       ip, [sp, #8]
+  0x00c0349c and       r3, r3, #7
+  0x00c034a0 cmp       ip, #2
+  0x00c034a4 bne       #0xc034bc
+  0x00c034a8 cmp       r3, #3
+  0x00c034ac lsl       r2, r2, #7
+
+===== sub_00c940b0 @0x00c940b0 (MMIO-literal candidate) =====
+  0x00c940b0 ldr       r1, [pc, #0x38]
+  0x00c940b4 mov       r2, #0x1c
+  0x00c940b8 ldr       r3, [r1, #0x18]
+  0x00c940bc tst       r3, #0x20
+  0x00c940c0 bne       #0xc940b8
+  0x00c940c4 mov       r3, #0xf
+  0x00c940c8 and       r3, r3, r0, lsr r2
+  0x00c940cc cmp       r3, #9
+  0x00c940d0 addle     r3, r3, #0x30
+  0x00c940d4 addgt     r3, r3, #0x37
+  0x00c940d8 str       r3, [r1]
+  0x00c940dc cmp       r2, #0
+  0x00c940e0 beq       #0xc940ec
+  0x00c940e4 sub       r2, r2, #4
+  0x00c940e8 b         #0xc940b8
+  0x00c940ec bx        lr
+  0x00c940f0 rfeia     #1!
+  0x00c940f4 ldr       r1, [pc, #0x10]
+  0x00c940f8 ldr       r3, [r1, #0x18]
+  0x00c940fc tst       r3, #0x20
+  0x00c94100 bne       #0xc940f8
+  0x00c94104 str       r0, [r1]
+  0x00c94108 bx        lr
+  0x00c9410c rfeia     #1!
+  0x00c94110 bx        lr
+  0x00c94114 bx        lr
+  0x00c94118 bx        lr
+  0x00c9411c push      {r3, r4, r5, r6, r7, lr}
+  0x00c94120 ldr       r3, [pc, #0x17c]
+  0x00c94124 ldr       r4, [pc, #0x17c]
+  0x00c94128 mov       r6, r0
+  0x00c9412c ldr       r5, [r3, #0x108]
+  0x00c94130 bl        #0xc94394
+  0x00c94134 ldr       r3, [r4, #8]
+  0x00c94138 tst       r3, #0x20
+  0x00c9413c beq       #0xc94168
+  0x00c94140 ldr       r0, [pc, #0x164]
+  0x00c94144 mov       r1, #0x10
+  0x00c94148 ldr       r2, [pc, #0x160]
+  0x00c9414c mov       r3, r4
+  0x00c94150 bl        #0xc94398
+  0x00c94154 mvn       r2, #0
+  0x00c94158 mov       r0, #2
+  0x00c9415c mov       r1, r4
+  0x00c94160 mov       r3, r2
+  0x00c94164 bl        #0xc94fe4
+  0x00c94168 mov       r0, #0x10
+  0x00c9416c bl        #0xc94d98
+  0x00c94170 cmp       r0, #0
+  0x00c94174 movne     r4, #0
+  0x00c94178 bne       #0xc941a0
+  0x00c9417c ldr       r7, [pc, #0x120]
+  0x00c94180 bic       r3, r5, #0xff0
+  0x00c94184 bic       r3, r3, #0xf
+  0x00c94188 ldr       r1, [pc, #0x118]
+  0x00c9418c str       r3, [r7, #0x108]
+  0x00c94190 mov       r0, r7
+  0x00c94194 bl        #0xc96170
+  0x00c94198 str       r5, [r7, #0x108]
+  0x00c9419c mov       r4, r0
+  0x00c941a0 mov       r0, #0x10000
+  0x00c941a4 bl        #0xc94d98
+  0x00c941a8 cmp       r0, #0
+  0x00c941ac bne       #0xc941d4
+
+===== sub_00c08854 @0x00c08854 (MMIO-literal candidate) =====
+  0x00c08854 push      {r4, r5, r6, r7, lr}
+  0x00c08858 sub       sp, sp, #0x204
+  0x00c0885c mov       r5, r0
+  0x00c08860 mov       r1, sp
+  0x00c08864 bl        #0xc098c4
+  0x00c08868 cmp       r0, #0
+  0x00c0886c ldrne     r0, [pc, #0x1ec]
+  0x00c08870 movwne    r2, #0x38f
+  0x00c08874 ldrne     r1, [pc, #0x1e8]
+  0x00c08878 bne       #0xc08a20
+  0x00c0887c bl        #0xc05dac
+  0x00c08880 ldr       r3, [pc, #0x1e0]
+  0x00c08884 ldrb      r2, [sp, #0xc0]
+  0x00c08888 ldr       r3, [r3]
+  0x00c0888c cmp       r0, #0
+  0x00c08890 movne     r6, #1
+  0x00c08894 moveq     r6, #7
+  0x00c08898 tst       r3, #0x1000
+  0x00c0889c ldrb      r3, [sp, #0xa2]
+  0x00c088a0 movne     r4, #2
+  0x00c088a4 moveq     r4, #1
+  0x00c088a8 cmp       r2, #4
+  0x00c088ac bls       #0xc088f0
+  0x00c088b0 and       r3, r3, #3
+  0x00c088b4 cmp       r3, #1
+  0x00c088b8 beq       #0xc088f0
+  0x00c088bc mov       r1, #1
+  0x00c088c0 mov       r0, r5
+  0x00c088c4 mov       r2, #0xa2
+  0x00c088c8 mov       r3, r1
+  0x00c088cc bl        #0xc0a2a8
+  0x00c088d0 cmp       r0, #0
+  0x00c088d4 beq       #0xc088f0
+  0x00c088d8 ldr       r0, [pc, #0x180]
+  0x00c088dc movw      r2, #0x3ab
+  0x00c088e0 ldr       r1, [pc, #0x17c]
+  0x00c088e4 bl        #0xc1fa7c
+  0x00c088e8 ldr       r0, [pc, #0x17c]
+  0x00c088ec b         #0xc08a28
+  0x00c088f0 ldrb      r2, [sp, #0xc0]
+  0x00c088f4 ldrb      r3, [sp, #0xa6]
+  0x00c088f8 cmp       r2, #4
+  0x00c088fc bls       #0xc08948
+  0x00c08900 tst       r3, #1
+  0x00c08904 beq       #0xc08948
+  0x00c08908 ldrb      r3, [sp, #0xa7]
+  0x00c0890c cmp       r3, #0x1f
+  0x00c08910 beq       #0xc08948
+  0x00c08914 mov       r0, r5
+  0x00c08918 mov       r1, #1
+  0x00c0891c mov       r2, #0xa7
+  0x00c08920 mov       r3, #0x1f
+  0x00c08924 bl        #0xc0a2a8
+  0x00c08928 cmp       r0, #0
+  0x00c0892c beq       #0xc08948
+  0x00c08930 ldr       r0, [pc, #0x128]
+  0x00c08934 movw      r2, #0x3bb
+  0x00c08938 ldr       r1, [pc, #0x124]
+  0x00c0893c bl        #0xc1fa7c
+  0x00c08940 ldr       r0, [pc, #0x128]
+  0x00c08944 b         #0xc08a28
+  0x00c08948 ldrb      r3, [sp, #0xb3]
+  0x00c0894c ldrb      r7, [sp, #0xb1]
+  0x00c08950 ubfx      r3, r3, #3, #4
+
+===== sub_00c03748 @0x00c03748 (MMIO-literal candidate) =====
+  0x00c03748 push      {r4, r5, r6, lr}
+  0x00c0374c ldr       r3, [r0, #0x50]
+  0x00c03750 ldr       r4, [pc, #0x84]
+  0x00c03754 mov       r5, #0
+  0x00c03758 ubfx      r3, r3, #4, #2
+  0x00c0375c mov       r6, r1
+  0x00c03760 sub       r3, r3, #1
+  0x00c03764 lsl       r3, r3, #0xc
+  0x00c03768 orr       r3, r3, #0x150
+  0x00c0376c orr       r3, r3, #2
+  0x00c03770 str       r3, [r4, #0xc]
+  0x00c03774 str       r5, [r4, #0x1c]
+  0x00c03778 bl        #0xc04c44
+  0x00c0377c ldr       r3, [pc, #0x5c]
+  0x00c03780 cmp       r6, #1
+  0x00c03784 str       r0, [r4, #0x20]
+  0x00c03788 str       r3, [r4, #0x38]
+  0x00c0378c bne       #0xc037b0
+  0x00c03790 mov       r3, #0x43
+  0x00c03794 str       r3, [r4, #8]
+  0x00c03798 ldr       r3, [pc, #0x44]
+  0x00c0379c str       r5, [r4, #0x10]
+  0x00c037a0 str       r5, [r4, #0x14]
+  0x00c037a4 str       r5, [r4, #0x18]
+  0x00c037a8 str       r3, [r4, #0x30]
+  0x00c037ac pop       {r4, r5, r6, pc}
+  0x00c037b0 mov       r3, #0x4f
+  0x00c037b4 str       r3, [r4, #8]
+  0x00c037b8 mov       r3, #0xf8000000
+  0x00c037bc ldr       r3, [r3, #0xa0]
+  0x00c037c0 str       r3, [r4, #0x30]
+  0x00c037c4 mov       r3, #0x7f
+  0x00c037c8 str       r3, [r4, #0x10]
+  0x00c037cc mvn       r3, #0
+  0x00c037d0 str       r3, [r4, #0x14]
+  0x00c037d4 str       r5, [r4, #0x18]
+  0x00c037d8 pop       {r4, r5, r6, pc}
+  0x00c037dc .byte     0x00, 0x00, 0xa5, 0xf8
+  0x00c037e0 stclvs    p13, c6, [sp, #-0x1b4]!
+  0x00c037e4 strpl     r5, [sl, #0x5aa]!
+  0x00c037e8 b         #0xc04c74
+  0x00c037ec cmp       r2, #1
+  0x00c037f0 mvn       ip, #0
+  0x00c037f4 mvn       ip, ip, lsl r1
+  0x00c037f8 push      {r0, r1, r2, r3, r4, r5, r6, r7, sb, sl, fp, lr}
+  0x00c037fc mov       r4, r0
+  0x00c03800 mov       r6, r1
+  0x00c03804 mov       sl, r2
+  0x00c03808 moveq     fp, #0xf
+  0x00c0380c movne     fp, #0x1f
+  0x00c03810 mov       sb, #0
+  0x00c03814 mov       r7, r3
+  0x00c03818 mov       r5, ip
+  0x00c0381c b         #0xc038b8
+  0x00c03820 mov       r0, r4
+  0x00c03824 bl        #0xc03464
+  0x00c03828 mov       r3, #1
+  0x00c0382c str       r3, [r4, #0xa4]
+  0x00c03830 dsb       sy
+  0x00c03834 ldr       r1, [r4, #0xa8]
+  0x00c03838 mov       r2, #0
+  0x00c0383c str       r2, [r4, #0xa4]
+  0x00c03840 and       r1, r1, #0xf
+  0x00c03844 cmp       r1, r5
+
+===== sub_00c94f24 @0x00c94f24 (MMIO-literal candidate) =====
+  0x00c94f24 push      {r4, r5, r6, lr}
+  0x00c94f28 ldr       r2, [pc, #0xa0]
+  0x00c94f2c mov       r5, r0
+  0x00c94f30 mov       r4, r1
+  0x00c94f34 ldr       r0, [pc, #0x98]
+  0x00c94f38 mov       r1, #2
+  0x00c94f3c ldr       r3, [pc, #0x94]
+  0x00c94f40 mov       r6, #0
+  0x00c94f44 bl        #0xc94398
+  0x00c94f48 ldr       r3, [r5, #0x50]
+  0x00c94f4c ldr       r5, [pc, #0x84]
+  0x00c94f50 ubfx      r3, r3, #4, #2
+  0x00c94f54 sub       r3, r3, #1
+  0x00c94f58 lsl       r3, r3, #0xc
+  0x00c94f5c orr       r3, r3, #0x150
+  0x00c94f60 orr       r3, r3, #2
+  0x00c94f64 str       r3, [r5, #0xc]
+  0x00c94f68 str       r6, [r5, #0x1c]
+  0x00c94f6c bl        #0xc944f4
+  0x00c94f70 ldr       r3, [pc, #0x64]
+  0x00c94f74 cmp       r4, #1
+  0x00c94f78 str       r0, [r5, #0x20]
+  0x00c94f7c str       r3, [r5, #0x38]
+  0x00c94f80 bne       #0xc94fa4
+  0x00c94f84 mov       r3, #0x43
+  0x00c94f88 str       r3, [r5, #8]
+  0x00c94f8c ldr       r3, [pc, #0x4c]
+  0x00c94f90 str       r6, [r5, #0x10]
+  0x00c94f94 str       r6, [r5, #0x14]
+  0x00c94f98 str       r6, [r5, #0x18]
+  0x00c94f9c str       r3, [r5, #0x30]
+  0x00c94fa0 pop       {r4, r5, r6, pc}
+  0x00c94fa4 mov       r3, #0x4f
+  0x00c94fa8 str       r3, [r5, #8]
+  0x00c94fac mov       r3, #0xf8000000
+  0x00c94fb0 ldr       r3, [r3, #0xa0]
+  0x00c94fb4 str       r3, [r5, #0x30]
+  0x00c94fb8 mov       r3, #0x7f
+  0x00c94fbc str       r3, [r5, #0x10]
+  0x00c94fc0 mvn       r3, #0
+  0x00c94fc4 str       r3, [r5, #0x14]
+  0x00c94fc8 str       r6, [r5, #0x18]
+  0x00c94fcc pop       {r4, r5, r6, pc}
+  0x00c94fd0 .byte     0x7a, 0x38, 0xff, 0xff
+  0x00c94fd4 .byte     0xa0, 0x35, 0xff, 0xff
+  0x00c94fd8 .byte     0x00, 0x00, 0xa5, 0xf8
+  0x00c94fdc stclvs    p13, c6, [sp, #-0x1b4]!
+  0x00c94fe0 strpl     r5, [sl, #0x5aa]!
+  0x00c94fe4 b         #0xc942b4
+  0x00c94fe8 cmp       r2, #1
+  0x00c94fec mov       ip, r3
+  0x00c94ff0 push      {r4, r5, r6, r7, sb, sl, fp, lr}
+  0x00c94ff4 moveq     r3, #0xf
+  0x00c94ff8 movne     r3, #0x1f
+  0x00c94ffc mvn       fp, #0
+  0x00c95000 sub       sp, sp, #0x20
+  0x00c95004 mov       r4, r0
+  0x00c95008 mvn       fp, fp, lsl r1
+  0x00c9500c mov       sb, #0
+  0x00c95010 mov       r7, r2
+  0x00c95014 mov       sl, r1
+  0x00c95018 mov       r6, r3
+  0x00c9501c b         #0xc950c0
+  0x00c95020 mov       r0, r4
+
+===== sub_00c03424 @0x00c03424 (MMIO-literal candidate) =====
+  0x00c03424 ldr       r1, [pc, #0x10]
+  0x00c03428 ldr       r3, [r1, #0x18]
+  0x00c0342c tst       r3, #0x20
+  0x00c03430 bne       #0xc03428
+  0x00c03434 str       r0, [r1]
+  0x00c03438 bx        lr
+  0x00c0343c rfeia     #1!
+  0x00c03440 mov       r3, #0xf8000000
+  0x00c03444 ldr       r3, [r3, #0xd0]
+  0x00c03448 tst       r0, r3
+  0x00c0344c moveq     r0, #0
+  0x00c03450 movne     r0, #1
+  0x00c03454 bx        lr
+  0x00c03458 mov       r3, #0xf8000000
+  0x00c0345c ldr       r0, [r3, #0xa0]
+  0x00c03460 bx        lr
+  0x00c03464 ldr       r3, [r0, #0x70]
+  0x00c03468 orr       r3, r3, #0x100000
+  0x00c0346c str       r3, [r0, #0x70]
+  0x00c03470 bic       r3, r3, #0x100000
+  0x00c03474 str       r3, [r0, #0x70]
+  0x00c03478 ldr       r3, [r0, #4]
+  0x00c0347c orr       r3, r3, #0x8000
+  0x00c03480 str       r3, [r0, #4]
+  0x00c03484 bic       r3, r3, #0x8000
+  0x00c03488 str       r3, [r0, #4]
+  0x00c0348c dsb       sy
+  0x00c03490 bx        lr
+  0x00c03494 push      {r4, lr}
+  0x00c03498 ldr       ip, [sp, #8]
+  0x00c0349c and       r3, r3, #7
+  0x00c034a0 cmp       ip, #2
+  0x00c034a4 bne       #0xc034bc
+  0x00c034a8 cmp       r3, #3
+  0x00c034ac lsl       r2, r2, #7
+  0x00c034b0 addls     r2, r2, #0x210
+  0x00c034b4 addhi     r2, r2, #0x214
+  0x00c034b8 b         #0xc034cc
+  0x00c034bc cmp       r3, #3
+  0x00c034c0 lsl       r2, r2, #7
+  0x00c034c4 addls     r2, r2, #0x21c
+  0x00c034c8 addhi     r2, r2, #0x220
+  0x00c034cc and       r3, r3, #3
+  0x00c034d0 ldr       ip, [r2, r0]
+  0x00c034d4 mov       r4, #0xff
+  0x00c034d8 and       r1, r1, #0x1f
+  0x00c034dc lsl       r3, r3, #3
+  0x00c034e0 bic       ip, ip, r4, lsl r3
+  0x00c034e4 orr       r3, ip, r1, lsl r3
+  0x00c034e8 str       r3, [r2, r0]
+  0x00c034ec pop       {r4, lr}
+  0x00c034f0 b         #0xc03464
+  0x00c034f4 cmp       r3, #2
+  0x00c034f8 and       r2, r2, #7
+  0x00c034fc bne       #0xc03514
+  0x00c03500 cmp       r2, #3
+  0x00c03504 lsl       r1, r1, #7
+  0x00c03508 addls     r1, r1, #0x210
+  0x00c0350c addhi     r1, r1, #0x214
+  0x00c03510 b         #0xc03524
+  0x00c03514 cmp       r2, #3
+  0x00c03518 lsl       r1, r1, #7
+  0x00c0351c addls     r1, r1, #0x21c
+  0x00c03520 addhi     r1, r1, #0x220
+
+===== sub_00c74338 @0x00c74338 (MMIO-literal candidate) =====
+  0x00c74338 push      {r4, lr}
+  0x00c7433c ldr       r4, [pc, #0x2c]
+  0x00c74340 mov       r0, #0xc8
+  0x00c74344 ldr       r3, [r4, #0xb8]
+  0x00c74348 orr       r3, r3, #0x17000
+  0x00c7434c str       r3, [r4, #0xb8]
+  0x00c74350 bl        #0xc6c678
+  0x00c74354 ldr       r3, [r4, #0xbc]
+  0x00c74358 mov       r0, #0x64
+  0x00c7435c orr       r3, r3, #0xf00
+  0x00c74360 str       r3, [r4, #0xbc]
+  0x00c74364 bl        #0xc6c678
+  0x00c74368 mov       r0, #0
+  0x00c7436c pop       {r4, pc}
+  0x00c74370 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c74374 push      {r4, lr}
+  0x00c74378 ldr       r4, [pc, #0x2c]
+  0x00c7437c mov       r0, #0xc8
+  0x00c74380 ldr       r3, [r4, #0x198]
+  0x00c74384 orr       r3, r3, #0x15000
+  0x00c74388 str       r3, [r4, #0x198]
+  0x00c7438c bl        #0xc6c678
+  0x00c74390 ldr       r3, [r4, #0x190]
+  0x00c74394 mov       r0, #0x64
+  0x00c74398 orr       r3, r3, #0x300
+  0x00c7439c str       r3, [r4, #0x190]
+  0x00c743a0 bl        #0xc6c678
+  0x00c743a4 mov       r0, #0
+  0x00c743a8 pop       {r4, pc}
+  0x00c743ac .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c743b0 push      {r3, lr}
+  0x00c743b4 bl        #0xc74338
+  0x00c743b8 bl        #0xc74374
+  0x00c743bc mov       r0, #0
+  0x00c743c0 pop       {r3, pc}
+  0x00c743c4 cmp       r0, #0
+  0x00c743c8 bne       #0xc743d0
+  0x00c743cc b         #0xc74338
+  0x00c743d0 cmp       r0, #1
+  0x00c743d4 beq       #0xc743e0
+  0x00c743d8 mvn       r0, #0
+  0x00c743dc bx        lr
+  0x00c743e0 b         #0xc74374
+  0x00c743e4 push      {r3, lr}
+  0x00c743e8 bl        #0xc743c4
+  0x00c743ec mov       r0, #0
+  0x00c743f0 pop       {r3, pc}
+  0x00c743f4 b         #0xc743e4
+  0x00c743f8 cmp       r0, #0
+  0x00c743fc push      {r4, r5, r6, lr}
+  0x00c74400 bne       #0xc744b0
+  0x00c74404 cmp       r1, #0
+  0x00c74408 ldr       r4, [pc, #0x194]
+  0x00c7440c mov       r0, #0xc8
+  0x00c74410 ldrne     r3, [pc, #0x190]
+  0x00c74414 strne     r3, [r1]
+  0x00c74418 ldr       r3, [r4, #0xb8]
+  0x00c7441c orr       r3, r3, #0x17000
+  0x00c74420 str       r3, [r4, #0xb8]
+  0x00c74424 ldr       r3, [r4, #0xbc]
+  0x00c74428 orr       r3, r3, #0xf00
+  0x00c7442c str       r3, [r4, #0xbc]
+  0x00c74430 bl        #0xc6c678
+  0x00c74434 ldr       r2, [pc, #0x170]
+
+===== sub_00c0337c @0x00c0337c (MMIO-literal candidate) =====
+  0x00c0337c ldr       r3, [pc, #0x28]
+  0x00c03380 mov       r2, #0
+  0x00c03384 str       r2, [r3, #0x30]
+  0x00c03388 add       r2, r2, #0x2d
+  0x00c0338c str       r2, [r3, #0x24]
+  0x00c03390 mov       r2, #0xc
+  0x00c03394 str       r2, [r3, #0x28]
+  0x00c03398 movw      r2, #0x70
+  0x00c0339c str       r2, [r3, #0x2c]
+  0x00c033a0 movw      r2, #0x301
+  0x00c033a4 str       r2, [r3, #0x30]
+  0x00c033a8 bx        lr
+  0x00c033ac rfeia     #1!
+  0x00c033b0 ldr       r1, [pc, #0x24]
+  0x00c033b4 b         #0xc033cc
+  0x00c033b8 ldr       r3, [r1, #0x18]
+  0x00c033bc tst       r3, #0x20
+  0x00c033c0 bne       #0xc033b8
+  0x00c033c4 str       r2, [r1]
+  0x00c033c8 add       r0, r0, #1
+  0x00c033cc ldrb      r2, [r0]
+  0x00c033d0 cmp       r2, #0
+  0x00c033d4 bne       #0xc033b8
+  0x00c033d8 bx        lr
+  0x00c033dc rfeia     #1!
+  0x00c033e0 ldr       r1, [pc, #0x38]
+  0x00c033e4 mov       r2, #0x1c
+  0x00c033e8 ldr       r3, [r1, #0x18]
+  0x00c033ec tst       r3, #0x20
+  0x00c033f0 bne       #0xc033e8
+  0x00c033f4 mov       r3, #0xf
+  0x00c033f8 and       r3, r3, r0, lsr r2
+  0x00c033fc cmp       r3, #9
+  0x00c03400 addle     r3, r3, #0x30
+  0x00c03404 addgt     r3, r3, #0x37
+  0x00c03408 str       r3, [r1]
+  0x00c0340c cmp       r2, #0
+  0x00c03410 beq       #0xc0341c
+  0x00c03414 sub       r2, r2, #4
+  0x00c03418 b         #0xc033e8
+  0x00c0341c bx        lr
+  0x00c03420 rfeia     #1!
+  0x00c03424 ldr       r1, [pc, #0x10]
+  0x00c03428 ldr       r3, [r1, #0x18]
+  0x00c0342c tst       r3, #0x20
+  0x00c03430 bne       #0xc03428
+  0x00c03434 str       r0, [r1]
+  0x00c03438 bx        lr
+  0x00c0343c rfeia     #1!
+  0x00c03440 mov       r3, #0xf8000000
+  0x00c03444 ldr       r3, [r3, #0xd0]
+  0x00c03448 tst       r0, r3
+  0x00c0344c moveq     r0, #0
+  0x00c03450 movne     r0, #1
+  0x00c03454 bx        lr
+  0x00c03458 mov       r3, #0xf8000000
+  0x00c0345c ldr       r0, [r3, #0xa0]
+  0x00c03460 bx        lr
+  0x00c03464 ldr       r3, [r0, #0x70]
+  0x00c03468 orr       r3, r3, #0x100000
+  0x00c0346c str       r3, [r0, #0x70]
+  0x00c03470 bic       r3, r3, #0x100000
+  0x00c03474 str       r3, [r0, #0x70]
+  0x00c03478 ldr       r3, [r0, #4]
+
+===== sub_00c04cd8 @0x00c04cd8 (MMIO-literal candidate) =====
+  0x00c04cd8 push      {r3, r4, r5, r6, r7, lr}
+  0x00c04cdc ldr       r3, [pc, #0x164]
+  0x00c04ce0 mov       r6, r0
+  0x00c04ce4 ldr       r5, [r3, #0x108]
+  0x00c04ce8 bl        #0xc04c54
+  0x00c04cec ldr       r1, [pc, #0x158]
+  0x00c04cf0 ldr       r3, [r1, #8]
+  0x00c04cf4 tst       r3, #0x20
+  0x00c04cf8 beq       #0xc04d0c
+  0x00c04cfc mvn       r2, #0
+  0x00c04d00 mov       r0, #2
+  0x00c04d04 mov       r3, r2
+  0x00c04d08 bl        #0xc037e8
+  0x00c04d0c mov       r0, #0x10
+  0x00c04d10 bl        #0xc03440
+  0x00c04d14 cmp       r0, #0
+  0x00c04d18 movne     r4, #0
+  0x00c04d1c bne       #0xc04d44
+  0x00c04d20 ldr       r7, [pc, #0x120]
+  0x00c04d24 bic       r3, r5, #0xff0
+  0x00c04d28 bic       r3, r3, #0xf
+  0x00c04d2c ldr       r1, [pc, #0x118]
+  0x00c04d30 str       r3, [r7, #0x108]
+  0x00c04d34 mov       r0, r7
+  0x00c04d38 bl        #0xc03db8
+  0x00c04d3c str       r5, [r7, #0x108]
+  0x00c04d40 mov       r4, r0
+  0x00c04d44 mov       r0, #0x10000
+  0x00c04d48 bl        #0xc03440
+  0x00c04d4c cmp       r0, #0
+  0x00c04d50 bne       #0xc04d78
+  0x00c04d54 ldr       r0, [pc, #0xec]
+  0x00c04d58 mov       r1, #2
+  0x00c04d5c bl        #0xc03748
+  0x00c04d60 ldr       r0, [pc, #0xe0]
+  0x00c04d64 ldr       r1, [pc, #0xe0]
+  0x00c04d68 mov       r2, r6
+  0x00c04d6c mov       r3, #1
+  0x00c04d70 bl        #0xc04b20
+  0x00c04d74 add       r4, r4, r0
+  0x00c04d78 cmp       r4, #0
+  0x00c04d7c beq       #0xc04df4
+  0x00c04d80 mov       r0, #0x100000
+  0x00c04d84 bl        #0xc03440
+  0x00c04d88 cmp       r0, #0
+  0x00c04d8c bne       #0xc04dbc
+  0x00c04d90 ldr       r1, [pc, #0xb4]
+  0x00c04d94 ldr       r0, [pc, #0xac]
+  0x00c04d98 bl        #0xc0391c
+  0x00c04d9c ldr       r1, [pc, #0xa8]
+  0x00c04da0 mov       r2, r6
+  0x00c04da4 mov       r3, #1
+  0x00c04da8 mov       r4, r0
+  0x00c04dac ldr       r0, [pc, #0x94]
+  0x00c04db0 bl        #0xc04b20
+  0x00c04db4 adds      r4, r0, r4
+  0x00c04db8 beq       #0xc04df4
+  0x00c04dbc mov       r0, #0x200000
+  0x00c04dc0 bl        #0xc03440
+  0x00c04dc4 cmp       r0, #0
+  0x00c04dc8 bne       #0xc04df4
+  0x00c04dcc ldr       r1, [pc, #0x78]
+  0x00c04dd0 ldr       r0, [pc, #0x70]
+  0x00c04dd4 bl        #0xc04794
+
+===== sub_00c743fc @0x00c743fc (MMIO-literal candidate) =====
+  0x00c743fc push      {r4, r5, r6, lr}
+  0x00c74400 bne       #0xc744b0
+  0x00c74404 cmp       r1, #0
+  0x00c74408 ldr       r4, [pc, #0x194]
+  0x00c7440c mov       r0, #0xc8
+  0x00c74410 ldrne     r3, [pc, #0x190]
+  0x00c74414 strne     r3, [r1]
+  0x00c74418 ldr       r3, [r4, #0xb8]
+  0x00c7441c orr       r3, r3, #0x17000
+  0x00c74420 str       r3, [r4, #0xb8]
+  0x00c74424 ldr       r3, [r4, #0xbc]
+  0x00c74428 orr       r3, r3, #0xf00
+  0x00c7442c str       r3, [r4, #0xbc]
+  0x00c74430 bl        #0xc6c678
+  0x00c74434 ldr       r2, [pc, #0x170]
+  0x00c74438 mov       r0, #0x64
+  0x00c7443c ldr       r3, [r2, #0x120]
+  0x00c74440 orr       r3, r3, #8
+  0x00c74444 bic       r3, r3, #0x200
+  0x00c74448 bic       r3, r3, #1
+  0x00c7444c str       r3, [r2, #0x120]
+  0x00c74450 bl        #0xc6c678
+  0x00c74454 ldr       r3, [r4, #0xbc]
+  0x00c74458 mov       r0, #0x12c
+  0x00c7445c orr       r3, r3, #3
+  0x00c74460 str       r3, [r4, #0xbc]
+  0x00c74464 bl        #0xc6c678
+  0x00c74468 ldr       r3, [r4, #0xbc]
+  0x00c7446c movw      r0, #0x2710
+  0x00c74470 bic       r3, r3, #0x500
+  0x00c74474 str       r3, [r4, #0xbc]
+  0x00c74478 bl        #0xc6c678
+  0x00c7447c ldr       r3, [r4, #0xbc]
+  0x00c74480 mov       r0, #0x12c
+  0x00c74484 bic       r3, r3, #0xa00
+  0x00c74488 str       r3, [r4, #0xbc]
+  0x00c7448c bl        #0xc6c678
+  0x00c74490 ldr       r3, [r4, #0xb8]
+  0x00c74494 mov       r0, #0xc8
+  0x00c74498 bic       r3, r3, #0x17000
+  0x00c7449c orr       r3, r3, #0x7f
+  0x00c744a0 str       r3, [r4, #0xb8]
+  0x00c744a4 bl        #0xc6c678
+  0x00c744a8 mov       r0, #0
+  0x00c744ac pop       {r4, r5, r6, pc}
+  0x00c744b0 cmp       r0, #1
+  0x00c744b4 mvnne     r0, #0
+  0x00c744b8 popne     {r4, r5, r6, pc}
+  0x00c744bc cmp       r1, #0
+  0x00c744c0 ldr       r4, [pc, #0xdc]
+  0x00c744c4 mov       r0, #0xc8
+  0x00c744c8 ldr       r5, [pc, #0xdc]
+  0x00c744cc ldrne     r3, [pc, #0xdc]
+  0x00c744d0 movw      r6, #0xa60c
+  0x00c744d4 strne     r3, [r1]
+  0x00c744d8 ldr       r3, [r4, #0x198]
+  0x00c744dc orr       r3, r3, #0x15000
+  0x00c744e0 str       r3, [r4, #0x198]
+  0x00c744e4 bl        #0xc6c678
+  0x00c744e8 ldr       r3, [r4, #0x190]
+  0x00c744ec mov       r0, #0xc8
+  0x00c744f0 orr       r3, r3, #0x300
+  0x00c744f4 str       r3, [r4, #0x190]
+  0x00c744f8 bl        #0xc6c678
+
+===== sub_00c9411c @0x00c9411c (MMIO-literal candidate) =====
+  0x00c9411c push      {r3, r4, r5, r6, r7, lr}
+  0x00c94120 ldr       r3, [pc, #0x17c]
+  0x00c94124 ldr       r4, [pc, #0x17c]
+  0x00c94128 mov       r6, r0
+  0x00c9412c ldr       r5, [r3, #0x108]
+  0x00c94130 bl        #0xc94394
+  0x00c94134 ldr       r3, [r4, #8]
+  0x00c94138 tst       r3, #0x20
+  0x00c9413c beq       #0xc94168
+  0x00c94140 ldr       r0, [pc, #0x164]
+  0x00c94144 mov       r1, #0x10
+  0x00c94148 ldr       r2, [pc, #0x160]
+  0x00c9414c mov       r3, r4
+  0x00c94150 bl        #0xc94398
+  0x00c94154 mvn       r2, #0
+  0x00c94158 mov       r0, #2
+  0x00c9415c mov       r1, r4
+  0x00c94160 mov       r3, r2
+  0x00c94164 bl        #0xc94fe4
+  0x00c94168 mov       r0, #0x10
+  0x00c9416c bl        #0xc94d98
+  0x00c94170 cmp       r0, #0
+  0x00c94174 movne     r4, #0
+  0x00c94178 bne       #0xc941a0
+  0x00c9417c ldr       r7, [pc, #0x120]
+  0x00c94180 bic       r3, r5, #0xff0
+  0x00c94184 bic       r3, r3, #0xf
+  0x00c94188 ldr       r1, [pc, #0x118]
+  0x00c9418c str       r3, [r7, #0x108]
+  0x00c94190 mov       r0, r7
+  0x00c94194 bl        #0xc96170
+  0x00c94198 str       r5, [r7, #0x108]
+  0x00c9419c mov       r4, r0
+  0x00c941a0 mov       r0, #0x10000
+  0x00c941a4 bl        #0xc94d98
+  0x00c941a8 cmp       r0, #0
+  0x00c941ac bne       #0xc941d4
+  0x00c941b0 ldr       r0, [pc, #0xec]
+  0x00c941b4 mov       r1, #2
+  0x00c941b8 bl        #0xc94f24
+  0x00c941bc ldr       r0, [pc, #0xe0]
+  0x00c941c0 ldr       r1, [pc, #0xe0]
+  0x00c941c4 mov       r2, r6
+  0x00c941c8 mov       r3, #1
+  0x00c941cc bl        #0xc966d8
+  0x00c941d0 add       r4, r4, r0
+  0x00c941d4 cmp       r4, #0
+  0x00c941d8 beq       #0xc94250
+  0x00c941dc mov       r0, #0x100000
+  0x00c941e0 bl        #0xc94d98
+  0x00c941e4 cmp       r0, #0
+  0x00c941e8 bne       #0xc94218
+  0x00c941ec ldr       r1, [pc, #0xb4]
+  0x00c941f0 ldr       r0, [pc, #0xac]
+  0x00c941f4 bl        #0xc9516c
+  0x00c941f8 ldr       r1, [pc, #0xa8]
+  0x00c941fc mov       r2, r6
+  0x00c94200 mov       r3, #1
+  0x00c94204 mov       r4, r0
+  0x00c94208 ldr       r0, [pc, #0x94]
+  0x00c9420c bl        #0xc966d8
+  0x00c94210 adds      r4, r0, r4
+  0x00c94214 beq       #0xc94250
+  0x00c94218 mov       r0, #0x200000
+
+===== sub_00c17288 @0x00c17288 (MMIO-literal candidate) =====
+  0x00c17288 push      {r4, lr}
+  0x00c1728c bl        #0xc170cc
+  0x00c17290 pop       {r4, lr}
+  0x00c17294 b         #0xc1710c
+  0x00c17298 ldr       r3, [pc, #0x28]
+  0x00c1729c mov       r0, #0
+  0x00c172a0 mov       r2, #0x2d
+  0x00c172a4 str       r0, [r3, #0x30]
+  0x00c172a8 str       r2, [r3, #0x24]
+  0x00c172ac mov       r2, #0xc
+  0x00c172b0 str       r2, [r3, #0x28]
+  0x00c172b4 add       r2, r2, #0x64
+  0x00c172b8 str       r2, [r3, #0x2c]
+  0x00c172bc movw      r2, #0x301
+  0x00c172c0 str       r2, [r3, #0x30]
+  0x00c172c4 bx        lr
+  0x00c172c8 rfeia     #1!
+  0x00c172cc bx        lr
+  0x00c172d0 ldr       r3, [pc, #0xc]
+  0x00c172d4 ldr       r0, [r3, #0x18]
+  0x00c172d8 eor       r0, r0, #0x10
+  0x00c172dc ubfx      r0, r0, #4, #1
+  0x00c172e0 bx        lr
+  0x00c172e4 rfeia     #1!
+  0x00c172e8 ldr       r3, [pc, #0x10]
+  0x00c172ec ldr       r2, [r3, #0x18]
+  0x00c172f0 tst       r2, #0x20
+  0x00c172f4 bne       #0xc172e8
+  0x00c172f8 str       r0, [r3]
+  0x00c172fc bx        lr
+  0x00c17300 rfeia     #1!
+  0x00c17304 cmp       r0, #0xa
+  0x00c17308 push      {r4, lr}
+  0x00c1730c mov       r4, r0
+  0x00c17310 bne       #0xc1731c
+  0x00c17314 mov       r0, #0xd
+  0x00c17318 bl        #0xc172e8
+  0x00c1731c mov       r0, r4
+  0x00c17320 pop       {r4, lr}
+  0x00c17324 b         #0xc172e8
+  0x00c17328 push      {r3, r4, r5, lr}
+  0x00c1732c mov       r5, r0
+  0x00c17330 mov       r4, #0
+  0x00c17334 b         #0xc1733c
+  0x00c17338 bl        #0xc17304
+  0x00c1733c ldrb      r0, [r5, r4]
+  0x00c17340 add       r4, r4, #1
+  0x00c17344 cmp       r0, #0
+  0x00c17348 bne       #0xc17338
+  0x00c1734c pop       {r3, r4, r5, pc}
+  0x00c17350 b         #0xc172e8
+  0x00c17354 ldr       r3, [pc, #0x1c]
+  0x00c17358 ldr       r2, [r3, #0x18]
+  0x00c1735c tst       r2, #0x10
+  0x00c17360 bne       #0xc17354
+  0x00c17364 ldr       r0, [r3]
+  0x00c17368 bics      r2, r0, #0xff
+  0x00c1736c mvnne     r0, #0
+  0x00c17370 strne     r0, [r3, #4]
+  0x00c17374 bx        lr
+  0x00c17378 rfeia     #1!
+  0x00c1737c mov       r3, #0xf8000000
+  0x00c17380 ldr       r0, [r3, #0x88]
+  0x00c17384 cmp       r0, #3
+
+===== sub_00c17350 @0x00c17350 (MMIO-literal candidate) =====
+  0x00c17350 b         #0xc172e8
+  0x00c17354 ldr       r3, [pc, #0x1c]
+  0x00c17358 ldr       r2, [r3, #0x18]
+  0x00c1735c tst       r2, #0x10
+  0x00c17360 bne       #0xc17354
+  0x00c17364 ldr       r0, [r3]
+  0x00c17368 bics      r2, r0, #0xff
+  0x00c1736c mvnne     r0, #0
+  0x00c17370 strne     r0, [r3, #4]
+  0x00c17374 bx        lr
+  0x00c17378 rfeia     #1!
+  0x00c1737c mov       r3, #0xf8000000
+  0x00c17380 ldr       r0, [r3, #0x88]
+  0x00c17384 cmp       r0, #3
+  0x00c17388 moveq     r0, #3
+  0x00c1738c movne     r0, #0
+  0x00c17390 bx        lr
+  0x00c17394 push      {r3, r4, r5, r6, r7, lr}
+  0x00c17398 mov       r3, #0xf8000000
+  0x00c1739c ldr       r3, [r3, #0x88]
+  0x00c173a0 mov       r6, r0
+  0x00c173a4 mov       r4, r1
+  0x00c173a8 cmp       r3, #3
+  0x00c173ac bne       #0xc17414
+  0x00c173b0 bl        #0xc26b3c
+  0x00c173b4 subs      r5, r0, #0
+  0x00c173b8 bne       #0xc17414
+  0x00c173bc mov       r0, r6
+  0x00c173c0 mov       r1, r4
+  0x00c173c4 mov       r2, r5
+  0x00c173c8 mov       r3, r5
+  0x00c173cc bl        #0xc26adc
+  0x00c173d0 cmp       r0, #4
+  0x00c173d4 mov       r6, r0
+  0x00c173d8 ble       #0xc17414
+  0x00c173dc add       r3, r0, r4
+  0x00c173e0 sub       r2, r6, #4
+  0x00c173e4 mov       r0, r5
+  0x00c173e8 mov       r1, r4
+  0x00c173ec ldr       r7, [r3, #-4]
+  0x00c173f0 bl        #0xc6b9e8
+  0x00c173f4 and       r2, r7, #0xff0000
+  0x00c173f8 lsr       r3, r7, #0x18
+  0x00c173fc orr       r3, r3, r7, lsl #24
+  0x00c17400 and       r7, r7, #0xff00
+  0x00c17404 orr       r3, r3, r2, lsr #8
+  0x00c17408 orr       r7, r3, r7, lsl #8
+  0x00c1740c cmp       r0, r7
+  0x00c17410 beq       #0xc17418
+  0x00c17414 mvn       r6, #0
+  0x00c17418 mov       r0, r6
+  0x00c1741c pop       {r3, r4, r5, r6, r7, pc}
+  0x00c17420 mov       r3, #0xf8000000
+  0x00c17424 ldr       r3, [r3, #0x88]
+  0x00c17428 cmp       r3, #3
+  0x00c1742c bxne      lr
+  0x00c17430 b         #0xc26b04
+  0x00c17434 push      {r4, lr}
+  0x00c17438 bl        #0xc172d0
+  0x00c1743c cmp       r0, #0
+  0x00c17440 bne       #0xc1744c
+  0x00c17444 mvn       r0, #0
+  0x00c17448 pop       {r4, pc}
+  0x00c1744c pop       {r4, lr}
+
+===== sub_00c95260 @0x00c95260 (MMIO-literal candidate) =====
+  0x00c95260 push      {r4, r5, r6, lr}
+  0x00c95264 str       r3, [ip]
+  0x00c95268 mov       r3, #0
+  0x00c9526c str       r3, [ip, #4]
+  0x00c95270 dsb       sy
+  0x00c95274 ldr       ip, [pc, #0xfc]
+  0x00c95278 add       r3, r3, #1
+  0x00c9527c movw      r6, #0x3e7
+  0x00c95280 ldr       r5, [ip, #4]
+  0x00c95284 eor       r4, r5, #1
+  0x00c95288 cmp       r3, r6
+  0x00c9528c movhi     r4, #0
+  0x00c95290 andls     r4, r4, #1
+  0x00c95294 cmp       r4, #0
+  0x00c95298 bne       #0xc95274
+  0x00c9529c cmp       r3, r6
+  0x00c952a0 bls       #0xc952d0
+  0x00c952a4 ldr       r0, [pc, #0xd0]
+  0x00c952a8 mov       r1, #0x10
+  0x00c952ac ldr       r2, [pc, #0xcc]
+  0x00c952b0 bl        #0xc94398
+  0x00c952b4 mvn       r2, #0
+  0x00c952b8 mov       r0, #8
+  0x00c952bc mov       r1, r4
+  0x00c952c0 mov       r3, r2
+  0x00c952c4 bl        #0xc94fe4
+  0x00c952c8 mvn       r0, #0
+  0x00c952cc pop       {r4, r5, r6, pc}
+  0x00c952d0 and       r0, r0, #0x300
+  0x00c952d4 cmp       r0, #0x200
+  0x00c952d8 beq       #0xc95368
+  0x00c952dc tst       r5, #2
+  0x00c952e0 bne       #0xc95368
+  0x00c952e4 cmn       r2, #1
+  0x00c952e8 beq       #0xc95330
+  0x00c952ec ldr       r3, [ip, #0x80]
+  0x00c952f0 add       r0, r2, r1, lsl #3
+  0x00c952f4 mov       ip, #1
+  0x00c952f8 ands      ip, r3, ip, lsl r0
+  0x00c952fc bne       #0xc95370
+  0x00c95300 cmp       r2, #3
+  0x00c95304 lsl       r1, r1, #1
+  0x00c95308 ldr       r0, [pc, #0x74]
+  0x00c9530c subgt     r3, r2, #4
+  0x00c95310 lslle     r3, r2, #3
+  0x00c95314 add       r2, r1, r2, asr #2
+  0x00c95318 lslgt     r3, r3, #3
+  0x00c9531c mov       r1, #0xff
+  0x00c95320 ldr       r2, [r0, r2, lsl #2]
+  0x00c95324 ands      r1, r2, r1, lsl r3
+  0x00c95328 beq       #0xc95368
+  0x00c9532c b         #0xc95370
+  0x00c95330 cmn       r1, #1
+  0x00c95334 beq       #0xc95368
+  0x00c95338 ldr       r3, [ip, #0x80]
+  0x00c9533c mov       r2, #0xff
+  0x00c95340 ands      r2, r3, r2, lsl r1
+  0x00c95344 bne       #0xc95370
+  0x00c95348 ldr       r3, [pc, #0x34]
+  0x00c9534c ldr       r2, [r3, r1, lsl #3]
+  0x00c95350 lsl       r1, r1, #1
+  0x00c95354 add       r1, r1, #1
+  0x00c95358 ldr       r3, [r3, r1, lsl #2]
+  0x00c9535c add       r3, r3, r2
+
+===== sub_00c030d4 @0x00c030d4 (MMIO-literal candidate) =====
+  0x00c030d4 push      {r0, r1, r2, r3, r4, r5, r6, r7, sb, sl, fp, lr}
+  0x00c030d8 mov       r1, #0xf8000000
+  0x00c030dc ldr       r2, [r1, #0x98]
+  0x00c030e0 ldr       sb, [r1, #0x98]
+  0x00c030e4 ldr       r3, [r1, #0xc4]
+  0x00c030e8 ldr       r6, [r1, #0xc4]
+  0x00c030ec ldr       sl, [r1, #0xc4]
+  0x00c030f0 ldr       fp, [r1, #0xc8]
+  0x00c030f4 ldr       r5, [r1, #0xc8]
+  0x00c030f8 ldr       r7, [r1, #0xc8]
+  0x00c030fc ldr       r1, [r1, #0xee0]
+  0x00c03100 ldr       r4, [pc, #0x13c]
+  0x00c03104 ldr       r0, [pc, #0x13c]
+  0x00c03108 str       r1, [sp, #8]
+  0x00c0310c ldr       r1, [pc, #0x138]
+  0x00c03110 ldr       r1, [r1, #0x840]
+  0x00c03114 str       r1, [sp, #0xc]
+  0x00c03118 ldr       r1, [r4, #0x64]
+  0x00c0311c bic       r1, r1, #0xff000000
+  0x00c03120 orr       r1, r1, #0x1000000
+  0x00c03124 str       r1, [r4, #0x64]
+  0x00c03128 ldr       r1, [pc, #0x120]
+  0x00c0312c str       r1, [r4, #0x58]
+  0x00c03130 stm       sp, {r2, r3}
+  0x00c03134 bl        #0xc030a8
+  0x00c03138 ldr       lr, [r4, #0x5c]
+  0x00c0313c ldr       ip, [r4, #0x60]
+  0x00c03140 ldr       r2, [sp]
+  0x00c03144 lsl       r1, lr, #0x16
+  0x00c03148 ubfx      lr, lr, #0xc, #0xa
+  0x00c0314c lsl       r0, ip, #0x16
+  0x00c03150 ubfx      ip, ip, #0xc, #0xa
+  0x00c03154 lsr       r1, r1, #0x16
+  0x00c03158 ldr       r3, [sp, #4]
+  0x00c0315c lsr       r0, r0, #0x16
+  0x00c03160 add       r1, r0, r1
+  0x00c03164 ldr       r0, [r4, #0x18]
+  0x00c03168 add       r1, r1, lr
+  0x00c0316c add       r1, r1, ip
+  0x00c03170 ldr       ip, [r4, #0x1c]
+  0x00c03174 lsl       r0, r0, #0x10
+  0x00c03178 lsr       r1, r1, #2
+  0x00c0317c lsl       ip, ip, #0x10
+  0x00c03180 cmp       r1, r2, lsr #16
+  0x00c03184 lsr       r0, r0, #0x10
+  0x00c03188 lsr       ip, ip, #0x10
+  0x00c0318c blo       #0xc031a8
+  0x00c03190 and       r3, r3, #0xff0000
+  0x00c03194 and       fp, fp, #0xff0000
+  0x00c03198 orr       r0, r3, r0
+  0x00c0319c orr       ip, fp, ip
+  0x00c031a0 mov       r2, #1
+  0x00c031a4 b         #0xc031dc
+  0x00c031a8 lsl       sb, sb, #0x10
+  0x00c031ac lsr       sb, sb, #0x10
+  0x00c031b0 cmp       r1, sb
+  0x00c031b4 andlo     sl, sl, #0xff
+  0x00c031b8 andlo     r7, r7, #0xff
+  0x00c031bc ubfxhs    r6, r6, #8, #8
+  0x00c031c0 ubfxhs    r5, r5, #8, #8
+  0x00c031c4 orrlo     r0, r0, sl, lsl #16
+  0x00c031c8 orrlo     ip, ip, r7, lsl #16
+  0x00c031cc orrhs     r0, r0, r6, lsl #16
+  0x00c031d0 orrhs     ip, ip, r5, lsl #16
+
+===== sub_00c08c4c @0x00c08c4c (MMIO-literal candidate) =====
+  0x00c08c4c push      {r4, r5, r6, lr}
+  0x00c08c50 ldr       r4, [pc, #0x34]
+  0x00c08c54 mov       r0, #0x3e8
+  0x00c08c58 ldr       r5, [r4, #0xa0]
+  0x00c08c5c bic       r5, r5, #0x300
+  0x00c08c60 orr       r3, r5, #0x100
+  0x00c08c64 orr       r5, r5, #0x110
+  0x00c08c68 str       r3, [r4, #0xa0]
+  0x00c08c6c str       r5, [r4, #0xa0]
+  0x00c08c70 bic       r5, r5, #0x10
+  0x00c08c74 bl        #0xc6c678
+  0x00c08c78 orr       r5, r5, #3
+  0x00c08c7c mov       r0, #0x3e8
+  0x00c08c80 str       r5, [r4, #0xa0]
+  0x00c08c84 pop       {r4, r5, r6, lr}
+  0x00c08c88 b         #0xc6c678
+  0x00c08c8c .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c08c90 push      {r4, r5, r6, lr}
+  0x00c08c94 ldr       r6, [pc, #0xe0]
+  0x00c08c98 bl        #0xc08c4c
+  0x00c08c9c ldr       r5, [pc, #0xdc]
+  0x00c08ca0 ldr       r2, [pc, #0xdc]
+  0x00c08ca4 ldr       r3, [r6, #0x6c]
+  0x00c08ca8 cmp       r3, r5
+  0x00c08cac cmpne     r3, r2
+  0x00c08cb0 moveq     r5, #0
+  0x00c08cb4 movne     r5, #1
+  0x00c08cb8 beq       #0xc08ccc
+  0x00c08cbc ldr       r0, [pc, #0xc4]
+  0x00c08cc0 bl        #0xc1fa7c
+  0x00c08cc4 mvn       r0, #0x12
+  0x00c08cc8 pop       {r4, r5, r6, pc}
+  0x00c08ccc mov       r0, #0x140
+  0x00c08cd0 ldr       r4, [pc, #0xb4]
+  0x00c08cd4 bl        #0xc1febc
+  0x00c08cd8 cmp       r0, #0
+  0x00c08cdc str       r0, [r4]
+  0x00c08ce0 mvneq     r0, #0xb
+  0x00c08ce4 popeq     {r4, r5, r6, pc}
+  0x00c08ce8 mov       r1, r5
+  0x00c08cec mov       r2, #0x140
+  0x00c08cf0 bl        #0xc6c3cc
+  0x00c08cf4 mov       r3, r4
+  0x00c08cf8 ldr       r4, [r3], #0x200
+  0x00c08cfc mov       r1, #0x20
+  0x00c08d00 ldr       r2, [pc, #0x88]
+  0x00c08d04 add       r0, r4, #0xc
+  0x00c08d08 str       r3, [r4, #0x134]
+  0x00c08d0c str       r4, [r4, #0x2c]
+  0x00c08d10 str       r6, [r4, #0x128]
+  0x00c08d14 bl        #0xc6df94
+  0x00c08d18 ldr       r3, [pc, #0x74]
+  0x00c08d1c str       r5, [r4]
+  0x00c08d20 mov       r0, r4
+  0x00c08d24 str       r3, [r4, #0x114]
+  0x00c08d28 ldr       r3, [pc, #0x68]
+  0x00c08d2c str       r3, [r4, #0x118]
+  0x00c08d30 ldr       r3, [pc, #0x64]
+  0x00c08d34 str       r3, [r4, #0x11c]
+  0x00c08d38 ldr       r3, [pc, #0x60]
+  0x00c08d3c str       r3, [r4, #0x124]
+  0x00c08d40 ldr       r3, [pc, #0x5c]
+  0x00c08d44 str       r3, [r4, #0x120]
+  0x00c08d48 mov       r3, #0x4f
+
+===== sub_00c940f4 @0x00c940f4 (MMIO-literal candidate) =====
+  0x00c940f4 ldr       r1, [pc, #0x10]
+  0x00c940f8 ldr       r3, [r1, #0x18]
+  0x00c940fc tst       r3, #0x20
+  0x00c94100 bne       #0xc940f8
+  0x00c94104 str       r0, [r1]
+  0x00c94108 bx        lr
+  0x00c9410c rfeia     #1!
+  0x00c94110 bx        lr
+  0x00c94114 bx        lr
+  0x00c94118 bx        lr
+  0x00c9411c push      {r3, r4, r5, r6, r7, lr}
+  0x00c94120 ldr       r3, [pc, #0x17c]
+  0x00c94124 ldr       r4, [pc, #0x17c]
+  0x00c94128 mov       r6, r0
+  0x00c9412c ldr       r5, [r3, #0x108]
+  0x00c94130 bl        #0xc94394
+  0x00c94134 ldr       r3, [r4, #8]
+  0x00c94138 tst       r3, #0x20
+  0x00c9413c beq       #0xc94168
+  0x00c94140 ldr       r0, [pc, #0x164]
+  0x00c94144 mov       r1, #0x10
+  0x00c94148 ldr       r2, [pc, #0x160]
+  0x00c9414c mov       r3, r4
+  0x00c94150 bl        #0xc94398
+  0x00c94154 mvn       r2, #0
+  0x00c94158 mov       r0, #2
+  0x00c9415c mov       r1, r4
+  0x00c94160 mov       r3, r2
+  0x00c94164 bl        #0xc94fe4
+  0x00c94168 mov       r0, #0x10
+  0x00c9416c bl        #0xc94d98
+  0x00c94170 cmp       r0, #0
+  0x00c94174 movne     r4, #0
+  0x00c94178 bne       #0xc941a0
+  0x00c9417c ldr       r7, [pc, #0x120]
+  0x00c94180 bic       r3, r5, #0xff0
+  0x00c94184 bic       r3, r3, #0xf
+  0x00c94188 ldr       r1, [pc, #0x118]
+  0x00c9418c str       r3, [r7, #0x108]
+  0x00c94190 mov       r0, r7
+  0x00c94194 bl        #0xc96170
+  0x00c94198 str       r5, [r7, #0x108]
+  0x00c9419c mov       r4, r0
+  0x00c941a0 mov       r0, #0x10000
+  0x00c941a4 bl        #0xc94d98
+  0x00c941a8 cmp       r0, #0
+  0x00c941ac bne       #0xc941d4
+  0x00c941b0 ldr       r0, [pc, #0xec]
+  0x00c941b4 mov       r1, #2
+  0x00c941b8 bl        #0xc94f24
+  0x00c941bc ldr       r0, [pc, #0xe0]
+  0x00c941c0 ldr       r1, [pc, #0xe0]
+  0x00c941c4 mov       r2, r6
+  0x00c941c8 mov       r3, #1
+  0x00c941cc bl        #0xc966d8
+  0x00c941d0 add       r4, r4, r0
+  0x00c941d4 cmp       r4, #0
+  0x00c941d8 beq       #0xc94250
+  0x00c941dc mov       r0, #0x100000
+  0x00c941e0 bl        #0xc94d98
+  0x00c941e4 cmp       r0, #0
+  0x00c941e8 bne       #0xc94218
+  0x00c941ec ldr       r1, [pc, #0xb4]
+  0x00c941f0 ldr       r0, [pc, #0xac]
+
+===== sub_00c70fbc @0x00c70fbc (MMIO-literal candidate) =====
+  0x00c70fbc ldr       r3, [pc, #0x14]
+  0x00c70fc0 ldr       r2, [r3, #4]
+  0x00c70fc4 ldr       r3, [pc, #0x10]
+  0x00c70fc8 str       r2, [r3, #4]
+  0x00c70fcc mov       r2, #0
+  0x00c70fd0 str       r2, [r3]
+  0x00c70fd4 bx        lr
+  0x00c70fd8 .byte     0x00, 0x20, 0x00, 0xf8
+  0x00c70fdc sbcseq    fp, r0, r0, ror r0
+  0x00c70fe0 b         #0xc70fbc
+  0x00c70fe4 ldr       r3, [pc, #0x2c]
+  0x00c70fe8 ldr       r2, [r3, #4]
+  0x00c70fec ldr       r3, [pc, #0x28]
+  0x00c70ff0 ldm       r3, {r0, r1}
+  0x00c70ff4 cmp       r1, r2
+  0x00c70ff8 add       r1, r1, r0
+  0x00c70ffc sublo     r1, r1, #1
+  0x00c71000 rsb       r1, r2, r1
+  0x00c71004 str       r1, [r3]
+  0x00c71008 ldr       r3, [pc, #0xc]
+  0x00c7100c str       r2, [r3, #4]
+  0x00c71010 ldr       r0, [r3]
+  0x00c71014 bx        lr
+  0x00c71018 .byte     0x00, 0x20, 0x00, 0xf8
+  0x00c7101c sbcseq    fp, r0, r0, ror r0
+  0x00c71020 push      {r4, lr}
+  0x00c71024 mov       r4, r0
+  0x00c71028 bl        #0xc70fe4
+  0x00c7102c rsb       r0, r4, r0
+  0x00c71030 pop       {r4, pc}
+  0x00c71034 cmp       r0, #0x3e8
+  0x00c71038 push      {r3, r4, r5, lr}
+  0x00c7103c mov       r3, r0
+  0x00c71040 ldr       r4, [pc, #0x5c]
+  0x00c71044 blo       #0xc71060
+  0x00c71048 mov       r1, #0x3e8
+  0x00c7104c bl        #0xc77bd0
+  0x00c71050 ldr       r3, [r4, #8]
+  0x00c71054 mov       r1, #0x3e8
+  0x00c71058 mul       r0, r3, r0
+  0x00c7105c b         #0xc7106c
+  0x00c71060 ldr       r0, [r4, #8]
+  0x00c71064 ldr       r1, [pc, #0x3c]
+  0x00c71068 mul       r0, r0, r3
+  0x00c7106c bl        #0xc77bd0
+  0x00c71070 mov       r5, r0
+  0x00c71074 mov       r0, #0
+  0x00c71078 bl        #0xc71020
+  0x00c7107c add       r4, r0, r5
+  0x00c71080 add       r3, r4, #1
+  0x00c71084 cmp       r3, r0
+  0x00c71088 bhs       #0xc71094
+  0x00c7108c bl        #0xc70fbc
+  0x00c71090 mov       r4, r5
+  0x00c71094 bl        #0xc70fe4
+  0x00c71098 cmp       r0, r4
+  0x00c7109c blo       #0xc71094
+  0x00c710a0 pop       {r3, r4, r5, pc}
+  0x00c710a4 sbcseq    fp, r0, r0, ror r0
+  0x00c710a8 andeq     r4, pc, r0, asr #4
+  0x00c710ac cmp       r0, #0x3e8
+  0x00c710b0 mov       r3, r0
+  0x00c710b4 push      {r4, lr}
+  0x00c710b8 ldr       r4, [pc, #0x48]
+
+===== sub_00c74374 @0x00c74374 (MMIO-literal candidate) =====
+  0x00c74374 push      {r4, lr}
+  0x00c74378 ldr       r4, [pc, #0x2c]
+  0x00c7437c mov       r0, #0xc8
+  0x00c74380 ldr       r3, [r4, #0x198]
+  0x00c74384 orr       r3, r3, #0x15000
+  0x00c74388 str       r3, [r4, #0x198]
+  0x00c7438c bl        #0xc6c678
+  0x00c74390 ldr       r3, [r4, #0x190]
+  0x00c74394 mov       r0, #0x64
+  0x00c74398 orr       r3, r3, #0x300
+  0x00c7439c str       r3, [r4, #0x190]
+  0x00c743a0 bl        #0xc6c678
+  0x00c743a4 mov       r0, #0
+  0x00c743a8 pop       {r4, pc}
+  0x00c743ac .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c743b0 push      {r3, lr}
+  0x00c743b4 bl        #0xc74338
+  0x00c743b8 bl        #0xc74374
+  0x00c743bc mov       r0, #0
+  0x00c743c0 pop       {r3, pc}
+  0x00c743c4 cmp       r0, #0
+  0x00c743c8 bne       #0xc743d0
+  0x00c743cc b         #0xc74338
+  0x00c743d0 cmp       r0, #1
+  0x00c743d4 beq       #0xc743e0
+  0x00c743d8 mvn       r0, #0
+  0x00c743dc bx        lr
+  0x00c743e0 b         #0xc74374
+  0x00c743e4 push      {r3, lr}
+  0x00c743e8 bl        #0xc743c4
+  0x00c743ec mov       r0, #0
+  0x00c743f0 pop       {r3, pc}
+  0x00c743f4 b         #0xc743e4
+  0x00c743f8 cmp       r0, #0
+  0x00c743fc push      {r4, r5, r6, lr}
+  0x00c74400 bne       #0xc744b0
+  0x00c74404 cmp       r1, #0
+  0x00c74408 ldr       r4, [pc, #0x194]
+  0x00c7440c mov       r0, #0xc8
+  0x00c74410 ldrne     r3, [pc, #0x190]
+  0x00c74414 strne     r3, [r1]
+  0x00c74418 ldr       r3, [r4, #0xb8]
+  0x00c7441c orr       r3, r3, #0x17000
+  0x00c74420 str       r3, [r4, #0xb8]
+  0x00c74424 ldr       r3, [r4, #0xbc]
+  0x00c74428 orr       r3, r3, #0xf00
+  0x00c7442c str       r3, [r4, #0xbc]
+  0x00c74430 bl        #0xc6c678
+  0x00c74434 ldr       r2, [pc, #0x170]
+  0x00c74438 mov       r0, #0x64
+  0x00c7443c ldr       r3, [r2, #0x120]
+  0x00c74440 orr       r3, r3, #8
+  0x00c74444 bic       r3, r3, #0x200
+  0x00c74448 bic       r3, r3, #1
+  0x00c7444c str       r3, [r2, #0x120]
+  0x00c74450 bl        #0xc6c678
+  0x00c74454 ldr       r3, [r4, #0xbc]
+  0x00c74458 mov       r0, #0x12c
+  0x00c7445c orr       r3, r3, #3
+  0x00c74460 str       r3, [r4, #0xbc]
+  0x00c74464 bl        #0xc6c678
+  0x00c74468 ldr       r3, [r4, #0xbc]
+  0x00c7446c movw      r0, #0x2710
+  0x00c74470 bic       r3, r3, #0x500
+
+===== sub_00c033e0 @0x00c033e0 (MMIO-literal candidate) =====
+  0x00c033e0 ldr       r1, [pc, #0x38]
+  0x00c033e4 mov       r2, #0x1c
+  0x00c033e8 ldr       r3, [r1, #0x18]
+  0x00c033ec tst       r3, #0x20
+  0x00c033f0 bne       #0xc033e8
+  0x00c033f4 mov       r3, #0xf
+  0x00c033f8 and       r3, r3, r0, lsr r2
+  0x00c033fc cmp       r3, #9
+  0x00c03400 addle     r3, r3, #0x30
+  0x00c03404 addgt     r3, r3, #0x37
+  0x00c03408 str       r3, [r1]
+  0x00c0340c cmp       r2, #0
+  0x00c03410 beq       #0xc0341c
+  0x00c03414 sub       r2, r2, #4
+  0x00c03418 b         #0xc033e8
+  0x00c0341c bx        lr
+  0x00c03420 rfeia     #1!
+  0x00c03424 ldr       r1, [pc, #0x10]
+  0x00c03428 ldr       r3, [r1, #0x18]
+  0x00c0342c tst       r3, #0x20
+  0x00c03430 bne       #0xc03428
+  0x00c03434 str       r0, [r1]
+  0x00c03438 bx        lr
+  0x00c0343c rfeia     #1!
+  0x00c03440 mov       r3, #0xf8000000
+  0x00c03444 ldr       r3, [r3, #0xd0]
+  0x00c03448 tst       r0, r3
+  0x00c0344c moveq     r0, #0
+  0x00c03450 movne     r0, #1
+  0x00c03454 bx        lr
+  0x00c03458 mov       r3, #0xf8000000
+  0x00c0345c ldr       r0, [r3, #0xa0]
+  0x00c03460 bx        lr
+  0x00c03464 ldr       r3, [r0, #0x70]
+  0x00c03468 orr       r3, r3, #0x100000
+  0x00c0346c str       r3, [r0, #0x70]
+  0x00c03470 bic       r3, r3, #0x100000
+  0x00c03474 str       r3, [r0, #0x70]
+  0x00c03478 ldr       r3, [r0, #4]
+  0x00c0347c orr       r3, r3, #0x8000
+  0x00c03480 str       r3, [r0, #4]
+  0x00c03484 bic       r3, r3, #0x8000
+  0x00c03488 str       r3, [r0, #4]
+  0x00c0348c dsb       sy
+  0x00c03490 bx        lr
+  0x00c03494 push      {r4, lr}
+  0x00c03498 ldr       ip, [sp, #8]
+  0x00c0349c and       r3, r3, #7
+  0x00c034a0 cmp       ip, #2
+  0x00c034a4 bne       #0xc034bc
+  0x00c034a8 cmp       r3, #3
+  0x00c034ac lsl       r2, r2, #7
+  0x00c034b0 addls     r2, r2, #0x210
+  0x00c034b4 addhi     r2, r2, #0x214
+  0x00c034b8 b         #0xc034cc
+  0x00c034bc cmp       r3, #3
+  0x00c034c0 lsl       r2, r2, #7
+  0x00c034c4 addls     r2, r2, #0x21c
+  0x00c034c8 addhi     r2, r2, #0x220
+  0x00c034cc and       r3, r3, #3
+  0x00c034d0 ldr       ip, [r2, r0]
+  0x00c034d4 mov       r4, #0xff
+  0x00c034d8 and       r1, r1, #0x1f
+  0x00c034dc lsl       r3, r3, #3
+
+===== sub_00c0206c @0x00c0206c (MMIO-literal candidate) =====
+  0x00c0206c mov       r0, #0x100
+  0x00c02070 sub       r0, r0, #1
+  0x00c02074 cmp       r0, #0
+  0x00c02078 bne       #0xc02070
+  0x00c0207c mov       r0, #0xf8000000
+  0x00c02080 mov       r1, #0
+  0x00c02084 add       r1, r1, #1
+  0x00c02088 str       r1, [r0, #0x84]
+  0x00c0208c ldr       r2, [r0, #0x84]
+  0x00c02090 cmp       r1, r2
+  0x00c02094 bne       #0xc02084
+  0x00c02098 ldr       r1, [r0, #0xb8]
+  0x00c0209c ldr       r2, [pc, #0x528]
+  0x00c020a0 cmp       r1, r2
+  0x00c020a4 bne       #0xc020e0
+  0x00c020a8 mov       r1, sp
+  0x00c020ac str       r1, [r0, #0xb8]
+  0x00c020b0 ldr       r0, [pc, #-0x74]
+  0x00c020b4 ldr       r1, [pc, #-0x70]
+  0x00c020b8 sub       r0, r0, r1
+  0x00c020bc sub       r0, r0, #0x1f400
+  0x00c020c0 mov       r1, #0
+  0x00c020c4 mov       r2, #1
+  0x00c020c8 bl        #0xc027fc
+  0x00c020cc mov       r0, #0xf8000000
+  0x00c020d0 ldr       r1, [r0, #0xb8]
+  0x00c020d4 mov       sp, r1
+  0x00c020d8 ldr       r1, [r0, #0xbc]
+  0x00c020dc mov       pc, r1
+  0x00c020e0 mrs       r0, apsr
+  0x00c020e4 bic       r0, r0, #0x1f
+  0x00c020e8 orr       r0, r0, #0xd3
+  0x00c020ec msr       cpsr_fc, r0
+  0x00c020f0 mrc       p15, #0, r0, c1, c0, #1
+  0x00c020f4 orr       r0, r0, #0x40
+  0x00c020f8 mcr       p15, #0, r0, c1, c0, #1
+  0x00c020fc bl        #0xc023f4
+  0x00c02100 bl        #0xc0337c
+  0x00c02104 bl        #0xc024a8
+  0x00c02108 ldr       r0, [pc, #0x4c0]
+  0x00c0210c ldr       r0, [r0]
+  0x00c02110 lsr       r6, r0, #9
+  0x00c02114 and       r6, r6, #3
+  0x00c02118 mov       r4, #0xf8000000
+  0x00c0211c ldr       r2, [pc, #0x4b0]
+  0x00c02120 str       r2, [r4, #0xb8]
+  0x00c02124 cmp       r6, #1
+  0x00c02128 bne       #0xc0214c
+  0x00c0212c ldr       r0, [pc, #0x4a4]
+  0x00c02130 ldr       r0, [r0, #0xc4]
+  0x00c02134 and       r0, r0, #1
+  0x00c02138 cmp       r0, #1
+  0x00c0213c bne       #0xc02140
+  0x00c02140 mov       r2, #1
+  0x00c02144 str       r2, [r4, #0xbc]
+  0x00c02148 b         #0xc02190
+  0x00c0214c cmp       r6, #0
+  0x00c02150 bne       #0xc02154
+  0x00c02154 cmp       r6, #3
+  0x00c02158 bne       #0xc02170
+  0x00c0215c ldr       r2, [pc, #0x470]
+  0x00c02160 str       r2, [r4, #0xb8]
+  0x00c02164 mov       r2, #3
+  0x00c02168 str       r2, [r4, #0xbc]
+
+===== sub_00c170cc @0x00c170cc (MMIO-literal candidate) =====
+  0x00c170cc ldr       r2, [pc, #0x10]
+  0x00c170d0 ldr       r3, [r2, #0xcc]
+  0x00c170d4 orr       r3, r3, #0xf000
+  0x00c170d8 orr       r3, r3, #3
+  0x00c170dc str       r3, [r2, #0xcc]
+  0x00c170e0 bx        lr
+  0x00c170e4 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c170e8 bx        lr
+  0x00c170ec bx        lr
+  0x00c170f0 ldr       r3, [pc, #0x10]
+  0x00c170f4 mov       r1, #1
+  0x00c170f8 ldr       r2, [r3, #0xcc]
+  0x00c170fc bic       r2, r2, r1, lsl r0
+  0x00c17100 str       r2, [r3, #0xcc]
+  0x00c17104 bx        lr
+  0x00c17108 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c1710c push      {r4, lr}
+  0x00c17110 mov       r0, #4
+  0x00c17114 bl        #0xc170f0
+  0x00c17118 mov       r0, #5
+  0x00c1711c bl        #0xc170f0
+  0x00c17120 mov       r0, #0x64
+  0x00c17124 pop       {r4, lr}
+  0x00c17128 b         #0xc6c678
+  0x00c1712c push      {r0, r1, r4, r5, r6, lr}
+  0x00c17130 ldr       r4, [pc, #0x144]
+  0x00c17134 bl        #0xc1710c
+  0x00c17138 bl        #0xc170cc
+  0x00c1713c movw      r0, #0x2710
+  0x00c17140 bl        #0xc6c678
+  0x00c17144 mov       r5, #0
+  0x00c17148 str       r5, [sp, #4]
+  0x00c1714c mov       r0, #0x3e8
+  0x00c17150 str       r5, [sp]
+  0x00c17154 ldr       r6, [r4, #0x168]
+  0x00c17158 orr       r6, r6, #2
+  0x00c1715c str       r6, [r4, #0x168]
+  0x00c17160 bl        #0xc6c678
+  0x00c17164 bic       r6, r6, #2
+  0x00c17168 mov       r0, #0x3e8
+  0x00c1716c str       r6, [r4, #0x168]
+  0x00c17170 bl        #0xc6c678
+  0x00c17174 orr       r6, r6, #2
+  0x00c17178 mov       r0, #0x3e8
+  0x00c1717c str       r6, [r4, #0x168]
+  0x00c17180 bl        #0xc6c678
+  0x00c17184 mov       r0, r5
+  0x00c17188 add       r1, sp, #4
+  0x00c1718c mov       r2, sp
+  0x00c17190 bl        #0xc6b78c
+  0x00c17194 subs      r6, r0, #0
+  0x00c17198 bne       #0xc17218
+  0x00c1719c ldr       r3, [sp, #4]
+  0x00c171a0 cmp       r3, r5
+  0x00c171a4 beq       #0xc17218
+  0x00c171a8 ldrb      r2, [r3, #0x400]
+  0x00c171ac mov       r4, #1
+  0x00c171b0 ldr       r1, [sp]
+  0x00c171b4 add       r5, r5, #4
+  0x00c171b8 add       r0, r0, #0x3e8
+  0x00c171bc orr       r2, r2, r4, lsl r1
+  0x00c171c0 uxtb      r2, r2
+  0x00c171c4 strb      r2, [r3, #0x400]
+  0x00c171c8 ldr       r3, [sp]
+
+===== sub_00c039b0 @0x00c039b0 (MMIO-literal candidate) =====
+  0x00c039b0 mov       r3, r1
+  0x00c039b4 ldr       r1, [pc, #0x104]
+  0x00c039b8 push      {r4, r5, r6, lr}
+  0x00c039bc orr       ip, r0, #1
+  0x00c039c0 str       ip, [r1]
+  0x00c039c4 mov       ip, #0
+  0x00c039c8 str       ip, [r1, #4]
+  0x00c039cc dsb       sy
+  0x00c039d0 ldr       r4, [pc, #0xe8]
+  0x00c039d4 add       ip, ip, #1
+  0x00c039d8 movw      r6, #0x3e7
+  0x00c039dc ldr       r5, [r4, #4]
+  0x00c039e0 eor       r1, r5, #1
+  0x00c039e4 cmp       ip, r6
+  0x00c039e8 movhi     r1, #0
+  0x00c039ec andls     r1, r1, #1
+  0x00c039f0 cmp       r1, #0
+  0x00c039f4 bne       #0xc039d0
+  0x00c039f8 cmp       ip, r6
+  0x00c039fc bls       #0xc03a18
+  0x00c03a00 mvn       r2, #0
+  0x00c03a04 mov       r0, #8
+  0x00c03a08 mov       r3, r2
+  0x00c03a0c bl        #0xc037e8
+  0x00c03a10 mvn       r0, #0
+  0x00c03a14 pop       {r4, r5, r6, pc}
+  0x00c03a18 and       r0, r0, #0x300
+  0x00c03a1c cmp       r0, #0x200
+  0x00c03a20 beq       #0xc03ab0
+  0x00c03a24 tst       r5, #2
+  0x00c03a28 bne       #0xc03ab0
+  0x00c03a2c cmn       r2, #1
+  0x00c03a30 beq       #0xc03a78
+  0x00c03a34 ldr       r1, [r4, #0x80]
+  0x00c03a38 add       r0, r2, r3, lsl #3
+  0x00c03a3c mov       ip, #1
+  0x00c03a40 ands      ip, r1, ip, lsl r0
+  0x00c03a44 bne       #0xc03ab8
+  0x00c03a48 cmp       r2, #3
+  0x00c03a4c lsl       r3, r3, #1
+  0x00c03a50 ldr       r0, [pc, #0x6c]
+  0x00c03a54 subgt     r1, r2, #4
+  0x00c03a58 lslle     r1, r2, #3
+  0x00c03a5c add       r2, r3, r2, asr #2
+  0x00c03a60 lslgt     r1, r1, #3
+  0x00c03a64 ldr       r3, [r0, r2, lsl #2]
+  0x00c03a68 mov       r2, #0xff
+  0x00c03a6c ands      r2, r3, r2, lsl r1
+  0x00c03a70 beq       #0xc03ab0
+  0x00c03a74 b         #0xc03ab8
+  0x00c03a78 cmn       r3, #1
+  0x00c03a7c beq       #0xc03ab0
+  0x00c03a80 ldr       r2, [r4, #0x80]
+  0x00c03a84 mov       r1, #0xff
+  0x00c03a88 ands      r1, r2, r1, lsl r3
+  0x00c03a8c bne       #0xc03ab8
+  0x00c03a90 ldr       r2, [pc, #0x2c]
+  0x00c03a94 ldr       r1, [r2, r3, lsl #3]
+  0x00c03a98 lsl       r3, r3, #1
+  0x00c03a9c add       r3, r3, #1
+  0x00c03aa0 ldr       r3, [r2, r3, lsl #2]
+  0x00c03aa4 add       r3, r3, r1
+  0x00c03aa8 cmp       r3, #0
+  0x00c03aac bne       #0xc03ab8
+
+===== sub_00c028e0 @0x00c028e0 (MMIO-literal candidate) =====
+  0x00c028e0 ldr       r3, [pc, #8]
+  0x00c028e4 ldr       r0, [r3, #4]
+  0x00c028e8 mvn       r0, r0
+  0x00c028ec bx        lr
+  0x00c028f0 .byte     0x00, 0x20, 0x00, 0xf8
+  0x00c028f4 push      {r4, lr}
+  0x00c028f8 mov       r4, r0
+  0x00c028fc bl        #0xc028a8
+  0x00c02900 mov       r3, #0x18
+  0x00c02904 mul       r4, r3, r4
+  0x00c02908 bl        #0xc028e0
+  0x00c0290c cmp       r0, r4
+  0x00c02910 blo       #0xc02908
+  0x00c02914 pop       {r4, lr}
+  0x00c02918 b         #0xc028cc
+  0x00c0291c ldr       r3, [pc, #0x40]
+  0x00c02920 push      {r4, lr}
+  0x00c02924 ldr       r1, [pc, #0x3c]
+  0x00c02928 ldr       r4, [r3, #0xa0]
+  0x00c0292c bic       r4, r4, #0x300
+  0x00c02930 orr       r0, r4, #0x200
+  0x00c02934 orr       r4, r4, #0x210
+  0x00c02938 bl        #0xc028a0
+  0x00c0293c ldr       r1, [pc, #0x24]
+  0x00c02940 mov       r0, r4
+  0x00c02944 bl        #0xc028a0
+  0x00c02948 mov       r0, #0x3e8
+  0x00c0294c bl        #0xc028f4
+  0x00c02950 bic       r0, r4, #0x10
+  0x00c02954 orr       r0, r0, #3
+  0x00c02958 ldr       r1, [pc, #8]
+  0x00c0295c pop       {r4, lr}
+  0x00c02960 b         #0xc028a0
+  0x00c02964 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c02968 .byte     0xa0, 0x20, 0xa2, 0xf8
+  0x00c0296c push      {r4, r5, r6, lr}
+  0x00c02970 mov       r4, r0
+  0x00c02974 mov       r5, r1
+  0x00c02978 ldr       r0, [pc, #0xd8]
+  0x00c0297c ldr       r1, [pc, #0xd8]
+  0x00c02980 mov       r6, r2
+  0x00c02984 bl        #0xc028a0
+  0x00c02988 mov       r0, r5
+  0x00c0298c ldr       r1, [pc, #0xcc]
+  0x00c02990 bl        #0xc028a0
+  0x00c02994 orr       r0, r4, #0xa0000000
+  0x00c02998 orr       r0, r0, #0x2000
+  0x00c0299c ldr       r1, [pc, #0xc0]
+  0x00c029a0 bl        #0xc028a0
+  0x00c029a4 bl        #0xc028a8
+  0x00c029a8 ldr       r3, [pc, #0xb8]
+  0x00c029ac ldr       r4, [r3, #0x2c]
+  0x00c029b0 cmp       r4, #0
+  0x00c029b4 bge       #0xc029c8
+  0x00c029b8 bl        #0xc028e0
+  0x00c029bc ldr       r3, [pc, #0xa8]
+  0x00c029c0 cmp       r0, r3
+  0x00c029c4 bls       #0xc029a8
+  0x00c029c8 bl        #0xc028cc
+  0x00c029cc cmp       r4, #0
+  0x00c029d0 bge       #0xc029dc
+  0x00c029d4 mov       r0, #1
+  0x00c029d8 bl        #0xc025a0
+  0x00c029dc bl        #0xc028a8
+
+===== sub_00c032f0 @0x00c032f0 (MMIO-literal candidate) =====
+  0x00c032f0 ldr       r3, [pc, #0x1c]
+  0x00c032f4 ldr       r2, [r3, #0x84]
+  0x00c032f8 tst       r2, #0x40000
+  0x00c032fc subeq     r3, r3, #0x90000
+  0x00c03300 ldrne     r0, [r3, #0x80]
+  0x00c03304 ldreq     r0, [r3]
+  0x00c03308 andne     r0, r0, #3
+  0x00c0330c ubfxeq    r0, r0, #9, #2
+  0x00c03310 bx        lr
+  0x00c03314 .byte     0x00, 0x00, 0xab, 0xf8
+  0x00c03318 push      {r4, lr}
+  0x00c0331c bl        #0xc032f0
+  0x00c03320 cmp       r0, #2
+  0x00c03324 popne     {r4, pc}
+  0x00c03328 ldr       r0, [pc, #0x3c]
+  0x00c0332c mov       r1, #0
+  0x00c03330 mov       r2, #3
+  0x00c03334 bl        #0xc030c0
+  0x00c03338 ldr       r0, [pc, #0x30]
+  0x00c0333c mov       r1, #0
+  0x00c03340 mov       r2, #1
+  0x00c03344 bl        #0xc030c0
+  0x00c03348 ldr       r0, [pc, #0x24]
+  0x00c0334c mov       r1, #0
+  0x00c03350 mov       r2, #1
+  0x00c03354 bl        #0xc030c0
+  0x00c03358 ldr       r0, [pc, #0x18]
+  0x00c0335c mov       r1, #0
+  0x00c03360 mov       r2, #1
+  0x00c03364 pop       {r4, lr}
+  0x00c03368 b         #0xc030c0
+  0x00c0336c .byte     0x00, 0x10, 0xa2, 0xf8
+  0x00c03370 .byte     0x04, 0x10, 0xa2, 0xf8
+  0x00c03374 .byte     0x08, 0x10, 0xa2, 0xf8
+  0x00c03378 .byte     0x0c, 0x10, 0xa2, 0xf8
+  0x00c0337c ldr       r3, [pc, #0x28]
+  0x00c03380 mov       r2, #0
+  0x00c03384 str       r2, [r3, #0x30]
+  0x00c03388 add       r2, r2, #0x2d
+  0x00c0338c str       r2, [r3, #0x24]
+  0x00c03390 mov       r2, #0xc
+  0x00c03394 str       r2, [r3, #0x28]
+  0x00c03398 movw      r2, #0x70
+  0x00c0339c str       r2, [r3, #0x2c]
+  0x00c033a0 movw      r2, #0x301
+  0x00c033a4 str       r2, [r3, #0x30]
+  0x00c033a8 bx        lr
+  0x00c033ac rfeia     #1!
+  0x00c033b0 ldr       r1, [pc, #0x24]
+  0x00c033b4 b         #0xc033cc
+  0x00c033b8 ldr       r3, [r1, #0x18]
+  0x00c033bc tst       r3, #0x20
+  0x00c033c0 bne       #0xc033b8
+  0x00c033c4 str       r2, [r1]
+  0x00c033c8 add       r0, r0, #1
+  0x00c033cc ldrb      r2, [r0]
+  0x00c033d0 cmp       r2, #0
+  0x00c033d4 bne       #0xc033b8
+  0x00c033d8 bx        lr
+  0x00c033dc rfeia     #1!
+  0x00c033e0 ldr       r1, [pc, #0x38]
+  0x00c033e4 mov       r2, #0x1c
+  0x00c033e8 ldr       r3, [r1, #0x18]
+  0x00c033ec tst       r3, #0x20
+
+===== sub_00c10b48 @0x00c10b48 (MMIO-literal candidate) =====
+  0x00c10b48 ldr       r3, [pc, #0x24]
+  0x00c10b4c cmp       r1, #0
+  0x00c10b50 ldr       r2, [pc, #0x1c]
+  0x00c10b54 ldr       r3, [r3, #0x60]
+  0x00c10b58 bic       r3, r3, #0x700
+  0x00c10b5c orrne     r3, r3, #0x400
+  0x00c10b60 biceq     r3, r3, #1
+  0x00c10b64 orrne     r3, r3, #1
+  0x00c10b68 bic       r3, r3, #0x10
+  0x00c10b6c str       r3, [r2, #0x60]
+  0x00c10b70 bx        lr
+  0x00c10b74 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c10b78 ldr       r3, [r0, #8]
+  0x00c10b7c mvn       r2, #0xf0000000
+  0x00c10b80 cmp       r1, #0
+  0x00c10b84 str       r2, [r3, #0xd0]
+  0x00c10b88 movne     r1, #0x700
+  0x00c10b8c ldr       r3, [pc, #0x14]
+  0x00c10b90 moveq     r1, #0x400
+  0x00c10b94 ldr       r2, [r3, #0x60]
+  0x00c10b98 bic       r2, r2, #0x700
+  0x00c10b9c orr       r2, r1, r2
+  0x00c10ba0 str       r2, [r3, #0x60]
+  0x00c10ba4 bx        lr
+  0x00c10ba8 .byte     0x00, 0x20, 0xa2, 0xf8
+  0x00c10bac ldr       r3, [r0, #0xf4]
+  0x00c10bb0 tst       r3, #0x10
+  0x00c10bb4 beq       #0xc10be0
+  0x00c10bb8 cmp       r2, #0
+  0x00c10bbc ldr       r3, [r0, #0x2c]
+  0x00c10bc0 ldr       r2, [r0, #0x28]
+  0x00c10bc4 orrne     r3, r3, #0x4000
+  0x00c10bc8 biceq     r3, r3, #0x4000
+  0x00c10bcc orrne     r2, r2, #0x4000
+  0x00c10bd0 biceq     r2, r2, #0x4000
+  0x00c10bd4 strne     r2, [r0, #0x28]
+  0x00c10bd8 streq     r2, [r0, #0x28]
+  0x00c10bdc str       r3, [r0, #0x2c]
+  0x00c10be0 cmp       r1, #0
+  0x00c10be4 ldr       r2, [r0, #8]
+  0x00c10be8 ldrne     r3, [r0, #0x28]
+  0x00c10bec ldreq     r3, [r0, #0x2c]
+  0x00c10bf0 mov       r0, #0
+  0x00c10bf4 str       r3, [r2]
+  0x00c10bf8 bx        lr
+  0x00c10bfc mov       r0, #1
+  0x00c10c00 bx        lr
+  0x00c10c04 ldr       r2, [r0, #0xa0]
+  0x00c10c08 ldr       r3, [r2, #0x124]
+  0x00c10c0c ldr       ip, [r3, #0x18]
+  0x00c10c10 cmp       ip, #0x70
+  0x00c10c14 ldreq     r3, [r2]
+  0x00c10c18 ldrbeq    r0, [r3]
+  0x00c10c1c bxeq      lr
+  0x00c10c20 cmp       ip, #0x90
+  0x00c10c24 ldr       r0, [r3, #0x14]
+  0x00c10c28 ldrne     r2, [r3, #0x44]
+  0x00c10c2c add       r1, r0, #1
+  0x00c10c30 str       r1, [r3, #0x14]
+  0x00c10c34 subne     r2, r2, #1
+  0x00c10c38 ldreq     r3, [r2]
+  0x00c10c3c ldrne     r3, [r3, #0x60]
+  0x00c10c40 addne     r1, r2, r1
+  0x00c10c44 ldrbeq    r0, [r0, r3]

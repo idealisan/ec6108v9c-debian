@@ -119,16 +119,44 @@ docs/044 已确认静态配置层齐全；"无 IP"更可能是内核没起来（
 
 ---
 
-## 5. 判据与更靠前的前置（不能跳过）
+## 5. 判据分层：TTY 是目标，绿带是更靠前的探针（不矛盾）
+
+> 用户提问（2026-11-09）：「既然决定了用私有驱动，为什么还用绿色作判据，不直接把显示画面接到 TTY？」
+> 结论：**两者不是二选一，而是同一条串行启动链上前后两级、依赖递减的判据。最终目标确实是
+> HDMI 出 TTY（`console=tty0`+`fbcon=map:0`+`CONFIG_VT/FRAMEBUFFER_CONSOLE/FONT`），但 TTY 是链的
+> 末端，绿带是链的最前端**。理由如下。
+
+### 为什么不能直接拿 TTY 当第一判据
+TTY 出现在 HDMI 需要**整条链全部成立**：6.x 内核启动 → 私有显示驱动 probe 成功 →
+VO/HDMI/PHY 初始化 → 注册 framebuffer → `fbcon` 绑定（`fb_is_primary_device()` 在 ARM 恒 0，
+靠 `fbcon=map:0` 绕过，docs/024 §6.4）→ VT + 字体 → `console=tty0` → 有 printk/getty 输出。
+任何一环断，屏幕都是**同一种黑屏**，你无法区分是"内核根本没起来"还是"内核起来了但显示/fbcon 没绑上"。
+把 TTY 当唯一判据，黑屏时等于把两类完全不同的故障混成一个，无法定位。
+
+### 绿带的定位：依赖最少的一级"内核活着"探针
+绿带 boot marker（`hi3798mv100-hdmi-console.c` 的 `subsys_initcall`）只要**内核跑到
+subsys_initcall + 显存地址可写**就画，不需要网络 / TTY / fbcon / VT / 字体 / 串口 / rootfs / 私有驱动。
+它是把"内核起没起"从"显示绑没绑上"里**剥离**出来的最小信号：
+- 绿带出现 = 内核至少跑到显示 initcall、显存地址对 → 再往下查 TTY / fbcon / 私有驱动。
+- 绿带都不出现（只有 logo + 浅蓝细线）= 内核没到那一步 → 先查启动链
+  （DTB `/chosen bootargs` + `mem=1G` + `/memory@0` + uImage load/entry + ATAG↔DTB + early panic），
+  **此时调 TTY/fb_base/私有驱动全是白费**。
+
+### 分层判据（真机为准，静态反汇编不能判定"起没起"）
+| 级 | 信号 | 依赖 | 证明什么 |
+|---|---|---|---|
+| L0 | 绿带 / pstore `dmesg-*` | 内核到 initcall + 显存可写 | 内核起来了（优先级 0） |
+| L1 | HDMI 出 TTY 文字 / 内核启动日志 | + 私有驱动 + framebuffer + fbcon 绑定 | **本阶段目标：能显示 TTY** |
+| L2 | 路由器新 IP / SSH | + rootfs + userspace + 网络 | 整机可联网 |
 
 docs/044 §0 / docs/024 §6 / docs/026 §0 一致结论：主线 6.3「无显示 + 无 IP」同时出现，
-最简洁一致的解仍是**内核没启动到 userspace**。所以：
-- **无论用哪套驱动，内核得先起来**。内核里已内置绿带 boot marker（`hi3798mv100-hdmi-console.c`），
-  只要跑到 `subsys_initcall` 就会在屏幕顶部画纯绿粗带，不需要网络/TTY/串口/pstore。
-- 试包时盯绿带：出现 = 内核起来了（新显示驱动才有意义）；始终只有 logo + 浅蓝细线 = 内核没起来，
-  先查启动链（DTB `/chosen bootargs` + `mem=1G` + `/memory@0` + uImage load/entry + early panic）。
-  研究员全量反汇编也附带核对 6.x 启动链是否与原厂 hiboot 交接约定冲突。
-- 静态反汇编不能判定"内核起没起"，必须真机信号。真机为准，静态推断不作为成功依据。
+最简洁一致的解是**内核没启动到 userspace**（L0 没过）。研究员全量反汇编
+（`research/full-disasm/UNKNOWNS.md` 优先级 0）也把"内核是否启动"列为高于一切显存/显示问题。
+所以顺序必须是 **L0 → L1 → L2**：私有驱动（L1 的手段）只有先确认 L0 过了才有意义。
+
+> 注：绿带目前是 legacy simplefb 驱动里的，属"蹭 hiboot 遗留显存"的过渡手段；私有驱动路线
+> （`patches/vendor-display/`）终态是自己初始化 VO/HDMI/PHY 并注册 framebuffer，那时 TTY 直出
+> 既是目标也是判据，绿带可退化/移除。两者是路线演进，不是互相替代。
 
 ---
 
