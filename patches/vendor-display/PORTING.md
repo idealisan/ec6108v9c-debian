@@ -5,15 +5,25 @@
 > 网卡保持主线 hisi_femac，不在本目录范围。
 
 ## 状态（诚实）
-- **当前：占位，驱动尚未写入，但寄存器初始化序列已交付**（全量反汇编产物已归档于
-  `research/full-disasm/`，见 `reg_init_sequence.md` §2 最小可落地清单 + `FINDINGS.md §D` 偏移定音）。
-  `DISPLAY_DRIVER=vendor-backport` 仍会 fail-fast：缺 `hi3798mv100_vendor_display.c` +
-  `0004-...patch`，写好后即解除。
-- 序列落地不手写猜寄存器值（docs/025 §2.2 铁律）：可直接写成 `writel` 表的确定性静态序列有
-  `reg_init_sequence.md` 的**序列 A（HDMI PHY 7 写，含 reg5=0x04）、序列 B（CRG 复位 5 写 + 3 Delay）、
-  `ACR_CTRL=0x04`**；RMW / fb_base / EDID / 时序一律运行时算、标 [推断]/[未知]。
+- **当前：阶段 2「可编译骨架」已落地，`DISPLAY_DRIVER=vendor-backport` 不再 fail-fast。**
+  两个文件已就位：`hi3798mv100_vendor_display.c` + `0004-vendor-display-kconfig-makefile.patch`
+  （已用 0001→0002→0003→0004 全链 `git apply --check` 验证落在 0003-applied 基线）。
+  `scripts/build-kernel.sh` 的 vendor 分支会 enable `CONFIG_HI3798MV100_VENDOR_DISPLAY`、
+  disable legacy `CONFIG_FB_HI3798MV100_HDMI_CONSOLE`，两者都注册 `simple-framebuffer` id 0
+  不能共存。默认 `simplefb` 路径完全不 apply 0004、不 cp 驱动，零回归。
+- **但这是骨架，不是完整的海思私有显示栈**，不假装完成：
+  - 运行时仍走主线 simplefb 交接（读 §D 定死的 VO G0 偏移 → 注册 framebuffer →
+    fbcon/VT 绑 TTY → 绿带 L0）。与 legacy 的根本差别是：独立私有驱动符号 + §D 正确偏移 +
+    把反汇编确定性序列编译进内核镜像。
+  - 序列 A（HDMI PHY 7 写，含 DRV=0x04）、序列 B（CRG 复位）逐字节来自
+    `research/full-disasm/reg_init_sequence.{md,tsv}`，做成 `vd_hw_init[]` 数据表编译进内核，
+    **但 `run_hw_init` 默认 0，不执行**。原因：hiboot 已点亮 HDMI，重跑 CRG/PHY 复位会黑屏
+    （postmarketOS 教训 + legacy 驱动同结论）；完整 `HI_DRV_HDMI_Init→DISP→Open→Reset→
+    WakeUp→G0→AVI` 链还需要运行时 EDID/HPD/时序值（[未知]），未实现。
+  - RMW / fb_base / EDID / 时序一律运行时算，标 [推断]/[未知]，绝不写死（docs/025 §2.2 铁律）。
 - **更靠前的前置仍是"6.x 内核到底起没起"**（`research/full-disasm/UNKNOWNS.md` 优先级 0）：
-  给没启动的内核调显示驱动无意义。先真机绿带 / pstore / 新 IP 确认，再谈显示。
+  给没启动的内核调显示驱动无意义。骨架能编译出包 ≠ 能点亮 ≠ 内核已引导，
+  必须真机绿带 / TTY 文字 / 新 IP 确认。CI 编译日志只能证明"代码编进去了"。
 
 ## 要 backport 的源码（HiSTB SDK `TMP/sdk-src/`，只取寄存器写入序列，不整目录照搬 MPP 框架）
 | 来源 | 取什么 | 用途 |

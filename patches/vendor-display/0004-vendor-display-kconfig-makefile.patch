@@ -1,0 +1,41 @@
+diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
+index 92d683b..e29c4db 100644
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -2176,6 +2176,24 @@ config FB_HI3798MV100_HDMI_CONSOLE
+ 	  messages on HDMI. It does not reprogram the display engine,
+ 	  which would blank the screen. Needs console=tty0.
+ 
++config HI3798MV100_VENDOR_DISPLAY
++	bool "Hi3798MV100 vendor VO/HDMI framebuffer backport (skeleton)"
++	depends on FB_SIMPLE && ARM
++	default n
++	help
++	  Backported HiSilicon private VO/HDMI display-stack skeleton on a 6.3
++	  mainline kernel. Reads the VO layer-0 registers left by hiboot
++	  (research/full-disasm/FINDINGS.md section D offsets) and registers a
++	  simple-framebuffer platform device so fbcon (console=tty0,
++	  fbcon=map:0) can show kernel messages on HDMI. Deterministic register
++	  sequences recovered from the stock kernels are compiled in as data but
++	  are NOT executed by default: reprogramming the display engine after
++	  hiboot has lit HDMI blanks the screen, and a full HI_DRV_HDMI_Init
++	  chain still needs runtime EDID/HPD/timing values that are unknown.
++	  This is a skeleton, not a complete display stack; see docs/052 and
++	  patches/vendor-display/PORTING.md. Mutually exclusive with
++	  FB_HI3798MV100_HDMI_CONSOLE (both register simple-framebuffer id 0).
++
+ config FB_SIMPLE
+ 	tristate "Simple framebuffer support"
+ 	depends on FB
+diff --git a/drivers/video/fbdev/Makefile b/drivers/video/fbdev/Makefile
+index da25b85..d564ea7 100644
+--- a/drivers/video/fbdev/Makefile
++++ b/drivers/video/fbdev/Makefile
+@@ -127,6 +127,7 @@ obj-$(CONFIG_FB_DA8XX)		  += da8xx-fb.o
+ obj-$(CONFIG_FB_SSD1307)	  += ssd1307fb.o
+ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
+ obj-$(CONFIG_FB_HI3798MV100_HDMI_CONSOLE) += hi3798mv100-hdmi-console.o
++obj-$(CONFIG_HI3798MV100_VENDOR_DISPLAY) += hi3798mv100_vendor_display.o
+ 
+ # the test framebuffer is last
+ obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
