@@ -60,6 +60,7 @@
 #include <linux/console.h>
 #include <linux/font.h>
 #include <linux/spinlock.h>
+#include <asm/cacheflush.h>
 
 /*
  * SELF-DRAWN FRAMEBUFFER CONSOLE ("hi3798fb")
@@ -194,6 +195,39 @@ static u32  vd_con_x, vd_con_y;/* current cursor (glyph units) */
 static const struct font_desc *vd_con_font;
 static DEFINE_RAW_SPINLOCK(vd_con_lock);
 
+/* The framebuffer is ordinary System RAM mapped MEMREMAP_WB: memremap()
+ * refuses non-WB flags for RAM (kernel/iomem.c), so CPU pixel stores linger
+ * in the D-cache and the VO DMA scanner keeps reading stale DDR. Real HW
+ * showed exactly that: freshly drawn text "shattered"/noisy while older lines
+ * (evicted by later writes) stayed intact, and poking USB to force more
+ * printk made it readable. Fix: explicitly clean the touched cache lines
+ * after every console write. Byte range accumulated under vd_con_lock. */
+static size_t vd_flush_lo, vd_flush_hi;
+
+static void vd_flush_mark(size_t off, size_t len)
+{
+	size_t hi = off + len;
+
+	if (vd_flush_lo >= vd_flush_hi) {
+		vd_flush_lo = off;
+		vd_flush_hi = hi;
+	} else {
+		if (off < vd_flush_lo)
+			vd_flush_lo = off;
+		if (hi > vd_flush_hi)
+			vd_flush_hi = hi;
+	}
+}
+
+static void vd_flush_apply(void)
+{
+	if (vd_con_fb && vd_flush_lo < vd_flush_hi)
+		__cpuc_flush_dcache_area((u8 *)vd_con_fb + vd_flush_lo,
+					 vd_flush_hi - vd_flush_lo);
+	vd_flush_lo = 0;
+	vd_flush_hi = 0;
+}
+
 static bool vd_valid_fb_addr(u32 val)
 {
 	return val >= (DDR_START + 0x100000) && val < (DDR_END - FB_ADDR_MARGIN)
@@ -274,6 +308,8 @@ static void vd_paint_boot_marker(phys_addr_t addr, u32 stride)
 	}
 	for (i = 0; i < words; i++)
 		w[i] = BOOT_MARK_COLOR;
+	/* CPU wrote to WB-mapped DDR; clean so VO scans green, not stale logo. */
+	__cpuc_flush_dcache_area(w, (size_t)stride * BOOT_MARK_LINES);
 	if (temp)
 		memunmap(w);
 }
@@ -292,6 +328,8 @@ static void vd_con_clear_row(u32 row)
 		for (b = 0; b < vd_con_w; b++)
 			line[b] = CON_BG;
 	}
+	vd_flush_mark((size_t)y0 * vd_con_stride,
+		      (size_t)CON_GLYPH_H * vd_con_stride);
 }
 
 /* Scroll the text region up by one row; keep the green band intact. */
@@ -302,6 +340,8 @@ static void vd_con_scroll(void)
 	size_t move_words = row_words * (vd_con_rows - 1);
 
 	memmove(base, base + row_words, move_words * sizeof(u32));
+	vd_flush_mark((size_t)BOOT_MARK_LINES * vd_con_stride,
+		      (size_t)vd_con_rows * CON_GLYPH_H * vd_con_stride);
 	vd_con_clear_row(vd_con_rows - 1);
 }
 
@@ -331,6 +371,8 @@ static void vd_con_putc_at(u32 col, u32 row, char c)
 		for (b = 0; b < CON_GLYPH_W; b++)
 			line[b] = (bits & (0x80u >> b)) ? CON_FG : CON_BG;
 	}
+	vd_flush_mark((size_t)y0 * vd_con_stride,
+		      (size_t)CON_GLYPH_H * vd_con_stride);
 }
 
 /*
@@ -372,6 +414,7 @@ static void vd_con_write(struct console *co, const char *s, unsigned int count)
 		if (++vd_con_x >= vd_con_cols)
 			vd_con_newline();
 	}
+	vd_flush_apply();
 	raw_spin_unlock_irqrestore(&vd_con_lock, flags);
 }
 

@@ -48,6 +48,7 @@ on:
       - 'scripts/**'
       - 'configs/**'
       - 'patches/**'
+      - 'firmware/**'
       - 'rootfs/**'
       - '.github/workflows/build-release.yml'
 

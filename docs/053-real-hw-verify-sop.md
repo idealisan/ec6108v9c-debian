@@ -38,9 +38,10 @@
      （docs/053 §6 早已预判）——主线 DTB `/memory@0` 覆盖全 1GB、只有
      `ramoops@0x30000000` 是 no-map，hiboot logo buffer 落在高端可用 RAM 里，内核
      buddy 随运行逐渐把这些页分配/写脏 → 画面被噪点「侵蚀」。另一候选：VO 双缓冲
-     （`G0_NADDR` 未写第二帧）翻页露出旧帧。**已排除**「WB cache 一致性」：静默卡住
-     时无 CPU 写显存、且 `memremap()` 对 System RAM 拒绝任何非 WB flag
-     （`kernel/iomem.c:106` 返回 NULL），改 WC 反而会连绿带都画不出（已撤销）。
+     （`G0_NADDR` 未写第二帧）翻页露出旧帧。当时**误排除**「WB cache 一致性」——
+     理由「静默卡住时无 CPU 写显存」不成立（每来一条新 printk 就有 CPU 写）。
+     `memremap()` 对 System RAM 拒绝非 WB flag（`kernel/iomem.c:106`）这点仍成立，
+     所以修法不是改 WC，而是**显式 clean d-cache**（真机第 3 轮已证伪并修正，见下）。
 - **卡点定位（重要）**：屏幕停在 `random: crng init done`（`random.c:726`，
   `_credit_init_bits()` 熵池达 `POOL_READY_BITS` 时 pr_notice），之后等了约 700 秒都
   无新日志，直到拔 U 盘才出现 `usb disconnect`。这说明**内核没死**——中断、printk、
@@ -66,6 +67,55 @@
   - 保持 `MEMREMAP_WB`（System RAM 只能用 WB，见上）；绿带 L0 与 console 不受影响。
   - 若下次仍斜，回报屏幕 `VO layer0: ... stride_raw=... pitch=...` 数值，或用
     `hi3798mv100_vendor_display.con_stride=<bytes>` 直接指定，无需重编译。
+
+### 真机第 3 轮（2026-11-14，刷含 45° 斜切修复的包 `build-20261114T133008Z`）
+
+- **斜切修复生效**：文字终于能读出具体字符串（上版"难以辨认"），因此拿到了
+  十几轮以来第一批**可读的完整内核日志**。
+- **日志里看到的（经源码核对，全部非致命）**：EMMC 检测成功、USB 枚举成功；
+  `direct firmware load for rtlwifi/rtl8188fufw.bin failed with error -2` +
+  `RTL8xxxu: Probe of 3-2:1.0 failed with error -11`（USB WiFi 缺固件；`-11=-EAGAIN`
+  是 `rtl8xxxu_load_firmware()` 里同步 `request_firmware()` 失败的返回值）；
+  `cfg80211: failed to load regulatory.db`（`reg.c:1008` 的 `pr_info`，无线监管库，
+  内核回退内置 world domain）；`clk: Not disabling unused clocks`
+  （`clk.c:1405` 的 `pr_warn`，是 `clk_ignore_unused` 生效的**正常提示**）；
+  4 个 `amba f8aXXXXX.timer deferred probe pending`（`dd.c:316`，
+  `deferred_probe_timeout` 到期时的汇总打印，内核已继续）。
+- **卡在 `random: crng init done` 之后、无任何新日志**；等约 700 秒拔插 U 盘才刷出
+  `usb disconnect` → 内核活着、中断/printk/console 全活，是**静默卡死**。
+
+**决定性根因（静态钉死，非猜测）**：`root=mmcblk0p8` **缺 `/dev/` 前缀**。
+`name_to_dev_t()`（`do_mounts.c:277`）把它交给 `devt_from_devnum()`，后者按
+**16 进制**解析、遇第一个 `m` 即 `return 0` → `ROOT_DEV` 永远为 0。于是
+`prepare_namespace()` 的 `rootwait` 分支（`do_mounts.c:635`）
+`while (driver_probe_done()!=0 || (ROOT_DEV = name_to_dev_t(...))==0) msleep(5);`
+每 5ms 静默空转、**一条 printk 都不打** —— 精确解释"内核活着但无声卡住、无 IP"。
+且 `driver_probe_done()` 查的是活跃 `probe_count`，不是 deferred pending 列表，
+所以那 4 个 pending 设备不是主因。
+
+- **修法**：`root=/dev/mmcblk0p8`（走 `devt_from_devname()` → `blk_lookup_devt()`
+  拿到真实分区 dev_t，挂载成功即进 userspace 出 IP），并把 `rootwait` 换成
+  `rootdelay=5`：若 root 仍缺失，则让 `mount_root()` 明确打印
+  `VFS: Cannot open root device` + `here are the available partitions` 分区列表
+  + panic，一次刷机即可定位。p2 runtime env 的 `bootargs` 与 DTB `/chosen/bootargs`
+  同源（`configs/partition-layout.env`），两处同时生效。
+- **"新日志破碎、老日志稳定、拔插 USB 刷新后能看清" = WB cache 一致性**（修正第 2 轮
+  误判）：CPU 写像素滞留在 D-cache 未回写 DDR，VO DMA 读到旧数据；后续写入推动
+  cache line 淘汰回写，老行才稳定。修法：console 写完像素后按本次触及的字节范围
+  显式 `__cpuc_flush_dcache_area()` clean（`asm/cacheflush.h`），保持 `MEMREMAP_WB`
+  （改 WC 会让 `memremap` 对 System RAM 返回 NULL、连绿带都丢）。
+- **WiFi 固件顺手修好**：主线 `rtl8xxxu` 本身就是开源驱动（社区 4.4 用的是
+  out-of-tree vendor `rtl8188fu.ko`，不能用于 6.3），只缺 blob。本启动链**无
+  initramfs**，initcall 阶段读不到 rootfs 的 `/lib/firmware`；且 Debian
+  `firmware-realtek` 只含 8188e/8188eu、不含 8188fu。故取 linux-firmware 上游
+  `rtlwifi/rtl8188fufw.bin`（21,020 B，signature `0x88f1`→`0x88f0` 命中
+  `rtl8xxxu_load_firmware()` 白名单），用 `CONFIG_EXTRA_FIRMWARE` **编进 vmlinux**，
+  `EXTRA_FIRMWARE_DIR` 由 `build-kernel.sh` 在构建时设为绝对路径（不写进仓库文件）。
+  `regulatory.db` 仍会报缺失（非致命，用内置 world regulatory domain）。
+- **下一版回报重点**：① 文字是否**不再破碎**；② `crng init done` 之后是否出现
+  `Freeing unused kernel memory` / `Run /sbin/init`（有 = 进 userspace），或
+  `VFS: Cannot open root device` + 分区列表（有 = 贴出分区列表）；③ 路由器有没有
+  新 IP / SSH；④ 日志里还有没有 rtlwifi 固件报错（应消失）、有无 `wlan0`。
 
 ## 0. 静态侧已排除的嫌疑（不用再查，节省时间）
 

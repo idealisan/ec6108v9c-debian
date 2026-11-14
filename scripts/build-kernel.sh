@@ -180,11 +180,21 @@ if [ "$DISPLAY_DRIVER" = "vendor-backport" ]; then
   # +0x494 offsets. Two drivers would collide on the same pdev/framebuffer.
   "$KERNEL_SRC/scripts/config" --file "$OUT/.config" -d FB_HI3798MV100_HDMI_CONSOLE
 fi
+# Built-in WiFi firmware: CONFIG_EXTRA_FIRMWARE (in the fragment) names the
+# blob; EXTRA_FIRMWARE_DIR must be an absolute path because Kconfig defaults
+# to /lib/firmware, which does not exist in the CI checkout. Keep the
+# machine-specific path OUT of tracked files by setting it here at build time.
+# (drivers/base/firmware_loader/builtin/Makefile resolves a leading / as an
+# absolute fwdir for the .incbin.)
+if [ -f "$ROOT_DIR/firmware/rtlwifi/rtl8188fufw.bin" ]; then
+  "$KERNEL_SRC/scripts/config" --file "$OUT/.config" \
+    --set-str EXTRA_FIRMWARE_DIR "$ROOT_DIR/firmware"
+fi
 "$MAKE" -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="${CROSS:+$CROSS}" $MAKE_EXTRA olddefconfig
 echo "== kernel: verify key options =="
 # The wired MAC is included here on purpose: if any of these ever reads
 # "is not set", eth0 is never created and the box boots with no IP at all.
-grep -E "^(CONFIG_RTL8XXXU|CONFIG_FB_SIMPLE|CONFIG_FRAMEBUFFER_CONSOLE|CONFIG_THERMAL=|CONFIG_HI3798MV100_TSENSOR|CONFIG_HI3798MV100_VENDOR_DISPLAY|CONFIG_FB_HI3798MV100_HDMI_CONSOLE|CONFIG_EXT4_FS|CONFIG_BTRFS_FS|CONFIG_NTFS3_FS|CONFIG_EXFAT_FS|CONFIG_USB_HID|CONFIG_NETDEVICES|CONFIG_NET_VENDOR_HISILICON|CONFIG_HISI_FEMAC|CONFIG_MDIO_HISI_FEMAC|CONFIG_PHYLIB|CONFIG_COMMON_CLK_HI3798|CONFIG_RESET_HISI)=" "$OUT/.config"
+grep -E "^(CONFIG_RTL8XXXU|CONFIG_EXTRA_FIRMWARE|CONFIG_EXTRA_FIRMWARE_DIR|CONFIG_FB_SIMPLE|CONFIG_FRAMEBUFFER_CONSOLE|CONFIG_THERMAL=|CONFIG_HI3798MV100_TSENSOR|CONFIG_HI3798MV100_VENDOR_DISPLAY|CONFIG_FB_HI3798MV100_HDMI_CONSOLE|CONFIG_EXT4_FS|CONFIG_BTRFS_FS|CONFIG_NTFS3_FS|CONFIG_EXFAT_FS|CONFIG_USB_HID|CONFIG_NETDEVICES|CONFIG_NET_VENDOR_HISILICON|CONFIG_HISI_FEMAC|CONFIG_MDIO_HISI_FEMAC|CONFIG_PHYLIB|CONFIG_COMMON_CLK_HI3798|CONFIG_RESET_HISI)=" "$OUT/.config"
 
 echo "== kernel: build zImage / dtbs / modules =="
 "$MAKE" -C "$KERNEL_SRC" O="$ROOT_DIR/$OUT" ARCH=arm CROSS_COMPILE="${CROSS:+$CROSS}" $MAKE_EXTRA \
