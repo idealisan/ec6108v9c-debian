@@ -117,6 +117,40 @@
   `VFS: Cannot open root device` + 分区列表（有 = 贴出分区列表）；③ 路由器有没有
   新 IP / SSH；④ 日志里还有没有 rtlwifi 固件报错（应消失）、有无 `wlan0`。
 
+### 真机第 4 轮（2026-11-14 深夜，OCR 屏摄）：`No working init found` —— 根因已静态坐实并修复
+
+用户拍屏 OCR 出启动尾部（`6.3.0-rc5+`、双核 `CPU0/CPU1: stopping` 的 IPI backtrace，
+13.3s 时 `Kernel panic - not syncing: No working init found. Try passing init=...`）。
+
+- **重大进展**：`root=/dev/mmcblk0p8` 修复完全生效 —— 内核**成功挂载了 root 并跑到
+  `kernel_init` 启动 userspace 阶段**（否则会是 `VFS: Cannot open root device` 或旧版
+  `rootwait` 静默死循环）。`CPU0/CPU1: stopping` 是 panic 停其它核的正常 IPI 栈，
+  不是独立故障。
+- **根因（100% 复现坐实，非推测）**：把 U 盘的 `debian-root.ext4`（Android sparse）
+  用 Python 展开成 ext4 并解析 inode/dirent/symlink，发现刷入镜像里 **`/lib` 是实体
+  目录、内容只有 `modules/`**，而 `/bin`、`/sbin` 仍是 symlink。Debian bookworm 是
+  usrmerge：`/lib → usr/lib`，systemd 本体在 `/usr/lib/systemd/systemd`（71KB ELF 在），
+  `/usr/sbin/init → /lib/systemd/systemd` 是**绝对路径** symlink。`/lib` 一旦变成实体
+  目录，`/lib/systemd/systemd`、`/lib/ld-linux-armhf.so.3` 全部不可达 → 内核按顺序
+  execve `/sbin/init`、`/etc/init`、`/bin/init`、`/bin/sh` 全 ENOENT → panic。
+- **为什么会变实体目录（复现实验）**：`make-community-flash-package.sh` 里
+  `tar -xzf modules.tar.gz -C "$WORK/root"`，而 `modules.tar.gz` 顶层是真实目录 `lib/`
+  + `lib/modules/...`。GNU tar 解包到已有 `lib → usr/lib` symlink 的 rootfs 时，会
+  **移除 symlink、创建真实 `lib/` 目录**，只留 modules。本地复现：解包后
+  `/lib` 变实体、`/lib/systemd/systemd` 从 YES 变 NO。
+  （`build-rootfs.sh:213` 的 `rm -rf "$ROOT/lib/modules/"*` 清的是 usr/lib/modules，
+  与此无关。）
+- **修复（已提交）**：把 modules 解到 **`-C "$WORK/root/usr"`**（顶层 `lib/` 落到
+  `usr/lib/`，经 `/lib` symlink 仍可达），并在打包脚本加**防御性断言**：解包后
+  `/lib` 必须是 symlink、`/lib/systemd/systemd` 与 `/lib/ld-linux-armhf.so.3` 必须
+  可达，否则 fail-fast，杜绝同类坏包再次静默产出。真实 rootfs tar + modules tar
+  本地验证：`/lib → usr/lib` 保留、systemd/ld/modules 全 YES。recovery 包复用同一
+  份 `debian-root.ext4`，改这一处即修全部包。
+- **下一版回报重点**：刷修复后包，看 ① 有没有 `Run /sbin/init as init process` /
+  systemd 启动文字（不再 panic）；② 绿带 + 日志；③ 路由器新 IP / SSH；
+  ④ `wlan0`。**若仍 `No working init found`**，请把 panic 前几行
+  `Failed to execute /sbin/init (error -N)` 的 `-N` 一并 OCR 出来定位。
+
 ### 「原生 TTY」实验版（用户要求，2026-11-14 夜间，与上一版并存/可选）
 
 用户觉得自绘 console「手动画字怪怪的」，要求做一版走内核标准链路的 TTY。

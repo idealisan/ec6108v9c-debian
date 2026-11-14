@@ -105,8 +105,28 @@ fi
 echo "== rootfs ext4 -> Android sparse =="
 $SUDO tar -xzf "$ROOTFS_TAR" -C "$WORK/root" --numeric-owner
 if [ -f "$MODULES_TAR" ]; then
-  $SUDO tar -xzf "$MODULES_TAR" -C "$WORK/root"
+  # modules.tar.gz has a top-level "lib/modules/..." tree. Debian bookworm is
+  # usrmerged: /lib is a SYMLINK to usr/lib. Extracting to the root would make
+  # tar REPLACE that symlink with a real, modules-only directory, hiding
+  # /lib/systemd/systemd and /lib/ld-linux-armhf.so.3 -> the kernel cannot run
+  # any init ("No working init found", seen on real HW). Extract into usr/
+  # instead so modules land in usr/lib/modules, reachable through the symlink.
+  $SUDO tar -xzf "$MODULES_TAR" -C "$WORK/root/usr"
 fi
+# Fail fast rather than shipping a rootfs that cannot boot. Verified on the
+# shipped sparse image: /lib must still be a symlink and systemd/ld must be
+# resolvable through it.
+if [ ! -L "$WORK/root/lib" ]; then
+  echo "rootfs USRMERGE BROKEN: /lib is a real directory, not a symlink" >&2
+  exit 1
+fi
+for probe in lib/systemd/systemd lib/ld-linux-armhf.so.3; do
+  if [ ! -e "$WORK/root/$probe" ]; then
+    echo "rootfs USRMERGE BROKEN: /$probe unreachable (init would fail)" >&2
+    exit 1
+  fi
+done
+echo "  usrmerge OK: /lib symlink intact, systemd + ld-linux reachable"
 truncate -s "$((IMG_SIZE_MB * 1024 * 1024))" "$WORK/debian.ext4"
 $SUDO $MKFS -q -F -t ext4 -L debian-root -d "$WORK/root" "$WORK/debian.ext4"
 python3 scripts/img2simg.py "$WORK/debian.ext4" "$WORK/pkg/mv100/debian-root.ext4"
