@@ -5,25 +5,39 @@
 > 网卡保持主线 hisi_femac，不在本目录范围。
 
 ## 状态（诚实）
-- **当前：阶段 2「可编译骨架」已落地，`DISPLAY_DRIVER=vendor-backport` 不再 fail-fast。**
-  两个文件已就位：`hi3798mv100_vendor_display.c` + `0004-vendor-display-kconfig-makefile.patch`
-  （已用 0001→0002→0003→0004 全链 `git apply --check` 验证落在 0003-applied 基线）。
-  `scripts/build-kernel.sh` 的 vendor 分支会 enable `CONFIG_HI3798MV100_VENDOR_DISPLAY`、
-  disable legacy `CONFIG_FB_HI3798MV100_HDMI_CONSOLE`，两者都注册 `simple-framebuffer` id 0
-  不能共存。默认 `simplefb` 路径完全不 apply 0004、不 cp 驱动，零回归。
-- **但这是骨架，不是完整的海思私有显示栈**，不假装完成：
-  - 运行时仍走主线 simplefb 交接（读 §D 定死的 VO G0 偏移 → 注册 framebuffer →
-    fbcon/VT 绑 TTY → 绿带 L0）。与 legacy 的根本差别是：独立私有驱动符号 + §D 正确偏移 +
-    把反汇编确定性序列编译进内核镜像。
-  - 序列 A（HDMI PHY 7 写，含 DRV=0x04）、序列 B（CRG 复位）逐字节来自
-    `research/full-disasm/reg_init_sequence.{md,tsv}`，做成 `vd_hw_init[]` 数据表编译进内核，
-    **但 `run_hw_init` 默认 0，不执行**。原因：hiboot 已点亮 HDMI，重跑 CRG/PHY 复位会黑屏
-    （postmarketOS 教训 + legacy 驱动同结论）；完整 `HI_DRV_HDMI_Init→DISP→Open→Reset→
-    WakeUp→G0→AVI` 链还需要运行时 EDID/HPD/时序值（[未知]），未实现。
-  - RMW / fb_base / EDID / 时序一律运行时算，标 [推断]/[未知]，绝不写死（docs/025 §2.2 铁律）。
-- **更靠前的前置仍是"6.x 内核到底起没起"**（`research/full-disasm/UNKNOWNS.md` 优先级 0）：
-  给没启动的内核调显示驱动无意义。骨架能编译出包 ≠ 能点亮 ≠ 内核已引导，
-  必须真机绿带 / TTY 文字 / 新 IP 确认。CI 编译日志只能证明"代码编进去了"。
+- **真机 L0 已确认（2026-11-14）：刷 vendor-backport 包后，重启在 Debian Linux logo
+  之上出现一大片绿色横条 = 本驱动 `vd_paint_boot_marker` 在 `subsys_initcall` 画的。
+  这一次性坐实三件事**：(1) 主线 6.3 内核**确实启动了**并跑到显示驱动 initcall
+  （`research/full-disasm/UNKNOWNS.md` 优先级 0「内核到底起没起」结案：起来了）；
+  (2) §D 定死的 `+0x6010` 读到了真实有效的交接显存物理地址（`vd_valid_fb_addr`
+  通过才会画绿带，否则直接 `-ENODEV`），`+0x494` 压缩视图彻底作废；
+  (3) 显存可写、VO/HDMI 管线活着、交接地址跨这次启动有效。
+- **但绿带之后无 TTY 文字、路由器无新 IP**：绿带在 `subsys_initcall`(level 4, 很早)，
+  之后才轮到 simplefb probe → fbcon 绑定 → TTY，再是 MMC → root 挂载 → userspace → 网络。
+  两个都没有 → 内核停在 level 4 之后到 userspace 之间（某 initcall 崩 / `rootwait`
+  永久等根设备 / panic），或 userspace 根本没起来。已静态排除的确定性根因：
+  `CONFIG_COMMON_CLK_HI3798=y`+`crg-hi3798.o` 编入、`mmc@9830000 status=okay` 与
+  `dw_mmc-hi3798cv200` 匹配、`a8r8g8b8` 在 simplefb 支持表、字体/VT/fbcon 全编入。
+  剩下是运行时事件，**必须靠内核日志定位**。
+- **新增自绘 framebuffer console（本轮）**：无串口、TTY 没绑、无 IP、pstore 断电丢 DDR，
+  拿日志的所有常规通道都断。绿带恰好证明显存可写 + VO 在扫描，于是加一路
+  `hi3798fb` console：用内建 `font_vga_8x16` 把 printk 直接画到交接显存（绿带下方文本区），
+  `CON_PRINTBUFFER` 在 `register_console` 时回放开机全量日志、之后实时输出。
+  **一次刷机即可在 HDMI 看到内核卡在哪一行**。写回调用 `raw_spin_trylock_irqsave`
+  + 持久 WB 映射，绝不睡眠/分配/递归 printk，panic/中断上下文安全；
+  `boot_console=0` 可关。这是"显示启动终端日志"目标的直接落地，也是定位 L1/L2 的手段。
+- **阶段 2 骨架接线不变量**：`hi3798mv100_vendor_display.c` +
+  `0004-...patch` 全链 `git apply --check` 通过；vendor 分支 enable
+  `CONFIG_HI3798MV100_VENDOR_DISPLAY`、disable legacy `CONFIG_FB_HI3798MV100_HDMI_CONSOLE`
+  （都注册 `simple-framebuffer` id 0 不能共存）；默认 `simplefb` 路径零回归。
+- **仍是骨架，不是完整海思私有显示栈**：运行时仍走主线 simplefb 交接；序列
+  A（PHY 7 写含 DRV=0x04）/ B（CRG 复位）做成 `vd_hw_init[]` 数据表编译进内核，
+  **`run_hw_init` 默认 0 不执行**（hiboot 已点亮 HDMI，重跑复位会黑屏；完整
+  `HI_DRV_HDMI_Init→...→AVI` 链需运行时 EDID/HPD/时序 [未知]，未实现）。
+  RMW / fb_base / EDID / 时序一律运行时算、标 [推断]/[未知]，绝不写死（docs/025 §2.2）。
+- **诚实边界**：CI 编译日志只证明"代码编进内核"；自绘 console 是否真机出字、内核
+  卡点究竟在哪，必须再刷一次真机、按 U 盘 `README-VERIFY.txt` 回报 L0/L1/L2。
+  骨架能编包 ≠ 能点亮 ≠ 已到 userspace ≠ 已连网。
 
 ## 要 backport 的源码（HiSTB SDK `TMP/sdk-src/`，只取寄存器写入序列，不整目录照搬 MPP 框架）
 | 来源 | 取什么 | 用途 |

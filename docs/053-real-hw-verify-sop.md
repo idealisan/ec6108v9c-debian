@@ -1,9 +1,29 @@
 # 053 — 主线 6.x 刷机包真机验证 SOP（一次性给出可判定信号）
 
-> 2026-11-09。配合 U 盘 `README-VERIFY.txt`。目标包：6.3 主线内核 + Debian rootfs，
-> recovery-flasher 方式刷入（p2/p5/p6/p8 绝对 LBA，p1 fastboot 永不写）。
-> 本文的目的：把「能引导 / 能显示 TTY / 能连网」三个目标拆成**互相独立、可分别观测**
-> 的判据，让你一次刷机就能告诉我卡在哪一级，我据此进入下一轮修改，不再盲试。
+> 2026-11-09 制定，2026-11-14 更新真机进度。配合 U 盘 `README-VERIFY.txt`。目标包：6.3
+> 主线内核 + Debian rootfs，recovery-flasher 方式刷入（p2/p5/p6/p8 绝对 LBA，p1 fastboot
+> 永不写）。本文的目的：把「能引导 / 能显示 TTY / 能连网」三个目标拆成**互相独立、
+> 可分别观测**的判据，让你一次刷机就能告诉我卡在哪一级，我据此进入下一轮修改，不再盲试。
+
+## 真机进度（2026-11-14，刷 vendor-backport 包 `build-20261114T035227Z`）
+
+- **L0 绿带 = 已确认**：刷机成功、断电重启后，`Debian Linux` logo 之上出现一大片绿色横条。
+  这是 vendor 显示驱动 `hi3798mv100_vendor_display.c` 的 `vd_paint_boot_marker` 在
+  `subsys_initcall` 画的（顶部 240 行 × stride）。它一次性坐实：
+  1. **主线 6.3 内核确实启动了**，并跑到显示驱动 initcall（UNKNOWNS 优先级 0 结案）；
+  2. §D 定死的 `+0x6010` 读到了真实有效的交接显存地址（`vd_valid_fb_addr` 通过才画，
+     否则 `-ENODEV`），`+0x494` 压缩视图作废；
+  3. 显存可写、VO/HDMI 管线活着、交接地址本次有效。
+- **L1 TTY 文字 = 无；L2 新 IP = 无**。绿带在 initcall level 4（很早），之后才轮到
+  simplefb probe→fbcon→TTY、MMC→root 挂载→userspace→网络。两个都没有 → 内核停在
+  level 4 之后到 userspace 之间；已静态排除 clock/mmc/format/字体 等确定性缺配置。
+- **本轮改动 = 新增自绘 framebuffer console**：拿日志的常规通道（串口/TTY/IP/pstore）
+  全断，但绿带证明显存可写 + VO 在扫描，于是用 `font_vga_8x16` 把 printk 直接画到
+  交接显存（绿带下方文本区），`CON_PRINTBUFFER` 回放开机全量日志 + 之后实时输出。
+  **下一版刷机，绿带下方应出现启动日志文字；屏幕停在最后一行 = 内核卡点。**
+  `boot_console=0` 可关。详见 `patches/vendor-display/PORTING.md` 状态段。
+- **下一版回报重点**：绿带下方是否有文字？屏幕最后几行写的是什么？（能直接定位
+  `rootwait` / 某 initcall panic / MMC probe defer / 到没到 userspace）。L2 仍看路由器新 IP。
 
 ## 0. 静态侧已排除的嫌疑（不用再查，节省时间）
 
