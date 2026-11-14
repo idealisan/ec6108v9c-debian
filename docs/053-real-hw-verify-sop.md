@@ -41,12 +41,17 @@
      （`G0_NADDR` 未写第二帧）翻页露出旧帧。**已排除**「WB cache 一致性」：静默卡住
      时无 CPU 写显存、且 `memremap()` 对 System RAM 拒绝任何非 WB flag
      （`kernel/iomem.c:106` 返回 NULL），改 WC 反而会连绿带都画不出（已撤销）。
-- **卡点定位（重要）**：屏幕停在 `random: crng init done`，之后等了约 700 秒都无新
-  日志，直到拔 U 盘才出现 `usb disconnect`。这说明**内核没死**——中断、printk、
-  console 全活着；是**静默卡死**在 `crng init done` 之后。`crng init done` 是
-  `random_init()`(`start_kernel:1060`) 阶段、CRNG 熵池就绪的标志，属内核极早期、
-  **远早于** initcalls / 挂载 rootfs / 起 systemd / 网络。头号嫌疑：`rootwait` 无限等
-  `mmcblk0p8`、或某 initcall 自旋、或 MMC probe defer。
+- **卡点定位（重要）**：屏幕停在 `random: crng init done`（`random.c:726`，
+  `_credit_init_bits()` 熵池达 `POOL_READY_BITS` 时 pr_notice），之后等了约 700 秒都
+  无新日志，直到拔 U 盘才出现 `usb disconnect`。这说明**内核没死**——中断、printk、
+  console 全活着；是**静默卡死**在 `crng init done` 之后。它属**内核启动阶段**
+  （熵攒够时打印，通常在 initcalls 期间或之后），确定**还没进 userspace**——之后本该
+  依次出现 `Freeing unused kernel memory` → `Run /sbin/init as init process` → systemd
+  → DHCP/新 IP，`一条都没有` → 卡在 initcalls 后期到挂载 root 之间。cmdline 带
+  `rootwait`，头号嫌疑是无限等 `mmcblk0p8`（MMC 没认出分区 / probe defer）或某
+  initcall 自旋。**下版判据**：若倾斜修好、文字能认，看 `crng init done` 之后有没有
+  `Waiting for root device ...`（`do_mounts.c:636`，rootwait 触发时必打）——有=卡在等
+  根设备，可查 MMC/分区；没有=卡在更早的某个 initcall。
 - **本轮修复（均在 vendor 驱动一个文件内，零引导链/DTB/cmdline 改动）**：
   - **主修 45° 斜切**：写入行步长严格 = VO 硬件扫描行步长（`G0_STRIDE*16`，
     SDK `drv_hifb_hal.c:39/:616` 依据；两编码自适应 + `con_stride` cmdline 逃生舱），
