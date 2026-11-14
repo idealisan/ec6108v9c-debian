@@ -43,6 +43,23 @@
  * Register bases ([观察], reg_init_sequence.md §0):
  *   VO/VDP 0xf8cc0000 | HDMI TX 0xf8ce0000 | PHY 0xf8ce1800 | CRG 0xf8a22000
  *
+ * NATIVE TTY (native_tty=1, default): register a plain, standard fbdev
+ * framebuffer (framebuffer_alloc + register_framebuffer) and let the kernel's
+ * own fbcon / VT / console=tty0 stack render the boot log. This is the
+ * "proper" way the user asked for, versus the hand-drawn 8x16 glyph console.
+ * The framebuffer's screen_base is the SAME MEMREMAP_WB mapping that the
+ * green-marker/self-drawn console proved works on real HW; the fbops wrap the
+ * kernel cfb_fillrect/copyarea/imageblit and clean the touched D-cache lines
+ * so the VO DMA scanner sees fbcon's output. We deliberately do NOT go
+ * through simplefb: simplefb_probe() uses ioremap_wc() on this System-RAM
+ * framebuffer (cache-attribute alias) and devm_aperture_acquire() on an
+ * unreserved RAM region, which is why the native fbcon chain never bound.
+ * Registration happens at device_initcall, after fbmem_init's fb_console_init
+ * (subsys_initcall), so do_fbcon_takeover() fires immediately; fbcon=map:0 +
+ * console=tty0 are already on the cmdline and ARM fb_is_primary_device()=0 is
+ * bypassed by map_override=1. Set native_tty=0 to fall back to the fully
+ * verified self-drawn console if native fbcon ever fails to take over.
+ *
  * Built-in only (bool Kconfig): subsys_initcall, never unloads.
  */
 
@@ -60,6 +77,7 @@
 #include <linux/console.h>
 #include <linux/font.h>
 #include <linux/spinlock.h>
+#include <linux/fb.h>
 #include <asm/cacheflush.h>
 
 /*
@@ -181,8 +199,28 @@ module_param_named(con_stride, vd_con_force_stride, uint, 0444);
 MODULE_PARM_DESC(con_stride,
 	"Force console scanline stride in bytes (0 = derive from VO G0_STRIDE).");
 
+/* Native fbcon TTY path (default on). 0 = fall back to the hand-drawn console
+ * that was verified on real HW. See the file header for the full rationale. */
+static bool vd_native_tty = true;
+module_param_named(native_tty, vd_native_tty, bool, 0444);
+MODULE_PARM_DESC(native_tty,
+	"Register a standard fbdev framebuffer so the kernel's fbcon/VT renders "
+	"console=tty0 (default 1). Set 0 to use the self-drawn boot console.");
+
 static void __iomem *vo_base;
 static struct platform_device *vd_simplefb_pdev;
+
+/* Geometry resolved at subsys_initcall, consumed by the device_initcall that
+ * registers the native fbdev. Kept separate from vd_con_* (self-drawn path). */
+static phys_addr_t vd_geom_phys;
+static size_t vd_geom_bytes;
+static u32 vd_geom_width, vd_geom_height, vd_geom_stride;
+static bool vd_geom_valid;
+
+/* Native fbdev state. */
+static void *vd_fb_screen;         /* persistent WB mapping, cpu address */
+static struct fb_info *vd_fb_info;
+static u32 vd_pseudo_palette[16];
 
 /* Self-drawn console state. vd_con_fb is a PERSISTENT mapping of the
  * hiboot framebuffer, made once in init: console->write must not sleep.
@@ -589,53 +627,90 @@ static int __init hi3798_vendor_display_init(void)
 	pdata.stride = stride;
 	fb_phys = (phys_addr_t)addr;
 
-	/*
-	 * Set up the persistent framebuffer mapping + self-drawn console FIRST,
-	 * so the green band and the boot-log replay share one mapping and the
-	 * SAME hardware-derived pitch. vd_con_setup() does the memremap;
-	 * vd_paint_boot_marker() only draws.
-	 */
-	vd_con_setup(fb_phys, width, height, pdata.stride);
+	/* Publish the resolved geometry for the native fbdev path (registered
+	 * later at device_initcall). Clamp the mapping length the same way
+	 * vd_con_setup() does so both paths agree on the visible height. */
+	{
+		size_t bytes = (size_t)stride * height;
+		size_t max_bytes = 0;
+
+		if (fb_phys < DDR_END)
+			max_bytes = (size_t)(DDR_END - fb_phys);
+		if (bytes > max_bytes) {
+			bytes = max_bytes;
+			height = bytes / stride;
+		}
+		vd_geom_phys   = fb_phys;
+		vd_geom_bytes  = bytes;
+		vd_geom_width  = width;
+		vd_geom_height = height;
+		vd_geom_stride = stride;
+		vd_geom_valid  = (stride != 0 && height > 1 &&
+				  bytes >= (size_t)stride * 2);
+		pr_info("hi3798-vd: geometry for native fbdev: %ux%u pitch=%uB "
+			"bytes=%zu valid=%d\n",
+			width, height, stride, bytes, vd_geom_valid);
+	}
+
+	/* The self-drawn console is the FALLBACK path only. When native_tty is
+	 * set, the kernel's own fbcon/VT renders console=tty0 instead, so we
+	 * must NOT also register a hand-drawn console (both would write the
+	 * same framebuffer and fight). */
+	if (!vd_native_tty)
+		vd_con_setup(fb_phys, width, height, stride);
 
 	/* Prove the kernel booted even if fbcon never binds. Green band stays
-	 * at the top; the console text region below it is left untouched. */
-	vd_paint_boot_marker(fb_phys, pdata.stride);
+	 * at the top; independent of either console path. */
+	vd_paint_boot_marker(fb_phys, stride);
 	pr_info("hi3798-vd: BOOT MARKER (green) at 0x%08llx -- kernel alive\n",
 		(unsigned long long)fb_phys);
 
-	/* Keep simplefb's geometry self-consistent with the hardware scan pitch
-	 * (width*4 == stride), so a late-bound fbcon cannot disagree with our
-	 * self-drawn console's row layout. */
-	pdata.width = stride / 4;
-	pdata.height = height;
-	pdata.format = FB_FORMAT;
+	/* Only the FALLBACK path registers a simple-framebuffer platform device.
+	 * In native mode the standard fbdev (registered at device_initcall)
+	 * supplies framebuffer for fbcon directly; registering simplefb here
+	 * too would ioremap_wc() the System-RAM buffer and collide on the
+	 * aperture, which is exactly what kept fbcon from binding before. */
+	if (!vd_native_tty) {
+		/* Keep simplefb's geometry self-consistent with the hardware
+		 * scan pitch (width*4 == stride). */
+		pdata.width = stride / 4;
+		pdata.height = height;
+		pdata.format = FB_FORMAT;
 
-	memset(&res, 0, sizeof(res));
-	res.start = fb_phys;
-	res.end = fb_phys + FB_SIZE - 1;
-	if (res.end > DDR_END - 1)
-		res.end = DDR_END - 1;
-	res.flags = IORESOURCE_MEM;
-	res.name = "vendor hiboot framebuffer";
+		memset(&res, 0, sizeof(res));
+		res.start = fb_phys;
+		res.end = fb_phys + FB_SIZE - 1;
+		if (res.end > DDR_END - 1)
+			res.end = DDR_END - 1;
+		res.flags = IORESOURCE_MEM;
+		res.name = "vendor hiboot framebuffer";
 
-	vd_simplefb_pdev = platform_device_alloc("simple-framebuffer", 0);
-	if (!vd_simplefb_pdev) {
-		ret = -ENOMEM;
-		goto out_unmap;
+		vd_simplefb_pdev = platform_device_alloc("simple-framebuffer", 0);
+		if (!vd_simplefb_pdev) {
+			ret = -ENOMEM;
+			goto out_unmap;
+		}
+		ret = platform_device_add_resources(vd_simplefb_pdev, &res, 1);
+		if (ret)
+			goto out_put;
+		ret = platform_device_add_data(vd_simplefb_pdev, &pdata,
+					       sizeof(pdata));
+		if (ret)
+			goto out_put;
+		ret = platform_device_add(vd_simplefb_pdev);
+		if (ret) {
+			pr_err("hi3798-vd: cannot register simple-framebuffer: %d\n",
+			       ret);
+			goto out_put;
+		}
+		pr_info("hi3798-vd: registered %ux%u framebuffer at 0x%08llx "
+			"for fbcon/TTY\n", width, height,
+			(unsigned long long)fb_phys);
+	} else {
+		pr_info("hi3798-vd: native_tty=1: no simplefb pdev, no "
+			"self-drawn console; standard fbdev registers at "
+			"device_initcall so fbcon/VT owns console=tty0\n");
 	}
-	ret = platform_device_add_resources(vd_simplefb_pdev, &res, 1);
-	if (ret)
-		goto out_put;
-	ret = platform_device_add_data(vd_simplefb_pdev, &pdata, sizeof(pdata));
-	if (ret)
-		goto out_put;
-	ret = platform_device_add(vd_simplefb_pdev);
-	if (ret) {
-		pr_err("hi3798-vd: cannot register simple-framebuffer: %d\n", ret);
-		goto out_put;
-	}
-	pr_info("hi3798-vd: registered %ux%u framebuffer at 0x%08llx "
-		"for fbcon/TTY\n", width, height, (unsigned long long)fb_phys);
 
 	iounmap(vo_base);
 	vo_base = NULL;
@@ -652,6 +727,178 @@ out_unmap:
 	return ret;
 }
 subsys_initcall(hi3798_vendor_display_init);
+
+/* ----- native fbdev / fbcon TTY path ------------------------------------- */
+/*
+ * fbcon renders via cfb_fillrect/copyarea/imageblit into info->screen_base,
+ * which is our WB mapping of the hiboot framebuffer. As with the self-drawn
+ * console, CPU stores sit in the D-cache, so every cfb operation must clean
+ * the touched scanlines or VO keeps scanning stale DDR. We wrap the three
+ * generic helpers and clean just the affected byte range.
+ */
+static void vd_fb_clean_lines(u32 y0, u32 y1)
+{
+	size_t off, len;
+
+	if (!vd_fb_screen || !vd_geom_stride)
+		return;
+	if (y0 >= y1)
+		return;
+	if (y1 > vd_geom_height)
+		y1 = vd_geom_height;
+	if (y0 >= y1)
+		return;
+	off = (size_t)y0 * vd_geom_stride;
+	len = (size_t)(y1 - y0) * vd_geom_stride;
+	if (off >= vd_geom_bytes)
+		return;
+	if (off + len > vd_geom_bytes)
+		len = vd_geom_bytes - off;
+	__cpuc_flush_dcache_area((u8 *)vd_fb_screen + off, len);
+}
+
+static void vd_fb_fillrect(struct fb_info *info, const struct fb_fillrect *r)
+{
+	cfb_fillrect(info, r);
+	vd_fb_clean_lines(r->dy, r->dy + r->height);
+}
+
+static void vd_fb_copyarea(struct fb_info *info, const struct fb_copyarea *a)
+{
+	u32 lo = min(a->sy, a->dy);
+	u32 hi = max(a->sy + a->height, a->dy + a->height);
+
+	cfb_copyarea(info, a);
+	vd_fb_clean_lines(lo, hi);
+}
+
+static void vd_fb_imageblit(struct fb_info *info, const struct fb_image *im)
+{
+	cfb_imageblit(info, im);
+	vd_fb_clean_lines(im->dy, im->dy + im->height);
+}
+
+static int vd_fb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
+			   u_int transp, struct fb_info *info)
+{
+	u32 *pal = info->pseudo_palette;
+	u32 cr = red >> (16 - info->var.red.length);
+	u32 cg = green >> (16 - info->var.green.length);
+	u32 cb = blue >> (16 - info->var.blue.length);
+	u32 value;
+
+	if (regno >= 16)
+		return -EINVAL;
+	value = (cr << info->var.red.offset) |
+		(cg << info->var.green.offset) |
+		(cb << info->var.blue.offset);
+	if (info->var.transp.length > 0)
+		value |= ((1u << info->var.transp.length) - 1)
+			 << info->var.transp.offset;
+	pal[regno] = value;
+	return 0;
+}
+
+static void vd_fb_destroy(struct fb_info *info)
+{
+	/* Persistent mapping is intentionally kept for the whole boot; the
+	 * kernel owns info and frees it here. Never unregister (built-in). */
+	framebuffer_release(info);
+}
+
+static const struct fb_ops vd_fb_ops = {
+	.owner		= THIS_MODULE,
+	.fb_destroy	= vd_fb_destroy,
+	.fb_setcolreg	= vd_fb_setcolreg,
+	.fb_fillrect	= vd_fb_fillrect,
+	.fb_copyarea	= vd_fb_copyarea,
+	.fb_imageblit	= vd_fb_imageblit,
+};
+
+/*
+ * Register at device_initcall (after fbmem_init's fb_console_init at
+ * subsys_initcall) so fbcon has finished initialising and
+ * fbcon_fb_registered() -> do_fb_registered() -> do_fbcon_takeover() fires
+ * immediately for this framebuffer. console=tty0 + fbcon=map:0 are already
+ * on the cmdline; map_override=1 bypasses ARM's fb_is_primary_device()=0.
+ */
+static int __init hi3798_native_fb_init(void)
+{
+	struct fb_info *info;
+	void *cpu;
+	int ret;
+
+	if (!vd_native_tty || !vd_geom_valid) {
+		pr_info("hi3798-vd: native fbdev skipped (native_tty=%d, "
+			"geom_valid=%d)\n", vd_native_tty, vd_geom_valid);
+		return 0;
+	}
+	if (vd_fb_info)              /* already registered */
+		return 0;
+
+	cpu = memremap(vd_geom_phys, vd_geom_bytes, MEMREMAP_WB);
+	if (!cpu) {
+		pr_warn("hi3798-vd: cannot WB-map framebuffer for native fbdev\n");
+		return -ENOMEM;
+	}
+
+	info = framebuffer_alloc(0, NULL);
+	if (!info) {
+		memunmap(cpu);
+		return -ENOMEM;
+	}
+
+	vd_fb_screen = cpu;
+	vd_fb_info = info;
+
+	strscpy(info->fix.id, "hi3798vd", sizeof(info->fix.id));
+	info->fix.type		= FB_TYPE_PACKED_PIXELS;
+	info->fix.visual	= FB_VISUAL_TRUECOLOR;
+	info->fix.accel		= FB_ACCEL_NONE;
+	info->fix.smem_start	= (unsigned long)vd_geom_phys;
+	info->fix.smem_len	= (u32)vd_geom_bytes;
+	info->fix.line_length	= vd_geom_stride;
+
+	info->var.xres		= vd_geom_width;
+	info->var.yres		= vd_geom_height;
+	info->var.xres_virtual	= vd_geom_width;
+	info->var.yres_virtual	= vd_geom_height;
+	info->var.bits_per_pixel = 32;
+	/* a8r8g8b8, matching the handoff format and SIMPLEFB_FORMATS. */
+	info->var.red		= (struct fb_bitfield){16, 8, 0};
+	info->var.green		= (struct fb_bitfield){ 8, 8, 0};
+	info->var.blue		= (struct fb_bitfield){ 0, 8, 0};
+	info->var.transp	= (struct fb_bitfield){24, 8, 0};
+	info->var.height	= -1;
+	info->var.width		= -1;
+	info->var.activate	= FB_ACTIVATE_NOW;
+	info->var.vmode		= FB_VMODE_NONINTERLACED;
+
+	info->fbops		= &vd_fb_ops;
+	info->flags		= FBINFO_DEFAULT | FBINFO_VIRTFB |
+				  FBINFO_READS_FAST;
+	info->pseudo_palette	= vd_pseudo_palette;
+	info->screen_base	= (char __iomem *)cpu;
+
+	ret = register_framebuffer(info);
+	if (ret < 0) {
+		/* Deliberately do NOT free info / unmap here: do_register_framebuffer
+		 * may already have set refcount=1 and inserted it into
+		 * registered_fb[], so framebuffer_release() would WARN and a
+		 * memunmap() could yank a still-referenced screen_base. A one-time
+		 * leak on this near-unreachable path is harmless for a built-in. */
+		pr_err("hi3798-vd: register_framebuffer failed: %d "
+		       "(reboot with native_tty=0 to fall back)\n", ret);
+		return ret;
+	}
+
+	pr_info("hi3798-vd: NATIVE fbdev fb%d registered %ux%u@0x%08llx "
+		"pitch=%uB -- fbcon/VT should now own console=tty0\n",
+		info->node, vd_geom_width, vd_geom_height,
+		(unsigned long long)vd_geom_phys, vd_geom_stride);
+	return 0;
+}
+device_initcall(hi3798_native_fb_init);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hi3798MV100 vendor VO/HDMI framebuffer backport skeleton");

@@ -117,6 +117,23 @@
   `VFS: Cannot open root device` + 分区列表（有 = 贴出分区列表）；③ 路由器有没有
   新 IP / SSH；④ 日志里还有没有 rtlwifi 固件报错（应消失）、有无 `wlan0`。
 
+### 「原生 TTY」实验版（用户要求，2026-11-14 夜间，与上一版并存/可选）
+
+用户觉得自绘 console「手动画字怪怪的」，要求做一版走内核标准链路的 TTY。
+新增 `native_tty` 模块参数（默认 **1**）：
+- `native_tty=1`：**标准 fbdev 路径** —— 用 `framebuffer_alloc + register_framebuffer`
+  注册 `fb_info`，`console=tty0` 交给内核 `fbcon`/VT 渲染；`screen_base` 用已验证的
+  `MEMREMAP_WB` 映射，`fbops` 包装 `cfb_*` 并 clean cache；不走 simplefb
+  （它对 System RAM 用 `ioremap_wc` + aperture，是原生 fbcon 一直绑不上的嫌疑）。
+  注册在 `device_initcall`，`fbcon=map:0` 保证 `do_fbcon_takeover` 触发。
+- `native_tty=0`：完全回退到已验证的自绘 console（simplefb pdev + 绿带 + 日志回放）。
+
+**这一版回报重点（原生）**：① 开机文字是否是**内核标准 TTY 字体/排版**（而非
+自绘 8x16 小字）、绿带是否还是那一条；② `hi3798-vd: NATIVE fbdev fbN registered`
+是否出现（fbdev 注册成功）、有没有 `fbcon: ...` 接管日志；③ 若黑屏无字，
+说明 fbcon 没接管 —— 回报后我按 `native_tty=0` 或查 `register_framebuffer` 返回值处理；
+④ 同样看 `root=/dev/...` 后是否进 userspace / 路由器新 IP。
+
 ## 0. 静态侧已排除的嫌疑（不用再查，节省时间）
 
 - 内核源 = 6.3.0-rc5 主线（`third_party/linux-hi3798mv100`，Makefile VERSION=6/PATCHLEVEL=3，
@@ -124,9 +141,10 @@
 - uImage magic/CRC 自洽，`load=entry=0x02000000` 与 hiboot
   `bootcmd=mmc read 0 0x1FFFFC0 0x7000 0xA000; bootm 0x1FFFFC0` 对得上（0x1FFFFC0 + 0x40 header）。
 - appended DTB 位于 payload 末尾、`totalsize` 合法；`/chosen/bootargs` 全项齐：
-  `mem=1G`、`root=mmcblk0p8`、`console=tty0 console=ttyAMA0,115200`、
-  `fbcon=map:0`、`blkdevparts`（8 分区）、`clk_ignore_unused`；`/memory@0 reg=<0x0 0x40000000>`
-  与 `mem=1G` 一致。
+  `mem=1G`、`root=/dev/mmcblk0p8`（第 3 轮修复后带 `/dev/`，见上）、`rootdelay=5`
+  （原 `rootwait` 因 `name_to_dev_t` 解析失败会静默死等，已换）、
+  `console=tty0 console=ttyAMA0,115200`、`fbcon=map:0`、`blkdevparts`（8 分区）、
+  `clk_ignore_unused`；`/memory@0 reg=<0x0 0x40000000>` 与 `mem=1G` 一致。
 - `CONFIG_ARM_APPENDED_DTB=y` + `CONFIG_ARM_ATAG_DTB_COMPAT=y`（defconfig 自带，兼容 hiboot ATAG）。
 - TTY 链配置齐：`CONFIG_VT/FRAMEBUFFER_CONSOLE/FONT_8x16/FB_SIMPLE=y` + `console=tty0` + `fbcon=map:0`。
 - 网络链配置齐：`CONFIG_HISI_FEMAC/MDIO_HISI_FEMAC/PHYLIB=y` + rootfs `eth0` DHCP/systemd-networkd。

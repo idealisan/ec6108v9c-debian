@@ -5,6 +5,23 @@
 > 网卡保持主线 hisi_femac，不在本目录范围。
 
 ## 状态（诚实）
+- **新增「原生 TTY」路径（2026-11-14 夜间，用户要求）**：自绘 console 是手搓 8x16 字形
+  画到显存的权宜之计，用户觉得「怪怪的」。这一版补上内核标准链路：
+  - `native_tty=1`（默认）：**不注册自绘 console、不注册 simplefb pdev**，改在
+    `device_initcall` 用 `framebuffer_alloc + register_framebuffer` 注册标准 `fb_info`，
+    由内核自带 `fbcon`/VT/`console=tty0` 渲染启动日志（真正的原生 TTY）。
+  - `screen_base` 复用已真机验证的 `MEMREMAP_WB` 持久映射；`fbops` 包装内核
+    `cfb_fillrect/copyarea/imageblit` 并按触及行 `__cpuc_flush_dcache_area` 清 cache，
+    让 VO DMA 扫到 fbcon 的输出。
+  - **不走 simplefb**：`simplefb_probe()` 用 `ioremap_wc()` 映射这块 System-RAM 显存
+    （cache 属性别名）且走 `devm_aperture_acquire()` 对未保留 RAM 区，是原生 fbcon
+    之前一直绑不上的高度可疑原因。
+  - 注册时机 `device_initcall`(6) 晚于 `fbmem_init`/`fb_console_init`(subsys,4)，
+    `fbcon_fb_registered→do_fbcon_takeover` 立即触发；`fbcon=map:0` 令
+    `con2fb_map_boot[*]=fb0`+`map_override=1`，绕过 ARM `fb_is_primary_device()=0`。
+  - `native_tty=0` 一键回退到已真机验证的自绘 console（simplefb pdev + 绿带 + 日志回放），
+    零回归。绿带 L0 判据两模式都保留。**静态已查穿、编译由 CI 验证；真机原生
+    fbcon 是否接管仍需刷一次确认**。
 - **真机 L0 已确认（2026-11-14）：刷 vendor-backport 包后，重启在 Debian Linux logo
   之上出现一大片绿色横条 = 本驱动 `vd_paint_boot_marker` 在 `subsys_initcall` 画的。
   这一次性坐实三件事**：(1) 主线 6.3 内核**确实启动了**并跑到显示驱动 initcall
