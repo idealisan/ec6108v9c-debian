@@ -93,8 +93,19 @@
 #define VO_REG_BASE    0xf8cc0000UL
 #define VO_REG_SIZE    0xfff0
 #define VO_G0_ADDR     0x6010
+#define VO_G0_NADDR    0x6018
 #define VO_G0_STRIDE   0x601c
 #define VO_G0_IRESO    0x6020
+
+/* SDK drv_hifb_hal.c:39 "STRIDE_ALIGN 16"; :616 reads the G0_STRIDE
+ * register as (surface_stride * STRIDE_ALIGN) bytes.  The register stores
+ * the scanline pitch in units of 16 bytes, NOT bytes.  Using the raw value
+ * as a byte stride (an earlier bug) shears the whole text area ~45deg. */
+#define STRIDE_ALIGN   16
+
+/* A plausible 32bpp byte-pitch: 320..4096 px/line, 4-byte aligned.
+ * Used to tell the two G0_STRIDE encodings apart without guessing width. */
+#define VD_PITCH_SANE(p)  ((p) >= 320u * 4 && (p) <= 4096u * 4 && !((p) & 3))
 
 #define PHY_BASE       0xf8ce1800UL
 #define PHY_SIZE       0x100
@@ -161,11 +172,20 @@ module_param_named(boot_console, vd_boot_console, bool, 0444);
 MODULE_PARM_DESC(boot_console,
 	"Draw the kernel boot log on the HDMI framebuffer (default on).");
 
+/* Optional cmdline override if the VO G0_STRIDE decode is ever wrong on a
+ * given hiboot build: hi3798mv100_vendor_display.con_stride=<bytes>.
+ * 0 (default) = derive the scan pitch from the hardware register. */
+static u32 vd_con_force_stride;
+module_param_named(con_stride, vd_con_force_stride, uint, 0444);
+MODULE_PARM_DESC(con_stride,
+	"Force console scanline stride in bytes (0 = derive from VO G0_STRIDE).");
+
 static void __iomem *vo_base;
 static struct platform_device *vd_simplefb_pdev;
 
-/* Self-drawn console state. vd_con_fb is a PERSISTENT cached mapping of the
- * hiboot framebuffer, made once in init: console->write must not sleep. */
+/* Self-drawn console state. vd_con_fb is a PERSISTENT mapping of the
+ * hiboot framebuffer, made once in init: console->write must not sleep.
+ * Kept MEMREMAP_WB on purpose -- see the note in vd_con_setup(). */
 static u32 *vd_con_fb;         /* cpu address of pixel (0,0) */
 static u32  vd_con_stride;     /* bytes per scanline */
 static u32  vd_con_w, vd_con_h;/* visible pixels */
@@ -363,7 +383,7 @@ static struct console vd_console = {
 };
 
 /*
- * Establish a persistent cached mapping of the hiboot framebuffer and
+ * Establish a persistent mapping of the hiboot framebuffer and
  * register the self-drawn console. CON_PRINTBUFFER makes the kernel replay
  * the entire boot log at registration time; every later printk is drawn as
  * it happens. Fails harmlessly (green band / simplefb path unaffected).
@@ -395,6 +415,15 @@ static void vd_con_setup(phys_addr_t fb_phys, u32 width, u32 height, u32 stride)
 		map_bytes = max_bytes;
 		height = map_bytes / stride;
 	}
+	/* MUST use MEMREMAP_WB, not WC/WT: this framebuffer sits inside the
+	 * kernel's System RAM (mem=1G, no reserved-memory/no-map region), so
+	 * region_intersects() reports REGION_INTERSECTS and memremap() refuses
+	 * every non-WB flag with WARN_ONCE + NULL (kernel/iomem.c:106). Switching
+	 * to WC here would silently kill the whole console AND the green L0 band.
+	 * The real-HW "noise eating the picture" is a separate issue: the hiboot
+	 * logo buffer is not reserved from the kernel's page allocator, so pages
+	 * get recycled under it over time. That needs a DTB reserved-memory fix,
+	 * not a mapping-type change (see docs/053). */
 	cpu = memremap(fb_phys, map_bytes, MEMREMAP_WB);
 	if (!cpu) {
 		pr_warn("hi3798-vd: cannot persist-map framebuffer, skip boot console\n");
@@ -403,10 +432,12 @@ static void vd_con_setup(phys_addr_t fb_phys, u32 width, u32 height, u32 stride)
 
 	vd_con_fb = (u32 *)cpu;
 	vd_con_stride = stride;
-	vd_con_w = width;
+	/* Visible pixels-per-line derived from the REAL scan pitch, not a
+	 * guessed width, so clear_row/putc_at never cross a hardware row. */
+	vd_con_w = stride / 4;
 	vd_con_h = height;
 	vd_con_font = f;
-	vd_con_cols = width / CON_GLYPH_W;
+	vd_con_cols = vd_con_w / CON_GLYPH_W;
 	if (height > BOOT_MARK_LINES)
 		vd_con_rows = (height - BOOT_MARK_LINES) / CON_GLYPH_H;
 	else
@@ -430,7 +461,7 @@ static int __init hi3798_vendor_display_init(void)
 	struct simplefb_platform_data pdata;
 	struct resource res;
 	phys_addr_t fb_phys;
-	u32 addr, stride, ireso;
+	u32 addr, stride_raw, stride, ireso;
 	u32 width = FB_WIDTH, height = FB_HEIGHT;
 	int ret;
 
@@ -448,12 +479,22 @@ static int __init hi3798_vendor_display_init(void)
 		return -ENOMEM;
 	}
 
-	/* Layer 0 registers as programmed by hiboot (FINDINGS.md §D offsets). */
-	addr   = vd_read_vo(VO_G0_ADDR);
-	stride = vd_read_vo(VO_G0_STRIDE) & 0xffff;
-	ireso  = vd_read_vo(VO_G0_IRESO);
-	pr_info("hi3798-vd: VO layer0: addr=0x%08x stride=%u ireso=0x%08x\n",
-		addr, stride, ireso);
+	/* Layer 0 registers as programmed by hiboot (FINDINGS.md §D offsets).
+	 * G0_STRIDE holds surface_stride in units of STRIDE_ALIGN(16) bytes:
+	 * SDK drv_hifb_hal.c:39 "STRIDE_ALIGN 16", :616 "GetLayerStride =
+	 * surface_stride * STRIDE_ALIGN". VO scans stride_raw*16 bytes per
+	 * line. Our framebuffer writes MUST use that exact pitch, otherwise
+	 * every text row is sheared relative to the previous one -- the
+	 * "45-degree tilted picture" seen on real HW. The old code used the
+	 * raw register value as a byte pitch (16x too small) and then guessed
+	 * width*4 from ireso; both are wrong. */
+	addr       = vd_read_vo(VO_G0_ADDR);
+	stride_raw = vd_read_vo(VO_G0_STRIDE) & 0xffff;
+	ireso      = vd_read_vo(VO_G0_IRESO);
+	pr_info("hi3798-vd: VO layer0: addr=0x%08x stride_raw=%u -> pitch=%uB "
+		"ireso=0x%08x naddr=0x%08x\n",
+		addr, stride_raw, stride_raw * STRIDE_ALIGN, ireso,
+		vd_read_vo(VO_G0_NADDR));
 
 	if (!vd_valid_fb_addr(addr)) {
 		/* No hard-coded fb_base: the hand-off address is [未知] across
@@ -475,14 +516,41 @@ static int __init hi3798_vendor_display_init(void)
 			height = h;
 		}
 	}
-	pdata.stride = (stride >= width * 4 && stride <= width * 8)
-			? stride : width * 4;
+	/* Recover the VO hardware scan pitch (BYTES per display row). SDK
+	 * drv_hifb_hal.c:39/:616 encodes it as surface_stride = pitch/16, so
+	 * pitch = stride_raw * 16. A few hiboot builds instead store the byte
+	 * pitch verbatim; accept that value too if it is sane. NEVER derive the
+	 * pitch from a guessed pixel width (the old width*4 heuristic): that is
+	 * exactly what sheared the text -- our row advance (vd_con_stride/4)
+	 * differed from VO's true scan advance, so each text line drifted
+	 * sideways into a 45-degree tilted picture. The green boot band looked
+	 * fine only because it is a single linear fill, not row-addressed. */
+	{
+		u32 pitch_x16 = stride_raw * STRIDE_ALIGN;
+
+		if (vd_con_force_stride)             /* cmdline escape hatch */
+			stride = vd_con_force_stride;
+		else if (VD_PITCH_SANE(pitch_x16))
+			stride = pitch_x16;              /* normal: register = pitch/16 */
+		else if (VD_PITCH_SANE(stride_raw))
+			stride = stride_raw;             /* some builds: byte pitch */
+		else
+			stride = width * 4;              /* last resort, still self-consistent */
+	}
+	/* Width is ALWAYS derived from the chosen byte pitch so putc_at /
+	 * clear_row / scroll / simplefb all agree on the row stride. */
+	width = stride / 4;
+	pr_info("hi3798-vd: framebuffer geometry: %ux%u pitch=%uB "
+		"(%u px/line), bpp=32, raw=%u, force=%u\n",
+		width, height, stride, stride / 4, stride_raw, vd_con_force_stride);
+	pdata.stride = stride;
 	fb_phys = (phys_addr_t)addr;
 
 	/*
 	 * Set up the persistent framebuffer mapping + self-drawn console FIRST,
-	 * so the green band and the boot-log replay share one cached mapping.
-	 * vd_con_setup() does the memremap; vd_paint_boot_marker() only draws.
+	 * so the green band and the boot-log replay share one mapping and the
+	 * SAME hardware-derived pitch. vd_con_setup() does the memremap;
+	 * vd_paint_boot_marker() only draws.
 	 */
 	vd_con_setup(fb_phys, width, height, pdata.stride);
 
@@ -492,7 +560,10 @@ static int __init hi3798_vendor_display_init(void)
 	pr_info("hi3798-vd: BOOT MARKER (green) at 0x%08llx -- kernel alive\n",
 		(unsigned long long)fb_phys);
 
-	pdata.width = width;
+	/* Keep simplefb's geometry self-consistent with the hardware scan pitch
+	 * (width*4 == stride), so a late-bound fbcon cannot disagree with our
+	 * self-drawn console's row layout. */
+	pdata.width = stride / 4;
 	pdata.height = height;
 	pdata.format = FB_FORMAT;
 

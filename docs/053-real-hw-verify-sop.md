@@ -25,6 +25,43 @@
 - **下一版回报重点**：绿带下方是否有文字？屏幕最后几行写的是什么？（能直接定位
   `rootwait` / 某 initcall panic / MMC probe defer / 到没到 userspace）。L2 仍看路由器新 IP。
 
+### 真机第 2 轮（2026-11-14，刷含自绘 console 的包 `build-20261114T060735Z`）
+
+- **L1 文字确实出现了**（自绘 console 成功，`CON_PRINTBUFFER` 回放生效）——这是拿日志
+  通道被打通的里程碑。但暴露两个**显示层 bug**（非启动 bug）：
+  1. **整个画面 45° 像素级斜切**，文字像斜体/斜切一样难认。根因已定位：写入显存的
+     行步长 ≠ VO 硬件扫描行步长。`G0_STRIDE` 寄存器存的是 `pitch/16`（SDK
+     `drv_hifb_hal.c:39 STRIDE_ALIGN 16`、`:616 GetLayerStride=surface_stride*16`），旧
+     驱动却把寄存器原值当字节 pitch、又用 `width*4` 猜，行寻址每行相对上一行横移 →
+     斜切。绿带看着正常只因它是**线性连续填充**（不按行寻址），恰好掩盖了此 bug。
+  2. **像素随时间被噪点慢慢侵蚀**：最可能是**交接显存页没从内核页分配器保留**
+     （docs/053 §6 早已预判）——主线 DTB `/memory@0` 覆盖全 1GB、只有
+     `ramoops@0x30000000` 是 no-map，hiboot logo buffer 落在高端可用 RAM 里，内核
+     buddy 随运行逐渐把这些页分配/写脏 → 画面被噪点「侵蚀」。另一候选：VO 双缓冲
+     （`G0_NADDR` 未写第二帧）翻页露出旧帧。**已排除**「WB cache 一致性」：静默卡住
+     时无 CPU 写显存、且 `memremap()` 对 System RAM 拒绝任何非 WB flag
+     （`kernel/iomem.c:106` 返回 NULL），改 WC 反而会连绿带都画不出（已撤销）。
+- **卡点定位（重要）**：屏幕停在 `random: crng init done`，之后等了约 700 秒都无新
+  日志，直到拔 U 盘才出现 `usb disconnect`。这说明**内核没死**——中断、printk、
+  console 全活着；是**静默卡死**在 `crng init done` 之后。`crng init done` 是
+  `random_init()`(`start_kernel:1060`) 阶段、CRNG 熵池就绪的标志，属内核极早期、
+  **远早于** initcalls / 挂载 rootfs / 起 systemd / 网络。头号嫌疑：`rootwait` 无限等
+  `mmcblk0p8`、或某 initcall 自旋、或 MMC probe defer。
+- **本轮修复（均在 vendor 驱动一个文件内，零引导链/DTB/cmdline 改动）**：
+  - **主修 45° 斜切**：写入行步长严格 = VO 硬件扫描行步长（`G0_STRIDE*16`，
+    SDK `drv_hifb_hal.c:39/:616` 依据；两编码自适应 + `con_stride` cmdline 逃生舱），
+    `width=stride/4` 让 putc/scroll/clear/simplefb 全部按同一 pitch 行寻址 → 消除斜切。
+    旧代码把寄存器原值（=pitch/16）当字节用、又用 `width*4` 猜，是斜切根因。
+  - **侵蚀本轮不动 DTB**（避免破坏已能引导的状态），改为**加诊断、等真机数值**：
+    `pr_info` 打印 `addr` / `stride_raw` / 换算 pitch / `ireso` / `naddr` / 几何 / force，
+    随开机日志回放显示在屏幕上。下一版据此二选一精确修：
+    - 若 `naddr` 与 `addr` 相差一帧 → 双缓冲，需把绿带+文字也写进第二帧；
+    - 否则 → 显存页复用，在 DTB 加 `reserved-memory/no-map` 把这段高端 RAM 从
+      `mem=1G` 里挖出来（地址由本次 `addr` 真值确定，不写死猜地址）。
+  - 保持 `MEMREMAP_WB`（System RAM 只能用 WB，见上）；绿带 L0 与 console 不受影响。
+  - 若下次仍斜，回报屏幕 `VO layer0: ... stride_raw=... pitch=...` 数值，或用
+    `hi3798mv100_vendor_display.con_stride=<bytes>` 直接指定，无需重编译。
+
 ## 0. 静态侧已排除的嫌疑（不用再查，节省时间）
 
 - 内核源 = 6.3.0-rc5 主线（`third_party/linux-hi3798mv100`，Makefile VERSION=6/PATCHLEVEL=3，
