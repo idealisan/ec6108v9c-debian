@@ -8,9 +8,9 @@ on:
         type: boolean
         default: false
       display_driver:
-        description: 'Display driver scheme (docs/052): simplefb = legacy mainline handoff (default); vendor-backport = 6.3 mainline kernel + backported HiSilicon VO/HDMI/hifb private stack (user wants mainline kernel features, not necessarily mainline drivers).'
+        description: 'Display driver scheme (docs/052): vendor-backport = 6.3 mainline kernel + backported HiSilicon VO/HDMI/hifb private stack (the package actually flashed to real HW); simplefb = legacy mainline handoff (kept only as a fallback/reference, its push-default build was removed as useless).'
         type: choice
-        default: 'simplefb'
+        default: 'vendor-backport'
         options:
           - 'simplefb'
           - 'vendor-backport'
@@ -42,15 +42,13 @@ on:
         description: 'extra kernel params appended to /chosen/bootargs'
         type: string
         default: ''
-  push:
-    branches: [main]
-    paths:
-      - 'scripts/**'
-      - 'configs/**'
-      - 'patches/**'
-      - 'firmware/**'
-      - 'rootfs/**'
-      - '.github/workflows/build-release.yml'
+  # NOTE: `on: push` was REMOVED on purpose. A push-triggered build always
+  # used the default simplefb path, whose package is never the one flashed to
+  # real HW (that is the vendor-backport build). It only burned ~30 min of CI
+  # and occupied the single concurrency slot, delaying the useful build.
+  # Builds are now started EXPLICITLY, e.g.:
+  #   gh workflow run build-release.yml --ref main -f display_driver=vendor-backport
+  # Pushing code no longer starts any workflow.
 
 permissions:
   contents: write
