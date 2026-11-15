@@ -341,6 +341,36 @@ locale 数据文件**，因此不受 shrink 影响、也不需要 `locale-gen`�
 > 注：之前判断"NTFS 不用升级内核"依然成立；本节的"中文显示"完全是 userspace
 > locale 配置问题，与内核文件系统/编码支持无关，两件事不要混为一谈。
 
+## 6.3 CI 构建失败记录：`mke2fs -d` 镜像装不下 rootfs（已修）
+
+run `43675288224` 的 `package` job 失败（kernel/rootfs/qemu 均通过）：
+
+```
+__populate_fs: Could not allocate block in ext2 filesystem while writing
+               file "base-passwd.templates"
+mke2fs: Could not allocate block in ext2 filesystem while populating file system
+```
+
+**根因**：`make-community-flash-package.sh` 把 ext4 镜像尺寸写死为
+`IMG_SIZE_MB=384`（当初 payload ~240 MiB 够用）。§5.2 往 PACKAGES 加了
+`iw rfkill dnsutils netcat-openbsd` 等基础工具后，CI 日志显示
+`payload now: 287M`，`mke2fs -d` 还要额外装 inode/journal/保留块，384 MiB
+被撑爆。**不是磁盘满、不是权限、也不是 rootfs 内容坏了。**
+
+**修复**（已落地）：改为按实际 payload 动态计算，不再写死：
+- 取 `du -sm "$WORK/root"`，给 50% 余量，向上取整到 32 MiB 边界
+- 下限 384 MiB；上限 480 MiB（约束：p8 从 98 MiB 起，社区 p9 从 610 MiB 起，
+  98 + IMG 必须留在这之下，刷机失败仍能回社区系统）
+- 超过 480 直接 fail 并提示"精简 rootfs 或显式调整上限"，不静默产出坏包
+- 仍支持 `IMG_SIZE_MB` 环境变量显式覆盖
+
+验证：`287M -> 448M`（98+448=546 < 610）；`bash -n` 通过。
+recovery 包复用同一 sparse 文件，其 manifest 里 p8 为 `S` 类型（bytes 忽略），
+不受尺寸变化影响。
+
+> 这个 run 触发于 locale 修复推送之前，因此其产物不含 §6.2 的 locale 修复。
+> 修复镜像尺寸后基于最新 HEAD 重新触发的 release 才包含全部修复。
+
 ### 6.2 已启用的文件系统/存储能力（config fragment 实测）
 
 | 类别 | 已启用 |
