@@ -950,11 +950,14 @@ input HAL 格式，不是 Linux rc keymap），要用 `ir-keytable -t` 逐键录
 **"能不能不装 Docker"**（用户本轮提问，见回答部分）：CasaOS 主体是 Go 二进制 +
 systemd 服务（gateway 提供 WebUI，user-service/local-storage/message-bus 提供后端），
 这些**本身不依赖 Docker**；强依赖 Docker 的是 `app-management`（应用商店/一键装 App）
-与部分存储特性。因此"只跑核心 WebUI 体验"理论上可以手工解压 arm-7 各组件、
-跳过 `app-management` 与 Docker，但官方一键脚本不支持这种裁剪，属于非官方玩法。
-且 Docker 会覆盖 `docker.service.d/override.conf`、起 Samba/udevil、创建可写
-`/DATA` —— 在一个还在调试的基线上属于较重的改动。本轮**只调研、未安装**（脚本
-仅下载到 `TMP/casaos/install.sh` 审阅）。
+与部分存储特性。用户后续明确"这台是测试系统，搞乱无所谓，装上 CasaOS + Docker 试一下"，
+因此本轮**实际安装完成**，详见 §13。
+
+> 说明：官方一键脚本在 armv7 精简 Debian 上坑太多（`Check_Docker_Install` 强制走
+> `get.docker.com`，而 32 位 armhf 已无 Docker CE 包；`mergerfs`/`udevil`/`samba`
+> 依赖；`Check_Disk` 的 `select ... < /dev/tty` 交互；`ipconfig.io` 地区判断；
+> 到处 `set -e; exit 1`）。按用户建议"根据它脚本的过程手动/改造安装"，最终采用
+> **预下组件 + 手动精简安装**，见 §13.2。
 
 ### 12.6 网络代理加速与一次"卡死"
 
@@ -981,3 +984,83 @@ systemd 服务（gateway 提供 WebUI，user-service/local-storage/message-bus �
 本地校验：`bash -n`、config fragment 逐行解析（121 个 `=y` / 3 个 `=m` / 4 个 `=n`，
 无异常行）、隐私复核通过。**产物以 CI 为准**，出包后需真机刷入验证
 `/dev/dri` 与 `/sys/class/rc/rc0`。
+
+---
+
+## 13. 出包验证与 CasaOS/Docker 实际安装（本轮收尾）
+
+### 13.1 CI release `build-20261115T094258Z` 与制品校验
+
+`3cc2920`（GPU/红外 config + rootfs 工具 + 报告）推送后显式触发
+`build-release.yml`（vendor-backport），CI run `43698231848` 全绿
+（`WATCH_EXIT=0`：kernel 28m35s / rootfs 8m12s / qemu 1m46s / package 1m11s）。
+
+制品 `mv100-mdmo1g-mainline-recovery-flash-20261115T094258Z.zip`（136.9 MB）
+已下载到项目内 `TMP/ci-download/` 并校验：
+
+| 校验项 | 结果 |
+|---|---|
+| 包内 10 个文件 SHA256 | 10/10 OK |
+| zip 自身 SHA256 | 匹配 SHA256SUMS.txt |
+| 内核 DTB `/chosen/bootargs` | `root=/dev/mmcblk0p8 ... rootwait rootwait_timeout=30 ... fbcon=map:0 mem=1G` 正确 |
+| `hi_kernel.bin` 大小 vs manifest | `0x71cc00` 一致（比上一版大，含 lima/IR 驱动） |
+| p1 fastboot | 未写入 ✓ |
+| sparse rootfs | 480 MiB / 33 chunks |
+| rootfs 用户态 | `libdrm`/`ir-ctl` 在，`C.UTF-8`、登录界面 IP 等上几轮修复未回退 |
+
+**GPU/红外确实编进内核**（`extract-ikconfig` 在 macOS 上失败，改用最硬的证据 ——
+CI 编译日志）：
+```
+CC drivers/gpu/drm/lima/lima_drv.o ... lima_devfreq.o
+AR drivers/gpu/drm/lima/built-in.a          <- =y 内建
+CC drivers/gpu/drm/drm_gem_shmem_helper.o
+CC drivers/media/rc/ir-hix5hd2.o            <- 红外驱动
+```
+即 config fragment 未被 `olddefconfig` 静默丢弃。真机刷入后验证
+`ls /dev/dri`、`dmesg | grep lima`、`/sys/class/rc/rc0`（待用户刷机）。
+
+### 13.2 CasaOS + Docker 手动精简安装（完成，WebUI 可访问）
+
+用户授权："这台是测试系统，搞乱无所谓，装上 CasaOS 试一下，也装上 docker"。
+**未跑官方 `install.sh`**（原因见 §12.5 末尾），按脚本过程手动完成：
+
+**Docker**（§13.2.1）：走 SSH `-R` 代理装 Debian bookworm armhf 源的
+`docker.io 20.10.24+dfsg1`（连带 containerd/iptables/runc 等），
+`systemctl enable/start docker`，`docker version` = `20.10.24+dfsg1`、`active`。
+避开 `get.docker.com` 对 32 位 armhf 不发包的问题。
+
+**CasaOS**（§13.2.2）手动步骤（`TMP/casaos/manual-install.sh`）：
+1. 本机下载官方 release v0.4.15 的 9 个组件（`linux-arm-7` 各服务 +
+   `linux-all` UI/AppStore），本机解压合并成统一 `build/sysroot/`
+   （8 个 Go 二进制、7 个 systemd unit、UI `www/`、AppStore、7 个
+   `*.conf.sample`），打包 `casaos-sysroot.tar.gz`（67 MB）传到真机；
+2. 纯覆盖复制 `cp -a sysroot/. /`（**不删除任何现有文件**）；
+3. 由 `.conf.sample` 生成各 `*.conf`；`gateway.ini` 填 `port=80`；
+4. 建运行时目录 `/var/run/casaos`、`/var/log/casaos`、`/var/lib/casaos/*`；
+5. `systemctl daemon-reload` + 按依赖顺序 `enable/start` 7 个服务；
+6. 装 rclone（见下）+ 基础依赖走代理。
+
+**踩坑与修复**：CasaOS 的 `rclone.service` 用 `--rc-addr unix:///var/run/rclone/rclone.sock`，
+Debian 的 `rclone 1.60.1-DEV` 不支持 `unix://`（报 `listen tcp: ... unknown port`），
+导致每 10 秒重启、白耗 CPU。按官方脚本 `Install_rclone_from_source` 的意图，下载
+**rclone v1.61.1 linux-arm-v7** 官方二进制覆盖 `/usr/bin/rclone` 后，
+`rclone.sock` 正常生成、服务 active。
+
+**最终态**（真机实测）：
+
+| 项 | 结果 |
+|---|---|
+| 7 个 CasaOS 服务 | 全部 `active`（gateway / message-bus / user-service / rclone / casaos / local-storage / app-management） |
+| docker | `active`，`Server=20.10.24+dfsg1` |
+| `casaos -v` | `v0.4.15` |
+| 80 端口 | `*:80 LISTEN`（casaos-gateway） |
+| WebUI | 盒子内 `127.0.0.1` 与**从开发机 `http://<BOX_LAN_IP>/` 均返回 200**（首页 1165 B） |
+| systemd | `running`，**0 个 failed unit** |
+
+> 一次"从开发机访问返回 000"是开发机 curl 走了本机代理的假象，
+> `--noproxy '*'` 后 200，与盒子无关。
+> 期间 load 曾到 2~3.8（rclone 反复重启 + 多服务启动），修复 rclone 后回落。
+
+**注意**：CasaOS / Docker / FFmpeg / 测试片均为**在线安装**在测试机上，重刷
+（含刷 §13.1 的新包）后会全部消失；这些是体验性改动，未固化进 rootfs。
+`TMP/casaos/` 里保留了各组件包、合并的 sysroot 与安装脚本，便于复现或清理时参考。
