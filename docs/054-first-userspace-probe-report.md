@@ -444,6 +444,59 @@ H.265/HEVC 软解基本不现实。GPU 侧 `lima` 可考虑启用（OpenGL ES 2.
 保持现状即可；若后续确实需要硬解，只能走 vendor 私有多媒体栈（工作量远大于
 本轮主线方案），不应期待靠升级内核版本自动获得。
 
+### 7.1 第二轮复测 +「用原厂安卓私有驱动/固件」可行性（用户建议）
+
+第二轮真机（§11 同期）复测确认 §7 结论不变：无 `/dev/dri`、无
+`/dev/video*`/`/dev/media*`、平台设备只有 `f9200000.gpu`、模块只有
+`drm` + `drm_panel_orientation_quirks`、dmesg 无 `mali`/`vpu`/`vdec`/`venc`；
+用户态无 `ffmpeg`/`gstreamer`/`mesa` 任何工具。CPU 为 4× ARMv7（NEON、VFPv4，
+BogoMIPS 1959.93），1080p H.264 软解勉强、H.265 不现实 —— 与用户"解码估计也就
+H264、H265 很难"的判断一致。
+
+**主线 GPU 其实有一条现成的路（不需要原厂私有驱动）**：
+
+| 项 | 状态 |
+|---|---|
+| 主线 6.3 `drivers/gpu/drm/lima/`（Mali-4xx UTgard 开源驱动） | **源码存在** |
+| DTS `gpu@9200000` | 存在，`compatible="arm,mali-450","arm,mali-utgard"`、8 个中断带 `interrupt-names`、`clocks=<&crg HISTB_GPU_BUS_CLK/GP_CLK>`、`resets=<&crg 0xd4 4>`、`mali-supply`、8 档 OPP(150~500 MHz)；但 **`status="disabled"`** |
+| config fragment | 只有 `CONFIG_FRAMEBUFFER_CONSOLE*`，**没有任何 DRM/LIMA/MEDIA 项** |
+
+即驱动与硬件描述都齐，只差 ① DTS `status="okay"` ② 启用 `CONFIG_DRM` +
+`CONFIG_DRM_LIMA`（及 CMA/DMA_CMA 依赖）③ 确认 crg clock/reset 驱动能提供 GPU
+时钟 ④ 用户态 Mesa `lima_dri.so` + libdrm。一轮 CI 可验证，但 lima 只给
+OpenGL ES 2.0 级 3D，**不提供视频硬解**。
+
+**用户建议：利用原厂安卓私有驱动/固件/配置** —— 素材确实在（本地
+`TMP/stock-rom-research/extracted/p15fs/` 与 `p15_filelist.txt`）：
+
+| 类别 | 原厂 Android 里的私有组件 |
+|---|---|
+| GPU 用户态 | `/lib/egl/libGLES_mali.so`(1,087,560 B)、`libEGL.so`、`libGLESv1_CM/v2.so`、`egl.cfg` |
+| 编解码 OMX HAL | `libOMX.hisi.video.decoder.so`、`.encoder.so`、`libOMX_Core.so`、`libHV.VIDEO.FFMPEG_VDEC.decode.so` |
+| HiSilicon 中间件 | `libhi_msp.so`(870 KB)、`libhi_common.so`、`libhi_vp.so`、`libhi_gfx2d.so`、`sample_venc` 等 |
+| 内核侧接口 | `/dev/mali*`、`/dev/mmz_userdev`、`/proc/msp/*`、`mmz=ddr,0,0,400M` |
+
+但**不能直接搬到 Debian + 主线 6.3**：
+1. 用户态库是 Android **bionic** + gralloc/hwcomposer/ashmem/binder 依赖，
+   glibc 系统上跑不起来；OMX 也没有对应的 V4L2/VA-API 适配层。
+2. 内核侧 GPU/VDEC/VENC 是**内建进 vendor 3.x/4.4 内核**的（原厂解包出的 `.ko`
+   只有 USB/WiFi/NTFS 之类，没有 mali/vdec），与 6.3 的 DRM/V4L2/设备模型 ABI
+   不兼容，无法直接加载。
+3. 还依赖私有 `hi_mmz`（Media Memory Zone）—— 正是 §4.3 里用主线
+   `reserved-memory` 替代掉的那个内存管理机制，主线没有 `hi_mmz` 驱动。
+
+**结论**：原厂私有栈作为**参考实现 / 寄存器初始化序列 / 固件**有价值（与之前
+显示驱动 RE 同理，可反编译提取），但作为"直接复用的驱动"不可行。真正要硬解
+只能把 vendor 多媒体子系统整体 backport 到 6.3（工作量远大于本项目显示驱动
+的 backport，应另立项）。
+
+**建议分档**：
+- GPU：走主线 `lima`（小改动、一轮 CI 可验证），但网关用途非必需，优先级 P2。
+- 硬解：先装 `ffmpeg` 软解实测 1080p H.264 帧率，确认是否够用；不够再评估
+  vendor backport。
+- 保持现状对"双 USB 网络存储网关"完全够，本轮不改内核 config（避免与正在
+  跑的 release 构建叠加）。
+
 ---
 
 ## 8. 本轮已落地的代码改动
@@ -479,7 +532,7 @@ H.265/HEVC 软解基本不现实。GPU 侧 `lima` 可考虑启用（OpenGL ES 2.
 | P1-7 | 中 | `ifup@wlan0.service` 导致 systemd `degraded`（§11.3） | 已修（interfaces 精简），在线验证回到 `running` |
 | P2-1 | 低 | `nmcli`：按 §5.3 方案评估是否引入 NetworkManager | 待用户决定 |
 | P2-2 | 低 | 文件系统：补 `UDF_FS`/`HFSPLUS_FS` + 用户态 fs 工具 + NFS/CIFS 服务端 | 内核基础已够 |
-| P2-3 | 低 | GPU：评估启用 `CONFIG_DRM_LIMA`；硬解走私有栈另立项 | 非网关必需 |
+| P2-3 | 低 | GPU：评估启用 `CONFIG_DRM_LIMA`（DTS 节点 `status="disabled"`，需改 okay + Mesa）；硬解走私有栈另立项 | 已调研（§7.1）：主线 `lima` 可行；原厂 Android 私有栈（bionic + vendor 内核 ABI）不可直接复用 |
 | P2-4 | 低 | 绿带 24 行的真机观感确认 | 待反馈 |
 
 ---
