@@ -357,19 +357,30 @@ mke2fs: Could not allocate block in ext2 filesystem while populating file system
 `payload now: 287M`，`mke2fs -d` 还要额外装 inode/journal/保留块，384 MiB
 被撑爆。**不是磁盘满、不是权限、也不是 rootfs 内容坏了。**
 
-**修复**（已落地）：改为按实际 payload 动态计算，不再写死：
-- 取 `du -sm "$WORK/root"`，给 50% 余量，向上取整到 32 MiB 边界
-- 下限 384 MiB；上限 480 MiB（约束：p8 从 98 MiB 起，社区 p9 从 610 MiB 起，
-  98 + IMG 必须留在这之下，刷机失败仍能回社区系统）
-- 超过 480 直接 fail 并提示"精简 rootfs 或显式调整上限"，不静默产出坏包
-- 仍支持 `IMG_SIZE_MB` 环境变量显式覆盖
+**修复历程（两次 40 分钟 CI 失败，值得记录）**：
 
-验证：`287M -> 448M`（98+448=546 < 610）；`bash -n` 通过。
-recovery 包复用同一 sparse 文件，其 manifest 里 p8 为 `S` 类型（bytes 忽略），
-不受尺寸变化影响。
+1. 第一次尝试改成"按实际 payload 动态计算"（`du -sm "$WORK/root"`）。**引入了新
+   bug**：rootfs 由 `sudo` 解压，`/root`、`/etc/ssl/private` 是 root-only，普通用户
+   `du` 报 `Permission denied`，而脚本 `set -o pipefail` 让 `du | cut` 整条退出
+   非 0 → job 直接挂。第二次 CI 因此又失败 29s。
+2. 同时发现动态方案的系数/上限组合还有隐患：payload 已 287 MiB，但**打包阶段
+   还会解压 `modules.tar.gz`**（实测压缩 22.7 MiB / 解压 70.7 MiB / 1925 个文件），
+   实际 payload ≈ 358 MiB，很容易触发 fail-fast 上限 → 会埋第三次失败。
+3. 最终采用**简单固定值 480 MiB**，去掉易错的动态计算：
+   - 实测余量：`358 MiB payload → 480 MiB 镜像`，余 122 MiB 给 ext4 元数据
+     （inode / journal / 5% reserved blocks），充足
+   - 上限约束：p8 从 LBA `0x31000`（98 MiB）起；社区刷机法从同一 LBA 写
+     `0x100000` 扇区（512 MiB，到 610 MiB）作为 Ubuntu 回退区。
+     `98 + 480 = 578 < 610`，保住 32 MiB 余量，刷机失败仍可回退
+   - 保留 `IMG_SIZE_MB` 环境变量覆盖；`bash -n` 通过
 
-> 这个 run 触发于 locale 修复推送之前，因此其产物不含 §6.2 的 locale 修复。
-> 修复镜像尺寸后基于最新 HEAD 重新触发的 release 才包含全部修复。
+> 教训（写给后续）：不要用 `du` 去量 `sudo` 解压出来的 tree，除非也用 `sudo du`
+> 且对 pipefail 做兜底；这个包里能静态确定的常量比"自适应"更可靠。
+> recovery 包复用同一 sparse 文件，其 manifest 里 p8 为 `S` 类型（bytes 忽略），
+> 不受尺寸变化影响。
+
+**当前状态**：镜像尺寸修复已提交推送；基于最新 HEAD 的 release 正在重新构建
+（该 HEAD 已包含 §4.3 显存保留、§5.2 工具补齐、§6.2 locale 修复等全部改动）。
 
 ### 6.2 已启用的文件系统/存储能力（config fragment 实测）
 

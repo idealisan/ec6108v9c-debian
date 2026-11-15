@@ -24,13 +24,20 @@ DIST=${DIST:-dist}
 KERNEL_IMG=${KERNEL_IMG:-$DIST/hi_kernel.bin}
 MODULES_TAR=${MODULES_TAR:-$DIST/modules.tar.gz}
 ROOTFS_TAR=${ROOTFS_TAR:-$DIST/debian-rootfs-armhf-bookworm.tar.gz}
-# Image size is derived from the ACTUAL unpacked rootfs (see the auto-size
-# block below). A fixed 384 MiB was enough for the original ~240 MiB payload,
-# but adding base network tools (iw, rfkill, dnsutils, netcat-openbsd, ...)
-# pushed the payload to ~287 MiB and "mke2fs -d" failed with
-# "Could not allocate block in ext2 filesystem while populating".
-# Leaving IMG_SIZE_MB unset = auto-size; set it explicitly to override.
-IMG_SIZE_MB=${IMG_SIZE_MB:-}
+# 480 MiB image. The original 384 MiB was sized for a ~240 MiB payload, but
+# adding base network tools (iw, rfkill, dnsutils, netcat-openbsd, ...) grew
+# the rootfs tar to ~287 MiB, and this script ALSO unpacks modules.tar.gz
+# (~30 MiB compressed, considerably more unpacked) into usr/ before
+# mke2fs -d. Together they exceed 384 MiB once ext4 metadata (inodes,
+# journal, 5% reserved blocks) is accounted for, so mke2fs failed with
+# "Could not allocate block ... while populating file system".
+#
+# Upper bound: p8 starts at LBA 0x31000 (98 MiB). The community flash method
+# writes Ubuntu from that same LBA for 0x100000 sectors (512 MiB, ending at
+# 610 MiB); keeping 98 + IMG <= 610 preserves that region as a fallback if
+# our flash fails. 480 MiB -> 578 MiB, clear of it with 32 MiB to spare.
+# Override with IMG_SIZE_MB=<MiB> only if the rootfs genuinely outgrows it.
+IMG_SIZE_MB=${IMG_SIZE_MB:-480}
 ROOT_PASSWD=${ROOT_PASSWD:-ec6108v9c}
 SUDO=${SUDO:-sudo}
 MKFS=${MKFS:-mke2fs}
@@ -130,26 +137,6 @@ for probe in lib/systemd/systemd lib/ld-linux-armhf.so.3; do
   fi
 done
 echo "  usrmerge OK: /lib symlink intact, systemd + ld-linux reachable"
-
-# ---- image size: derive from the real payload, do not hardcode ----------
-# "mke2fs -d" needs room for data + inodes + journal + reserved blocks, which
-# is substantially more than the payload itself. A fixed 384 MiB silently
-# broke once the payload reached 287 MiB ("Could not allocate block"). Give
-# 50% headroom, round up to a 32 MiB boundary, and clamp to the range that
-# keeps p8 clear of the community p9 (p8 starts at 98 MiB, p9 at 610 MiB,
-# so 98 + IMG_SIZE_MB <= 610 even in the worst case).
-if [ -z "$IMG_SIZE_MB" ]; then
-  PAYLOAD_MB=$(du -sm "$WORK/root" | cut -f1)
-  IMG_SIZE_MB=$(( (PAYLOAD_MB * 3 / 2 + 31) / 32 * 32 ))
-  [ "$IMG_SIZE_MB" -lt 384 ] && IMG_SIZE_MB=384
-  if [ "$IMG_SIZE_MB" -gt 480 ]; then
-    echo "rootfs payload ${PAYLOAD_MB} MiB needs ~${IMG_SIZE_MB} MiB image," >&2
-    echo "which exceeds the 480 MiB ceiling (98 + IMG would reach community p9)." >&2
-    echo "Trim the rootfs or raise the ceiling deliberately." >&2
-    exit 1
-  fi
-  echo "  auto-sized ext4 image: payload ${PAYLOAD_MB} MiB -> ${IMG_SIZE_MB} MiB"
-fi
 truncate -s "$((IMG_SIZE_MB * 1024 * 1024))" "$WORK/debian.ext4"
 $SUDO $MKFS -q -F -t ext4 -L debian-root -d "$WORK/root" "$WORK/debian.ext4"
 python3 scripts/img2simg.py "$WORK/debian.ext4" "$WORK/pkg/mv100/debian-root.ext4"
