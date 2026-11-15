@@ -1310,6 +1310,7 @@ GPU 回到「lima 编进内核但 deferred、不阻塞启动」的状态，`/dev
 | sparse rootfs | 480 MiB / 33 chunks |
 | `modules.tar.gz` | `lima.ko` + `gpu-sched.ko` + `drm_shmem_helper.ko` 齐全，`modules.dep` 依赖链完整 |
 | rootfs 内容 | `ec6108-gpu.service`（ExecStart 指向 helper）、`/usr/local/bin/ec6108-gpu`、helper 日志标签均在 |
+| CI 编译日志 | `applied: 0005-rootwait-bounded-timeout.patch`；`CONFIG_DRM_LIMA=m` / `CONFIG_DRM_SCHED=m`（`select` 顶成 m）；`LD [M] lima.ko` + `INSTALL lima.ko` —— 短路修复进内核、lima 模块化、模块已打包全部对上 |
 
 **仍需真机确认**（唯一剩余、需刷一次）：刷入本版后 `ls /dev/dri`（应出现 `card0`）、
 `lsmod | grep lima`、`dmesg | grep -i lima` 无 probe 报错、TTY/IP/SSH 正常、
