@@ -1,0 +1,15 @@
+#!/bin/sh
+# Redraw the console login prompt so /etc/issue's \4 / \6 escapes show the
+# addresses obtained by DHCP. agetty expands those escapes only when it
+# starts, which can precede the lease: wait (bounded) for a global address,
+# then restart the console gettys. Never disturb an active local session.
+i=0
+while [ "$i" -lt 12 ]; do
+    ip -o -4 addr show scope global 2>/dev/null | grep -q . && break
+    sleep 0.5
+    i=$((i + 1))
+done
+if ps -t tty1 -o comm= 2>/dev/null | grep -qE '^(login|bash|sh|dash)$'; then
+    exit 0
+fi
+systemctl try-restart getty@tty1.service serial-getty@ttyAMA0.service 2>/dev/null || true

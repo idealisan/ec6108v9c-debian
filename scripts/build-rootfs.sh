@@ -22,7 +22,7 @@ PACKAGES=(
   ca-certificates locales sudo login passwd
   openssh-server openssh-client
   busybox
-  systemd-sysv systemd udev dbus kmod
+  systemd-sysv systemd udev dbus kmod systemd-timesyncd fake-hwclock
   ifupdown iproute2 isc-dhcp-client netbase net-tools iputils-ping ethtool
   wpasupplicant wireless-tools wireless-regdb firmware-realtek
   iw rfkill dnsutils netcat-openbsd
@@ -80,21 +80,15 @@ sudo mkdir -p "$ROOT/etc/systemd/system/getty.target.wants"
 sudo ln -sf /lib/systemd/system/serial-getty@.service "$ROOT/etc/systemd/system/getty.target.wants/serial-getty@ttyAMA0.service"
 
 # DHCP on the single hisi-femac port
-sudo tee "$ROOT/etc/network/interfaces" >/dev/null <<EOF
+# Keep the ifupdown file minimal: systemd-networkd owns every interface
+# (10-eth0.network / 20-wlan.network). An "allow-hotplug wlan0" stanza here
+# made udev fire ifup@wlan0.service, which failed (no wpa_supplicant.conf yet,
+# and its if-pre-up.d hook cannot create /dev/stderr) and left systemd
+# "degraded" on every boot. Connect WiFi with: ec6108-wifi '<SSID>' '<pass>'
+sudo tee "$ROOT/etc/network/interfaces" >/dev/null <<'IF_EOF'
 auto lo
 iface lo inet loopback
-auto eth0
-iface eth0 inet dhcp
-
-# WiFi (RTL8188FU, mainline rtl8xxxu) is owned by systemd-networkd via
-# 20-wlan.network (matches wl*, does DHCP). networking.service is masked
-# below, so this ifupdown stanza is kept only as a manual fallback. The
-# kernel cmdline carries net.ifnames=0, so the adapter is wlan0, not a
-# predictable wlx<mac> name. To connect: ec6108-wifi <SSID> <password>.
-allow-hotplug wlan0
-iface wlan0 inet dhcp
-    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
-EOF
+IF_EOF
 
 # ---- SSH ----
 sudo sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" "$ROOT/etc/ssh/sshd_config"
@@ -154,8 +148,66 @@ sudo ln -sf /lib/systemd/system/systemd-networkd.service "$ROOT/etc/systemd/syst
 # started directly by the service symlink above.
 # ifupdown must stay out of the way now that networkd owns the interfaces
 sudo ln -sf /dev/null "$ROOT/etc/systemd/system/multi-user.target.wants/networking.service"
-# ... but keep the file for manual "ifup eth0" usage
-sudo sed -i "s/^auto eth0/#auto eth0/; s/^iface eth0 inet dhcp/#iface eth0 inet dhcp/" "$ROOT/etc/network/interfaces"
+
+# ---- DNS ---------------------------------------------------------------
+# debootstrap leaves a copy of the BUILD HOST's stub-resolv.conf at
+# /etc/resolv.conf ("nameserver 127.0.0.53" + a build-host search domain).
+# This minimal tree has neither systemd-resolved nor resolvconf, so nobody
+# listens on that stub and DNS is dead after every flash. Ship a static
+# fallback and rebuild it at boot from the DNS networkd learned via DHCP.
+sudo tee "$ROOT/etc/resolv.conf" >/dev/null <<'RESOLV_EOF'
+# static fallback; rewritten at boot by ec6108-dns-init with DHCP DNS
+nameserver 223.5.5.5
+nameserver 119.29.29.29
+nameserver 8.8.8.8
+options timeout:2 attempts:2
+RESOLV_EOF
+sudo tee "$ROOT/etc/systemd/system/ec6108-dns-init.service" >/dev/null <<'UNIT_EOF'
+[Unit]
+Description=Rebuild /etc/resolv.conf from DHCP DNS at boot
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ec6108-dns-init
+TimeoutStartSec=25
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+sudo ln -sf /etc/systemd/system/ec6108-dns-init.service \
+    "$ROOT/etc/systemd/system/multi-user.target.wants/ec6108-dns-init.service"
+
+# ---- time: no hardware RTC, so use Debian's file-backed software clock ----
+# The mainline kernel has CONFIG_RTC_CLASS off and the DTB carries no rtc
+# node: there is no /dev/rtc and no battery, so a cold boot would otherwise
+# fall back to an old default date and apt rejects "not valid yet" Release
+# files. Use the standard RTC-less stack (same as Raspberry Pi images):
+#   * fake-hwclock - saves the clock to /etc/fake-hwclock.data on shutdown
+#                    and restores it on boot (ExecStart=load / ExecStop=save).
+#                    'load' refuses to move the clock backwards, so it never
+#                    fights systemd-timesyncd's NTP-synced value.
+#   * clock-epoch  - systemd >= 246 uses this file's mtime as a lower bound
+#                    for the system clock at PID1 startup (first boot).
+#   * timesyncd    - NTP discipline (UDP/123 verified reachable).
+# Debian postinst already enables both services into sysinit.target.wants;
+# the symlinks below are an explicit chroot fallback.
+sudo mkdir -p "$ROOT/etc/systemd/system/sysinit.target.wants"
+sudo ln -sf /lib/systemd/system/fake-hwclock.service \
+    "$ROOT/etc/systemd/system/sysinit.target.wants/fake-hwclock.service"
+sudo ln -sf /lib/systemd/system/systemd-timesyncd.service \
+    "$ROOT/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service"
+sudo mkdir -p "$ROOT/etc/systemd/timesyncd.conf.d"
+sudo tee "$ROOT/etc/systemd/timesyncd.conf.d/10-ec6108.conf" >/dev/null <<'NTP_EOF'
+[Time]
+NTP=ntp.aliyun.com cn.pool.ntp.org time.windows.com pool.ntp.org
+FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org
+NTP_EOF
+# Seed both file-backed clocks with the build time so the very first boot
+# (before any NTP contact) is already a sane date and apt works offline.
+date -u '+%Y-%m-%d %H:%M:%S' | sudo tee "$ROOT/etc/fake-hwclock.data" >/dev/null
+sudo touch "$ROOT/usr/lib/clock-epoch"
 
 # ---- telnet (busybox telnetd, standalone, no inetd needed) ----
 sudo tee "$ROOT/etc/systemd/system/telnetd.service" >/dev/null <<'UNIT_EOF'
@@ -174,13 +226,43 @@ WantedBy=multi-user.target
 UNIT_EOF
 sudo ln -sf /etc/systemd/system/telnetd.service "$ROOT/etc/systemd/system/multi-user.target.wants/telnetd.service"
 
-# login banner / credential hint
-sudo tee "$ROOT/etc/issue" >/dev/null <<EOF
-EC6108V9C / Hi3798MV100 - Debian $SUITE armhf
-SSH:    ssh root@<dhcp-ip>    (password: $ROOT_PASSWD)
-Telnet: telnet <dhcp-ip>     (plaintext, change the password first)
+# Login banner with LIVE addresses. agetty expands the \4 / \6 issue escapes
+# into the box's IPv4 / IPv6 address each time a getty (re)starts, so the
+# console always shows which IP to SSH to (no router lookup needed). A
+# single-quoted heredoc keeps the backslashes intact; sed fills the two
+# placeholders. The oneshot service below redraws the prompt after the DHCP
+# lease arrives, since agetty may start before networkd gets an address.
+sudo tee "$ROOT/etc/issue" >/dev/null <<'ISSUE_EOF'
+EC6108V9C / Hi3798MV100 - Debian __SUITE__ armhf
+
+  Network addresses:
+    IPv4   \4
+    IPv6   \6
+
+SSH:    ssh root@\4        (password: __ROOT_PASSWD__)
+Telnet: telnet \4          (plaintext, change the password first)
 Serial: ttyAMA0 115200
-EOF
+WiFi:   ec6108-wifi '<SSID>' '<password>'   (then: iw dev wlan0 link)
+ISSUE_EOF
+sudo sed -i "s/__SUITE__/$SUITE/g; s/__ROOT_PASSWD__/$ROOT_PASSWD/g" "$ROOT/etc/issue"
+
+# ---- login prompt address refresh ----
+sudo tee "$ROOT/etc/systemd/system/ec6108-issue-refresh.service" >/dev/null <<'UNIT_EOF'
+[Unit]
+Description=Show current IP addresses on the console login prompt
+After=systemd-networkd.service getty@tty1.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ec6108-issue-refresh
+TimeoutStartSec=15
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+sudo ln -sf /etc/systemd/system/ec6108-issue-refresh.service \
+    "$ROOT/etc/systemd/system/multi-user.target.wants/ec6108-issue-refresh.service"
 
 # ---- root password ----
 echo "root:$ROOT_PASSWD" | sudo chroot "$ROOT" chpasswd
@@ -211,6 +293,7 @@ EOF
 echo "== device helper scripts =="
 sudo cp -a "$ROOT_DIR/rootfs/usr/local/bin/." "$ROOT/usr/local/bin/"
 sudo chown root:root "$ROOT"/usr/local/bin/ec6108-*
+sudo chmod 755 "$ROOT"/usr/local/bin/ec6108-*
 echo "== shrink =="
 # The image is written to the box by hiboot's "fatload", so every byte we
 # drop here is a byte we do not have to push through the USB stick. The

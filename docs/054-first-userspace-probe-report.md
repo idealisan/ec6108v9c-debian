@@ -12,7 +12,7 @@
 | CI run | `43669116315`（全绿：rootfs 6m57s / kernel 35m55s / qemu 1m12s / package 1m6s） |
 | 内核 | `6.3.0-rc5+` `armv7l` `SMP` |
 | 发行版 | Debian 12 (bookworm) armhf |
-| 探测方式 | 局域网 SSH（`192.168.3.102`），开发机本地 HTTP 代理经 SSH `-R` 转发 |
+| 探测方式 | 局域网 SSH（`<BOX_LAN_IP>`）；TCP 出口直连可用，无需代理（§2.2 已更正） |
 | 里程碑 | **L2 达成**：rootfs 挂载成功、systemd `running`、0 failed unit、以太网 DHCP + 互联网、`fbcon/VT` 接管显示、TTY 登录提示出现 |
 
 **当前版本定位**：基础成功版，适合作为探测基线。已确认的内核侧能力基本齐备，
@@ -28,7 +28,7 @@
 - 内存 `988Mi` total / `~138Mi` used；无 swap
 - 根：`/dev/mmcblk0p8` ext4，6.7G，首启 `resize2fs` 已从 98304 → 1883648 blocks
 - eMMC `008G30` 7.28 GiB，8 分区 `p1..p8`（`p8=debian`，`blkdevparts` 生效）
-- 网络：`eth0 192.168.3.102/24`，网关 `192.168.3.38`，`hisi-femac` 100Mbps/Full
+- 网络：`eth0 <BOX_LAN_IP>/24`，网关 `<GW>`，`hisi-femac` 100Mbps/Full
 - USB：`RTL8188FTV 0bda:f179`（WiFi）、键盘、U 盘、4 个 root hub
 - 显示：`fb0 hi3798vd 1920x1079@0x3f6ce000 pitch=7680`，`native_tty=1`，fbcon/VT 接管
 
@@ -36,13 +36,15 @@
 
 ## 2. 网络连通性：三层分离的关键发现
 
-用户报告"能 ICMP 到网关、能连互联网"，但 `apt` 完全装不上包。实测是三层各自独立：
+用户报告"能 ICMP 到网关、能连互联网"，但 `apt` 完全装不上包。首轮实测曾误判为
+"TCP 出口被拦"；第二轮在 DNS 与时钟修好后复测，**证实 TCP 直连完全可用**（见
+§2.2 更正）。`apt` 失败其实只有 DNS + 时钟两个独立阻断点。
 
 | 层 | 结果 | 说明 |
 |---|---|---|
 | ICMP（L3） | 通 | `223.5.5.5` / `119.29.29.29` 均 0% 丢包，~9ms |
-| DNS | **失败** | 见 §2.1 |
-| TCP/80/443 | **被拦** | 见 §2.2 |
+| DNS | **首轮失败** | 见 §2.1；§11.5 已根治 |
+| TCP/80/443 | **通（首轮误判）** | 见 §2.2 更正 |
 
 ### 2.1 DNS：stub 存在但无监听者
 
@@ -53,29 +55,35 @@
 
 → 有 stub 地址、没有 stub 服务，`getent hosts deb.debian.org` 必然失败。
 
-**临时修复（已做）**：写静态 `/etc/resolv.conf`，指向 DHCP 下发的网关 DNS
-`192.168.3.38` + 公共 DNS 兜底，解析立即恢复。
+**临时修复（已做，但重刷会回退）**：写静态 `/etc/resolv.conf`，指向 DHCP 下发的
+网关 DNS `<GW>` + 公共 DNS 兜底，解析立即恢复。
 
-**根治建议**：rootfs 里启用 `systemd-resolved`（或明确改用静态 resolv.conf + 关闭
-stub 语义），二者只能选一，不能留"stub 文件 + 无服务"这种中间态。
+**根治**（§11.5，本轮已落地）：rootfs 内置静态兜底 `resolv.conf`，开机由
+`ec6108-dns-init.service` 从 DHCP DNS 重建（网关优先 + 公共兜底）；不引入
+`systemd-resolved`，彻底消除"stub 文件 + 无服务"的中间态。
 
-### 2.2 TCP 出口：只有 ICMP 能出
+### 2.2 TCP 出口：首轮误判"被拦"，第二轮证实直连可用 ★（更正）
 
-`curl` 对 `deb.debian.org`、清华/阿里/中科大镜像、`www.baidu.com` 全部 `000`
-（连 `https://` 也不通），但域名解析已正常、ICMP 正常 —— 说明是 **TCP 出口被网络策略拦截**，
-不是盒子协议栈问题。
+首轮 `curl` 对 `deb.debian.org`、清华/阿里/中科大镜像、`www.baidu.com` 全部 `000`，
+当时 DNS 与时钟均为坏状态，遂误判为"TCP 出口被网络策略拦截"，并用 SSH `-R` 把
+开发机 HTTP 代理带进盒子（`curl -x ... 200`、apt 走该通道成功）作为临时绕行。
 
-**打通方式（已验证）**：开发机本地 HTTP 代理只监听 `127.0.0.1:10808`，且开发机与盒子
-不在同一网段，盒子无法直连。用 SSH 反向转发把代理带进盒子：
+**第二轮复测（DNS §11.5 与时钟 §11.6 修好后）推翻该结论** —— 用户指出"明明刚用命令
+下载了文件"，实测确认：
 
-```
-ssh -R 11080:127.0.0.1:10808 root@<BOX_LAN_IP>
-# 盒子侧
-export http_proxy=http://127.0.0.1:11080 https_proxy=http://127.0.0.1:11080
-```
+| 测试（无任何代理变量） | 结果 |
+|---|---|
+| `curl` 默认 → deb.debian.org / 清华 / 阿里 / 百度 | 全部 `code=200` |
+| `curl -4` 同上 | 全部 `code=200` |
+| `curl -6` | `code=000`（盒子只有 `fe80::` link-local IPv6，无全局 IPv6） |
+| `apt-get update -qq` 直连 | `RC=0` |
+| 直连下载 `Release` 文件 | `code=200, 149266 B` |
+| `apt-get install fake-hwclock` 直连 | 成功（6.3 kB，无需代理） |
 
-`curl -x http://127.0.0.1:11080 .../InRelease` 返回 `200`，通道可用。
-`apt-get update` 经此通道成功拿到 14.9 MB 索引。
+根因：DNS 会优先返回 AAAA（`2a04:4e42:99::644`），而盒子没有全局 IPv6，curl
+卡在 IPv6 上超时；叠加当时 DNS/时钟故障，表现为"TCP 全不通"。
+**结论：TCP/80/443 出口本来就是通的，不需要代理**。SSH `-R` 只是当时的临时绕行
+手段，已从方案中移除；本节保留更正记录，避免后续再按错误结论排查。
 
 ### 2.3 时钟：无 RTC、无 NTP，落后约 200 天
 
@@ -90,11 +98,13 @@ NTP service: n/a
 apt 因此报 `Release file ... is not valid yet (invalid for another 74d ...)`，
 **即使网络通了也拒绝安装**。这是第三个独立阻断点。
 
-**临时修复（已做）**：`date -s @<epoch>` 校准。
-**根治建议**：启用 `systemd-timesyncd`（或首次启动校时脚本）；无 RTC 的板子每次
-冷启动都会回到固定旧时间，必须依赖 NTP。
+**临时修复（已做，重刷会回退）**：`date -s @<epoch>` 校准。
+**根治**（§11.6，本轮已落地）：Debian 标准的 RTC-less 三件套 —— `fake-hwclock`
+（文件式软件 RTC，关机存 / 开机恢复）+ `/usr/lib/clock-epoch`（systemd 时间下限）
++ `systemd-timesyncd`（NTP 精校）。
 
-> 小结：apt 失败是 **DNS + TCP 出口 + 时钟** 三个独立问题叠加，单独修任何一个都不够。
+> 小结（按 §2.2 更正）：apt 失败是 **DNS + 时钟** 两个独立问题叠加；
+> TCP 出口本来就是通的，首轮属误判。
 
 ---
 
@@ -444,6 +454,10 @@ H.265/HEVC 软解基本不现实。GPU 侧 `lima` 可考虑启用（OpenGL ES 2.
 | `scripts/build-rootfs.sh` | PACKAGES 加 `iw rfkill dnsutils netcat-openbsd`；`/etc/network/interfaces` 写死接口名改 `wlan0` | 基础网络工具内置、修 WiFi 配置 |
 | `rootfs/usr/local/bin/ec6108-wifi` | 动态探测接口、改用 `wpa_supplicant`+networkd、去掉 `ifup`、不杀进程 | 修 WiFi 连接脚本 |
 | `patches/vendor-display/hi3798mv100_vendor_display.c` | `BOOT_MARK_LINES` 240 → **24** | 绿带缩小到约 1/10，减少晃眼，保留排障可见性；文字区反而多约 14 行 |
+| `scripts/build-rootfs.sh` | `/etc/issue` 改用 agetty `\4`/`\6` 转义（单引号 heredoc + sed 占位符替换）；新增 `ec6108-issue-refresh.service`；`/etc/network/interfaces` 精简为只有 `lo`；helper 统一 `chmod 755` | 登录界面实时显示 IPv4/IPv6；修 systemd `degraded`（§11.2/§11.3） |
+| `rootfs/usr/local/bin/ec6108-issue-refresh` | 新增：有界等待全局地址后 `try-restart` console getty，且跳过 tty1 已有登录会话 | 保证开机首次登录提示就带真实地址（§11.2） |
+| `scripts/build-rootfs.sh` | 内置静态 `resolv.conf` 兜底 + `ec6108-dns-init.service`；PACKAGES 加 `systemd-timesyncd` + `fake-hwclock`；写 `timesyncd.conf.d`、`/etc/fake-hwclock.data`、`/usr/lib/clock-epoch`、enable symlinks | 根治 DNS（§11.5）、NTP 与软件 RTC（§11.6） |
+| `rootfs/usr/local/bin/ec6108-dns-init` | 新增：开机从 DHCP DNS 重建 `resolv.conf`（网关优先 + 公共兜底） | 修 DNS（§11.5） |
 
 （commit message 遵循仓库风格、无任何 AI Agent 追加信息 / trailer；
 所有推送内容已检查不含本机绝对路径与用户名。）
@@ -454,12 +468,15 @@ H.265/HEVC 软解基本不现实。GPU 侧 `lima` 可考虑启用（OpenGL ES 2.
 
 | # | 优先级 | 事项 | 状态 |
 |---|---|---|---|
-| P0-1 | 高 | 刷入含 §4.3 显存保留的包，验证花屏消失、TTY 正常、apt 不再 segfault | **待真机验证** |
-| P0-2 | 高 | 时钟：启用 `systemd-timesyncd` 或首启校时（无 RTC，冷启动必回旧时间） | 临时已校准，根治待做 |
-| P1-1 | 中 | DNS：统一 `systemd-resolved` 或静态 resolv.conf，消除"stub 文件 + 无服务" | 临时已修，根治待做 |
-| P1-2 | 中 | TCP 出口：确认是上游网关策略还是盒子网络配置；若长期受限，固化代理配置方案 | 已定位，待定性 |
-| P1-3 | 中 | 把 `iw`/`nc`/`vim`/`git` 真正装进 rootfs（本轮在线安装受显存踩踏影响失败） | 已加 PACKAGES，待出包验证 |
-| P1-4 | 中 | `regulatory.db` 早期加载失败：评估是否内置进 `CONFIG_EXTRA_FIRMWARE` | 已定位，非致命 |
+| P0-1 | 高 | 刷入含 §4.3 显存保留的包，验证花屏消失、TTY 正常、apt 不再 segfault | **已验证 ✓**（§11.1） |
+| P0-2 | 高 | 时间：无硬件 RTC，冷启动必回旧时间 | **已根治 ✓**（§11.6：`fake-hwclock` 文件式软件 RTC + `clock-epoch` + `systemd-timesyncd` NTP） |
+| P1-1 | 中 | DNS：统一 `systemd-resolved` 或静态 resolv.conf，消除"stub 文件 + 无服务" | **已根治 ✓**（§11.5，静态兜底 + 开机从 DHCP 重建） |
+| P1-2 | 中 | ~~TCP 出口受限~~（首轮误判） | **关闭**：§2.2 复测直连全通（`apt-get update` RC=0、下载 149 KB 成功），系 IPv6 优先 + DNS/时钟故障叠加的假象，无需代理 |
+| P1-3 | 中 | 把 `vim`/`git` 装进 rootfs（`iw`/`nc` 等已内置并实测可用） | 部分完成；`vim`/`git` 待定（加 PACKAGES 需评估 480 MiB 余量，§11.1） |
+| P1-4 | 中 | `regulatory.db` 早期加载失败：评估是否内置进 `CONFIG_EXTRA_FIRMWARE` | 已定位，非致命（rootfs 内文件可用，§11.4） |
+| P1-5 | 中 | 登录界面显示 IPv4/IPv6（§11.2）：固化 `build-rootfs.sh` 并出包 | 已落地，待 release 产物验证 |
+| P1-6 | 中 | WiFi 实际关联 + DHCP 验证（扫描已通，§11.4） | 待用户提供 SSID/密码 |
+| P1-7 | 中 | `ifup@wlan0.service` 导致 systemd `degraded`（§11.3） | 已修（interfaces 精简），在线验证回到 `running` |
 | P2-1 | 低 | `nmcli`：按 §5.3 方案评估是否引入 NetworkManager | 待用户决定 |
 | P2-2 | 低 | 文件系统：补 `UDF_FS`/`HFSPLUS_FS` + 用户态 fs 工具 + NFS/CIFS 服务端 | 内核基础已够 |
 | P2-3 | 低 | GPU：评估启用 `CONFIG_DRM_LIMA`；硬解走私有栈另立项 | 非网关必需 |
@@ -481,10 +498,9 @@ curl -s -o /dev/null -m 5 -w "%{http_code}\n" http://deb.debian.org/debian/dists
 ping -c2 -W2 223.5.5.5
 timedatectl status; date -u
 
-# 经 SSH -R 代理装包
-ssh -R 11080:127.0.0.1:10808 root@<BOX_LAN_IP>
-export http_proxy=http://127.0.0.1:11080 https_proxy=http://127.0.0.1:11080
-apt-get update && apt-get install -y --no-install-recommends iw rfkill dnsutils netcat-openbsd
+# 装包（TCP 出口直连可用，无需代理；见 §2.2 更正）
+apt-get update && apt-get install -y --no-install-recommends <pkg>
+curl -4 -O <url>          # DNS 优先返回 AAAA 而盒子无全局 IPv6 时，强制 IPv4
 
 # 显示 / 显存
 dmesg | grep -iE "hi3798-vd|fb0|reserved mem"
@@ -494,9 +510,196 @@ ls /dev/dri /dev/video* /dev/media* 2>/dev/null
 # WiFi
 lsusb; iw dev; iw dev IFACE scan | grep -E 'SSID|signal|RSN'; rfkill list
 iw reg get; dmesg | grep -iE "rtl8xxxu|firmware|cfg80211"
+ec6108-wifi '<SSID>' '<password>'; iw dev wlan0 link; ip -br addr show wlan0
+
+# 登录界面 / IP 显示（无需拍屏：/dev/vcs1 直接读屏）
+cat /etc/issue
+cat /dev/vcs1 | tr -d '\000' | fold -w 100 | head -18
+systemctl status ec6108-issue-refresh.service
+systemctl restart getty@tty1.service      # 让 issue 改动立即显示
 
 # 文件系统
 grep -E "CONFIG_(NTFS3|EXFAT|VFAT|BTRFS|XFS|F2FS|UDF|HFSPLUS)_FS" /path/to/config
 ```
 
 > 凭据、开发机地址与本机路径不写入本报告；仅保留复现所需的形式化占位符。
+
+---
+
+## 11. 第二轮真机探测（刷入「全部修复版」后，DHCP 地址尾号 .103）
+
+### 11.1 上一版修复全部生效 ✓
+
+| 项 | 实测证据 |
+|---|---|
+| 显存保留（§4.3） | `OF: reserved mem: 0x3e000000..0x3fffffff (32768 KiB) map non-reusable framebuffer-reserved@3e000000`；`map`（非 `no-map`）= 仍是 System RAM，`memremap(WB)` 不失效；`fb0 1920x1079@0x3f6ce000` 落在区间内。本轮未再出现彩色噪点/条带 |
+| locale（§6.2） | `/etc/default/locale` = `LANG=C.UTF-8`；`locale -a` = `C / C.utf8 / POSIX`；sshd `AcceptEnv LANG` 已注释 |
+| 基础网络工具 | `iw rfkill dig nslookup nc nano iwconfig iwlist wpa_supplicant wpa_passphrase` 全部在；`nano` 本来就有 |
+| 480 MiB rootfs | 根 `6.7G / 361M 已用`，`dpkg --audit` 空（健康），不再解包 segfault |
+| 内核/cmdline | `6.3.0-rc5+`，`rootwait rootwait_timeout=30`、`fbcon=map:0`、`net.ifnames=0` 均在 |
+
+`vim`、`git` 仍缺（§9 P1-3）：本轮没有把它们加进 PACKAGES —— 上两轮
+`mke2fs -d` 因镜像尺寸连续失败，加 `git` 会显著抬升 payload；需要时在线装
+或单独评估尺寸后再固化。
+
+### 11.2 新需求：登录界面直接显示本机 IPv4 / IPv6
+
+用户痛点：每次要靠路由器查 DHCP 地址才能 SSH。`/etc/issue` 原来写死
+`ssh root@<dhcp-ip>` 占位符，屏幕上看到的仍是占位文字。
+
+**方案（原生、零新依赖）**：util-linux 2.38.1 的 agetty 支持 `/etc/issue`
+转义 `\4` / `\6`（及 `\4{iface}` / `\6{iface}`），每次 getty 启动时展开成
+本机 IPv4 / IPv6；实测在 tty2 起一个临时 getty 后 `/dev/vcs2` 读屏：
+
+```
+IPv4_all   : <BOX_LAN_IP>
+IPv4_eth0  : <BOX_LAN_IP>
+IPv6_all   : <LINK_LOCAL_IPV6>
+IPv6_eth0  : <LINK_LOCAL_IPV6>
+```
+
+`\4` 不带参数即主 IPv4，`\6` 给出 IPv6，`\4{iface}` 语法同样有效。
+
+**`/dev/vcsN` 是直接读屏幕文字的关键技巧**（VT 屏幕缓冲区，纯文本），
+本轮所有登录界面验证都靠 `cat /dev/vcs1 | tr -d '\000' | fold -w 100`，
+不需要拍照或 OCR。
+
+最终 `/etc/issue`（单引号 heredoc 保留反斜杠 + sed 填占位符）：
+
+```
+EC6108V9C / Hi3798MV100 - Debian bookworm armhf
+
+  Network addresses:
+    IPv4   \4
+    IPv6   \6
+
+SSH:    ssh root@\4        (password: <ROOT_PASSWD>)
+Telnet: telnet \4          (plaintext, change the password first)
+Serial: ttyAMA0 115200
+WiFi:   ec6108-wifi '<SSID>' '<password>'   (then: iw dev wlan0 link)
+```
+
+把 WiFi 连接命令也印进登录界面，避免再忘。
+
+**开机时序兜底**：agetty 只在启动时展开一次，可能早于 DHCP 拿到地址。
+新增 `ec6108-issue-refresh.service`（oneshot，`After=systemd-networkd.service
+getty@tty1.service`）+ `ec6108-issue-refresh` 脚本：有界等待全局 IPv4
+（12×0.5s），若 tty1 已有登录会话则跳过，否则 `try-restart` console getty
+重画提示。重启 tty1 后 `/dev/vcs1` 读屏确认 `IPv4 <BOX_LAN_IP>`、
+`IPv6 <LINK_LOCAL_IPV6>`、`ssh root@<BOX_LAN_IP>` 均正确展开。
+
+### 11.3 systemd `degraded` 根因与修复
+
+`systemctl is-system-running` 原为 `degraded`，唯一 failed 单元是
+`ifup@wlan0.service`：
+
+```
+ExecStart=/bin/sh -ec ifup --allow=hotplug wlan0; ...  -> status=1
+/etc/network/if-pre-up.d/wpasupplicant: cannot create /dev/stderr
+```
+
+根因：上一版 `/etc/network/interfaces` 里保留 `allow-hotplug wlan0` +
+`wpa-conf`（指向尚不存在的 `wpa_supplicant.conf`），udev 因此触发
+`ifup@wlan0.service`，与已 mask 的 ifupdown / networkd 分工冲突。
+**修复**：interfaces 只保留 `lo`，所有接口交由 networkd；删掉该 stanza 后
+`reset-failed` 并重启，`is-system-running` 回到 `running`、`--failed` 为空。
+
+### 11.4 WiFi 实测（本轮扫描）
+
+| 项 | 结果 |
+|---|---|
+| 芯片/驱动 | `0bda:f179 RTL8188FTV`，`rtl8xxxu` 内置固件 `Firmware revision 4.0` |
+| 接口 | `wlan0`，`rfkill` 无软/硬封锁，`iw dev` 正常 |
+| 扫描 | `ip link set wlan0 up` 后 `iw dev wlan0 scan` 成功，扫到 10+ 个 2.4G AP（含中文 SSID），链路可用 |
+| regulatory | `iw reg get` 正常（world domain `00`）；`regulatory.db` 符号链接指向 `regulatory.db-debian`，文件存在；dmesg 那条 `Direct firmware load ... failed` 是 rootfs 挂载前的早期请求，非致命 |
+| 未做 | 未真正关联 AP —— 需要 SSID/密码；`ec6108-wifi` 脚本已就绪（写 wpa conf + `wpa_supplicant` 关联，DHCP 交给 networkd） |
+
+连接命令：
+
+```
+ec6108-wifi '<SSID>' '<password>'
+iw dev wlan0 link            # 看关联状态
+ip -br addr show wlan0       # 看 DHCP 拿到的地址
+```
+
+### 11.5 DNS：**上一版没根治，本轮实测确认并修好** ★
+
+用户追问 DNS，实测结论：**确实没解决**（上一轮只是在线临时覆盖
+`/etc/resolv.conf`，没写进 rootfs，重刷全回退）：
+
+| 检查 | 实测 |
+|---|---|
+| `/etc/resolv.conf` | 普通文件（非 symlink），内容是 debootstrap 从**构建主机**继承的 stub 模板：`nameserver 127.0.0.53` + `options edns0 trust-ad` + 一个 CI runner 的内网 `search` 域 |
+| `systemd-resolved` | `not-installed`，无 unit 文件，`resolvectl` 不存在 → `127.0.0.53` 无人监听 |
+| `/run/systemd/resolve/` | 不存在 |
+| `getent hosts deb.debian.org` | **FAIL** |
+| `networkctl status eth0` | `DNS: <GW>` —— networkd **已经**从 DHCP 拿到了正确网关 DNS，只是精简 rootfs 里没有任何机制把它写进 `resolv.conf` |
+
+**修复（零新包、零新守护进程）**：
+1. rootfs 内置一份**静态兜底** `/etc/resolv.conf`（公共 DNS），保证刷机后立即可解析；
+2. 新增 `ec6108-dns-init.service`（oneshot，`After=systemd-networkd.service`）
+   + `ec6108-dns-init`：开机用 `networkctl status eth0` 的 `DNS:` 行提取 DHCP
+   DNS，重建 `resolv.conf`（网关 DNS 优先，公共 DNS 兜底）。不引入
+   `systemd-resolved`/`resolvconf`，避免再动依赖与镜像尺寸。
+
+在线实测（RC=0）：
+
+```
+# generated at boot by ec6108-dns-init (DHCP DNS + public fallback)
+nameserver <GW>
+nameserver 223.5.5.5
+nameserver 119.29.29.29
+nameserver 8.8.8.8
+options timeout:2 attempts:2
+getent hosts deb.debian.org -> 解析成功
+```
+
+### 11.6 时间：软件 RTC + NTP（用户追问）★
+
+用户追问"NTP 服务似乎也没解决？RTC 也没解决？"，并明确指出：即便没有硬件 RTC，
+也应该用 **基于文件的软件 RTC**（Debian 对 RTC-less 设备的标准做法），不能放弃。
+据此把首轮"RTC 不做"的结论推翻，实测与修正如下：
+
+| 检查 | 实测 | 结论 |
+|---|---|---|
+| `/dev/rtc*` / `/proc/driver/rtc` | 均不存在 | 无硬件 RTC 设备 |
+| 内核 `CONFIG_RTC*` | config fragment 里一项都没有；DTB 无 rtc 节点 | 主线内核没启用 RTC class |
+| `timedatectl`（首轮） | `RTC time: n/a`、`NTP service: n/a` | 冷启动必然丢时间 |
+| `systemd-timesyncd` | 首轮 `not-installed` | NTP 客户端缺失 |
+| `/usr/lib/clock-epoch` | 首轮不存在 | systemd 时间下限缺失 |
+| `fake-hwclock` | 首轮 `not-installed`；apt 候选 `0.12+nmu1` 可用 | 软件 RTC 缺失 |
+| **UDP/123 出口** | `ntp.aliyun.com` 0.05s、`cn.pool.ntp.org` 0.28s、`time.windows.com` 0.10s、`pool.ntp.org` 0.26s 全部收到 48B NTP 响应（仅 `time.google.com` 超时） | **NTP 完全可达** |
+
+**关于硬件 RTC**：机顶盒无 RTC 电池，主线 6.3 未启用 `CONFIG_RTC_CLASS`、DTB 无
+rtc 节点，硬件 RTC 确实不存在；但这**不等于时钟问题无解** —— 应按 Debian 对
+Raspberry Pi 等无 RTC 设备的标准方案，用**文件式软件 RTC** 兜住冷启动，再由
+NTP 精校。若将来要真正的硬件 RTC，需另立项（内核启用 RTC class + Hisilicon
+RTC 驱动 + DTS 节点 + 硬件电池），非本项目必需。
+
+**根治（本轮已落地，Debian 标准三件套）**：
+1. **`fake-hwclock`**（PACKAGES 加入）：`fake-hwclock.service` 开机
+   `ExecStart=/sbin/fake-hwclock load`、关机 `ExecStop=/sbin/fake-hwclock save`，
+   数据在 `/etc/fake-hwclock.data`；postinst 自动 enable 到
+   `sysinit.target.wants`。实测 save/load 往返成功，且 `load` **默认拒绝回拨**
+   （`saved clock information is in the past ... use force`），不会覆盖
+   timesyncd 已同步的更晚时间，两者不冲突。
+2. **`/usr/lib/clock-epoch`**：systemd ≥ 246 在 PID1 启动时以该文件 mtime 作为
+   系统时钟下限；构建时 `touch` 它，保证刷机后首次开机时间不倒退。
+3. **`systemd-timesyncd`** + `timesyncd.conf.d/10-ec6108.conf`（实测可达的 NTP 池）。
+4. 构建时把 `/etc/fake-hwclock.data` 预置为构建时刻，首次开机（尚未联系 NTP）
+   就是合理日期，离线时 apt 也不会被 `Release ... not valid yet` 卡住。
+
+在线验证（装包走 **TCP 直连**，见 §2.2 更正）：
+
+```
+fake-hwclock save  -> /etc/fake-hwclock.data = <BUILD_DATE>
+date -s '+1 day'   -> fake-hwclock load 恢复(并提示 saved clock is in the past)
+timedatectl status -> System clock synchronized: yes / NTP service: active
+journalctl: Contacted time server <NTP_IP>:123 (ntp.aliyun.com)
+```
+
+### 11.7 仍待处理
+
+- `vim`/`git`（PACKAGES 已有 `vim-tiny`）、NTFS 自动挂载 fstab、NM/nmcli 分工（§5.3）等按 §9 清单推进。
+- 本轮所有 rootfs 改动需经 CI 出包后真机刷入验证（制品以 CI 为准）。
+- TCP 出口结论已在 §2.2 更正（直连可用、无需代理），不再列为待办。

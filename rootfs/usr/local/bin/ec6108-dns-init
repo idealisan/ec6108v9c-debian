@@ -1,0 +1,22 @@
+#!/bin/sh
+# systemd-networkd learns the upstream DNS via DHCP, but this minimal rootfs
+# ships neither systemd-resolved nor resolvconf, so nothing ever writes
+# /etc/resolv.conf (it stays a stale 127.0.0.53 stub with no listener).
+# Rebuild it at boot from the DHCP DNS, with public resolvers as fallback.
+dns=""
+i=0
+while [ "$i" -lt 20 ]; do
+    dns=$(networkctl status eth0 --no-pager 2>/dev/null \
+          | awk '/^[[:space:]]*DNS:/ {print $2; exit}')
+    [ -n "$dns" ] && break
+    sleep 0.5
+    i=$((i + 1))
+done
+{
+    echo "# generated at boot by ec6108-dns-init (DHCP DNS + public fallback)"
+    [ -n "$dns" ] && echo "nameserver $dns"
+    echo "nameserver 223.5.5.5"
+    echo "nameserver 119.29.29.29"
+    echo "nameserver 8.8.8.8"
+    echo "options timeout:2 attempts:2"
+} > /etc/resolv.conf
