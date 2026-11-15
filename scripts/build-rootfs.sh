@@ -32,6 +32,14 @@ PACKAGES=(
   lm-sensors fbset kbd console-setup
   python3-minimal python3
   tzdata bash-completion tmux minicom
+  # IR (hisilicon,hix5hd2-ir): ir-keytable / ir-ctl read raw scancodes.
+  v4l-utils
+  # DRM device enumeration (tiny). The full Mesa OpenGL stack is NOT baked in:
+  # libgl1-mesa-dri pulls libllvm15 (~98 MiB installed), which together with
+  # ffmpeg's deps would blow the 480 MiB image (docs/054 §6.3, two past
+  # mke2fs failures). lima probing /dev/dri needs no userspace driver; install
+  # Mesa (lima_dri.so) + mesa-utils online if OpenGL ES is ever needed.
+  libdrm2 libgbm1
 )
 # firmware-realtek lives in non-free-firmware in bookworm.
 COMPONENTS=${COMPONENTS:-main,contrib,non-free,non-free-firmware}

@@ -838,3 +838,146 @@ journalctl: Contacted time server <NTP_IP>:123 (ntp.aliyun.com)
 - `vim`/`git`（PACKAGES 已有 `vim-tiny`）、NTFS 自动挂载 fstab、NM/nmcli 分工（§5.3）等按 §9 清单推进。
 - 本轮所有 rootfs 改动需经 CI 出包后真机刷入验证（制品以 CI 为准）。
 - TCP 出口结论已在 §2.2 更正（直连可用、无需代理），不再列为待办。
+
+---
+
+## 12. 第三轮：GPU/红外启用、1080p 解码实测、CasaOS 与硬解调研
+
+用户明确要求：做 GPU（lima）、能用就做红外、装 FFmpeg 做 **1080p/H.264/30fps** 解码
+测试（低分辨率无意义）、调研 CasaOS（home lab WebUI），并问"硬解结论如何、能否
+加上硬解"。以下逐项记录。
+
+### 12.1 H.264 解码实测（这次是真正有意义的 1080p30）★
+
+**测试片**（本机生成/下载，重编码全在开发机做，不给盒子加压）：
+
+| 项 | 低码率片（首轮，用户指出太低） | 1080p30 片（本轮） |
+|---|---|---|
+| 来源 | `archive.org` `BigBuckBunny_512kb.mp4` | `test-videos.co.uk` 1080p 源（60fps）→ 本机 ffmpeg 规整 |
+| 分辨率 | 416×240 | **1920×1080** |
+| 编码 | H.264 Constrained Baseline | H.264 High |
+| 帧率 | 24 | **30** |
+| 码率 | 512 kb/s | ~3.9 Mb/s |
+| 时长/帧数 | 596s | 30s / 900 帧 |
+
+**结果**（`ffmpeg -benchmark -f null -`，`nice -n 10` 降优先级）：
+
+| 片 | 耗时 | speed | 解码 fps | 是否实时 |
+|---|---|---|---|---|
+| 416×240 512kb | 596s 素材 → **23s** | 23.5x | 564 | 远超实时 |
+| **1080p30 3.9Mb** | 30s 素材 → **45s** | **0.699x** | **21** | **否，约 0.7 倍速** |
+
+即：这颗 4× Cortex-A7 级 CPU（NEON，BogoMIPS ~1959）**软解 1080p30 达不到实时**，
+缺约 30% 性能；用户"很可能会有压力"的预判正确。低码率/低分辨率完全够用，
+1080p 则有明显压力 —— 这也是"希望最好能硬解"的现实动机。
+
+**硬解路径全部不可用**（实测）：
+- `ffmpeg -decoders` 里有 `h264_v4l2m2m` 包装器，但盒子**无 `/dev/video*`**，
+  `-c:v h264_v4l2m2m` 报 `Could not find a valid device / can't configure decoder`；
+- `-hwaccel drm` 报 `Device creation failed: -14`（无 `/dev/dri`，lima 尚未启用）；
+- `vaapi`/`vdpau` 虽有框架列表但无对应硬件/驱动。
+
+### 12.2 硬解结论：目前没有任何硬解，且短期无法"加上"
+
+综合 §7.1 / §7.2 与本轮复测：
+
+| 路径 | 可行性 | 原因 |
+|---|---|---|
+| 主线 6.3 V4L2 M2M（hantro/verisilicon） | ✗ | 驱动 compatible 全是 `rockchip,*-vpu`/i.MX，对应 VeriSilicon G1/G2 VPU；本 SoC 是**海思自研 VDH**（`vdec_vdh`/`vdec_scd`），寄存器/固件完全不同；主线 `drivers/media/` 里 hisilicon 只有红外遥控，零视频编解码驱动 |
+| 社区 4.4 vendor 内核的多媒体栈 | 内核侧有、用户态没接上 | 社区 4.4 = 原厂 Hisilicon SDK 内核，内建 `hi_mmz`/VDEC/VENC/Mali 驱动（`mmz=ddr,0,0,60M`、DTB `gpu@0xf9200000`、中断名含 `vdec_vdh`/`venc`），但 Android 私有 HAL（`libhi_msp.so`/`libOMX.hisi.*`/`libGLES_mali.so`，**bionic**）在 Ubuntu/Debian glibc 上跑不起来，也没有 V4L2/VA-API 适配层 |
+| 主线 `lima` GPU 硬解 | ✗ | lima 是 Mali-450 的 **render-only** DRM 驱动（OpenGL ES 2.0 级 3D），不含任何视频编解码引擎，启用它也**不会**带来硬解 |
+| 整体 backport vendor 多媒体栈 | 大工程，另立项 | 需移植 `hi_mmz` + VDEC/VENC + OMX + HAL，工作量远大于本项目的显示驱动 backport |
+
+**结论**：这台机器在当前主线 6.3 方案下**没有、也无法通过简单配置获得硬件解码**；
+可用的是纯软解，能力上限见 §12.1（1080p30 约 0.7x）。
+编码同理（用户已判断"没人会拿电视盒子做编码器"，一致）。硬解只能靠另立项的
+vendor 栈整体 backport，或换用本身就带 V4L2 硬解的 SoC。
+
+### 12.3 GPU 部分（本轮已落地，出包验证）：启用主线 lima
+
+沿用 §7.2.3 的结论 —— Mali-450 是 Arm 通用 IP，主线 `lima` 已跨 14 个 SoC 通用，
+不需要海思私有驱动。关键点：**board DTS `&gpu`/`&ir` 早已是 `status="okay"`**
+（`hi3798mv100-ec6108v9c.dts`），`f9200000.gpu` / `f8001000.ir` 平台设备在当前内核
+里就已存在（`ls /sys/bus/platform/devices/`），缺的只是**内核驱动配置 + 用户态工具**。
+所以本轮是纯 config 改动，不动 DTS：
+
+- `configs/kernel/ec6108v9c.config` 追加：
+  - `CONFIG_DRM=y` / `CONFIG_DRM_LIMA=y`，并显式列出 lima `select` 的
+    `DRM_SCHED` / `DRM_GEM_SHMEM_HELPER` / `PM_DEVFREQ` /
+    `DEVFREQ_GOV_SIMPLE_ONDEMAND`（及 `PM`/`PM_OPP`），避免 `olddefconfig` 因依赖
+    未满足静默丢弃（§8 的历史教训）；
+  - `CONFIG_DRM_FBDEV_EMULATION=n`：lima 是 render-only，绝不能让 DRM 注册 fbdev
+    去抢 `/dev/fb0` / fbcon（否则会破坏已稳定的 TTY 显示）；
+  - 时钟/复位由 `crg-hi3798`（`COMMON_CLK_HI3798`，`ARCH_HISI` 默认带入）提供
+    `HISTB_GPU_BUS_CLK/GP_CLK`，已确认存在。
+- `scripts/build-rootfs.sh` PACKAGES 追加 `libdrm2 libgbm1`（很小）。
+  **刻意不把 `libgl1-mesa-dri`/`mesa-utils` 固化**：`libgl1-mesa-dri` 会拉
+  `libllvm15`（~98 MiB installed），叠加 FFmpeg 依赖会撑爆 480 MiB 镜像（§6.3 两次
+  `mke2fs` 失败）。lima 探测 `/dev/dri` 不需要用户态驱动；真要 OpenGL ES 时在线
+  `apt install libgl1-mesa-dri mesa-utils` 即可（网络已通）。
+
+验证方式：出包刷机后 `ls /dev/dri`（应出现 `renderD*`/`card*`）、
+`dmesg | grep lima`、`/sys/class/drm/`。**注意 lima 不提供硬解**（§12.2）。
+
+### 12.4 红外（本轮已落地，出包验证）：主线 hix5hd2-ir
+
+用户"能用就更好"。当前实测**完全没启用**：无 `/sys/class/rc`、无 `/dev/lirc*`、
+无驱动模块、无工具；但 `f8001000.ir` 平台设备已存在，DTS `&ir status="okay"`。
+本轮打开：
+
+- `configs/kernel/ec6108v9c.config` 追加 `CONFIG_RC_CORE=y` / `CONFIG_RC_DEVICES=y` /
+  `CONFIG_LIRC=y` / `CONFIG_IR_HIX5HD2=y` + 常用协议解码器（NEC/RC5/RC6/SONY/
+  JVC/SANYO/SHARP/MCE_KBD/XMP）为 `=y`（无 initramfs，开机即需，不能靠模块）。
+  时钟 `HISTB_IR_CLK` 由 `crg-hi3798` 的 `hi3798mv100-sysctrl` 提供（已确认）。
+- `scripts/build-rootfs.sh` PACKAGES 追加 `v4l-utils`（`ir-keytable` / `ir-ctl`）。
+
+出包刷机后应出现 `/sys/class/rc/rc0`，`ir-keytable -t` 能读原始 scancode。
+**后续可做**：本遥控器无现成 keymap（原厂 Android `/usr/keylayout/*.kl` 是 Android
+input HAL 格式，不是 Linux rc keymap），要用 `ir-keytable -t` 逐键录制生成
+`/etc/rc_keymaps/*.toml` 才能映射成按键 —— 这对 home lab 做自定义遥控触发
+（如一键脚本）正是"额外妙用"的落点。
+
+### 12.5 CasaOS 调研（home lab WebUI，用户想初步体验）
+
+| 检查 | 结论 |
+|---|---|
+| 是否有 armv7 版本 | **有**。官方 release v0.4.15 含 `linux-arm-7-casaos-v0.4.15.tar.gz`（及 gateway/user-service/local-storage/message-bus/app-management 各 arm-7 包）；安装脚本 `Check_Arch` 明确把 `armv7*` → `TARGET_ARCH=arm-7` |
+| 官方支持矩阵 | 官网标称 amd64/armv7/arm64，Debian 12 为测试系统 |
+| **最大门槛：Docker** | CasaOS 是围绕 Docker 生态的应用管理器，脚本 `Check_Docker_Install` 会强制装 Docker（走 `get.docker.com`）。而 **Docker 已不再为 32 位 armhf 发包**；实测本机 Debian bookworm armhf 源里有 `docker.io 20.10.24` + `containerd 1.6.20` 可用，但官方脚本仍优先拉 Docker CE。脚本最低要求 Docker ≥ 20 |
+| 内存/端口/磁盘 | 956 MiB 内存（可用 ~768）、80 端口空闲、6.0 GiB 可用磁盘 —— 勉强够 CasaOS 最低 400 MiB 要求 |
+| 维护状态 | v0.4.15（2024-12）为最后稳定版，官方已转向 ZimaOS，开发放缓 |
+
+**"能不能不装 Docker"**（用户本轮提问，见回答部分）：CasaOS 主体是 Go 二进制 +
+systemd 服务（gateway 提供 WebUI，user-service/local-storage/message-bus 提供后端），
+这些**本身不依赖 Docker**；强依赖 Docker 的是 `app-management`（应用商店/一键装 App）
+与部分存储特性。因此"只跑核心 WebUI 体验"理论上可以手工解压 arm-7 各组件、
+跳过 `app-management` 与 Docker，但官方一键脚本不支持这种裁剪，属于非官方玩法。
+且 Docker 会覆盖 `docker.service.d/override.conf`、起 Samba/udevil、创建可写
+`/DATA` —— 在一个还在调试的基线上属于较重的改动。本轮**只调研、未安装**（脚本
+仅下载到 `TMP/casaos/install.sh` 审阅）。
+
+### 12.6 网络代理加速与一次"卡死"
+
+- apt 直连 `deb.debian.org` 装 FFmpeg 时卡在 fastly CDN（`146.75.46.132:80`）
+  下 `libglib2.0-0`，15 分钟只下了 415 KB。按用户建议用 **SSH `-R` 把开发机
+  `127.0.0.1:10808` 代理转发到盒子 `11080`**，`http_proxy=127.0.0.1:11080`
+  下 `apt-get install ffmpeg` 约 7 分钟完成（FFmpeg 5.1.9 + 30 余依赖）。
+  海外站点/装包走代理明显更快（与 §2.2 "直连可用"不矛盾：可用但部分 CDN 慢）。
+- 一次用户反馈"机器似乎卡死"：当时并发了多个 SSH 会话 + apt 解包 30+ 依赖 +
+  两次满 CPU 的 1080p 解码 benchmark，瞬时负载高导致 SSH 响应变慢；随后复测
+  `load 0.53`、`systemd running`、无残留进程、`nice` 降优先级后恢复正常。
+  非系统损坏。**此后重活一律串行、单次 SSH、`nice` 降优先级**。
+- FFmpeg 与测试片均为**在线安装/传输**（`/root/video-test/`），重刷后会消失；
+  未固化进 rootfs（镜像尺寸约束，§12.3）。
+
+### 12.7 本轮代码改动（待出包）
+
+| 文件 | 改动 |
+|---|---|
+| `configs/kernel/ec6108v9c.config` | 追加 GPU（DRM/lima，含 select 依赖与 `DRM_FBDEV_EMULATION=n`）与红外（RC_CORE/IR_HIX5HD2/协议解码器）配置 |
+| `scripts/build-rootfs.sh` | PACKAGES 追加 `v4l-utils`（红外）+ `libdrm2 libgbm1`（GPU 枚举）；刻意避开 Mesa/LLVM 大包 |
+| `docs/054`（本文件） | 新增 §12 全部记录 |
+
+本地校验：`bash -n`、config fragment 逐行解析（121 个 `=y` / 3 个 `=m` / 4 个 `=n`，
+无异常行）、隐私复核通过。**产物以 CI 为准**，出包后需真机刷入验证
+`/dev/dri` 与 `/sys/class/rc/rc0`。
