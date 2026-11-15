@@ -497,6 +497,88 @@ OpenGL ES 2.0 级 3D，**不提供视频硬解**。
 - 保持现状对"双 USB 网络存储网关"完全够，本轮不改内核 config（避免与正在
   跑的 release 构建叠加）。
 
+### 7.2 社区 4.4 内核 / SDK / 跨 SoC 同型号 GPU 复用（用户追问）★
+
+用户追问：社区 4.4 内核里是否做了 GPU 与媒体编解码？SDK 里有无相关资料？
+若能找到**其他 SoC 上的同型号 GPU**，是否有可能拿来用？逐一查证：
+
+#### 7.2.1 社区 4.4 内核：**内核侧确实有**，但用户态没接上
+
+社区 4.4 与原厂 Android 用的是**同一个 Hisilicon vendor SDK 内核**，只是把
+rootfs 换成 Ubuntu。证据：
+
+| 证据 | 内容 |
+|---|---|
+| 社区内核自带 cmdline | `mem=1G mmz=ddr,0,0,60M`（p2 env 各档为 `mmz=ddr,0,0,48M`）—— **MMZ 媒体内存区**，证明内核内建了多媒体子系统 |
+| 社区 4.4 DTB (`flash_analysis/kernel.dts:423`) | `gpu@0xf9200000`，`compatible="arm,mali-450","arm,mali-utgard"`、`clock-names="clk_mali"`、`mali-supply` |
+| 同 DTS `:444` 的 `interrupt-names` | 列出 `vdec_vdh` / `vdec_scd` / `vdec_vdh_safe` / `vdec_scd_safe` / `venc` / `vpss0` / `tde` / `jpeg` / `png` / `vdp` / `gpu` —— SoC 硬件里这些多媒体 IP 都实装并各占一条中断 |
+| 内核镜像 `strings` | 能扫到 `vdec_scd` / `vdec_vdh` / `venc` / `arm,mali-450` / `gpu@0xf9200000` / `#clk_mali` / `mali-supply` —— 驱动/设备名编进了内核 |
+| 原厂 `/lib/modules/*.ko` 清单 | 只有 WiFi/USB/NTFS 类（`rtl8188fu.ko`、`ehci-hcd.ko`、`tntfs_hisilicon.ko`…），**没有 mali/vdec 的 .ko** → 印证它们是**内建**而非模块 |
+
+**但社区 Ubuntu 用户态是空的**：`box_backup/community_etc_opt.tar.gz`（社区
+Ubuntu 的 `/etc`+`/opt`，1510 条）里只有 `etc/modules-load.d/modules.conf`、
+`etc/X11/`、`etc/modprobe.d/*` 等通用配置，**没有任何** `mali`/`vdec`/`omx`/
+`hi_` 的模块加载或 HAL；512 MiB 的 `www_ecoo_top.raw` 也扫不到
+`libGLES_mali` / `libOMX` / `libhi_msp`。即内核驱动在、却无用户态调用者，
+**社区系统实际上没用上 GPU 与硬解**。这与用户此前"社区 4.4 没有实现显示
+画面"的观察一致：换了 Ubuntu rootfs，私有 HAL 没跟过来。
+
+> 修正 §7.1 的一处措辞：`vdec_vdh`/`vdec_scd`/`venc` 在社区 DTB 里只是
+> **中断线命名**，不是 V4L2 设备节点；vendor 驱动不走标准 DTB platform 绑定，
+> 而是内核内自行注册，这也是它无法直接移植到主线的原因之一。
+
+#### 7.2.2 SDK 资料：有，但都是 Android 用户态 HAL
+
+本地留存的 SDK/原厂素材（`TMP/stock-rom-research/`、`stock-partition-backups/`、
+`docs/027`、`docs/052`、`RESEARCH-NOTES.md`）里能找到完整私有栈：
+`libGLES_mali.so`(1,087,560 B)、`libEGL.so`、`libGLESv1_CM/v2.so`、
+`libOMX.hisi.video.decoder/encoder.so`、`libOMX_Core.so`、
+`libHV.VIDEO.FFMPEG_VDEC.decode.so`、`libhi_msp.so`(870 KB)、
+`libhi_common.so`、`libhi_vp.so`、`libhi_gfx2d.so`、`/bin/sample_venc`，
+以及内核侧 `/dev/mali*` / `/dev/mmz_userdev` / `/proc/msp/*`。
+`RESEARCH-NOTES.md:12` 已定性为"专有的 Android 用户态 HAL（gralloc /
+hwcomposer / hidisplay / libhi_msp / Mali EGL）" —— **bionic + Android HAL**，
+glibc 系统上跑不起来，也没有 V4L2/VA-API 适配层。作为寄存器序列/固件参考
+有价值，作为可直接复用的驱动不可行（§7.1）。
+
+#### 7.2.3 跨 SoC 同型号 GPU：**能，而且不用找 —— 主线 lima 已经做了**
+
+这是本轮最有价值的发现。Mali-450 是 **Arm 的通用 GPU IP**，不是海思私有：
+
+| 证据 | 内容 |
+|---|---|
+| 主线 `lima_drv.c:463` 的 `dt_match` | `{ .compatible = "arm,mali-400" }` / `{ .compatible = "arm,mali-450", .data = lima_gpu_mali450 }` —— **按 GPU IP 型号匹配，完全不绑定 SoC 厂商** |
+| 主线内核里 `arm,mali-450` 出现的 SoC | **14 个 DTS**，横跨 5 家厂商：Amlogic `meson8/meson8b/meson-gxbb/meson-gxl/gx-mali450`、Rockchip `rk3328`、Allwinner `sun50i-h5`、MediaTek `mt7623n`、HiSilicon `hi3796mv200/hi3798mv200/hi3716dv100/hi6220`，以及本板 `hi3798mv100` |
+| 跨 SoC 范例 `rk3328.dtsi:605` | `compatible = "rockchip,rk3328-mali", "arm,mali-450"` —— 厂商特有串 + 通用 fallback，lima 匹配后者即可驱动；节点只有 `reg`/`interrupts`/`clocks` |
+| 本板 `hi3798mv100.dtsi:464` | 属性**比 rk3328 还全**：`reg`、8 个中断带 `interrupt-names`、`clocks`(bus/core)、`resets`、`mali-supply`、8 档 OPP(150–500 MHz)、`#cooling-cells`；唯一缺的是 `status="disabled"` |
+| `flash_analysis/modules.tar.gz` | 是 **6.14.3 主线内核**的模块包，内含 `lima.ko`（不是社区 4.4 的）—— 佐证 lima 可独立编成模块 |
+
+**结论**：不需要移植海思私有驱动，也不需要"另找"同型号 GPU 的驱动 ——
+主线 `lima` 本身就是这个跨 SoC 通用驱动。落地只要 ① DTS `status="okay"`
+② 启用 `CONFIG_DRM` + `CONFIG_DRM_LIMA`（Kconfig 依赖 `DRM`/`MMU`/
+`COMMON_CLK`/`OF`，自动 select `DRM_SCHED`/`DRM_GEM_SHMEM_HELPER`/
+`PM_DEVFREQ`/`DEVFREQ_GOV_SIMPLE_ONDEMAND`）③ `&crg` 提供
+`HISTB_GPU_BUS_CLK`/`HISTB_GPU_GP_CLK`（cmdline 已有 `clk_ignore_unused`）
+④ 用户态 Mesa `lima_dri.so` + libdrm。一轮 CI 可验证。
+
+#### 7.2.4 但 VDEC 不能跨 SoC 复用
+
+`vdec_vdh`/`vdec_scd` 是**海思自研私有 IP**，不是 Arm 那种跨厂商授权核。
+主线 6.3 的 V4L2 M2M 硬解驱动 `drivers/media/platform/verisilicon/`(hantro)
+的 compatible 全是 `rockchip,*-vpu` / i.MX 等，对应 VeriSilicon G1/G2 VPU，
+与海思 VDH 寄存器/固件完全不同；`drivers/media/` 里 hisilicon 只有红外遥控
+(`rc-hix5hd2.c`)，**零视频编解码驱动**；本板主线 DTS 里也只有 Mali 节点、
+无 `vdec`/`venc`/`codec` 设备节点。所以硬解没有"其他 SoC 同型号"可借，
+只能整体 backport vendor 多媒体栈（大工程）或走软解。
+
+#### 7.2.5 小结
+
+| 目标 | 跨 SoC 复用可行？ | 推荐路径 |
+|---|---|---|
+| **GPU (Mali-450)** | **是**，主线 lima 已通用化 | 启用 `CONFIG_DRM_LIMA` + DTS okay + Mesa，P2、小改动 |
+| **VDEC/VENC (海思 VDH)** | **否**，私有 IP 无同类 | vendor backport（另立项）或软解；先实测 ffmpeg 1080p H.264 |
+| 社区 4.4 内核驱动 | 内核侧有、用户态无 | 可作寄存器/初始化序列参考，不可直接搬 HAL |
+
 ---
 
 ## 8. 本轮已落地的代码改动
@@ -532,7 +614,7 @@ OpenGL ES 2.0 级 3D，**不提供视频硬解**。
 | P1-7 | 中 | `ifup@wlan0.service` 导致 systemd `degraded`（§11.3） | 已修（interfaces 精简），在线验证回到 `running` |
 | P2-1 | 低 | `nmcli`：按 §5.3 方案评估是否引入 NetworkManager | 待用户决定 |
 | P2-2 | 低 | 文件系统：补 `UDF_FS`/`HFSPLUS_FS` + 用户态 fs 工具 + NFS/CIFS 服务端 | 内核基础已够 |
-| P2-3 | 低 | GPU：评估启用 `CONFIG_DRM_LIMA`（DTS 节点 `status="disabled"`，需改 okay + Mesa）；硬解走私有栈另立项 | 已调研（§7.1）：主线 `lima` 可行；原厂 Android 私有栈（bionic + vendor 内核 ABI）不可直接复用 |
+| P2-3 | 低 | GPU：启用 `CONFIG_DRM_LIMA`（DTS 节点 `status="disabled"`，需改 okay + Mesa）；硬解走私有栈另立项 | **已调研（§7.1/§7.2）**：Mali-450 是 Arm 通用 IP，主线 `lima` 已跨 14 个 SoC 通用，改动小可落地；VDEC 是海思私有 IP 无跨 SoC 复用可能；社区 4.4 内核有驱动但 Ubuntu 用户态没接上 |
 | P2-4 | 低 | 绿带 24 行的真机观感确认 | 待反馈 |
 
 ---
