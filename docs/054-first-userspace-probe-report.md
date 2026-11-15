@@ -379,8 +379,14 @@ mke2fs: Could not allocate block in ext2 filesystem while populating file system
 > recovery 包复用同一 sparse 文件，其 manifest 里 p8 为 `S` 类型（bytes 忽略），
 > 不受尺寸变化影响。
 
-**当前状态**：镜像尺寸修复已提交推送；基于最新 HEAD 的 release 正在重新构建
-（该 HEAD 已包含 §4.3 显存保留、§5.2 工具补齐、§6.2 locale 修复等全部改动）。
+**最终状态（2026-11-15 13:53）**：release **`build-20261115T054445Z`** 全绿发布
+（CI run `43680457572`，含 §4.3 显存保留、§5.2 工具补齐/绿带缩小、§6.2 locale
+修复、§6.1.1 NTFS 记录、§6.3 镜像尺寸修复等全部改动）。制品已下载到项目内
+`TMP/ci-download/`，SHA256 全量 10/10 OK，并已只覆盖（不删除）装到 U 盘
+`/Volumes/BOXBAK`：U 盘侧 SHA256 全量 OK、`hi_kernel.bin` 大小与 manifest 一致、
+p1 fastboot 未写、顶层 `bootargs.bin` 的 recovery 刷机入口 CRC 正确、
+sparse 镜像 480 MiB。**仍待真机刷入验证**：花屏是否消失、TTY 是否正常、
+中文文件名是否正常、apt 是否不再 segfault（§9 P0-1 等）。
 
 ### 6.2 已启用的文件系统/存储能力（config fragment 实测）
 
