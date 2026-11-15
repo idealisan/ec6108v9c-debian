@@ -1064,3 +1064,86 @@ Debian 的 `rclone 1.60.1-DEV` 不支持 `unix://`（报 `listen tcp: ... unknow
 **注意**：CasaOS / Docker / FFmpeg / 测试片均为**在线安装**在测试机上，重刷
 （含刷 §13.1 的新包）后会全部消失；这些是体验性改动，未固化进 rootfs。
 `TMP/casaos/` 里保留了各组件包、合并的 sysroot 与安装脚本，便于复现或清理时参考。
+
+---
+
+## 14. 刷入 GPU 版后 lima 未 probe 的诊断与修复（DHCP 地址尾号 .101）
+
+### 14.1 现象
+
+刷入 §13.1 的包（含 `CONFIG_DRM_LIMA` / `IR_HIX5HD2`）后真机实测：
+
+| 检查 | 结果 |
+|---|---|
+| `/dev/dri/` | **不存在**；`/sys/class/drm/` 只有 `version` |
+| `dmesg` | `platform f9200000.gpu: deferred probe pending` |
+| `/sys/kernel/debug/devices_deferred` | 列有 `f9200000.gpu`（另有 4 个 amba timer，历史遗留） |
+| `/sys/bus/platform/drivers/lima/` | 目录存在但只有 `bind`/`unbind`/`uevent`，**无已绑定设备** |
+| `/dev/fb0` (`hi3798vd`) | **仍在** —— `CONFIG_DRM_FBDEV_EMULATION=n` 成功保护了 TTY |
+
+**红外则成功**：`/dev/lirc0`、`/sys/class/rc/rc0`、`input0` 均注册，
+`dmesg` 有 `rc rc0: hix5hd2-ir ... registered`、`IR NEC/RC5/RC6/... protocol
+handler initialized`。`ir-ctl` 可用；`ir-keytable` 未安装（keymap 录制按用户要求暂缓）。
+
+### 14.2 根因：`mali-supply` 指向一个主线没有驱动的 regulator
+
+- board DTS 的 `&gpu` 只有 `status="okay"`，属性全部继承自 SoC dtsi：
+  `mali-supply = <&vddgpu>`，而 `vddgpu` 的 compatible 是
+  **`hisilicon,hi3798mv100-volt`**。
+- 主线 6.3 的 `drivers/regulator/` **没有该驱动**；真机上
+  `/sys/class/regulator/` 只有一个 `regulator-dummy`，
+  `f8a23020.regulator` 设备节点**无 `driver` 软链**。
+- `fw_devlink` 依据 DT 引用建了
+  `supplier:platform:f8a23020.regulator → f9200000.gpu` 依赖，GPU 一直
+  等这个永不出现的 supplier。
+- `drivers/gpu/drm/lima/lima_device.c:189` 的 `lima_regulator_init()`：
+  `devm_regulator_get_optional(dev, "mali")` 遇到「DT 有 supply 属性、
+  supplier 未注册」返回 `-EPROBE_DEFER`，且 lima 对 `-EPROBE_DEFER`
+  **不打印错误、直接 return** → 静默无限 defer。这正是 dmesg 里只有
+  一句 `deferred probe pending`、看不到 lima 具体报错的原因。
+
+**排除项**（逐一实测）：
+- 时钟：`hi3798-crg` 已绑定、`clk_gpu`/`clk_gpu_gp`/`clk_gpu_pp0`/`clk_gpu_pp1`
+  均 200 MHz 且存在 → 不是时钟问题；
+- 复位：`resets = <&crg 0xd4 4>`，同一 crg 驱动提供 → 没问题；
+- OPP/devfreq：`lima_devfreq_init()` 只在存在 **`operating-points-v2`** 时继续，
+  dtsi 用的是老式 `operating-points`，会直接 `return 0` → 不会踩第二个坑；
+- 用户态 Mesa（`lima_dri.so`）刻意未固化，只影响 OpenGL ES 应用，
+  **不影响内核 probe 与 `/dev/dri` 生成**。
+
+**在线旁证**：把 `f8a23020.regulator` 用 `driver_override` 强制绑到
+主线自带的 `reg-fixed-voltage`，报
+`Fixed regulator specified with variable voltages` (`-EINVAL`)
+—— 因为节点 `min=900mV / max=1320mV` 不等，进一步说明该节点缺的是
+专用驱动。实验后已把 `driver_override` 还原为空，未改内核/DTB。
+
+### 14.3 修复
+
+在 `patches/kernel/0001-ec6108v9c-dts-simplefb-tsensor.patch` 增加第三个
+hunk，于 board DTS 的 `&gpu` 节点中删除继承来的 supply：
+
+```dts
+&gpu {
+	status = "okay";
+	/* no hisilicon,hi3798mv100-volt driver in mainline: drop mali-supply */
+	/delete-property/ mali-supply;
+};
+```
+
+删掉后 `devm_regulator_get_optional()` 返回 `-ENODEV`，lima 走
+`return 0` 分支继续 probe：`lima_regulator_enable()` 对 NULL regulator
+直接返回 0，devfreq 也跳过 —— 主线里不带 voltage regulator 的 Mali-450
+板子正是这条路径。同时 `fw_devlink` 不再为 GPU 建那条 supplier 依赖。
+
+**本地验证（不构建镜像，制品以 CI 为准）**：
+- `git apply --check` 通过（正/反向状态正确）；
+- 最小 DTS 验证 `/delete-property/` 语法，`dtc` 反编译确认属性消失；
+- **完整链路**：应用 0001 → `apply-dts-placeholders.py` 填占位符 →
+  `clang -E` 预处理（含 `hi3798mv100.dtsi` 与 `dt-bindings`）→
+  `dtc -I dts -O dtb` 编译成功 → 反编译确认 `gpu@9200000` 仍为
+  `status="okay"`、`clocks`/`resets`/`operating-points` 齐全，
+  **且已无 `mali-supply`**；随后把 submodule 里的 board DTS 还原，diff 为 0。
+
+**待真机验证**：新包刷入后 `ls /dev/dri`（应出现 `card0`）、
+`dmesg | grep -i lima`、`/sys/bus/platform/drivers/lima/` 出现设备软链。
+若仍 deferred，再查 `devices_deferred` 与 lima 的 `bus/core clk`。

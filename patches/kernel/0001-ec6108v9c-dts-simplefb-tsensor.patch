@@ -38,3 +38,15 @@
  	};
  };
  
+@@ -65,9 +89,11 @@
+ &gpio5 {
+ 	status = "okay";
+ };
+ 
+ &gpu {
+ 	status = "okay";
++	/* no hisilicon,hi3798mv100-volt driver in mainline: drop mali-supply */
++	/delete-property/ mali-supply;
+ };
+ 
+ &mmc {
