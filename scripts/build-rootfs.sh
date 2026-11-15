@@ -25,6 +25,7 @@ PACKAGES=(
   systemd-sysv systemd udev dbus kmod
   ifupdown iproute2 isc-dhcp-client netbase net-tools iputils-ping ethtool
   wpasupplicant wireless-tools wireless-regdb firmware-realtek
+  iw rfkill dnsutils netcat-openbsd
   curl wget rsync vim-tiny nano less htop procps psmisc
   e2fsprogs parted dosfstools util-linux mount findutils coreutils
   usbutils pciutils i2c-tools lsof strace tcpdump
@@ -85,10 +86,13 @@ iface lo inet loopback
 auto eth0
 iface eth0 inet dhcp
 
-# WiFi (RTL8188FU, mainline rtl8xxxu). Fill wpa_supplicant.conf with
-# /usr/local/bin/ec6108-wifi <SSID> <password>, then ifup the interface.
-allow-hotplug wlx8421f1edf583
-iface wlx8421f1edf583 inet dhcp
+# WiFi (RTL8188FU, mainline rtl8xxxu) is owned by systemd-networkd via
+# 20-wlan.network (matches wl*, does DHCP). networking.service is masked
+# below, so this ifupdown stanza is kept only as a manual fallback. The
+# kernel cmdline carries net.ifnames=0, so the adapter is wlan0, not a
+# predictable wlx<mac> name. To connect: ec6108-wifi <SSID> <password>.
+allow-hotplug wlan0
+iface wlan0 inet dhcp
     wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
 EOF
 

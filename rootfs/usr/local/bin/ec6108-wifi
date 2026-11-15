@@ -1,19 +1,45 @@
 #!/bin/sh
 # Connect the RTL8188FU USB WiFi on EC6108V9C (mainline rtl8xxxu).
 # Usage: ec6108-wifi <SSID> <password>
-# DHCP is handled by ifupdown (see /etc/network/interfaces).
+#
+# This image is managed by systemd-networkd (20-wlan.network owns any wl*
+# interface and does DHCP). ifupdown is deliberately masked, so do NOT call
+# ifup here. wpa_supplicant only handles the WPA handshake; networkd handles
+# the lease. Detect the interface at runtime instead of hardcoding a
+# predictable name: the kernel cmdline carries net.ifnames=0, so the USB
+# adapter comes up as wlan0, not wlx<mac>.
 set -e
 SSID=$1
 PASS=$2
-IF=wlx8421f1edf583
 if [ -z "$SSID" ] || [ -z "$PASS" ]; then
     echo "usage: ec6108-wifi <SSID> <password>" >&2
     exit 1
 fi
+
+IF=$(iw dev 2>/dev/null | awk '$1 == "Interface" { print $2; exit }')
+if [ -z "$IF" ]; then
+    IF=$(ls -d /sys/class/net/wl* 2>/dev/null | head -1)
+    IF=${IF##*/}
+fi
+if [ -z "$IF" ]; then
+    echo "no wireless interface found (is the USB adapter plugged in?)" >&2
+    echo "check: iw dev ; lsusb ; dmesg | grep -i rtl8xxxu" >&2
+    exit 1
+fi
+echo "wireless interface: $IF"
+
 mkdir -p /etc/wpa_supplicant
 wpa_passphrase "$SSID" "$PASS" > /etc/wpa_supplicant/wpa_supplicant.conf
 chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+
 ip link set "$IF" up
-ifdown "$IF" 2>/dev/null || true
-ifup "$IF"
-echo "WiFi connecting... check with: ip -brief addr show $IF"
+# If an earlier association is still running, starting another one on the
+# same interface simply fails; tell the user instead of killing anything.
+if wpa_supplicant -B -i "$IF" -D nl80211 \
+        -c /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null; then
+    echo "WiFi association started; systemd-networkd handles DHCP."
+else
+    echo "wpa_supplicant did not start (already running for $IF, or driver busy)" >&2
+    echo "inspect: iw dev $IF link ; ps | grep wpa_supplicant" >&2
+fi
+echo "check: iw dev $IF link ; ip -brief addr show $IF ; ping -I $IF <gateway>"

@@ -135,7 +135,12 @@
 #define DDR_END        0x40000000UL
 #define FB_ADDR_MARGIN 0x800000
 
-#define BOOT_MARK_LINES 240
+/* L0 "kernel alive" band. 24 lines on 1080p (~1/10 of the old 240-line
+ * band): still easy to spot when something is wrong, but a short flash
+ * instead of a full-height green block that is hard on the eyes. The
+ * self-drawn console starts right below it, so shrinking the band also
+ * gains ~14 extra text rows for the boot log. */
+#define BOOT_MARK_LINES 24
 #define BOOT_MARK_COLOR 0xff00ff00u	/* a8r8g8b8 opaque green */
 
 #define FB_WIDTH   1920
