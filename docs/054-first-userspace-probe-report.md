@@ -1282,7 +1282,12 @@ GPU 回到「lima 编进内核但 deferred、不阻塞启动」的状态，`/dev
 
 1. **`0005` 补丁修短路**：`rootwait` 循环改为 `while(1){ ROOT_DEV=name_to_dev_t(...); if(ROOT_DEV) break; if(waited_ms>=timeout) break; }`，每轮都解析 root 设备名，与 `driver_probe_done()` 完全解耦。eMMC 一出现即挂载，任何驱动的 probe/defer 都不再能造成 `unknown-block(0,0)`。
 2. **删除 `mali-supply`**（board DTS `&gpu` 里 `/delete-property/`）：去掉指向无驱动 regulator 的依赖，lima 不再永久 deferred，能真正 probe GPU。clocks/resets/中断/OPP 全部保留。
-3. **`CONFIG_DRM_LIMA=m`（模块，非内建）+ 开机后异步加载**：GPU 寄存器访问彻底移出启动关键路径。新增 `ec6108-gpu.service`（`After=network/ssh`、oneshot、`TimeoutStartSec=30`）与 `/usr/local/bin/ec6108-gpu`：`modprobe lima`（`timeout 20`）→ 失败则 `insmod` 兜底（lima 依赖 drm/sched/shmem 均为内建 `=y`，无外部 .ko 依赖）→ 全程 `exit 0` 并把 `/dev/dri`、模块、`devices_deferred`、GPU clocks、dmesg 记录到 `/run/ec6108-gpu.log`。
+3. **`CONFIG_DRM_LIMA=m`（模块，非内建）+ 开机后异步加载**：GPU 寄存器访问彻底移出启动关键路径。新增 `ec6108-gpu.service`（`After=network/ssh`、oneshot、`TimeoutStartSec=30`）与 `/usr/local/bin/ec6108-gpu`：`modprobe lima`（`timeout 20`）→ 失败则 `insmod` 兜底 → 全程 `exit 0` 并把 `/dev/dri`、模块、`devices_deferred`、GPU clocks、dmesg 记录到 `/run/ec6108-gpu.log`。
+   > 制品实测补注：Kconfig 的 `select DRM_SCHED`/`DRM_GEM_SHMEM_HELPER` 是 tristate，随
+   > `DRM_LIMA=m` 一并被顶成模块（fragment 里显式 `=y` 被覆盖）。`modules.dep` 实际为
+   > `lima.ko: gpu-sched.ko drm_shmem_helper.ko`，三者都在 `modules.tar.gz` 里。主路径
+   > `modprobe lima` 会经 `modules.dep` 连带加载依赖；`insmod` 单插兜底仅在依赖已就绪时有效，
+   > 在线验证脚本 `TMP/gpu-verify-online.sh` 已加入按依赖顺序的 `modprobe`/`insmod` 恢复逻辑。
 
 即使 lima probe 卡住/失败：系统已起来、SSH 可达，可在线 `rmmod/modprobe`、看 dmesg、
 读寄存器反复调试，**不需要再刷机**——正好满足「不用一遍遍刷」的诉求。
@@ -1295,7 +1300,24 @@ GPU 回到「lima 编进内核但 deferred、不阻塞启动」的状态，`/dev
 | 2 | 应用全部 patch → 占位符填充 → `clang -E` + `dtc` 完整编译 DTB → 反编译核对 gpu 节点 `mali-supply` 已删、clocks/resets 齐全、`status=okay`，chosen/mmc/reserved-memory/memory@0 完好；submodule 还原 diff=0 | 通过 |
 | 3 | `0005` 短路修复逻辑（`while(1)`+每轮解析）、`prepare_namespace` 括号平衡（30/30, 7/7）、`CONFIG_DRM_LIMA=m` 与 CI verify 行、unit/helper 一致性、全文件隐私复核 | 通过 |
 
+### 16.5 CI 制品落地校验（release `build-20261115T152847Z`，CI `43727529090` 全绿）
+
+| 项 | 结果 |
+|---|---|
+| SHA256 全量 / zip 自身 | 10/10 OK、zip 匹配 |
+| 内核 DTB `gpu@9200000` | `mali-supply` 已删、`status=okay`、clocks/resets/中断在 |
+| cmdline / manifest / p1 | 不变（`root=/dev/mmcblk0p8 rootwait rootwait_timeout=30`）；`hi_kernel.bin 0x717000` 与 manifest 一致；p1 fastboot 未写 |
+| sparse rootfs | 480 MiB / 33 chunks |
+| `modules.tar.gz` | `lima.ko` + `gpu-sched.ko` + `drm_shmem_helper.ko` 齐全，`modules.dep` 依赖链完整 |
+| rootfs 内容 | `ec6108-gpu.service`（ExecStart 指向 helper）、`/usr/local/bin/ec6108-gpu`、helper 日志标签均在 |
+
 **仍需真机确认**（唯一剩余、需刷一次）：刷入本版后 `ls /dev/dri`（应出现 `card0`）、
 `lsmod | grep lima`、`dmesg | grep -i lima` 无 probe 报错、TTY/IP/SSH 正常、
-`dmesg | grep -i rootwait` 无超时放弃行。届时 GPU 可用后即可装 Mesa
-`libgl1-mesa-dri`（提供 `lima_dri.so`）跑 glmark2/kmscube 展示 GUI。
+`dmesg | grep -i rootwait` 无超时放弃行。刷入后把 `TMP/gpu-verify-online.sh` 传上去跑一遍，
+即完成「GPU 是否可用」判定 + 3 遍启动复核；若 lima 未自动加载，脚本内已带按依赖顺序的
+`modprobe`/`insmod` 恢复。GPU 可用后即可装 Mesa `libgl1-mesa-dri`（提供 `lima_dri.so`）
+跑 glmark2/kmscube 展示 GUI。
+
+> 真机当前不可达（刷的是失败的 `131938Z`，起不来），所以本轮所有验证都在离线/制品层完成；
+> 「GPU 真正可用」的最后确认必须刷这一版后在线做。这一版把 GPU 与启动彻底解耦，
+> **刷一次系统必起**，之后 GPU 全部在线调，不必再反复刷机。
