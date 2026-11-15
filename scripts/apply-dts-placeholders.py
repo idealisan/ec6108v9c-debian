@@ -78,16 +78,41 @@ if fb_base:
           + ' stride=' + FB_GEOM['EC6108_FB_STRIDE']
           + ' format=' + FB_GEOM['EC6108_FB_FORMAT'] + '; ramoops enabled')
 else:
+    # vendor-backport display path: FB_BASE is deliberately unset because the
+    # private VO/HDMI driver discovers the hiboot framebuffer at runtime.
+    # But hiboot leaves that buffer in the TOP of DDR and VO keeps scanning
+    # it. Without a reservation the kernel hands those pages to ordinary
+    # allocations -> random coloured bands/noise on HDMI and corrupted
+    # userspace data (seen as dpkg "lzma corrupt" / segfault while apt
+    # unpacked). The stock Android kernel solves exactly this with its
+    # private hi_mmz driver + "mmz=" cmdline; mainline 6.x has no hi_mmz,
+    # so use the standard reserved-memory mechanism instead.
+    #
+    # Deliberately WITHOUT "no-map": memblock_reserve (rather than
+    # memblock_mark_nomap) keeps the range inside System RAM, which the
+    # display driver's memremap(MEMREMAP_WB) requires. Derive the range from
+    # the DDR size so no guessed physical address is baked into the tree.
+    reserve_size = os.environ.get('FB_RESERVE_SIZE') or '0x2000000'
+    mem_end = int(mem_size, 0)
+    reserve_bytes = int(reserve_size, 0)
+    fb_reserve_base = mem_end - reserve_bytes
+    fb_reserve_child = (
+        '\t\tfb_reserve: framebuffer-reserved@%x {' % fb_reserve_base + NL +
+        '\t\t\treg = <0x%x %s>;' % (fb_reserve_base, reserve_size) + NL +
+        '\t\t};' + NL)
     container = ('\treserved-memory {' + NL +
                  '\t\t#address-cells = <1>;' + NL +
                  '\t\t#size-cells = <1>;' + NL +
                  '\t\tranges;' + NL +
+                 fb_reserve_child +
                  ramoops_child +
                  '\t};' + NL)
     d = inject_block(d, container)
     d = d.replace('__FB_BASE__', '0x3d000000')
     d = d.replace('__FB_STATUS__', '"disabled"')
-    print('framebuffer nodes omitted (FB_BASE unset); pstore ramoops enabled')
+    print('framebuffer nodes omitted (FB_BASE unset); reserved top 0x%x bytes '
+          'at 0x%x for VO scan-out; pstore ramoops enabled'
+          % (reserve_bytes, fb_reserve_base))
 
 d = d.replace('__CMDLINE__', cmdline)
 d = d.replace('__MEM_SIZE__', mem_size)
