@@ -270,6 +270,43 @@ CONFIG_NTFS3_FS=y        # CI build log 实测确认生效
 
 所以 Linux 6.3 主线**已有 NTFS 内置支持**，无需升级内核、无需 `ntfs-3g`（FUSE）。
 
+### 6.1.1 实测坑：`mount` 不带 `-t` 会失败（名字不匹配）
+
+真机实测（2026-11-15，接一块 931.5G "Elements SE" NTFS 移动硬盘）：
+
+```
+# mount /dev/sdb1 /mnt/usb2
+mount: /mnt/usb2: unknown filesystem type 'ntfs'.
+
+cat /proc/filesystems | grep -i ntfs   ->  ntfs3      # 内核注册名是 ntfs3
+blkid /dev/sdb1                        ->  TYPE="ntfs" # libblkid 返回 ntfs
+find /lib/modules -iname '*ntfs*'      ->  (空)        # =y 内建, 非模块
+```
+
+**根因**：内核 `ntfs3` 驱动注册的文件系统名是 `ntfs3`，而 `libblkid` 探测返回
+`ntfs`；`mount` 不带 `-t` 时按 blkid 的名字去调内核，找不到 `ntfs` 便报错。
+**不是内核缺驱动**，也不是 `CONFIG_NTFS3_FS` 没生效。
+
+**解决**：显式指定类型即可（实测 `MOUNT_EXIT=0`，`rw`，931.5G 正常列出内容）：
+
+```
+mount -t ntfs3 /dev/sdb1 /mnt/usb2
+```
+
+**一劳永逸的做法**（三选一，避免每台机器都手动加 `-t`）：
+1. `/etc/filesystems` 里把 `ntfs3` 放在 `ntfs` 之前，`mount` 探测时会优先尝试；
+2. 在 `/etc/fstab` 明确写 `ntfs3`（用 UUID，不写 `/dev/sdX`）：
+   `UUID=<ntfs-uuid> /mnt/usb2 ntfs3 defaults,uid=0,gid=0,iocharset=utf8,nofail 0 0`；
+3. 用 udev/systemd-mount 自动挂载时，在规则里指定 `fstype=ntfs3`。
+
+> 注意：Debian 的 `ntfs-3g` 包会在 `/sbin/mount.ntfs` 放一个 helper，使不带 `-t`
+> 的挂载也能走 FUSE；本镜像没有装它（也不需要），所以必须显式 `-t ntfs3`。
+> 若后续为了兼容旧脚本要装 `ntfs-3g`，反而会用 FUSE 覆盖内核原生 ntfs3，
+> 性能和稳定性都更差 —— 建议不装，统一用 `-t ntfs3`。
+
+**顺带**：dmesg 里 `FAT-fs (sda): Directory bread(block N) failed` 是刷机用的那个
+U 盘（FAT32）的读错误，与这块 NTFS 移动硬盘无关；两者不要混淆。
+
 ### 6.2 已启用的文件系统/存储能力（config fragment 实测）
 
 | 类别 | 已启用 |
