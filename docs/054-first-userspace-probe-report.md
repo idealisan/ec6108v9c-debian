@@ -307,6 +307,40 @@ mount -t ntfs3 /dev/sdb1 /mnt/usb2
 **顺带**：dmesg 里 `FAT-fs (sda): Directory bread(block N) failed` 是刷机用的那个
 U 盘（FAT32）的读错误，与这块 NTFS 移动硬盘无关；两者不要混淆。
 
+### 6.2 中文文件名不能正确显示：locale 未生成（非缺 UTF-8 支持） ★
+
+真机实测（2026-11-15，NTFS 盘上有 `猫和老鼠.fcpbundle` / `第一项完整病历` 等）：
+
+| 层 | 结论 |
+|---|---|
+| 文件名与内核 NLS | **正常**。`os.listdir()` 得到 `e78cab...`（"猫"的标准 UTF-8 字节），挂载带 `iocharset=utf8`，`/proc/filesystems` 有 `ntfs3`；`CONFIG_NLS_UTF8` / `CONFIG_NLS_DEFAULT="utf8"` 均已启用 |
+| userspace locale | **坏**。`locale` 报 `Cannot set LC_CTYPE to default locale: No such file or directory`；`LANG=en_US.UTF-8`，但 `locale -a` 只有 `C / C.utf8 / POSIX` |
+| 根因 | `build-rootfs.sh` 装了 `locales` 包却**从未 `locale-gen`**，且 shrink 步骤删掉 `/usr/share/locale`；sshd 的 `AcceptEnv LANG LC_*` 把客户端的 `LANG=en_US.UTF-8` 带进来，指向一个不存在的 locale → glibc 退回 C/ASCII 行为（中文被 quote 成 `\xxx`、排序错乱、程序报错） |
+|  aggravating factor | 在线尝试 `locale-gen en_US.UTF-8` 直接 **Segmentation fault** —— 与 §4 的显存未保留同源（内存密集操作），刷入含显存保留的包后应消失 |
+
+**关键认识**：`C.UTF-8` 是 glibc ≥ 2.35 内建的（bookworm 为 2.36），**不需要任何
+locale 数据文件**，因此不受 shrink 影响、也不需要 `locale-gen`。验证：
+`LANG=C.UTF-8 ls -1 /mnt/usb2` 正确输出 `猫和老鼠.fcpbundle`、`第一项完整病历`、
+`第二项XML格式`。
+
+**已在线修复**（`/etc/default/locale` 写 `LANG=C.UTF-8`，注释掉 sshd 的
+`AcceptEnv LANG LC_*` 以防客户端覆盖，`systemctl reload ssh`）：
+`locale` 不再报错，中文文件名正常显示。
+
+**已固化到 `scripts/build-rootfs.sh`**（下版刷机自带，无需再手工改）：
+1. SSH 段里注释 `AcceptEnv LANG LC_*`
+2. `tee /etc/default/locale` 写入 `LANG=C.UTF-8`
+3. shrink 注释同步更正（原注释说"The C locale..."，容易让人误以为已处理 UTF-8）
+
+**关于 TTY 控制台字体**：fbcon 用的是 8x16 点阵字体（`console-setup`/`kbd` 已装，
+`/usr/share/consolefonts/` 存在），这类字体最多 256/512 个字形，**不含 CJK 汉字**，
+所以 HDMI 本地 TTY 上中文仍会显示成方块/问号，这是内核 console 字体的固有限制，
+与 locale 无关。SSH/串口终端由终端模拟器渲染 UTF-8，不受此限。若确需本地 TTY
+显示中文，需要额外加载 CJK console 字体（`setfont` + unifont 之类），本项目暂不做。
+
+> 注：之前判断"NTFS 不用升级内核"依然成立；本节的"中文显示"完全是 userspace
+> locale 配置问题，与内核文件系统/编码支持无关，两件事不要混为一谈。
+
 ### 6.2 已启用的文件系统/存储能力（config fragment 实测）
 
 | 类别 | 已启用 |

@@ -99,6 +99,17 @@ EOF
 # ---- SSH ----
 sudo sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" "$ROOT/etc/ssh/sshd_config"
 sudo sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" "$ROOT/etc/ssh/sshd_config"
+# Clients (e.g. terminal apps) send LANG=en_US.UTF-8 by default via
+# AcceptEnv, but this image never runs locale-gen, so that locale does not
+# exist -> "Cannot set LC_CTYPE to default locale" and programs fall back to
+# C/ASCII behaviour (Chinese filenames quoted as \xxx, broken sorting, etc).
+# C.UTF-8 is built into glibc >= 2.35 (bookworm has 2.36) and needs NO locale
+# files, so it survives the shrink step below. Refuse the client's LANG and
+# pin C.UTF-8 as the system default.
+sudo sed -i "s/^AcceptEnv LANG LC_\*/#AcceptEnv LANG LC_*/" "$ROOT/etc/ssh/sshd_config"
+sudo tee "$ROOT/etc/default/locale" >/dev/null <<'LOCALE_EOF'
+LANG=C.UTF-8
+LOCALE_EOF
 # postinst normally creates host keys; regenerate defensively for first boot
 sudo chroot "$ROOT" /usr/bin/ssh-keygen -A || true
 sudo mkdir -p "$ROOT/etc/systemd/system/multi-user.target.wants"
@@ -209,8 +220,9 @@ sudo rm -rf "$ROOT/var/lib/apt/lists/"*
 sudo rm -f "$ROOT/usr/bin/qemu-arm-static"
 sudo rm -rf "$ROOT/var/cache/"*
 # docs, man pages and translations are ~84 MiB and useless on an appliance.
-# The C locale is built into glibc and needs no locale files at all, so the
-# whole locale directory can go (a debootstrap tree only ships translations).
+# C.UTF-8 is built into glibc and needs no locale files at all (see the
+# /etc/default/locale setup above), so the whole locale directory can go
+# (a debootstrap tree only ships gettext translations there).
 sudo rm -rf "$ROOT/usr/share/doc" "$ROOT/usr/share/man" "$ROOT/usr/share/info"
 sudo rm -rf "$ROOT/usr/share/locale"
 # kernel modules are installed separately (modules.tar.gz)
