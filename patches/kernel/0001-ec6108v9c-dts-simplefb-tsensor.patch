@@ -1,6 +1,8 @@
+diff --git a/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts b/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts
+index b16f63daf..4664686ca 100644
 --- a/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts
 +++ b/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,7 @@ / {
  
  	chosen {
  		stdout-path = "serial0:115200n8";
@@ -8,11 +10,10 @@
  	};
  
  	leds {
-@@ -31,6 +32,29 @@
- 			panic-indicator;
+@@ -32,6 +33,29 @@ ir {
  			default-state = "off";
  		};
-+	};
+ 	};
 +
 +/*
 + * Memory map: DDR starts at physical 0x0 on this board (verified via
@@ -35,6 +36,17 @@
 +		compatible = "hisilicon,hi3798mv100-tsensor";
 +		reg = <0xf8a23000 0x1000>;
 +		status = "okay";
- 	};
++	};
  };
  
+ &timer1 {
+@@ -68,6 +92,9 @@ &gpio5 {
+ 
+ &gpu {
+ 	status = "okay";
++	/* mainline lima drives this Mali-450 itself; the SoC volt regulator
++	 * has no driver here and would only defer lima forever */
++	/delete-property/ mali-supply;
+ };
+ 
+ &mmc {

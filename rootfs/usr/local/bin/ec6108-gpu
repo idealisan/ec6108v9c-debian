@@ -1,0 +1,57 @@
+#!/bin/sh
+# Load the mainline lima (Mali-450) DRM driver AFTER userspace is up.
+#
+# Why a load-time helper instead of built-in:
+#   lima is built as =m so NO GPU register access happens on the boot critical
+#   path. This helper runs only after network/SSH are ready (ec6108-gpu.service),
+#   so even a stuck/slow lima probe can never affect mounting root or reaching
+#   a login prompt. It also makes the GPU hot-swappable for online debugging
+#   (rmmod/modprobe) without reflashing the box.
+#
+# Every step is non-fatal and time-bounded: this script ALWAYS exits 0 so the
+# systemd unit can never put the machine into a degraded/failed state.
+
+LOG=/run/ec6108-gpu.log
+log() { echo "$*" >> "$LOG"; echo "ec6108-gpu: $*"; }
+
+: > "$LOG"
+log "=== ec6108-gpu start @ $(cut -d' ' -f1 /proc/uptime)s ==="
+
+if grep -q '^lima ' /proc/modules 2>/dev/null; then
+    log "lima already loaded"
+else
+    # modprobe first (uses modules.dep from modules_install). lima's only
+    # dependencies (drm, drm_sched, drm_shmem_helper) are built-in =y, so
+    # lima.ko has no external .ko deps and insmod works too as a fallback
+    # if modules.dep is missing in this minimal rootfs.
+    log "loading lima via modprobe (timeout 20s)"
+    timeout 20 modprobe lima 2>>"$LOG"
+    rc=$?
+    log "modprobe rc=$rc"
+
+    if ! grep -q '^lima ' /proc/modules 2>/dev/null; then
+        KO=$(find /lib/modules /usr/lib/modules -path '*lima*.ko' -type f 2>/dev/null | head -1)
+        if [ -n "$KO" ]; then
+            log "fallback insmod $KO (timeout 20s)"
+            timeout 20 insmod "$KO" 2>>"$LOG"
+            log "insmod rc=$?"
+        else
+            log "lima.ko not found under /lib/modules or /usr/lib/modules"
+        fi
+    fi
+fi
+
+# Diagnostics for online verification / debugging (never fatal).
+log "--- /dev/dri ---"
+ls -la /dev/dri/ 2>&1 >>"$LOG" || log "no /dev/dri"
+log "--- lima/drm modules ---"
+lsmod 2>/dev/null | grep -iE 'lima|gpu_sched|drm' >>"$LOG" || log "none"
+log "--- devices_deferred (gpu) ---"
+grep -i gpu /sys/kernel/debug/devices_deferred 2>/dev/null >>"$LOG" || log "gpu not deferred / debugfs off"
+log "--- gpu clocks ---"
+grep -i gpu /sys/kernel/debug/clk/clk_summary 2>/dev/null >>"$LOG" || log "clk_summary unavailable"
+log "--- dmesg lima/gpu ---"
+dmesg 2>/dev/null | grep -iE 'lima|mali|f9200000.gpu|drm' | tail -25 >>"$LOG" || log "dmesg unavailable"
+log "=== ec6108-gpu done ==="
+
+exit 0

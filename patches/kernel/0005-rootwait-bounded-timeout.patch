@@ -1,5 +1,5 @@
 diff --git a/init/do_mounts.c b/init/do_mounts.c
-index 811e94daf..47e9473d7 100644
+index 811e94daf..aa1999a8b 100644
 --- a/init/do_mounts.c
 +++ b/init/do_mounts.c
 @@ -31,6 +31,7 @@ int root_mountflags = MS_RDONLY | MS_SILENT;
@@ -36,19 +36,33 @@ index 811e94daf..47e9473d7 100644
  static char * __initdata root_mount_data;
  static int __init root_data_setup(char *str)
  {
-@@ -633,11 +653,20 @@ void __init prepare_namespace(void)
+@@ -633,11 +653,33 @@ void __init prepare_namespace(void)
  
  	/* wait for any asynchronous scanning to complete */
  	if ((ROOT_DEV == 0) && root_wait) {
 -		printk(KERN_INFO "Waiting for root device %s...\n",
 -			saved_root_name);
+-		while (driver_probe_done() != 0 ||
+-			(ROOT_DEV = name_to_dev_t(saved_root_name)) == 0)
 +		unsigned int waited_ms = 0;
 +
 +		printk(KERN_INFO "Waiting for root device %s (max %us)...\n",
 +			saved_root_name, rootwait_timeout);
- 		while (driver_probe_done() != 0 ||
--			(ROOT_DEV = name_to_dev_t(saved_root_name)) == 0)
-+			(ROOT_DEV = name_to_dev_t(saved_root_name)) == 0) {
++		/*
++		 * Resolve the root device on EVERY iteration, independent of
++		 * driver_probe_done(). The old form
++		 *   driver_probe_done() != 0 || (ROOT_DEV = name_to_dev_t(...)) == 0
++		 * short-circuits: while any driver is still probing (e.g. a GPU
++		 * with an unpowered domain, or a device looping -EPROBE_DEFER),
++		 * name_to_dev_t() is never called, ROOT_DEV stays 0 and the
++		 * bounded timeout then panics with unknown-block(0,0) even though
++		 * the eMMC partition is already present. Probing is unrelated to
++		 * whether /dev/mmcblk0p8 exists, so never gate it on probe state.
++		 */
++		while (1) {
++			ROOT_DEV = name_to_dev_t(saved_root_name);
++			if (ROOT_DEV != 0)
++				break;
 +			if (waited_ms >= rootwait_timeout * 1000) {
 +				pr_emerg("rootwait: %s did not appear within %us, giving up\n",
 +					saved_root_name, rootwait_timeout);

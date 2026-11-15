@@ -1252,3 +1252,50 @@ GPU 回到「lima 编进内核但 deferred、不阻塞启动」的状态，`/dev
    要么在 DTS 里把 `&gpu` 保持 `status="disabled"`，避免 lima 在启动早期 probe。
 3. 本轮真机刷入后请复核 `dmesg | grep -i rootwait` 不再出现超时放弃行、
    TTY 登录提示正常、IP 可 SSH。
+
+---
+
+## 16. 让 GPU 真正可用且绝不破坏启动：解耦方案（回退 §15 之后的正解）
+
+### 16.1 目标与约束
+
+用户明确：回退版（GPU 依旧不能用）与更早能启动的版本「没有区别」，不值得
+再刷一遍；要求**真正让 GPU 可用**（后续展示 GUI），且**绝对不能再把启动搞挂**，
+并在确认后复核 3 遍启动安全性。参考：原厂 Android、社区 4.4 内核、互联网上
+同款 Mali-450 / 同类 SoC 的主线 lima 用法，必要时逆向原厂驱动写主线驱动。
+
+### 16.2 调研结论（证据链）
+
+| 结论 | 证据 |
+|---|---|
+| Mali-450 是标准 IP，主线 lima 原生支持，无需私有 GPU 驱动/固件 | Mesa lima 文档（Mali-400/450 Supported，OpenGL ES 2.0，97% dEQP）；主线 `lima_drv.c` 的 `dt_match` 含 `arm,mali-450` |
+| 其它 9 个 SoC 的 Mali-450 节点都**不带** `mali-supply`，lima 照常工作 | 主线 DTS 逐个核对：hi6220 / meson8b / meson-gx / rk3328 / mt7623n / sun50i-h5 均 NO_SUPPLY；只有 Hisilicon 4 款带 |
+| 本板 GPU 的 clock/reset 主线齐全，无需私有上电驱动 | `crg-hi3798.c` 有 `clk_gpu`/`clk_gpu_gp`/`clk_gpu_pp0/1`（0xd4）与 `hisi_reset_init`；DTS `clocks=<&crg HISTB_GPU_BUS_CLK/CORE>, clock-names="bus","core", resets=<&crg 0xd4 4>`；lima 自带 `lima_pmu_hw_init`（`LIMA_PMU_POWER_UP`）做 GPU 内部域上电 |
+| `mali-supply` 指向的 `hisilicon,hi3798mv100-volt` 主线无驱动 | 主线 `drivers/regulator/` 搜不到；SDK 4.4 里只有 mv200/cv200/mv310 的 **devfreq 调压**驱动（非上电开关），注释即 "devfreq regulator for utgard GPUs" |
+| 原厂/社区 4.4 的 `pmu_domain_config`/`pmu_switch_delay`/`operating-points-tt` 是私有 mali 驱动解释的属性，主线 lima 不读 | 社区 4.4 `kernel.dts` GPU 节点全文；主线 lima 只读 standard bindings |
+| 之前「删 mali-supply 让 lima 能 probe」的尝试失败，根因不是 GPU 卡死，而是 `0005` 的 `\|\|` 短路 | IMG_0597 OCR：panic 为 `unknown-block(0,0)`、其余 CPU 均在 `do_idle`，说明内核已跑完 initcall 到达 `prepare_namespace`；`while (driver_probe_done()!=0 \|\| (ROOT_DEV=name_to_dev_t(...))==0)` 短路使设备未就绪时右侧永不执行，ROOT_DEV 恒 0，30s 超时 panic |
+
+> 结论：**不需要移植私有 GPU 驱动，也不需要逆向**。缺的只是「别让一个可选的
+> regulator 依赖把 lima 卡在 deferred」「别让 GPU 的 probe 结果传导到 root 挂载」。
+
+### 16.3 落地方案（三层保险，任一单点失败都不影响启动）
+
+1. **`0005` 补丁修短路**：`rootwait` 循环改为 `while(1){ ROOT_DEV=name_to_dev_t(...); if(ROOT_DEV) break; if(waited_ms>=timeout) break; }`，每轮都解析 root 设备名，与 `driver_probe_done()` 完全解耦。eMMC 一出现即挂载，任何驱动的 probe/defer 都不再能造成 `unknown-block(0,0)`。
+2. **删除 `mali-supply`**（board DTS `&gpu` 里 `/delete-property/`）：去掉指向无驱动 regulator 的依赖，lima 不再永久 deferred，能真正 probe GPU。clocks/resets/中断/OPP 全部保留。
+3. **`CONFIG_DRM_LIMA=m`（模块，非内建）+ 开机后异步加载**：GPU 寄存器访问彻底移出启动关键路径。新增 `ec6108-gpu.service`（`After=network/ssh`、oneshot、`TimeoutStartSec=30`）与 `/usr/local/bin/ec6108-gpu`：`modprobe lima`（`timeout 20`）→ 失败则 `insmod` 兜底（lima 依赖 drm/sched/shmem 均为内建 `=y`，无外部 .ko 依赖）→ 全程 `exit 0` 并把 `/dev/dri`、模块、`devices_deferred`、GPU clocks、dmesg 记录到 `/run/ec6108-gpu.log`。
+
+即使 lima probe 卡住/失败：系统已起来、SSH 可达，可在线 `rmmod/modprobe`、看 dmesg、
+读寄存器反复调试，**不需要再刷机**——正好满足「不用一遍遍刷」的诉求。
+
+### 16.4 启动安全性 3 遍复核（离线可验证部分）
+
+| 遍 | 检查 | 结果 |
+|---|---|---|
+| 1 | `bash -n`/`sh -n` 全部脚本；4 个 patch `apply --check`；config fragment 逐行解析（含新 `=m`）；隐私复核 | 通过（首次发现 0001 patch 手工拼 hunk 损坏，已改用 `git diff` 重新生成三 hunk 并通过） |
+| 2 | 应用全部 patch → 占位符填充 → `clang -E` + `dtc` 完整编译 DTB → 反编译核对 gpu 节点 `mali-supply` 已删、clocks/resets 齐全、`status=okay`，chosen/mmc/reserved-memory/memory@0 完好；submodule 还原 diff=0 | 通过 |
+| 3 | `0005` 短路修复逻辑（`while(1)`+每轮解析）、`prepare_namespace` 括号平衡（30/30, 7/7）、`CONFIG_DRM_LIMA=m` 与 CI verify 行、unit/helper 一致性、全文件隐私复核 | 通过 |
+
+**仍需真机确认**（唯一剩余、需刷一次）：刷入本版后 `ls /dev/dri`（应出现 `card0`）、
+`lsmod | grep lima`、`dmesg | grep -i lima` 无 probe 报错、TTY/IP/SSH 正常、
+`dmesg | grep -i rootwait` 无超时放弃行。届时 GPU 可用后即可装 Mesa
+`libgl1-mesa-dri`（提供 `lima_dri.so`）跑 glmark2/kmscube 展示 GUI。

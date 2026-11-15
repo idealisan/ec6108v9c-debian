@@ -187,6 +187,34 @@ UNIT_EOF
 sudo ln -sf /etc/systemd/system/ec6108-dns-init.service \
     "$ROOT/etc/systemd/system/multi-user.target.wants/ec6108-dns-init.service"
 
+# ---- GPU (Mali-450 / mainline lima) --------------------------------------
+# lima is built as a MODULE (=m), never built-in: probing it reads GPU
+# registers and, built-in, could stall the boot critical path (a built-in
+# lima probe previously turned into an unknown-block(0,0) boot panic). Load it
+# only AFTER userspace/network/SSH are up via a time-bounded, non-fatal unit.
+# Enabled by default so the GPU is usable right after flashing; because the
+# module probe is off the boot path and wrapped in timeouts + exit 0, even a
+# stuck probe cannot affect mounting root or reaching SSH. If it ever needs to
+# be parked for debugging, disable online: systemctl disable ec6108-gpu.
+sudo tee "$ROOT/etc/systemd/system/ec6108-gpu.service" >/dev/null <<'UNIT_EOF'
+[Unit]
+Description=Load lima (Mali-450) DRM driver after userspace is ready
+After=systemd-networkd.service ssh.service
+Wants=systemd-networkd.service
+ConditionPathExists=!/sys/module/lima
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ec6108-gpu
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+# Enable the unit (see comment above): safe because it starts only after SSH.
+sudo ln -sf /etc/systemd/system/ec6108-gpu.service \
+    "$ROOT/etc/systemd/system/multi-user.target.wants/ec6108-gpu.service"
+
 # ---- time: no hardware RTC, so use Debian's file-backed software clock ----
 # The mainline kernel has CONFIG_RTC_CLASS off and the DTB carries no rtc
 # node: there is no /dev/rtc and no battery, so a cold boot would otherwise
