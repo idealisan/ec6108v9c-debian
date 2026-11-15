@@ -1069,6 +1069,11 @@ Debian 的 `rclone 1.60.1-DEV` 不支持 `unix://`（报 `listen tcp: ... unknow
 
 ## 14. 刷入 GPU 版后 lima 未 probe 的诊断与修复（DHCP 地址尾号 .101）
 
+> **⚠️ 本章 §14.3 的「修复」已被真机证伪并回退（见 §15）。**
+> 删除 `mali-supply` 让 lima 真正 probe，但在这块板子上反而导致内核
+> 启动失败（`VFS: Unable to mount root fs on unknown-block(0,0)`）。
+> 本章保留作为诊断记录，**不要按 §14.3 再次实施**。当前正确状态见 §15。
+
 ### 14.1 现象
 
 刷入 §13.1 的包（含 `CONFIG_DRM_LIMA` / `IR_HIX5HD2`）后真机实测：
@@ -1147,3 +1152,103 @@ hunk，于 board DTS 的 `&gpu` 节点中删除继承来的 supply：
 **待真机验证**：新包刷入后 `ls /dev/dri`（应出现 `card0`）、
 `dmesg | grep -i lima`、`/sys/bus/platform/drivers/lima/` 出现设备软链。
 若仍 deferred，再查 `devices_deferred` 与 lima 的 `bus/core clk`。
+
+---
+
+## 15. §14.3 修复引入的启动回归与回退（release `build-20261115T131938Z`）
+
+### 15.1 用户报告与 OCR 证据
+
+用户反馈「这次 Linux 内核启动又失败了」，并明确「**最新的一个 release
+打的包出现的问题，再往前一个是正常的**」——即 `build-20261115T131938Z`
+（含 §14.3 的 `/delete-property/ mali-supply`）失败，而
+`build-20261115T094258Z`（含 GPU/IR config、但**保留** `mali-supply`）正常。
+
+屏幕照片经本地 Vision OCR 还原（62 行，平均置信度 1.00），尾部为：
+
+```
+103.664990] dump_stack_lvl from do_handle_IPI+0x220/0x260
+            ... do_handle_IPI / ipi_handler / gic_handle_irq ...
+            CPU1: stopping / CPU: 1 PID: 0 Comm: swapper/1
+            CPU0: stopping / CPU: 0 PID: 0 Comm: swapper/0
+103.89...] rest_init from arch_post_acpi_subsys_init+0x0/0x18
+104.606730] --[ end Kernel panic - not syncing:
+               VFS: Unable to mount root fs on unknown-block(0,0) ]--
+```
+
+即 `ROOT_DEV == 0`、根设备名解析不出来，且 panic 发生在 **104.6 秒**。
+
+### 15.2 回归范围锁定（精确到单行）
+
+对比 `094258Z`（正常）与 `131938Z`（失败）两个内核镜像里提取的 appended DTB，
+反编译后 diff 只有两类变化：
+
+| 变化 | 性质 |
+|---|---|
+| `mali-supply = <0x0b>` 从 `gpu@9200000` 消失 | **唯一的语义改动** |
+| 其余 17 行全是 phandle 编号 `-1` 平移（`0x0c→0x0b`、`0x0d→0x0c`、`0x10→0x0f` …）及其引用同步更新 | dtc 自动重编号，无语义变化 |
+
+`mmc@9830000`、`/chosen/bootargs`、`clocks`/`resets` 均完好一致：
+`root=/dev/mmcblk0p8 ... rootwait rootwait_timeout=30 ... mem=1G`。
+
+git 层面同样干净：`3cc2920..HEAD` 之间除 `docs/` 与 0001 patch 外
+**无任何代码文件变更**；U 盘落地校验也全过（SHA256 10/10、p1 未写、
+recovery 入口 CRC OK）。所以不是打包/刷写损坏，就是这一行 DTS 改动。
+
+### 15.3 根因分析
+
+`mali-supply` 删除后，`fw_devlink` 不再为 GPU 建立指向
+`f8a23020.regulator` 的 supplier 依赖，lima 于是**第一次真正 probe**
+（§14.1 里它一直 `deferred probe pending`、从未碰硬件）。
+
+`0005` 补丁的 `rootwait` 循环是：
+
+```c
+while (driver_probe_done() != 0 ||
+       (ROOT_DEV = name_to_dev_t(saved_root_name)) == 0) { ... msleep(5) ... }
+```
+
+`||` **短路求值**：只要 `driver_probe_done()` 返回 `-EBUSY`（`probe_count != 0`，
+即有设备还在 probe），右侧 `ROOT_DEV = name_to_dev_t(...)` 就**一次都不会执行**。
+lima probe 一旦卡住/长时间不返回，`probe_count` 不归零，
+`driver_probe_done()` 持续 `-EBUSY` → `ROOT_DEV` 恒为 0 →
+`waited_ms` 累到 30 秒（`rootwait_timeout=30`）→ 打印放弃 →
+`mount_root()` 拿到 `ROOT_DEV=0` → `unknown-block(0,0)` panic。
+
+时间线吻合：内核启动约 74 秒进入 `prepare_namespace`（此板外设/USB/FEMAC
+初始化较慢，§11 基线里 `EXT4-fs resized` 在 19 秒、网卡 link up 在 20 秒），
+再等满 30 秒超时 ≈ **104 秒**，与 OCR 的 104.606730 完全一致。
+
+> **教训**：本地 DTB 校验只能证明「属性删掉了」，不能证明「lima probe 能
+> 完成」。§14.3 把这个当成了修复完成，属于证据层级不够就下结论。
+> 涉及「让一个原本 deferred 的驱动真正 probe」的改动，必须真机验证，
+> 且要评估它对 `driver_probe_done()` / 启动早期时序的副作用。
+
+### 15.4 处置：回退该改动
+
+按用户一贯要求（「一定要解决问题，而不是只让他循环」），这里不靠加大
+`rootwait_timeout` 去赌，而是**回退引入回归的改动**，恢复到已验证可启动的基线：
+
+- 移除 0001 patch 里 §14.3 追加的第三个 hunk（`/delete-property/ mali-supply`）；
+- 回退后 0001 patch 与 `3cc2920`（对应正常版 `094258Z`）**逐字节一致**
+  （`git show 3cc2920:... | diff - ...` 为空）；
+- 本地完整校验：`git apply --check`、full DTS `clang -E` + `dtc` 编译、
+  反编译确认 `gpu@9200000` 的 `mali-supply = <0x0b>` 与 `status="okay"` 均恢复，
+  submodule board DTS diff 归 0。
+
+因此新 release 的内核/DTB/打包脚本将与 `094258Z` 完全相同，启动行为可预期。
+GPU 回到「lima 编进内核但 deferred、不阻塞启动」的状态，`/dev/dri` 仍无——
+这是当前可接受的已知限制（GPU 为 P2、非网关必需；见 §7.2 / §9 待办）。
+
+### 15.5 后续建议（本轮不做）
+
+1. **若要根治短路缺陷**：把 `0005` 的循环改为不依赖 `driver_probe_done()`
+   短路——例如先 `ROOT_DEV = name_to_dev_t(saved_root_name)`，仅在它为 0 时
+   再 `msleep` 并单独检查 `driver_probe_done()` 作为超时辅助判据。这样即使某个
+   驱动 probe 卡住，只要 eMMC 分区已注册就能正常挂载根文件系统。
+   该改动需单独出包并真机验证，不要与回归修复混在一起。
+2. **GPU 若仍要启用**：不要简单删 `mali-supply`；要么补一个主线可用的
+   fixed-regulator 描述（min=max，见 §14.2 在线实验的 `-EINVAL`），
+   要么在 DTS 里把 `&gpu` 保持 `status="disabled"`，避免 lima 在启动早期 probe。
+3. 本轮真机刷入后请复核 `dmesg | grep -i rootwait` 不再出现超时放弃行、
+   TTY 登录提示正常、IP 可 SSH。
