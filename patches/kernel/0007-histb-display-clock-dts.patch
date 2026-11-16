@@ -1,0 +1,85 @@
+--- a/include/dt-bindings/clock/histb-clock.h
++++ b/include/dt-bindings/clock/histb-clock.h
+@@ -80,4 +80,9 @@
+ #define HISTB_UART0_CLK			5
+ #define HISTB_LSADC_CLK			6
+ 
++/* HiSTB display clocks (backport, docs/055); IDs 92..95 are free (<128). */
++#define HISTB_VO_CLK			92
++#define HISTB_VO_HD_CLK			93
++#define HISTB_HDMI_CTRL_CLK			94
++#define HISTB_HDMI_PHY_CLK			95
+ #endif	/* __DTS_HISTB_CLOCK_H */
+--- a/drivers/clk/hisilicon/crg-hi3798.c
++++ b/drivers/clk/hisilicon/crg-hi3798.c
+@@ -419,6 +419,13 @@
+ 	/* FEPHY */
+ 	{ HISTB_FEPHY_CLK, "clk_fephy", "25m",
+ 		CLK_SET_RATE_PARENT, 0x120, 0, 0, },
++	/* HiSTB display clocks (docs/055): minimal gate definitions so the
++	 * VDP/HDMI drivers can prepare/enable them. VO timing is set by the
++	 * drivers via registers; these clocks only need to be gated on. */
++	{ HISTB_VO_CLK, "clk_vo", "clk_apb", 0, 0xd8, 0, 0, },
++	{ HISTB_VO_HD_CLK, "clk_vo_hd", "clk_apb", 0, 0xd8, 4, 0, },
++	{ HISTB_HDMI_CTRL_CLK, "clk_hdmi_ctrl", "clk_apb", 0, 0x10c, 0, 0, },
++	{ HISTB_HDMI_PHY_CLK, "clk_hdmi_phy", "clk_apb", 0, 0x110, 0, 0, },
+ };
+ 
+ static const struct hi3798_complex_clock hi3798mv100_complex_clks[] = {
+--- a/arch/arm/boot/dts/hi3798mv100.dtsi
++++ b/arch/arm/boot/dts/hi3798mv100.dtsi
+@@ -494,6 +494,36 @@
+ 			cooling-min-state = <0>;
+ 			cooling-max-state = <7>;
+ 			#cooling-cells = <2>; /* min followed by max */
++		};
++
++		vdp: display@8cc0000 {
++			compatible = "hisilicon,hi3798mv100-vdp";
++			reg = <0x8cc0000 0x10000>;
++			interrupts = <GIC_SPI 90 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&crg HISTB_VO_HD_CLK>, <&crg HISTB_VO_CLK>;
++			clock-names = "pix", "vo";
++			resets = <&crg 0xd8 30>;
++			status = "disabled";
++			ports { #address-cells = <1>; #size-cells = <0>;
++				port@0 { reg = <0>; vdp_out_hdmi: endpoint { };
++				};
++			};
++		};
++
++		hdmi: hdmi@8ce0000 {
++			compatible = "hisilicon,hi3798mv100-hdmi";
++			reg = <0x8ce0000 0x10000>;
++			interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&crg HISTB_HDMI_CTRL_CLK>, <&crg HISTB_HDMI_PHY_CLK>;
++			clock-names = "ctrl", "phy";
++			resets = <&crg 0x10c 9>, <&crg 0x10c 8>, <&crg 0x110 4>;
++			reset-names = "base", "bus", "phy";
++			status = "disabled";
++			ports { #address-cells = <1>; #size-cells = <0>;
++				port@0 { reg = <0>; hdmi_in_vdp: endpoint {
++					remote-endpoint = <&vdp_out_hdmi>; };
++				};
++			};
+ 		};
+ 
+ 		nand: nand@9810000 {
+--- a/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts
++++ b/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts
+@@ -111,3 +111,15 @@
+ &ir {
+ 	status = "okay";
+ };
++
++&vdp {
++	status = "okay";
++};
++
++&hdmi {
++	status = "okay";
++};
++
++&vdp_out_hdmi {
++	remote-endpoint = <&hdmi_in_vdp>;
++};
