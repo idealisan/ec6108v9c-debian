@@ -24,20 +24,17 @@ DIST=${DIST:-dist}
 KERNEL_IMG=${KERNEL_IMG:-$DIST/hi_kernel.bin}
 MODULES_TAR=${MODULES_TAR:-$DIST/modules.tar.gz}
 ROOTFS_TAR=${ROOTFS_TAR:-$DIST/debian-rootfs-armhf-bookworm.tar.gz}
-# 480 MiB image. The original 384 MiB was sized for a ~240 MiB payload, but
-# adding base network tools (iw, rfkill, dnsutils, netcat-openbsd, ...) grew
-# the rootfs tar to ~287 MiB, and this script ALSO unpacks modules.tar.gz
-# (~30 MiB compressed, considerably more unpacked) into usr/ before
-# mke2fs -d. Together they exceed 384 MiB once ext4 metadata (inodes,
-# journal, 5% reserved blocks) is accounted for, so mke2fs failed with
-# "Could not allocate block ... while populating file system".
+# Rootfs image size. Base payload ~287 MiB + modules ~30 MiB unpacked + Mesa/
+# X/LXDE GPU desktop stack (~200 MiB: libllvm15, lima_dri.so, Xorg, LXDE).
+# ext4 metadata (inodes, journal, 5% reserved) needs headroom on top.
 #
-# Upper bound: p8 starts at LBA 0x31000 (98 MiB). The community flash method
-# writes Ubuntu from that same LBA for 0x100000 sectors (512 MiB, ending at
-# 610 MiB); keeping 98 + IMG <= 610 preserves that region as a fallback if
-# our flash fails. 480 MiB -> 578 MiB, clear of it with 32 MiB to spare.
-# Override with IMG_SIZE_MB=<MiB> only if the rootfs genuinely outgrows it.
-IMG_SIZE_MB=${IMG_SIZE_MB:-480}
+# The old 480 MiB default was capped at 578 MiB to preserve a community-Ubuntu
+# fallback region (p8 from LBA 0x31000, Ubuntu written to 610 MiB). That
+# fallback no longer exists (the box has been flashed past it many times), so
+# the cap is lifted. 900 MiB is comfortable and not wasteful: the image is
+# flashed once, and first boot resize2fs grows p8 to the whole eMMC (~7 GiB),
+# so runtime free space is unaffected. Override with IMG_SIZE_MB=<MiB>.
+IMG_SIZE_MB=${IMG_SIZE_MB:-900}
 ROOT_PASSWD=${ROOT_PASSWD:-ec6108v9c}
 SUDO=${SUDO:-sudo}
 MKFS=${MKFS:-mke2fs}

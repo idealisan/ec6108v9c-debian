@@ -34,12 +34,17 @@ PACKAGES=(
   tzdata bash-completion tmux minicom
   # IR (hisilicon,hix5hd2-ir): ir-keytable / ir-ctl read raw scancodes.
   v4l-utils
-  # DRM device enumeration (tiny). The full Mesa OpenGL stack is NOT baked in:
-  # libgl1-mesa-dri pulls libllvm15 (~98 MiB installed), which together with
-  # ffmpeg's deps would blow the 480 MiB image (docs/054 §6.3, two past
-  # mke2fs failures). lima probing /dev/dri needs no userspace driver; install
-  # Mesa (lima_dri.so) + mesa-utils online if OpenGL ES is ever needed.
-  libdrm2 libgbm1
+  # ---- GPU-accelerated GUI desktop (docs/055) ----
+  # Mesa user-space (lima_dri.so for Mali-450) + EGL/GLES + X server with the
+  # modesetting DDX (DRI3/PRIME) + lightweight LXDE session. With the backported
+  # drm-histb KMS driver this renders the desktop on the GPU. There is no longer
+  # a community-Ubuntu fallback region to preserve, so the image may grow
+  # (IMG_SIZE_MB raised in make-community-flash-package.sh); first boot resize2fs
+  # expands p8 to the whole eMMC anyway.
+  libdrm2 libgbm1 libgl1-mesa-dri libegl1 libgles2 mesa-utils
+  xserver-xorg-core xserver-xorg xinit xauth
+  lxde-core lxsession openbox
+  # kmsro is built into Mesa's lima DRI driver; no separate package needed.
 )
 # firmware-realtek lives in non-free-firmware in bookworm.
 COMPONENTS=${COMPONENTS:-main,contrib,non-free,non-free-firmware}
@@ -325,6 +330,67 @@ sudo tee "$ROOT/etc/motd" >/dev/null <<EOF
 EC6108V9C / Hi3798MV100 - Debian $SUITE armhf
 serial console: ttyAMA0 115200, login root
 EOF
+
+# ---- GPU-accelerated X desktop (docs/055) ---------------------------------
+# X server uses the modesetting DDX with DRI3/PRIME: drm-histb (KMS display)
+# owns /dev/dri/card0, lima (render node) renders via kmsro, and the desktop
+# is composited to the HDMI framebuffer by the display engine. FBDEV DDX is
+# deliberately NOT used here (it falls back to swrast = CPU rendering).
+sudo mkdir -p "$ROOT/etc/X11/xorg.conf.d"
+sudo tee "$ROOT/etc/X11/xorg.conf.d/20-gpu.conf" >/dev/null <<'XORG_EOF'
+Section "ServerFlags"
+    Option "AutoAddGPU" "false"
+EndSection
+
+# Render off lima, display via the drm-histb KMS driver.
+Section "OutputClass"
+    Identifier "GPU"
+    MatchDriver "drm-histb-vdp"
+    Driver "modesetting"
+    Option "PrimaryGPU" "true"
+    Option "DRI" "3"
+EndSection
+
+Section "Device"
+    Identifier "DefaultDevice"
+    Driver "modesetting"
+    Option "DRI" "3"
+    Option "AccelMethod" "glamor"
+EndSection
+XORG_EOF
+
+# Auto-start LXDE on :0. Runs after network/ssh so a broken desktop never
+# blocks login; restarts are bounded so a crashing X cannot spin forever.
+sudo tee "$ROOT/etc/systemd/system/ec6108-desktop.service" >/dev/null <<'UNIT_EOF'
+[Unit]
+Description=LXDE desktop on Mali-450 (lima) via X11 modesetting
+After=systemd-networkd.service ssh.service ec6108-gpu.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=simple
+User=root
+Environment=DISPLAY=:0
+Environment=LIBGL_ALWAYS_SOFTWARE=0
+Environment=MESA_LOADER_DRIVER_OVERRIDE=lima
+ExecStart=/usr/bin/startx /usr/bin/startlxde -- :0 -nolisten tcp
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=3
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+sudo ln -sf /etc/systemd/system/ec6108-desktop.service \
+    "$ROOT/etc/systemd/system/multi-user.target.wants/ec6108-desktop.service"
+# Force root auto-login X session (no display manager needed).
+sudo tee "$ROOT/root/.xinitrc" >/dev/null <<'XINIT_EOF'
+#!/bin/sh
+exec startlxde
+XINIT_EOF
+sudo chmod 755 "$ROOT/root/.xinitrc"
 
 echo "== device helper scripts =="
 sudo cp -a "$ROOT_DIR/rootfs/usr/local/bin/." "$ROOT/usr/local/bin/"
