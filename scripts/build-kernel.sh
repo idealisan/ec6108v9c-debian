@@ -74,7 +74,8 @@ git -C "$KERNEL_SRC" checkout -- arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts \
 for p in "$PATCH_DIR/0001-ec6108v9c-dts-simplefb-tsensor.patch" \
          "$PATCH_DIR/0002-thermal-kconfig-makefile.patch" \
          "$PATCH_DIR/0003-hdmi-console-kconfig-makefile.patch" \
-         "$PATCH_DIR/0005-rootwait-bounded-timeout.patch"; do
+         "$PATCH_DIR/0005-rootwait-bounded-timeout.patch" \
+         "$PATCH_DIR/0006-histb-drm-display-backport.patch"; do
   if git -C "$KERNEL_SRC" apply --check "$ROOT_DIR/$p" 2>/dev/null; then
     git -C "$KERNEL_SRC" apply "$ROOT_DIR/$p"
     echo "  applied: $(basename "$p")"
