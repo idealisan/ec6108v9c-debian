@@ -1312,13 +1312,77 @@ GPU 回到「lima 编进内核但 deferred、不阻塞启动」的状态，`/dev
 | rootfs 内容 | `ec6108-gpu.service`（ExecStart 指向 helper）、`/usr/local/bin/ec6108-gpu`、helper 日志标签均在 |
 | CI 编译日志 | `applied: 0005-rootwait-bounded-timeout.patch`；`CONFIG_DRM_LIMA=m` / `CONFIG_DRM_SCHED=m`（`select` 顶成 m）；`LD [M] lima.ko` + `INSTALL lima.ko` —— 短路修复进内核、lima 模块化、模块已打包全部对上 |
 
-**仍需真机确认**（唯一剩余、需刷一次）：刷入本版后 `ls /dev/dri`（应出现 `card0`）、
-`lsmod | grep lima`、`dmesg | grep -i lima` 无 probe 报错、TTY/IP/SSH 正常、
-`dmesg | grep -i rootwait` 无超时放弃行。刷入后把 `TMP/gpu-verify-online.sh` 传上去跑一遍，
-即完成「GPU 是否可用」判定 + 3 遍启动复核；若 lima 未自动加载，脚本内已带按依赖顺序的
-`modprobe`/`insmod` 恢复。GPU 可用后即可装 Mesa `libgl1-mesa-dri`（提供 `lima_dri.so`）
-跑 glmark2/kmscube 展示 GUI。
+### 16.6 真机在线验证（2026-11-16，刷入 `build-20261115T152847Z`）—— GPU 确认可用
 
-> 真机当前不可达（刷的是失败的 `131938Z`，起不来），所以本轮所有验证都在离线/制品层完成；
-> 「GPU 真正可用」的最后确认必须刷这一版后在线做。这一版把 GPU 与启动彻底解耦，
-> **刷一次系统必起**，之后 GPU 全部在线调，不必再反复刷机。
+刷入 GPU 解耦版后真机一次启动成功（IP `192.168.3.103`，`6.3.0-rc5+`）。把
+`TMP/gpu-verify-online.sh` 传上盒子跑一遍，拿到决定性正面证据：
+
+| 判据 | 实测结果 |
+|---|---|
+| `/dev/dri` | `card0`（226,0）+ `renderD128`（226,128）+ `by-path/platform-f9200000.gpu-{card,render}` 全在 |
+| lima 模块 | `lima 53248 0`、`gpu_sched 32768 1 lima`、`drm_shmem_helper 20480 1 lima` 自动加载 |
+| dmesg lima | `[18.75~18.88] lima f9200000.gpu: gp/pp0/pp1 - mali450 version major 0 minor 0`；`l2 cache ... 128K`；`bus/mod rate = 200000000`；`[drm] Initialized lima 1.1.0 20191231 for f9200000.gpu on minor 0` |
+| devices_deferred (gpu) | 空 —— 困扰多轮的「lima 无限 deferred probe」彻底消失 |
+| clk_summary gpu | `clk_gpu/gp/pp0/pp1` 均 200000000 Hz，时钟正常使能 |
+| `ec6108-gpu.service` | `inactive (dead)`，因 `ConditionPathExists=!/sys/module/lima` 未满足而正确跳过 —— lima 已被 `modprobe@drm` 链路自动加载，helper 不必介入（三层保险的最后一层未触发即达成目标）|
+| lima 是模块 (非内建) | `/proc/modules` 有 lima；`lima_pdev_probe`/`lima_device_init` 在 kallsyms 中带 `[lima]` 模块标记，`=m` 生效 |
+| DTB gpu 节点 | dtc 从 `/proc/device-tree` 导出核对，`mali-supply` 已删 |
+| 启动健康 | `/proc/cmdline` 含 `root=/dev/mmcblk0p8 ... rootwait rootwait_timeout=30`；无 `did not appear within`/`Waiting for root device`/`VFS: Cannot open root`；`systemctl is-system-running=running`；`/` 挂载 `/dev/mmcblk0p8 ext4 6.7G`；`/lib -> usr/lib`（usrmerge 完好）；`/lib/systemd/systemd`+`ld-linux` 可达；`ssh active`；内存 956Mi/used 124Mi |
+
+脚本自动判定：**`SUMMARY: /dev/dri/card*=yes  lima_loaded=yes  rootwait_stall=no  systemd=running`
+→ `VERDICT: GPU usable AND boot healthy.`**
+
+证据原文存于 `TMP/gpu-verify-result-103.txt`（本机，未入库）。结论：困扰多轮的 GPU 不可用问题
+（无限 deferred probe → 删 mali-supply 引发启动回归 → rootwait 短路 bug 连锁）经「短接修复 +
+删 mali-supply + lima 模块化 + 启动解耦」组合彻底解决，且未破坏启动。
+
+**内核态 GPU 已就绪，但用户态渲染栈尚未安装**：盒内无 `lima_dri.so`（需 `libgl1-mesa-dri`），
+无 `glxinfo`/`glmark2`/`kmscube`/`eglinfo`。装上来即可用 GUI 实测渲染帧率（非本报告判定 GPU
+可用的必要条件——内核 DRM/lima 初始化成功已是充分证据）。
+
+> §16.4 的 3 遍复核是离线/制品层；§16.6 是真机在线层。真机反复启动验证与
+> `reboot` 热重启失败的记录见 §16.7。
+
+### 16.7 真机反复启动验证 + `reboot` 热重启失败的已知限制（2026-11-16）
+
+**冷启动（断电开机）反复验证 = 稳定通过。** 同一张 152847Z 卡在多次断电冷启动后均正常：
+IP 每次由 DHCP 重新分配（验证中见到 `.103`、`.101`），每次 `uptime≈70s` 时 SSH 进去均为
+`systemd running`、root 挂载 `/dev/mmcblk0p8 ext4`、`/dev/dri/card0`+`renderD128` 在、
+`lima` 已加载。§16.6 的 GPU 全绿证据即来自其中一次冷启动。这就是本项目 SOP 一直使用的
+标准启动方式，可靠。
+
+**`reboot`（SSH 内 `reboot`/`systemctl reboot`）= 失败，下次起不来。** 一次用
+`ssh root@box reboot` 做"3 遍启动复核"时，盒子再没起来；用户拍屏 OCR（IMG_0598）尾部：
+
+```
+CPU0: stopping / CPU1: stopping (do_handle_IPI → ipi_handler → gic_handle_irq ...)
+104.32  Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)
+```
+
+与 §15 上次失败同为 104 秒 panic，但**根因不同**：
+
+| | §15 上次（131938Z）| 本次（152847Z + `reboot`）|
+|---|---|---|
+| 触发 | 删 `mali-supply` 让 lima 首次真正 probe | 暖复位（`reboot` 命令）|
+| `0005` 短路 | 仍在（有 `driver_probe_done()\|\|`），probe 卡住时 root 永不解析 | **已删**（`while(1)` 每轮解析），不是短路问题 |
+| 失败机制 | probe 卡住 → `driver_probe_done()` 持续 -EBUSY → ROOT_DEV 恒 0 | warm reset 后 eMMC 卡未重新枚举 → `mmcblk0p8` 始终未注册 → `name_to_dev_t` 返回 0 |
+
+证据（冷启动基线 dmesg，说明 eMMC 正常时极快，故 reboot 失败与"等待不够"无关）：
+```
+3.20s  mmc0: new MMC card at address 0001
+3.24s  mmcblk0: p1(boot) p2(bootargs) ... p8(debian)
+6.74s  EXT4-fs (mmcblk0p8): mounted ...
+```
+
+reboot 路径源码核对：无 Hisilicon 专用 restart handler；有 `sp805-wdt f8a2c000.watchdog`
+注册 restart notifier → `reboot` 走 watchdog 触发的 **warm reset**（DDR/部分时钟不掉电）。
+该 SoC 的 eMMC 卡在 warm reset 后未能重新枚举，导致根设备缺失、104 秒 panic。
+panic 日志写在 DDR ramoops（`0x30000000`），而恢复必须断电冷启动（丢 DDR），故失败日志
+无法回收——这是诊断该问题的现实障碍。
+
+**处置（用户决定：记录问题、保持现状）：**
+- GPU 方案有效、冷启动稳定 —— 不回退、不改代码。
+- `reboot` 失败作为**已知限制**记录：本项目一律用断电开机/断电关机，不要在 SSH 里执行
+  `reboot`/`systemctl reboot`；需要重启时断电再上电。
+- 若要根治需进阶改动（加 netconsole 让 printk 走网络、或改 reboot 路径/让 eMMC 在 warm
+  reset 后可靠重初始化），属底层高风险改动，且受"失败日志难回收"制约，留待后续专门处理。
