@@ -6206,3 +6206,33 @@ new file mode 100644
  obj-y			+= solomon/
  obj-$(CONFIG_DRM_SPRD) += sprd/
 +obj-$(CONFIG_DRM_HISTB_VDP) += histb/
+--- a/drivers/gpu/drm/bridge/Kconfig
++++ b/drivers/gpu/drm/bridge/Kconfig
+@@ -239,6 +239,16 @@
+ 	help
+ 	  Silicon Image sii902x bridge chip driver.
+ 
++config DRM_SII9134
++	tristate "Silicon Image SiI9134 HDMI 1.4 transmitter"
++	depends on OF
++	select DRM_KMS_HELPER
++	select REGMAP
++	help
++	  HDMI 1.4 transmitter (SiI9134 core) as integrated on the HiSilicon
++	  Hi3798MV100. drm_bridge component needed by histb-vdp KMS driver
++	  to complete probe and drive HDMI output.
++
+ config DRM_SII9234
+ 	tristate "Silicon Image SII9234 HDMI/MHL bridge"
+ 	depends on OF
+--- a/drivers/gpu/drm/bridge/Makefile
++++ b/drivers/gpu/drm/bridge/Makefile
+@@ -16,6 +16,8 @@
+ obj-$(CONFIG_DRM_PARADE_PS8640) += parade-ps8640.o
+ obj-$(CONFIG_DRM_SIL_SII8620) += sil-sii8620.o
+ obj-$(CONFIG_DRM_SII902X) += sii902x.o
++obj-$(CONFIG_DRM_SII9134) += sii9134-hdmi.o
++sii9134-hdmi-y := sii9134.o hi3798mv100-hdmi.o
+ obj-$(CONFIG_DRM_SII9234) += sii9234.o
+ obj-$(CONFIG_DRM_SIMPLE_BRIDGE) += simple-bridge.o
+ obj-$(CONFIG_DRM_THINE_THC63LVD1024) += thc63lvd1024.o
