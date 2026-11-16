@@ -3762,7 +3762,7 @@ diff --git a/drivers/gpu/drm/bridge/sii9134.c b/drivers/gpu/drm/bridge/sii9134.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/bridge/sii9134.c
-@@ -0,0 +1,1637 @@
+@@ -0,0 +1,1633 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Copyright (c) 2023 David Yang
@@ -5341,13 +5341,9 @@ new file mode 100644
 +	 * generation has neither a DHD 4:2:2 producer nor an HDMI 2.0 4:2:0
 +	 * path.
 +	 */
-+	sii9134->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID |
-+			      DRM_BRIDGE_OP_HDMI;
-+	sii9134->bridge.supported_formats =
-+		BIT(DRM_COLOR_FORMAT_RGB444) |
-+		BIT(DRM_COLOR_FORMAT_YCBCR444);
-+	sii9134->bridge.vendor = "SII";
-+	sii9134->bridge.product = "SiI9134";
++	/* 6.3 lacks DRM_BRIDGE_OP_HDMI/supported_formats/vendor/product;
++	 * basic RGB display does not need them. */
++	sii9134->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID;
 +	/*
 +	 * drm_bridge_connector_init() rejects chains whose last bridge has no
 +	 * connector type
@@ -6208,7 +6204,7 @@ new file mode 100644
 +obj-$(CONFIG_DRM_HISTB_VDP) += histb/
 --- a/drivers/gpu/drm/bridge/Kconfig
 +++ b/drivers/gpu/drm/bridge/Kconfig
-@@ -239,6 +239,16 @@
+@@ -239,6 +239,15 @@
  	help
  	  Silicon Image sii902x bridge chip driver.
  
@@ -6218,9 +6214,8 @@ new file mode 100644
 +	select DRM_KMS_HELPER
 +	select REGMAP
 +	help
-+	  HDMI 1.4 transmitter (SiI9134 core) as integrated on the HiSilicon
-+	  Hi3798MV100. drm_bridge component needed by histb-vdp KMS driver
-+	  to complete probe and drive HDMI output.
++	  HDMI 1.4 transmitter (SiI9134 core) integrated on HiSilicon Hi3798MV100.
++	  drm_bridge component needed by histb-vdp KMS driver to drive HDMI.
 +
  config DRM_SII9234
  	tristate "Silicon Image SII9234 HDMI/MHL bridge"
