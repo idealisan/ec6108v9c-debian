@@ -149,3 +149,32 @@ config），作为后续若决定移植 clock 时的基础。
 **仍需真机确认（刷入后）**：drm-histb probe 能否拿到 clock、`/dev/dri/card0` 是否变
 modeset 设备、`modetest` 列 connector、X+LXDE 是否由 lima 渲染（glxinfo=Mali450），
 以及简化 gate clock 是否足够点亮 HDMI。盒子在 GPU 实验后曾离线，需用户断电恢复。
+
+## 10. 首次真机验证：黑屏根因与修复（2026-11-16）
+
+刷入 build-20261116T143801Z 后：内核启动（IP .102 出现）但 HDMI 全黑无背光。
+SSH 进去诊断：
+- `histb_vdp` 模块加载，dmesg `histb-vdp f8cc0000.display: quiesced before reset:
+  DHD0_CTRL 00008010`（VDP probe 时 reset 了 VO，关掉了 hiboot/私有 fbdev 的显示）；
+- 但 `/sys/class/drm/` 只有 card0=f9200000.gpu(lima)，**没有 histb-vdp 的 KMS card**；
+- XFCE 服务失败：`modesetting ... (EE) No devices detected / no screens found`；
+- **`sii9134.ko` 根本没编译出来**（`/lib/modules/*/drm/histb/` 下只有 histb-vdp.ko）。
+
+**根因（确凿）**：0006 patch 虽然把 `sii9134.c`/`hi3798mv100-hdmi.c` 源码加进了树，但
+**漏了 `drivers/gpu/drm/bridge/Kconfig` 和 `Makefile` 的修改**（自动提取 hunk 时因
+6.3 与 7.4 行号不同被静默跳过）→ `CONFIG_DRM_SII9134` 符号从未定义 → config fragment
+里的 `CONFIG_DRM_SII9134=m` 被 olddefconfig 丢弃 → sii9134 bridge 不编译 → VDP 的
+component master 永远等不齐 HDMI bridge → 不注册 DRM KMS card → 显示被 VDP reset 关掉
+后无人接管 → 黑屏；X modesetting 也因无 KMS 设备而 no screens found。
+
+**修复（commit e5b3204）**：手工按 6.3 的 bridge/Kconfig(DRM_SII902X@232) 和
+Makefile(sii902x.o@18) 锚点生成 hunk，补进 0006 patch：`config DRM_SII9134` +
+`obj-$(CONFIG_DRM_SII9134) += sii9134-hdmi.o`/`sii9134-hdmi-y := sii9134.o hi3798mv100-hdmi.o`。
+`git apply --check` 通过。重新出包验证中（run 43893167367）。
+
+**待真机确认**：bridge probe 是否成功 → VDP 是否注册 card1(KMS) → X modesetting 是否
+用 card1 → glxinfo 是否 Mali450。
+
+**附注（未解释）**：用户在卸载 histb_vdp + 写 modprobe blacklist 后冷启动，报告连 bootloader
+画面/绿条都不显示、完全无背光。blacklist 只是文本文件，不应影响 BootROM/bootloader 阶段，
+此现象无法用软件解释——可能是显示器/HDMI 物理层或 VO 复位后状态异常，需真机再观察。
