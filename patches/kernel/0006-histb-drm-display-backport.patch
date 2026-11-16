@@ -3762,7 +3762,7 @@ diff --git a/drivers/gpu/drm/bridge/sii9134.c b/drivers/gpu/drm/bridge/sii9134.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/bridge/sii9134.c
-@@ -0,0 +1,1633 @@
+@@ -0,0 +1,1630 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Copyright (c) 2023 David Yang
@@ -4182,7 +4182,7 @@ new file mode 100644
 +static void sii9134_send_vsdb(struct sii9134 *sii, u8 hdmi_vic)
 +{
 +	struct hdmi_vendor_infoframe frame;
-+	u8 buf[HDMI_MAX_INFOFRAME_SIZE];
++	u8 buf[32]; /* HDMI_MAX_INFOFRAME_SIZE */
 +	int ret;
 +
 +	if (!hdmi_vic) {
@@ -4478,7 +4478,6 @@ new file mode 100644
 +/* ------------------------------------------------------------------ */
 +
 +static int sii9134_bridge_attach(struct drm_bridge *bridge,
-+				 struct drm_encoder *encoder,
 +				 enum drm_bridge_attach_flags flags)
 +{
 +	if (!(flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR)) {
@@ -4909,8 +4908,7 @@ new file mode 100644
 +}
 +
 +static enum drm_connector_status
-+sii9134_bridge_detect(struct drm_bridge *bridge,
-+		      struct drm_connector *connector)
++sii9134_bridge_detect(struct drm_bridge *bridge)
 +{
 +	struct sii9134 *sii = bridge_to_sii9134(bridge);
 +	enum drm_connector_status status;
@@ -5274,7 +5272,6 @@ new file mode 100644
 +		.i2s = 1,
 +		.spdif = 0,
 +		.max_i2s_channels = SII9134_MAX_AUDIO_CHANNELS,
-+		.no_capture_mute = 1,
 +		.data = sii,
 +	};
 +
