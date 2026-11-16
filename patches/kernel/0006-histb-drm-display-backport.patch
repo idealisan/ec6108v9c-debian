@@ -195,7 +195,6 @@ new file mode 100644
 +	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 +	.fops			= &histb_vdp_fops,
 +	DRM_GEM_DMA_DRIVER_OPS,
-+	DRM_FBDEV_DMA_DRIVER_OPS,
 +	.name			= "histb-vdp",
 +	.desc			= "HiSTB VDP display engine",
 +	.major			= 1,
@@ -349,7 +348,7 @@ new file mode 100644
 +	 * starting the poll work here nothing would ever re-detect a plug
 +	 * event.  The drmm variant stops with the DRM device.
 +	 */
-+	drmm_kms_helper_poll_init(drm);
++	drm_kms_helper_poll_init(drm);
 +
 +	drm_mode_config_reset(drm);
 +
@@ -432,7 +431,7 @@ new file mode 100644
 +	const struct histb_vdp_variant *variant;
 +	int ret;
 +
-+	variant = of_device_get_match_data(&pdev->dev);
++	variant = device_get_match_data(&pdev->dev);
 +	if (!variant || !variant->probe)
 +		return -ENODEV;
 +
@@ -449,13 +448,14 @@ new file mode 100644
 +	return 0;
 +}
 +
-+static void histb_vdp_remove(struct platform_device *pdev)
++static int histb_vdp_remove(struct platform_device *pdev)
 +{
 +	const struct histb_vdp_variant *variant =
 +		((struct histb_vdp *)platform_get_drvdata(pdev))->variant;
 +
 +	component_master_del(&pdev->dev, &histb_vdp_master_ops);
 +	variant->remove(pdev);
++	return 0;
 +}
 +
 +/*
@@ -1049,7 +1049,7 @@ diff --git a/drivers/gpu/drm/histb/histb-vdp2.c b/drivers/gpu/drm/histb/histb-vd
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/histb/histb-vdp2.c
-@@ -0,0 +1,2554 @@
+@@ -0,0 +1,2555 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * DRM driver for the HiSTB VDP v2 display engine, found on hi3798mv100 /
@@ -2413,8 +2413,8 @@ new file mode 100644
 +
 +	drm_connector_helper_add(&wb->base, &histb_wb_conn_helper_funcs);
 +
-+	return drmm_writeback_connector_init(drm, wb, &histb_wb_conn_funcs, enc,
-+					     fmts, n_fmts);
++	return drm_writeback_connector_init_with_encoder(drm, wb, enc,
++					     &histb_wb_conn_funcs, fmts, n_fmts);
 +}
 +
 +static int histb_wb_init(struct histb_vdp2_display *disp)
@@ -3535,10 +3535,11 @@ new file mode 100644
 +	return ret;
 +}
 +
-+static void histb_vdp2_remove(struct platform_device *pdev)
++static int histb_vdp2_remove(struct platform_device *pdev)
 +{
 +	pm_runtime_put_sync_suspend(&pdev->dev);
 +	pm_runtime_disable(&pdev->dev);
++	return 0;
 +}
 +
 +static int histb_vdp2_display_init(struct histb_vdp_display *base)
@@ -5404,7 +5405,7 @@ diff --git a/drivers/gpu/drm/bridge/hi3798mv100-hdmi.c b/drivers/gpu/drm/bridge/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/bridge/hi3798mv100-hdmi.c
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,621 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Copyright (c) 2023 David Yang
@@ -5989,7 +5990,7 @@ new file mode 100644
 +	return ret;
 +}
 +
-+static void hi3798mv100_hdmi_remove(struct platform_device *pdev)
++static int hi3798mv100_hdmi_remove(struct platform_device *pdev)
 +{
 +	struct hi3798mv100_hdmi_priv *priv = platform_get_drvdata(pdev);
 +
@@ -6001,6 +6002,7 @@ new file mode 100644
 +	 */
 +	component_del(&pdev->dev, &hi3798mv100_hdmi_component_ops);
 +	sii9134_remove(&priv->sii9134);
++	return 0;
 +}
 +
 +static const struct of_device_id hi3798mv100_hdmi_of_match[] = {
