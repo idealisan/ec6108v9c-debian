@@ -86,3 +86,30 @@ hi3798mv100 的 VO 显示驱动**；显示只能走私有 fbdev + 用户态 mmap
 - 每一步先在 CI 编译校验，不本地生成镜像（遵循项目规则）。
 - 保留现有可启动版本；新内核作为独立 release 验证，失败可回退。
 - 不再用用户态 mmap 写 fb0 的 hack（已证伪，见 054 §16.8）。
+
+## 8. 动手 backport 后的实测障碍（2026-11-16，重要更新）
+
+按用户要求实际动手 backport（不切内核版本），完成了 DRM 驱动源码适配并生成 patch
+（`patches/kernel/0006-histb-drm-display-backport.patch`，`git apply --check` 通过）：
+- 提取 histb 新增源码 10 个文件到 `TMP/histb-backport/extracted/`，适配 6.3 API：
+  `drm_client_setup`→`drm_fbdev_generic_setup`、删 `DRM_FBDEV_DMA_DRIVER_OPS`/
+  `DRM_BRIDGE_CONNECTOR`/`DRM_CLIENT_SELECTION` select、sii9134 删 7.x HDMI infoframe
+  回调 + `edid_read`→`get_edid`、hi3798mv100-hdmi 的 `devm_drm_bridge_alloc`→`devm_kzalloc`。
+- config fragment 已加 `CONFIG_DRM_HISTB_VDP=y`/`CONFIG_DRM_SII9134=y`，禁私有 fbdev。
+- build-kernel.sh 已加 0006 patch 应用。
+
+**但挖到依赖链底层后发现真正的阻断点（DTS/clock）**：
+- histb 的 VDP/HDMI DT 节点用新 clock id（`HI3798MV100_VO_HD_CLK`=81、
+  `HDMI_CTRL_CLK`=100、`HDMI_PHY_CLK`=103 等），来自 histb 500-01 新头文件（135 个 define）
+  + 500-02 全新 CRG 驱动（35KB）。
+- 当前 6.3 内核的 `include/dt-bindings/clock/histb-clock.h` **只有 I2C/GPU clock**，
+  完全没有 VO/HDMI/VDP clock；`drivers/clk/hisilicon/crg-hi3798.c` 也不提供显示时钟。
+- 因此 VDP/HDMI 驱动即便编译进内核也**拿不到显示 clock，probe 必然失败**。
+- 要补齐必须 backport 整套新 CRG（500-01/02/110 系列），而当前 lima/MMC/USB 等全部
+  依赖旧 CRG 才能稳定启动——替换时钟基础是高风险、牵一发动全身的改动。
+
+**结论修正**：backport 不止是"适配 ~10 处 DRM API"，其真正成本在**替换整个 clock 子系统**。
+在当前 6.3 内核上让 drm-histb 真正跑起来 ≈ 移植 histb 的 clock/reset/regulator/DTS 全套，
+接近换内核的工作量，但风险更高（两套 CRG 抢同一节点）。这不是几轮 CI 能收敛的。
+当前已做的 DRM 驱动 patch 适配保留在 `patches/kernel/0006-*`（可编译但未接 clock，暂不启用
+config），作为后续若决定移植 clock 时的基础。
