@@ -34,17 +34,20 @@ PACKAGES=(
   tzdata bash-completion tmux minicom
   # IR (hisilicon,hix5hd2-ir): ir-keytable / ir-ctl read raw scancodes.
   v4l-utils
-  # ---- GPU-accelerated GUI desktop (docs/055) ----
-  # Mesa user-space (lima_dri.so for Mali-450) + EGL/GLES + X server with the
-  # modesetting DDX (DRI3/PRIME) + lightweight LXDE session. With the backported
-  # drm-histb KMS driver this renders the desktop on the GPU. There is no longer
-  # a community-Ubuntu fallback region to preserve, so the image may grow
-  # (IMG_SIZE_MB raised in make-community-flash-package.sh); first boot resize2fs
-  # expands p8 to the whole eMMC anyway.
+)
+
+# ---- GPU-accelerated GUI desktop (docs/055) ----
+# Kept OUT of debootstrap --include on purpose: XFCE pulls in dconf-service,
+# whose dh_installsystemd postinst fails inside debootstrap's foreign chroot
+# ("configuring base packages" -> give up after 5 retries). Installing the
+# desktop with apt AFTER second-stage (dpkg DB complete, base-passwd present,
+# policy-rc.d blocking daemon starts) configures these packages cleanly.
+# Mesa user-space: lima_dri.so (Mali-450) + EGL/GLES; X server with modesetting
+# DDX (DRI3/PRIME). kmsro is built into the lima DRI driver, no separate pkg.
+DESKTOP_PACKAGES=(
   libdrm2 libgbm1 libgl1-mesa-dri libegl1 libgles2 mesa-utils
   xserver-xorg-core xserver-xorg xinit xauth
-  lxde-core lxsession openbox
-  # kmsro is built into Mesa's lima DRI driver; no separate package needed.
+  xfce4 xfce4-terminal
 )
 # firmware-realtek lives in non-free-firmware in bookworm.
 COMPONENTS=${COMPONENTS:-main,contrib,non-free,non-free-firmware}
@@ -82,6 +85,16 @@ sudo chmod 755 "$ROOT/usr/sbin/policy-rc.d"
 
 echo "== debootstrap stage 2 =="
 sudo DEBIAN_FRONTEND=noninteractive chroot "$ROOT" /debootstrap/debootstrap --second-stage
+
+# ---- install GPU desktop stack AFTER second-stage ----
+# See DESKTOP_PACKAGES above: dconf-service's postinst cannot configure during
+# debootstrap's foreign stage, but with a complete dpkg DB + base-passwd it is
+# fine here. policy-rc.d (above) still prevents daemons from actually starting
+# inside the chroot.
+echo "== apt-get install GPU desktop (XFCE + Mesa lima + X) =="
+sudo chroot "$ROOT" apt-get update
+sudo DEBIAN_FRONTEND=noninteractive chroot "$ROOT" \
+    apt-get install -y --no-install-recommends "${DESKTOP_PACKAGES[@]}"
 sudo chroot "$ROOT" apt-get clean
 
 echo "== configure system =="
@@ -374,7 +387,7 @@ XORG_EOF
 # blocks login; restarts are bounded so a crashing X cannot spin forever.
 sudo tee "$ROOT/etc/systemd/system/ec6108-desktop.service" >/dev/null <<'UNIT_EOF'
 [Unit]
-Description=LXDE desktop on Mali-450 (lima) via X11 modesetting
+Description=XFCE desktop on Mali-450 (lima) via X11 modesetting
 After=systemd-networkd.service ssh.service ec6108-gpu.service
 Wants=systemd-networkd.service
 StartLimitIntervalSec=120
@@ -386,7 +399,7 @@ User=root
 Environment=DISPLAY=:0
 Environment=LIBGL_ALWAYS_SOFTWARE=0
 Environment=MESA_LOADER_DRIVER_OVERRIDE=lima
-ExecStart=/usr/bin/startx /usr/bin/lxsession -- :0 -nolisten tcp vt1
+ExecStart=/usr/bin/startx /usr/bin/startxfce4 -- :0 -nolisten tcp vt1
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=60
@@ -399,7 +412,8 @@ sudo ln -sf /etc/systemd/system/ec6108-desktop.service \
 # Force root auto-login X session (no display manager needed).
 sudo tee "$ROOT/root/.xinitrc" >/dev/null <<'XINIT_EOF'
 #!/bin/sh
-exec lxsession
+# Full XFCE desktop, drawn by X with GLX/DRI3 -> lima (Mali-450) rendering.
+exec startxfce4
 XINIT_EOF
 sudo chmod 755 "$ROOT/root/.xinitrc"
 
