@@ -3762,7 +3762,7 @@ diff --git a/drivers/gpu/drm/bridge/sii9134.c b/drivers/gpu/drm/bridge/sii9134.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/bridge/sii9134.c
-@@ -0,0 +1,1630 @@
+@@ -0,0 +1,1631 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Copyright (c) 2023 David Yang
@@ -3787,6 +3787,7 @@ new file mode 100644
 + * - Deep colour and pixel replication: the link runs 8 bits per channel.
 + */
 +
++#include <linux/bitfield.h>
 +#include <linux/delay.h>
 +#include <linux/device.h>
 +#include <linux/i2c.h>
