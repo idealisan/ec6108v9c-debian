@@ -113,3 +113,39 @@ hi3798mv100 的 VO 显示驱动**；显示只能走私有 fbdev + 用户态 mmap
 接近换内核的工作量，但风险更高（两套 CRG 抢同一节点）。这不是几轮 CI 能收敛的。
 当前已做的 DRM 驱动 patch 适配保留在 `patches/kernel/0006-*`（可编译但未接 clock，暂不启用
 config），作为后续若决定移植 clock 时的基础。
+
+## 9. 实际 backport 实施（2026-11-16，用户坚持要做完出包）
+
+尽管 §8 记录了 clock 深层障碍，用户明确要求"不要光说、补上 clock、做完出包"，故实际动手：
+
+**已落地（commit ce0e8d0 → a4da46b）：**
+- `patches/kernel/0006-histb-drm-display-backport.patch`：VDP v2 显示引擎 + hi3798mv100
+  片上 HDMI bridge + sii9134 核心 + histb regulator（mv100 所需子集），适配 6.3 API：
+  - `drm_client_setup`→`drm_fbdev_generic_setup`；删 `DRM_FBDEV_DMA_DRIVER_OPS`/
+    `DRM_BRIDGE_CONNECTOR`/`DRM_CLIENT_SELECTION` select；
+  - sii9134 删 7.x HDMI infoframe/atomic_create_state 回调，`edid_read`→`get_edid`
+    （返回类型 `struct drm_edid *`→`struct edid *`），include `drm_hdmi_helper`；
+  - `devm_drm_bridge_alloc`→`devm_kzalloc`+手动 funcs；
+  - `drmm_kms_helper_poll_init`→`drm_kms_helper_poll_init`；`of_device_get_match_data`→
+    `device_get_match_data`；`drmm_writeback_connector_init`→
+    `drm_writeback_connector_init_with_encoder`（参数顺序适配）；
+  - `.remove` 回调 void→int+return 0（core/vdp2/hdmi）。
+- `patches/kernel/0007-histb-display-clock-dts.patch`：**补上了 §8 说的缺失 clock**——
+  在 `histb-clock.h` 加 4 个显示 clock ID（92-95，避开现有 0-91 与 NR_CLKS=128），
+  在 `crg-hi3798.c` 的 `hi3798mv100_gate_clks[]` 加 `clk_vo`/`clk_vo_hd`/
+  `clk_hdmi_ctrl`/`clk_hdmi_phy` 简单 gate（寄存器 0xd8/0x10c/0x110），
+  并把 VDP/HDMI DT 节点（含 of_graph port）加进 dtsi + 板级 dts 启用。
+  注意：这是简化版 gate clock（不是 histb 500-02 的完整复杂 vo_hd 分频驱动），
+  应能满足"clock 存在且可 prepare/enable"，VO 时序由驱动写寄存器控制。
+- `configs/kernel/ec6108v9c.config`：`CONFIG_DRM_HISTB_VDP=m`/`CONFIG_DRM_SII9134=m`/
+  `CONFIG_DRM_FBDEV_EMULATION=y`；保守保留私有 fbdev（probe 失败不影响启动/TTY）。
+- `scripts/build-kernel.sh`：应用 0006/0007。
+- `scripts/build-rootfs.sh` + `make-community-flash-package.sh`：内置 Mesa lima +
+  X modesetting(DRI3/glamor) + LXDE 桌面；`IMG_SIZE_MB` 480→900（用户确认无兜底约束）。
+
+**CI 编译迭代：** 第一轮 run 43862480515 build-kernel 失败，日志给出精确错误
+（FBDEV_DMA/poll/match_data/remove），已逐项修复。新一轮 run 43864709752 进行中。
+
+**仍需真机确认（刷入后）**：drm-histb probe 能否拿到 clock、`/dev/dri/card0` 是否变
+modeset 设备、`modetest` 列 connector、X+LXDE 是否由 lima 渲染（glxinfo=Mali450），
+以及简化 gate clock 是否足够点亮 HDMI。盒子在 GPU 实验后曾离线，需用户断电恢复。
