@@ -366,6 +366,8 @@ sudo tee "$ROOT/etc/systemd/system/ec6108-desktop.service" >/dev/null <<'UNIT_EO
 Description=LXDE desktop on Mali-450 (lima) via X11 modesetting
 After=systemd-networkd.service ssh.service ec6108-gpu.service
 Wants=systemd-networkd.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -373,11 +375,9 @@ User=root
 Environment=DISPLAY=:0
 Environment=LIBGL_ALWAYS_SOFTWARE=0
 Environment=MESA_LOADER_DRIVER_OVERRIDE=lima
-ExecStart=/usr/bin/startx /usr/bin/startlxde -- :0 -nolisten tcp
+ExecStart=/usr/bin/startx /usr/bin/lxsession -- :0 -nolisten tcp vt1
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=120
-StartLimitBurst=3
 TimeoutStartSec=60
 
 [Install]
@@ -388,7 +388,7 @@ sudo ln -sf /etc/systemd/system/ec6108-desktop.service \
 # Force root auto-login X session (no display manager needed).
 sudo tee "$ROOT/root/.xinitrc" >/dev/null <<'XINIT_EOF'
 #!/bin/sh
-exec startlxde
+exec lxsession
 XINIT_EOF
 sudo chmod 755 "$ROOT/root/.xinitrc"
 
