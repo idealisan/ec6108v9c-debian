@@ -1049,7 +1049,7 @@ diff --git a/drivers/gpu/drm/histb/histb-vdp2.c b/drivers/gpu/drm/histb/histb-vd
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/histb/histb-vdp2.c
-@@ -0,0 +1,2555 @@
+@@ -0,0 +1,2553 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * DRM driver for the HiSTB VDP v2 display engine, found on hi3798mv100 /
@@ -1993,7 +1993,7 @@ new file mode 100644
 +}
 +
 +static void histb_vdp2_plane_atomic_update(struct drm_plane *plane,
-+					 struct drm_atomic_commit *state)
++					 struct drm_atomic_state *state)
 +{
 +	struct histb_vdp2 *vdp = plane_to_vdp(plane);
 +	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
@@ -2011,7 +2011,7 @@ new file mode 100644
 +}
 +
 +static void histb_vdp2_plane_atomic_disable(struct drm_plane *plane,
-+					  struct drm_atomic_commit *state)
++					  struct drm_atomic_state *state)
 +{
 +	struct histb_vdp2 *vdp = plane_to_vdp(plane);
 +
@@ -2021,7 +2021,7 @@ new file mode 100644
 +}
 +
 +static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
-+				       struct drm_atomic_commit *state)
++				       struct drm_atomic_state *state)
 +{
 +	struct drm_plane_state *new_state =
 +		drm_atomic_get_new_plane_state(state, plane);
@@ -2473,17 +2473,17 @@ new file mode 100644
 + */
 +static struct drm_framebuffer *
 +histb_vdp2_fb_create(struct drm_device *drm, struct drm_file *file,
-+		     const struct drm_format_info *info,
 +		     const struct drm_mode_fb_cmd2 *mode_cmd)
 +{
 +	struct drm_gem_object *objs[DRM_FORMAT_MAX_PLANES] = { NULL };
++	const struct drm_format_info *info = drm_format_info(mode_cmd->pixel_format);
 +	struct drm_framebuffer *fb;
 +	unsigned int i;
 +	int ret;
 +
 +	if (drm_any_plane_has_format(drm, mode_cmd->pixel_format,
 +				     mode_cmd->modifier[0]))
-+		return drm_gem_fb_create(drm, file, info, mode_cmd);
++		return drm_gem_fb_create(drm, file, mode_cmd);
 +
 +	if (!histb_wb_fmt_find(mode_cmd->pixel_format)) {
 +		drm_dbg_kms(drm, "%p4cc is neither scanned out nor written back\n",
@@ -2522,13 +2522,13 @@ new file mode 100644
 +	 * Plain slab allocation, not a drmm action: the destroy callback this
 +	 * framebuffer uses is drm_gem_fb_destroy(), which frees with kfree().
 +	 */
-+	fb = kzalloc_obj(*fb);
++	fb = kzalloc(sizeof(*fb), GFP_KERNEL);
 +	if (!fb) {
 +		ret = -ENOMEM;
 +		goto err_put;
 +	}
 +
-+	drm_helper_mode_fill_fb_struct(drm, fb, info, mode_cmd);
++	drm_helper_mode_fill_fb_struct(drm, fb, mode_cmd);
 +	for (i = 0; i < info->num_planes; i++)
 +		fb->obj[i] = objs[i];
 +
@@ -2978,7 +2978,7 @@ new file mode 100644
 + * the same step for their write-back taps.
 + */
 +static int histb_vdp2_crtc_atomic_check(struct drm_crtc *crtc,
-+					struct drm_atomic_commit *state)
++					struct drm_atomic_state *state)
 +{
 +	struct drm_crtc_state *new_state =
 +		drm_atomic_get_new_crtc_state(state, crtc);
@@ -3011,7 +3011,7 @@ new file mode 100644
 +}
 +
 +static void histb_vdp2_crtc_atomic_enable(struct drm_crtc *crtc,
-+					struct drm_atomic_commit *state)
++					struct drm_atomic_state *state)
 +{
 +	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
 +	struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
@@ -3035,8 +3035,7 @@ new file mode 100644
 +							&vdp->disp->base.encoder);
 +	conn_state = conn ? drm_atomic_get_new_connector_state(state, conn) :
 +			    NULL;
-+	yuv444 = conn_state && conn_state->hdmi.output_format ==
-+				 DRM_OUTPUT_COLOR_FORMAT_YCBCR444;
++	yuv444 = false; /* 6.3 lacks connector hdmi output_format state */
 +
 +	/* the channel clock is what the HDMI transmitter receives, too */
 +	histb_vdp2_set_pixclk(vdp, mode->clock);
@@ -3089,7 +3088,7 @@ new file mode 100644
 +}
 +
 +static void histb_vdp2_crtc_atomic_disable(struct drm_crtc *crtc,
-+					 struct drm_atomic_commit *state)
++					 struct drm_atomic_state *state)
 +{
 +	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
 +	struct histb_vdp2_display *disp = crtc_to_display(crtc);
@@ -3152,7 +3151,7 @@ new file mode 100644
 +}
 +
 +static void histb_vdp2_crtc_atomic_flush(struct drm_crtc *crtc,
-+				       struct drm_atomic_commit *state)
++				       struct drm_atomic_state *state)
 +{
 +	struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
 +	struct histb_vdp2_display *disp = crtc_to_display(crtc);
@@ -3425,7 +3424,7 @@ new file mode 100644
 +	struct histb_vdp2 *vdp;
 +	int ret;
 +
-+	vdp = devm_kzalloc_obj(dev, *vdp);
++	vdp = devm_kzalloc(dev, sizeof(*vdp), GFP_KERNEL);
 +	if (!vdp)
 +		return -ENOMEM;
 +
@@ -3496,7 +3495,7 @@ new file mode 100644
 +	 * property is not an error (-ENODEV): the device then keeps using the
 +	 * default pool.
 +	 */
-+	ret = devm_of_reserved_mem_device_init(dev);
++	ret = of_reserved_mem_device_init(dev);
 +	if (ret && ret != -ENODEV) {
 +		dev_err_probe(dev, ret, "memory-region init failed\n");
 +		goto err_pm_put;
@@ -3535,11 +3534,10 @@ new file mode 100644
 +	return ret;
 +}
 +
-+static int histb_vdp2_remove(struct platform_device *pdev)
++static void histb_vdp2_remove(struct platform_device *pdev)
 +{
 +	pm_runtime_put_sync_suspend(&pdev->dev);
 +	pm_runtime_disable(&pdev->dev);
-+	return 0;
 +}
 +
 +static int histb_vdp2_display_init(struct histb_vdp_display *base)
@@ -4435,7 +4433,7 @@ new file mode 100644
 +	struct i2c_adapter *adap;
 +	int ret;
 +
-+	adap = devm_kzalloc_obj(sii->dev, *adap);
++	adap = devm_kzalloc(sii->dev, sizeof(*adap), GFP_KERNEL);
 +	if (!adap)
 +		return -ENOMEM;
 +
@@ -4585,7 +4583,7 @@ new file mode 100644
 +
 +static void
 +sii9134_bridge_atomic_enable(struct drm_bridge *bridge,
-+			     struct drm_atomic_commit *state)
++			     struct drm_atomic_state *state)
 +{
 +	struct sii9134 *sii = bridge_to_sii9134(bridge);
 +	struct drm_connector *connector;
@@ -4878,7 +4876,7 @@ new file mode 100644
 +
 +static void
 +sii9134_bridge_atomic_disable(struct drm_bridge *bridge,
-+			      struct drm_atomic_commit *state)
++			      struct drm_atomic_state *state)
 +{
 +	struct sii9134 *sii = bridge_to_sii9134(bridge);
 +
@@ -5345,8 +5343,8 @@ new file mode 100644
 +	sii9134->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID |
 +			      DRM_BRIDGE_OP_HDMI;
 +	sii9134->bridge.supported_formats =
-+		BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444) |
-+		BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444);
++		BIT(DRM_COLOR_FORMAT_RGB444) |
++		BIT(DRM_COLOR_FORMAT_YCBCR444);
 +	sii9134->bridge.vendor = "SII";
 +	sii9134->bridge.product = "SiI9134";
 +	/*
