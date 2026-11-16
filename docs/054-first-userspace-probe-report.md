@@ -1386,3 +1386,56 @@ panic 日志写在 DDR ramoops（`0x30000000`），而恢复必须断电冷启�
   `reboot`/`systemctl reboot`；需要重启时断电再上电。
 - 若要根治需进阶改动（加 netconsole 让 printk 走网络、或改 reboot 路径/让 eMMC 在 warm
   reset 后可靠重初始化），属底层高风险改动，且受"失败日志难回收"制约，留待后续专门处理。
+
+### 16.8 用户态 GPU 画面尝试与三次死机（2026-11-16）—— 教训与架构正解调研
+
+**目标**：不止于内核态 lima 初始化，要真正用 GPU 渲染 GUI 桌面显示在 HDMI 上。
+
+**已验证的 GPU 渲染能力（强证据）**：装 `libgl1-mesa-dri`(lima_dri.so 22.3.6)、
+`mesa-utils`、`gcc`/EGL/GLES 开发包后（经反向端口转发 `127.0.0.1:10808` 走本机代理，
+包全部在盒内下载，符合用户要求）：
+- `eglinfo` GBM platform：`EGL driver name: lima`
+- 自写 EGL surfaceless GLES2 程序：`GL_RENDERER=Mali450` / `GL_VENDOR=lima` /
+  `GL_VERSION=OpenGL ES 2.0 Mesa 22.3.6`；`glClearColor(0.2,0.6,0.9)` 后
+  `glReadPixels` 读回 `RGBA(51,153,230,255)` 精确匹配 → GPU 确实在渲染。
+- 单帧渐变+圆环画面写 `/dev/fb0` 曾成功上屏一次（用户拍屏确认彩色过渡画面）。
+
+**三次死机（用户每次断电冷启动恢复，教训深刻）**：
+1. `ssh reboot`（warm reset）→ eMMC 未重枚举 → 104s `unknown-block(0,0)`（§16.7）。
+2. Xorg(fbdev) + `gpu_fb` 全屏 mmap 暴力写 → `Fatal exception in interrupt`。
+3. 持续动画 `gpu_show`（300 帧 `glReadPixels`+`msync` 高频写 fb0）+ 我加载的 netconsole
+   → `Fatal exception in interrupt`；panic 栈含
+   `netpoll_poll_dev` / `netpoll: hisi_femac_poll exceeded budget in poll`（netconsole 的
+   netpoll 在中断里 poll 网卡超预算，`do_translation_fault` 放大崩溃）。netconsole 既没
+   抓到日志，又参与了崩溃。
+
+**根因（调研后确认，非猜测）**：
+- Mesa 官方文档：Mali GPU 只负责渲染，无显示控制器；要把渲染结果显示需独立 display
+  driver 经 **kmsro + DRI3/PRIME** 共享 DMA-BUF。Lima 已验证的 display driver 只有
+  sun4i-drm/meson/exynos/rockchip/tinydrm/zynqmp —— **无 HiSilicon hi3798**。
+- 当前内核 `loonpn/ec6108v9c-linux-kernel` 6.3.0-rc5 的 `drivers/gpu/drm/hisilicon/` 只有
+  hibmc(PCIe)/kirin(手机)，**没有 hi3798mv100 的 VO DRM KMS 驱动**；显示只能走私有
+  fbdev `hi3798mv100-hdmi-console.c` + mmap fb0。用户态 mmap 写这块 VO DMA 持续扫描的
+  显存（cache 一致性 + DMA 竞争，§6 早年预警）+ Xorg 污染 fb 状态 → 反复死机。
+- **framebuffer 保留内存并非没做**：`apply-dts-placeholders.py` 早已注入
+  `framebuffer-reserved@3e000000`(0x2000000, 无 no-map)，实时 DTB 确认存在，显存
+  `0x3f6ce000-0x3fece000` 完全落在保留区内。此前"显存没 reserve 导致死机"是未查证的
+  错误臆断，已纠正。
+
+**架构正解（调研找到、社区现成方案）**：
+- `github.com/histb-mainline/linux` 分支 `histb`（基于 7.4-rc2，baseline SHA
+  `fd9230005e...`）已移植 hi3798mv100 全套主线驱动，论坛 bbs.histb.com/d/4770 确认
+  "7.3 mv100 HDMI 成功点亮"。
+- `github.com/histb-mainline/patches`（quilt series）里有现成 DRM KMS 显示驱动：
+  - `700-02-drm-histb-add-the-VDP-v2-display-engine-driver.patch`：`CONFIG_DRM_HISTB_VDP`，
+    `DRIVER_GEM|DRIVER_MODESET|DRIVER_ATOMIC`，一个 CRTC + primary plane（G0 图层），
+    `drm_gem_dma_helper` + `drm_fbdev_dma`，明确支持 hi3798mv100。
+  - `700-04-...on-chip-HDMI-transmitter-driver.patch`：drm_bridge/connector。
+  - `255-01-...hi3798mv100-mali.patch`：`hisilicon,hi3798mv100-mali` compatible（lima）。
+- 正解路线：**迁移到 histb-mainline 7.4 内核 + quilt 应用全量 patches**，获得
+  `drm-histb` KMS 显示驱动 → lima + kmsro + DRI3/PRIME + X modesetting → 桌面由 GPU
+  硬件渲染并扫描输出到 HDMI。这正是项目 task #12/#13/#14 早已规划但未执行的路线。
+
+**结论**：在现用 6.3 内核 + 私有 fbdev 架构下，"GPU 直驱 GUI 桌面"技术上走不通，
+继续 mmap 写 fb0 只会反复死机。不应再试。要实现目标必须换 histb-mainline 7.4 内核
+（大工程：换内核子模块 + CI 应用 quilt series + 重刷 + 验证），作为独立主线任务推进。
