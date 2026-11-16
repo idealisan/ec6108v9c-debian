@@ -369,7 +369,7 @@ EndSection
 # Render off lima, display via the drm-histb KMS driver.
 Section "OutputClass"
     Identifier "GPU"
-    MatchDriver "drm-histb-vdp"
+    MatchDriver "histb-vdp"
     Driver "modesetting"
     Option "PrimaryGPU" "true"
     Option "DRI" "3"
