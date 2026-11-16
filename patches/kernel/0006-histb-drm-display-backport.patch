@@ -3762,7 +3762,7 @@ diff --git a/drivers/gpu/drm/bridge/sii9134.c b/drivers/gpu/drm/bridge/sii9134.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/bridge/sii9134.c
-@@ -0,0 +1,1636 @@
+@@ -0,0 +1,1637 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Copyright (c) 2023 David Yang
@@ -4583,8 +4583,9 @@ new file mode 100644
 +
 +static void
 +sii9134_bridge_atomic_enable(struct drm_bridge *bridge,
-+			     struct drm_atomic_state *state)
++			     struct drm_bridge_state *bridge_state)
 +{
++	struct drm_atomic_state *state = bridge_state->base.state;
 +	struct sii9134 *sii = bridge_to_sii9134(bridge);
 +	struct drm_connector *connector;
 +	struct drm_connector_state *conn_state;
@@ -4876,7 +4877,7 @@ new file mode 100644
 +
 +static void
 +sii9134_bridge_atomic_disable(struct drm_bridge *bridge,
-+			      struct drm_atomic_state *state)
++			      struct drm_bridge_state *bridge_state)
 +{
 +	struct sii9134 *sii = bridge_to_sii9134(bridge);
 +
