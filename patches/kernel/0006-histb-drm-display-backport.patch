@@ -5419,7 +5419,7 @@ new file mode 100644
 +#include <linux/regmap.h>
 +#include <linux/reset.h>
 +#include <linux/string.h>
-+#include <linux/unaligned.h>
++#include <asm/unaligned.h>
 +
 +#include "sii9134.h"
 +
