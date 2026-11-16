@@ -54,7 +54,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-release-${{ github.ref }}
+  group: build-release-v2-${{ github.ref }}
   cancel-in-progress: true
 
 # The kernel build and the rootfs build are independent (neither reads the
