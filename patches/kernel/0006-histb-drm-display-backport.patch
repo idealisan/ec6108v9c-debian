@@ -4925,7 +4925,7 @@ new file mode 100644
 +	return status;
 +}
 +
-+static const struct drm_edid *
++static struct edid *
 +sii9134_bridge_edid_read(struct drm_bridge *bridge,
 +			 struct drm_connector *connector)
 +{
