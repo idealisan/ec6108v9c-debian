@@ -69,8 +69,19 @@ sudo mount -t sysfs sysfs "$ROOT/sys"
 sudo mount --bind /dev "$ROOT/dev"
 sudo mount --bind /dev/pts "$ROOT/dev/pts"
 
+# Prevent postinst scripts (notably dconf-service pulled in by LXDE) from
+# trying to start daemons inside the chroot, where there is no running init.
+# This is the standard Docker/debootstrap policy-rc.d trick; return 101 means
+# "do not start this service". Without it dconf-service postinst fails and
+# debootstrap gives up after 5 retries.
+sudo tee "$ROOT/usr/sbin/policy-rc.d" >/dev/null <<'POLICY_EOF'
+#!/bin/sh
+exit 101
+POLICY_EOF
+sudo chmod 755 "$ROOT/usr/sbin/policy-rc.d"
+
 echo "== debootstrap stage 2 =="
-sudo chroot "$ROOT" /debootstrap/debootstrap --second-stage
+sudo DEBIAN_FRONTEND=noninteractive chroot "$ROOT" /debootstrap/debootstrap --second-stage
 sudo chroot "$ROOT" apt-get clean
 
 echo "== configure system =="
