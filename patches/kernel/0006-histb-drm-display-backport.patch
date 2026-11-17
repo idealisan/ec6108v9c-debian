@@ -1049,7 +1049,7 @@ diff --git a/drivers/gpu/drm/histb/histb-vdp2.c b/drivers/gpu/drm/histb/histb-vd
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/histb/histb-vdp2.c
-@@ -0,0 +1,2558 @@
+@@ -0,0 +1,2568 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * DRM driver for the HiSTB VDP v2 display engine, found on hi3798mv100 /
@@ -2117,6 +2117,12 @@ new file mode 100644
 +	.update_plane		= drm_atomic_helper_update_plane,
 +	.disable_plane		= drm_atomic_helper_disable_plane,
 +	.destroy		= drm_plane_cleanup,
++	/* 6.3 requires .reset to create plane->state; the 7.4 original used
++	 * atomic_create_state (a 7.4-only API dropped in the backport). Without
++	 * it plane->state stays NULL, plane_duplicate_state WARNs and returns
++	 * NULL, atomic modeset fails, no CRTC/mode is produced and Xorg crashes.
++	 */
++	.reset			= drm_atomic_helper_plane_reset,
 +	.atomic_duplicate_state	= drm_atomic_helper_plane_duplicate_state,
 +	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
 +};
@@ -3227,6 +3233,10 @@ new file mode 100644
 +	.set_config		= drm_atomic_helper_set_config,
 +	.page_flip		= drm_atomic_helper_page_flip,
 +	.destroy		= drm_crtc_cleanup,
++	/* 6.3 requires .reset to create crtc->state (7.4 used atomic_create_state).
++	 * Without it crtc->state is NULL and atomic modeset cannot be committed.
++	 */
++	.reset			= drm_atomic_helper_crtc_reset,
 +	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
 +	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
 +	.enable_vblank		= histb_vdp2_crtc_enable_vblank,
