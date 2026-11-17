@@ -141,7 +141,7 @@ diff --git a/drivers/gpu/drm/histb/histb-vdp-core.c b/drivers/gpu/drm/histb/hist
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/histb/histb-vdp-core.c
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,409 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * DRM driver for the HiSTB VDP display engine family.
@@ -197,8 +197,16 @@ new file mode 100644
 +	DRM_GEM_DMA_DRIVER_OPS,
 +	.name			= "histb-vdp",
 +	.desc			= "HiSTB VDP display engine",
++	/* drm_version() -> drm_copy_field() WARNs ("BUG: the value to copy was
++	 * not set!") and reports a NULL date when .date is missing. Xorg's
++	 * modesetting DDX reads DRM_IOCTL_VERSION during probe; a NULL date
++	 * is a DRM driver contract violation and was seen alongside an Xorg
++	 * segfault on the real box. Every in-tree 6.3 driver sets .date.
++	 */
++	.date			= "20261117",
 +	.major			= 1,
 +	.minor			= 0,
++	.patchlevel		= 0,
 +};
 +
 +static int histb_vdp_bind(struct device *dev)
@@ -3777,7 +3785,7 @@ diff --git a/drivers/gpu/drm/bridge/sii9134.c b/drivers/gpu/drm/bridge/sii9134.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/bridge/sii9134.c
-@@ -0,0 +1,1631 @@
+@@ -0,0 +1,1637 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Copyright (c) 2023 David Yang
@@ -5006,6 +5014,12 @@ new file mode 100644
 +	.get_edid		= sii9134_bridge_edid_read,
 +	.atomic_duplicate_state	= drm_atomic_helper_bridge_duplicate_state,
 +	.atomic_destroy_state	= drm_atomic_helper_bridge_destroy_state,
++	/* 6.3 requires .atomic_reset to init bridge->base.state; the 7.4
++	 * original used atomic_create_state (a 7.4-only API). Without it
++	 * bridge->base.state stays NULL and bridge_duplicate_state WARNs,
++	 * breaking modeset once the plane/crtc state issue is fixed.
++	 */
++	.atomic_reset		= drm_atomic_helper_bridge_reset,
 +};
 +
 +/* ------------------------------------------------------------------ */
