@@ -2,15 +2,25 @@ diff --git a/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts b/arch/arm/boot/dts/hi3
 index b16f63daf..4664686ca 100644
 --- a/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts
 +++ b/arch/arm/boot/dts/hi3798mv100-ec6108v9c.dts
-@@ -8,6 +8,7 @@ / {
- 
+@@ -8,5 +8,17 @@ / {
++	/* Pin MMC numbering: eMMC must stay mmc0 because root= and blkdevparts=
++	 * both hardcode mmcblk0. Both dw_mmc controllers use asynchronous probe,
++	 * so without aliases the eMMC can become mmc1 (SD steals mmc0) and root
++	 * lookup panics with unknown-block(0,0). Aliases make it probe-order
++	 * independent while keeping the SD slot fully functional.
++	 */
++	aliases {
++		mmc0 = &mmc;
++		mmc1 = &sd;
++	};
++
  	chosen {
  		stdout-path = "serial0:115200n8";
 +		bootargs = "__CMDLINE__";
  	};
  
  	leds {
-@@ -32,6 +33,29 @@ ir {
+@@ -32,6 +46,29 @@ ir {
  			default-state = "off";
  		};
  	};
@@ -40,7 +50,7 @@ index b16f63daf..4664686ca 100644
  };
  
  &timer1 {
-@@ -68,6 +92,9 @@ &gpio5 {
+@@ -68,6 +105,9 @@ &gpio5 {
  
  &gpu {
  	status = "okay";
