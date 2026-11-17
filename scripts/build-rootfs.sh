@@ -46,7 +46,7 @@ PACKAGES=(
 # DDX (DRI3/PRIME). kmsro is built into the lima DRI driver, no separate pkg.
 DESKTOP_PACKAGES=(
   libdrm2 libgbm1 libgl1-mesa-dri libegl1 libgles2 mesa-utils
-  xserver-xorg-core xserver-xorg xinit xauth
+  xserver-xorg-core xserver-xorg xinit xauth dbus-x11
   xfce4 xfce4-terminal
 )
 # firmware-realtek lives in non-free-firmware in bookworm.
@@ -96,6 +96,36 @@ sudo chroot "$ROOT" apt-get update
 sudo DEBIAN_FRONTEND=noninteractive chroot "$ROOT" \
     apt-get install -y --no-install-recommends "${DESKTOP_PACKAGES[@]}"
 sudo chroot "$ROOT" apt-get clean
+
+# ---- Mesa kmsro shim: make libgbm/glamor render card0 with the Mali-450 ----
+# The on-SoC display engine registers as DRM driver "histb-vdp", but Debian
+# bookworm's lima_dri.so has no kmsro entry for that name, so Xorg's glamor
+# fails ("couldn't get display device") and XFCE falls back to CPU swrast.
+# libgbm picks the DRI driver by the kernel DRM name: it opens
+# <dri-dir>/histb_vdp_dri.so and dlsym()s __driDriverGetExtensions_histb_vdp.
+# Ship such a file as a byte-identical copy of lima_dri.so with the single
+# kmsro slot "sun4i_drm" (same 9-char length, same Mali render path) renamed
+# to "histb_vdp". The original lima_dri.so stays untouched, so the real lima
+# render node (/dev/dri/renderD128) keeps working. This lets the display card
+# (card0) be rendered by the very same Mali-450 GPU via lima's kmsro path.
+DRIDIR="$ROOT/usr/lib/arm-linux-gnueabihf/dri"
+if [ -f "$DRIDIR/lima_dri.so" ]; then
+  echo "== install histb-vdp kmsro shim (lima) =="
+  sudo cp "$DRIDIR/lima_dri.so" "$DRIDIR/histb_vdp_dri.so"
+  sudo python3 - "$DRIDIR/histb_vdp_dri.so" <<'PY'
+import sys
+path = sys.argv[1]
+data = bytearray(open(path, 'rb').read())
+# sun4i_drm and histb_vdp are both 9 bytes: in-place, ELF-safe. This renames
+# the kmsro extension symbol to the name libgbm derives from "histb-vdp".
+assert data.count(b'sun4i_drm') == 1, "unexpected sun4i_drm count"
+i = data.find(b'sun4i_drm')
+data[i:i+9] = b'histb_vdp'
+assert bytes(data).count(b'__driDriverGetExtensions_histb_vdp') == 1
+open(path, 'wb').write(data)
+print("kmsro shim ready:", path)
+PY
+fi
 
 echo "== configure system =="
 echo "$TARGET_HOST" | sudo tee "$ROOT/etc/hostname" >/dev/null
@@ -380,6 +410,24 @@ Section "Device"
     Driver "modesetting"
     Option "DRI" "3"
     Option "AccelMethod" "glamor"
+EndSection
+
+# Pin scanout to 1080p. The EDID's preferred mode is 3840x2160@297MHz; one
+# ARGB8888 frame there is ~33MB but CMA is only 16MB, so the DRM fbdev/emulation
+# and Xorg modesetting fail to allocate (ret=-12 / AddScreen failed) and the
+# desktop never starts. 1920x1080 (~8MB/frame) fits and was verified on HW.
+Section "Monitor"
+    Identifier "DefaultMonitor"
+    Option "PreferredMode" "1920x1080"
+EndSection
+Section "Screen"
+    Identifier "DefaultScreen"
+    Device "DefaultDevice"
+    Monitor "DefaultMonitor"
+    SubSection "Display"
+        Modes "1920x1080"
+        Depth 24
+    EndSubSection
 EndSection
 XORG_EOF
 
