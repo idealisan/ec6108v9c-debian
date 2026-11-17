@@ -1049,7 +1049,7 @@ diff --git a/drivers/gpu/drm/histb/histb-vdp2.c b/drivers/gpu/drm/histb/histb-vd
 new file mode 100644
 --- /dev/null
 +++ b/drivers/gpu/drm/histb/histb-vdp2.c
-@@ -0,0 +1,2553 @@
+@@ -0,0 +1,2558 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * DRM driver for the HiSTB VDP v2 display engine, found on hi3798mv100 /
@@ -2396,6 +2396,11 @@ new file mode 100644
 +	.fill_modes		= drm_helper_probe_single_connector_modes,
 +	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
 +	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
++	/* 6.3 drm_connector_init() rejects funcs without .destroy (-EINVAL).
++	 * Both wb connectors are embedded in struct histb_vdp2_display (not
++	 * separately allocated), so cleanup must not free the connector.
++	 */
++	.destroy		= drm_connector_cleanup,
 +};
 +
 +static int histb_wb_one(struct histb_vdp2_display *disp,
