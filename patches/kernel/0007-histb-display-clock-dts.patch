@@ -12,20 +12,194 @@
  #endif	/* __DTS_HISTB_CLOCK_H */
 --- a/drivers/clk/hisilicon/crg-hi3798.c
 +++ b/drivers/clk/hisilicon/crg-hi3798.c
-@@ -419,6 +419,13 @@
+@@ -7,6 +7,7 @@
+ 
+ #include <dt-bindings/clock/histb-clock.h>
+ #include <linux/clk-provider.h>
++#include <linux/bitfield.h>
+ #include <linux/module.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
+@@ -419,6 +420,11 @@
  	/* FEPHY */
  	{ HISTB_FEPHY_CLK, "clk_fephy", "25m",
  		CLK_SET_RATE_PARENT, 0x120, 0, 0, },
-+	/* HiSTB display clocks (docs/055): minimal gate definitions so the
-+	 * VDP/HDMI drivers can prepare/enable them. VO timing is set by the
-+	 * drivers via registers; these clocks only need to be gated on. */
++	/* HiSTB display gates (docs/055). clk_vo_hd (pixel clock) is a
++	 * dedicated HD-PLL clock registered in hi3798mv100_clk_register. */
 +	{ HISTB_VO_CLK, "clk_vo", "clk_apb", 0, 0xd8, 0, 0, },
-+	{ HISTB_VO_HD_CLK, "clk_vo_hd", "clk_apb", 0, 0xd8, 4, 0, },
 +	{ HISTB_HDMI_CTRL_CLK, "clk_hdmi_ctrl", "clk_apb", 0, 0x10c, 0, 0, },
 +	{ HISTB_HDMI_PHY_CLK, "clk_hdmi_phy", "clk_apb", 0, 0x110, 0, 0, },
  };
  
  static const struct hi3798_complex_clock hi3798mv100_complex_clks[] = {
+@@ -436,10 +442,166 @@
+ 	.complex_clks_nums = ARRAY_SIZE(hi3798mv100_complex_clks),
+ };
+ 
++
++/* ---- Hi3798MV100 HD pixel clock (backport from gthifb/histb-mainline
++ * 500-02, verified working: this is the clock that drives VO_G0/HDMI TMDS).
++ * PERI_CRG_PLL10/11 program the HD PLL; CRG54's vo_hd_clk_div halves it.
++ * No loop-setting formula is documented, so rates are a register-pair table
++ * (one entry per display format), exactly as upstream's driver does. */
++#define CRG54				0xd8
++#define  CRG54_VO_HD_CLK_DIV		GENMASK(19, 18)
++#define  CRG54_CLK_DIV_2		0
++
++struct hi3798_hd_pix_cfg {
++	unsigned long	rate;
++	u32		pll10;
++	u32		pll11;
++};
++
++static const struct hi3798_hd_pix_cfg hi3798mv100_hd_pix_cfgs[] = {
++	{  74250000, 0x14000000, 0x02002063, }, /* 720p50/60, 1080p24-30, 1080i */
++	{ 148500000, 0x12000000, 0x02002063, }, /* 1080p50/60 */
++	{ 297000000, 0x11000000, 0x02002063, }, /* 3840x2160@24/25/30 */
++	{ 296703000, 0x11E6A7EF, 0x00002062, }, /* 3840x2160@23.976/29.97 */
++	{  25200000, 0x24000000, 0x20050a8, }, /* 640x480@60 */
++	{  39805440, 0x25000000, 0x201967a, }, /* 800x600@60 */
++	{  65122560, 0x15000000, 0x201954a, }, /* 1024x768@60 */
++	{  83764800, 0x13000000, 0x2019417, }, /* 1280x800@60 */
++	{  85478400, 0x13000000, 0x2032859, }, /* 1360x768@60 */
++	{  85770240, 0x13000000, 0x200a1ad, }, /* 1366x768@60 */
++	{  88896000, 0x14000000, 0x2006163, }, /* 1440x900@60 RB */
++	{  97785600, 0x14000000, 0x2006187, }, /* 1600x900@60 RB */
++	{ 106755840, 0x12000000, 0x201e42b, }, /* 1440x900@60 */
++	{ 107855040, 0x15000000, 0x20198c9, }, /* 1280x1024@60 */
++	{ 121717440, 0x12000000, 0x20050cb, }, /* 1400x1050@60 */
++	{ 146217600, 0x12000000, 0x2018493, }, /* 1680x1050@60 */
++	{ 156750000, 0x12000000, 0x200309d, }, /* 2048x1152@60 */
++	{ 162000000, 0x12000000, 0x2001036, }, /* 1600x1200@60 */
++	{ 234000000, 0x11000000, 0x2001027, }, /* 1920x1440@60 */
++	{ 241500000, 0x12000000, 0x20020a1, }, /* 2560x1440@60 RB */
++	{ 268500000, 0x12000000, 0x20020b3, }, /* 2560x1600@60 RB */
++};
++
++struct hi3798_hd_pix_clock {
++	struct clk_hw	hw;
++	void __iomem	*pll10;
++	void __iomem	*pll11;
++	void __iomem	*crg54;
++};
++#define to_hi3798_hd_pix_clock(_hw) \
++	container_of(_hw, struct hi3798_hd_pix_clock, hw)
++
++static const struct hi3798_hd_pix_cfg *hi3798_hd_pix_cfg(unsigned long rate)
++{
++	const struct hi3798_hd_pix_cfg *best = &hi3798mv100_hd_pix_cfgs[0];
++	unsigned long diff = ~0UL;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(hi3798mv100_hd_pix_cfgs); i++) {
++		const struct hi3798_hd_pix_cfg *cfg = &hi3798mv100_hd_pix_cfgs[i];
++		unsigned long delta = rate > cfg->rate ? rate - cfg->rate :
++							     cfg->rate - rate;
++		if (delta < diff) {
++			diff = delta;
++			best = cfg;
++		}
++	}
++	return best;
++}
++
++static unsigned long hi3798_hd_pix_recalc_rate(struct clk_hw *hw,
++					       unsigned long parent_rate)
++{
++	struct hi3798_hd_pix_clock *clk = to_hi3798_hd_pix_clock(hw);
++	u32 pll10 = readl_relaxed(clk->pll10);
++	u32 pll11 = readl_relaxed(clk->pll11);
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(hi3798mv100_hd_pix_cfgs); i++) {
++		const struct hi3798_hd_pix_cfg *cfg = &hi3798mv100_hd_pix_cfgs[i];
++		if (cfg->pll10 == pll10 && cfg->pll11 == pll11 &&
++		    FIELD_GET(CRG54_VO_HD_CLK_DIV, readl_relaxed(clk->crg54)) ==
++		    CRG54_CLK_DIV_2)
++			return cfg->rate;
++	}
++	return 0;
++}
++
++static int hi3798_hd_pix_determine_rate(struct clk_hw *hw,
++					struct clk_rate_request *req)
++{
++	req->rate = hi3798_hd_pix_cfg(req->rate)->rate;
++	return 0;
++}
++
++static int hi3798_hd_pix_set_rate(struct clk_hw *hw, unsigned long rate,
++				  unsigned long parent_rate)
++{
++	struct hi3798_hd_pix_clock *clk = to_hi3798_hd_pix_clock(hw);
++	const struct hi3798_hd_pix_cfg *cfg = hi3798_hd_pix_cfg(rate);
++	u32 pll10_old = readl_relaxed(clk->pll10);
++	u32 pll11_old = readl_relaxed(clk->pll11);
++	u32 crg54_old = readl_relaxed(clk->crg54);
++	u32 val;
++
++	val = (crg54_old & ~CRG54_VO_HD_CLK_DIV) |
++	      FIELD_PREP(CRG54_VO_HD_CLK_DIV, CRG54_CLK_DIV_2);
++	writel_relaxed(cfg->pll10, clk->pll10);
++	writel_relaxed(cfg->pll11, clk->pll11);
++	writel_relaxed(val, clk->crg54);
++	if (readl_relaxed(clk->pll10) == cfg->pll10 &&
++	    readl_relaxed(clk->pll11) == cfg->pll11 &&
++	    readl_relaxed(clk->crg54) == val)
++		return 0;
++	writel_relaxed(pll10_old, clk->pll10);
++	writel_relaxed(pll11_old, clk->pll11);
++	writel_relaxed(crg54_old, clk->crg54);
++	return -EIO;
++}
++
++static const struct clk_ops hi3798_hd_pix_ops = {
++	.recalc_rate = hi3798_hd_pix_recalc_rate,
++	.determine_rate = hi3798_hd_pix_determine_rate,
++	.set_rate = hi3798_hd_pix_set_rate,
++};
++
++static struct clk *hi3798_clk_register_hd_pix(struct device *dev, void __iomem *base)
++{
++	struct hi3798_hd_pix_clock *clk;
++	static const char *const parents[] = { "clk_osc" };
++	struct clk_init_data init = {
++		.name = "clk_vo_hd",
++		.ops = &hi3798_hd_pix_ops,
++		.parent_names = parents,
++		.num_parents = ARRAY_SIZE(parents),
++	};
++
++	clk = devm_kzalloc(dev, sizeof(*clk), GFP_KERNEL);
++	if (!clk)
++		return ERR_PTR(-ENOMEM);
++	clk->hw.init = &init;
++	clk->pll10 = base + 0x28;
++	clk->pll11 = base + 0x2c;
++	clk->crg54 = base + CRG54;
++	return devm_clk_register(dev, &clk->hw);
++}
++/* ---- end HD pixel clock ---- */
++
+ static struct hisi_clock_data *hi3798mv100_clk_register(
+ 				struct platform_device *pdev)
+ {
+-	return hi3798_clk_register(pdev, &hi3798mv100_crg_clks);
++	struct hisi_clock_data *data =
++		hi3798_clk_register(pdev, &hi3798mv100_crg_clks);
++	struct clk *hd_pix;
++
++	if (IS_ERR(data))
++		return data;
++	/* clk_vo_hd is the pixel clock ("pix"); it must round/set to the
++	 * real HD-PLL rates, not sit at the 100MHz parent rate. */
++	hd_pix = hi3798_clk_register_hd_pix(&pdev->dev, data->base);
++	if (!IS_ERR(hd_pix))
++		data->clk_data.clks[HISTB_VO_HD_CLK] = hd_pix;
++	return data;
+ }
+ 
+ static void hi3798mv100_clk_unregister(struct platform_device *pdev)
 --- a/arch/arm/boot/dts/hi3798mv100.dtsi
 +++ b/arch/arm/boot/dts/hi3798mv100.dtsi
 @@ -494,6 +494,36 @@
