@@ -449,10 +449,12 @@ Type=simple
 User=root
 Environment=DISPLAY=:0
 Environment=LIBGL_ALWAYS_SOFTWARE=0
-# 不要设 MESA_LOADER_DRIVER_OVERRIDE=lima：它会强制 GL 走独立 lima render
-# 节点，绕过 histb-vdp 的 kmsro shim，导致 glamor 拿不到渲染设备退回 llvmpipe。
-# 去掉后 libgbm 按 DRM driver name 自动加载 histb-vdp_dri.so(shim)，glamor
-# 成功在 Mali450 上启用 (真机验证: "glamor X acceleration enabled on Mali450")。
+# GPU vs 软件渲染模式切换（无需重刷，SSH 改 /etc/ec6108/gpu-mode 后 restart 即可）：
+#   软件渲染(默认,稳定): MESA_LOADER_DRIVER_OVERRIDE=lima
+#   GPU渲染(Mali450,需cma=160M): 注释掉上面那行
+# 真机已证实：无 override 时 glamor 走 Mali450，但默认 16MB CMA 会导致 hard lockup；
+# cma=160M 内核参数用于给 kmsro/DRI3/PRIME 提供足够显存 buffer。
+EnvironmentFile=-/etc/ec6108/gpu-mode
 ExecStart=/usr/bin/startx /usr/bin/startxfce4 -- :0 -nolisten tcp vt1
 Restart=on-failure
 RestartSec=5
@@ -463,6 +465,13 @@ WantedBy=multi-user.target
 UNIT_EOF
 sudo ln -sf /etc/systemd/system/ec6108-desktop.service \
     "$ROOT/etc/systemd/system/multi-user.target.wants/ec6108-desktop.service"
+# gpu-mode 默认 = 软件渲染稳定态。要试 GPU 渲染，SSH 进去把下面这行注释掉再
+# `systemctl restart ec6108-desktop`（内核需带 cma=160M，否则会 hard lockup）。
+sudo mkdir -p "$ROOT/etc/ec6108"
+sudo tee "$ROOT/etc/ec6108/gpu-mode" >/dev/null <<'GPUMODE_EOF'
+# 默认软件渲染（稳定）。启用 Mali450 GPU 渲染：注释掉下一行后 restart ec6108-desktop。
+MESA_LOADER_DRIVER_OVERRIDE=lima
+GPUMODE_EOF
 # Force root auto-login X session (no display manager needed).
 sudo tee "$ROOT/root/.xinitrc" >/dev/null <<'XINIT_EOF'
 #!/bin/sh
