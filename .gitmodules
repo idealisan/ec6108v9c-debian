@@ -1,3 +1,4 @@
 [submodule "third_party/linux-hi3798mv100"]
 	path = third_party/linux-hi3798mv100
-	url = https://github.com/loonpn/ec6108v9c-linux-kernel.git
+	url = https://github.com/histb-mainline/linux.git
+	branch = master
