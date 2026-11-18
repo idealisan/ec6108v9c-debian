@@ -74,21 +74,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf u-boot-tools bc bison flex libssl-dev libelf-dev \
-            lz4 zstd xz-utils cpio rsync unzip file device-tree-compiler python3
+            lz4 zstd xz-utils cpio rsync unzip file device-tree-compiler python3 \
+            quilt patch
 
-      - name: Init kernel submodule (shallow, pinned commit)
-        run: git submodule update --init --depth 1 third_party/linux-hi3798mv100
+      - name: Checkout kernel tree at v7.4-rc2 (single pinned commit)
+        # Do not rely on `git submodule update --depth 1` fetching a non-tip
+        # gitlink SHA from the fork's master tip (7.4-rc4): fetch the exact
+        # baseline commit from configs/kernel-baseline.env by SHA instead.
+        run: |
+          set -e
+          BASE=$(grep '^BASE_COMMIT=' configs/kernel-baseline.env | cut -d= -f2)
+          SM=third_party/linux-hi3798mv100
+          URL=$(git config -f .gitmodules "submodule.$SM.url")
+          mkdir -p "$SM"
+          if [ ! -e "$SM/.git" ]; then git -C "$SM" init -q; fi
+          git -C "$SM" remote remove origin 2>/dev/null || true
+          git -C "$SM" remote add origin "$URL"
+          git -C "$SM" fetch --depth 1 origin "$BASE"
+          git -C "$SM" checkout --detach -q FETCH_HEAD
+          test "$(git -C "$SM" rev-parse HEAD)" = "$BASE"
+          grep -q '^EXTRAVERSION = -rc2' "$SM/Makefile"
 
-      - name: Build mainline 6.x kernel with local patches
+      - name: Build histb 7.4 kernel (v7.4-rc2 + quilt series)
         env:
-          DISPLAY_DRIVER: ${{ inputs.display_driver }}
-          FB_BASE: ${{ inputs.fb_base }}
           LAYOUT_ENV: configs/partition-layout.env
-          FB_WIDTH: ${{ inputs.fb_width }}
-          FB_HEIGHT: ${{ inputs.fb_height }}
-          FB_STRIDE: ${{ inputs.fb_stride }}
-          FB_FORMAT: ${{ inputs.fb_format }}
-          FB_SIZE: ${{ inputs.fb_size }}
           EXTRA_CMDLINE: ${{ inputs.extra_cmdline }}
         run: bash scripts/build-kernel.sh
 
@@ -188,17 +197,18 @@ jobs:
       - name: Write release notes
         run: |
           cat > RELEASE_NOTES.md <<EOF
-          EC6108V9C (Hi3798MV100) Debian armhf - mainline 6.x
+          EC6108V9C (Hi3798MV100) Debian armhf - histb 7.4
 
           - build (UTC): $STAMP
           - flash (RECOMMENDED): recovery-flasher - patched STOCK recovery 3.10
             kernel + terminal-style flasher, HDMI progress log, writes by
             absolute LBA from flash.manifest (p2/p5/p6/p8). p1 hiboot NEVER written.
           - legacy fallback: community (ECOO) hiboot mmc-write U-disk package
-          - kernel: mainline 6.3.0-rc5 + hi3798mv100 port, with local patches:
-              * HDMI console driver hands off the hiboot framebuffer to simplefb/fbcon
-              * pstore/ramoops reserved-memory node captures panic logs
-              * Hi3798MV100 on-chip Tsensor -> /sys/class/thermal/thermal_zone0/temp
+          - kernel: Linux v7.4-rc2 + histb-mainline quilt series (117 patches)
+              + ec6108v9c boot overlay:
+              * drm-histb VDP KMS display engine + SiI9134 HDMI bridge
+              * lima (Mali-450) render node + media_cma (160 MiB) for kmsro/PRIME
+              * board DTS: bootargs/memory@0/mmc0 alias/ramoops pinned
               * rtl8xxxu (RTL8188FU USB WiFi, 0bda:f179) built in
               * ext4/f2fs/btrfs/xfs/squashfs/overlay/exfat/ntfs3/fuse built in
           - rootfs: Debian 12 bookworm armhf (debootstrap)
@@ -248,7 +258,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "build-$STAMP" \
-            --title "$STAMP · debian12-armhf + linux-6.x + recovery-flasher USB" \
+            --title "$STAMP · debian12-armhf + histb-7.4 + recovery-flasher USB" \
             --notes-file RELEASE_NOTES.md \
             dist/*
 
