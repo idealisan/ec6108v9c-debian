@@ -111,8 +111,11 @@ sudo chroot "$ROOT" apt-get clean
 DRIDIR="$ROOT/usr/lib/arm-linux-gnueabihf/dri"
 if [ -f "$DRIDIR/lima_dri.so" ]; then
   echo "== install histb-vdp kmsro shim (lima) =="
-  sudo cp "$DRIDIR/lima_dri.so" "$DRIDIR/histb_vdp_dri.so"
-  sudo python3 - "$DRIDIR/histb_vdp_dri.so" <<'PY'
+  # libgbm derives the dri filename from the DRM driver name "histb-vdp"
+  # (hyphen), so the shim MUST be named histb-vdp_dri.so (hyphen). A previous
+  # build used histb_vdp_dri.so (underscore) and libgbm never found it.
+  sudo cp "$DRIDIR/lima_dri.so" "$DRIDIR/histb-vdp_dri.so"
+  sudo python3 - "$DRIDIR/histb-vdp_dri.so" <<'PY'
 import sys
 path = sys.argv[1]
 data = bytearray(open(path, 'rb').read())
@@ -446,7 +449,10 @@ Type=simple
 User=root
 Environment=DISPLAY=:0
 Environment=LIBGL_ALWAYS_SOFTWARE=0
-Environment=MESA_LOADER_DRIVER_OVERRIDE=lima
+# 不要设 MESA_LOADER_DRIVER_OVERRIDE=lima：它会强制 GL 走独立 lima render
+# 节点，绕过 histb-vdp 的 kmsro shim，导致 glamor 拿不到渲染设备退回 llvmpipe。
+# 去掉后 libgbm 按 DRM driver name 自动加载 histb-vdp_dri.so(shim)，glamor
+# 成功在 Mali450 上启用 (真机验证: "glamor X acceleration enabled on Mali450")。
 ExecStart=/usr/bin/startx /usr/bin/startxfce4 -- :0 -nolisten tcp vt1
 Restart=on-failure
 RestartSec=5
