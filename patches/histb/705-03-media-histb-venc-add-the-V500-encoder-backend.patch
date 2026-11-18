@@ -1,0 +1,3826 @@
+From 62856dd40c742314744a37bc2f05a02cb1e91351 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 3 Nov 2026 14:41:30 +0800
+Subject: [PATCH 3/3] media: histb-venc: add the V500 encoder backend
+
+The v5 V500 of hi3798mv200h is not driven by register writes. It takes a
+command image through DMA memory, owns a memory-management unit, and
+codes P pictures with driver-written parameter sets. Add the v5 backend
+behind the shared core: hardware programming, bitstream assembly and the
+V4L2 session.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../platform/hisilicon/histb-venc/Kconfig     |   21 +-
+ .../platform/hisilicon/histb-venc/Makefile    |    5 +
+ .../hisilicon/histb-venc/histb-venc.h         |    3 +
+ .../hisilicon/histb-venc/histb_venc_core.c    |    2 +
+ .../hisilicon/histb-venc/histb_venc_v5.h      |  326 ++++
+ .../histb-venc/histb_venc_v5_bitstream.c      |  676 +++++++
+ .../hisilicon/histb-venc/histb_venc_v5_drv.c  |  149 ++
+ .../hisilicon/histb-venc/histb_venc_v5_hw.c   |  738 +++++++
+ .../hisilicon/histb-venc/histb_venc_v5_regs.h |  121 ++
+ .../hisilicon/histb-venc/histb_venc_v5_v4l2.c | 1700 +++++++++++++++++
+ 10 files changed, 3734 insertions(+), 7 deletions(-)
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/histb_venc_v5.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_bitstream.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_drv.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_hw.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_regs.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_v4l2.c
+
+--- a/drivers/media/platform/hisilicon/histb-venc/Kconfig
++++ b/drivers/media/platform/hisilicon/histb-venc/Kconfig
+@@ -9,14 +9,21 @@ config VIDEO_HISTB_VENC
+ 	select V4L2_MEM2MEM_DEV
+ 	help
+ 	  Support for the VEDU video encoder family on HiSilicon HiSTB
+-	  set-top-box SoCs. The encoder is stateful: a raw picture goes in and
+-	  H.264 network abstraction layer data comes out, with the parameter
+-	  sets and the slice headers written by the driver.
++	  set-top-box SoCs. Both generations are stateful encoders: a raw
++	  picture goes in and H.264 network abstraction layer data comes out,
++	  with the parameter sets and the slice headers written by the driver.
+ 
+-	  This backend serves the v2 VEDU of Hi3716CV200 and Hi3798MV100 -- the
+-	  part the vendor calls V2R8, built through its venc_v1.0 layer. It is
+-	  programmed with register writes and a 64-byte packet ring, and codes
+-	  IDR pictures only.
++	  The v2 VEDU of hi3716cv200 and hi3798mv100 -- the part the vendor
++	  calls V2R8, built through its venc_v1.0 layer -- is programmed by
++	  register writes and a 64-byte packet ring, and codes IDR pictures. The
++	  v5 V500 of hi3798mv200h (HiVEDUV500R001, the venc_v2.0 layer) takes a
++	  command image in DMA memory, owns a memory-management unit and codes P
++	  pictures too.
++
++	  The backend suffix is the hardware generation the block belongs to,
++	  taken the same way in both video blocks: v2 is this family's VEDU V2R8
++	  and VDH V2/V3, v5 is VEDU V500 and VDH V5R6. It is not the vendor's
++	  venc_vX.Y layer number, which counts the other way round.
+ 
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called histb-venc.
+--- a/drivers/media/platform/hisilicon/histb-venc/Makefile
++++ b/drivers/media/platform/hisilicon/histb-venc/Makefile
+@@ -1,4 +1,9 @@
+ # SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_HISTB_VENC) += histb-venc.o
+ 
+ histb-venc-y += histb_venc_core.o
+ histb-venc-y += histb_venc_v2.o
++histb-venc-y += histb_venc_v5_drv.o
++histb-venc-y += histb_venc_v5_hw.o
++histb-venc-y += histb_venc_v5_v4l2.o
++histb-venc-y += histb_venc_v5_bitstream.o
+--- a/drivers/media/platform/hisilicon/histb-venc/histb-venc.h
++++ b/drivers/media/platform/hisilicon/histb-venc/histb-venc.h
+@@ -29,8 +29,11 @@ struct histb_venc_variant {
+ };
+ 
+ extern const struct histb_venc_variant histb_venc_v2_variant;
++extern const struct histb_venc_variant histb_venc_v5_variant;
+ 
+ int histb_venc_v2_probe(struct platform_device *pdev);
+ void histb_venc_v2_remove(struct platform_device *pdev);
++int histb_venc_v5_probe(struct platform_device *pdev);
++void histb_venc_v5_remove(struct platform_device *pdev);
+ 
+ #endif /* __HISTB_VENC_H__ */
+--- a/drivers/media/platform/hisilicon/histb-venc/histb_venc_core.c
++++ b/drivers/media/platform/hisilicon/histb-venc/histb_venc_core.c
+@@ -88,6 +88,8 @@ static const struct of_device_id histb_v
+ 	  .data = &histb_venc_v2_variant },
+ 	{ .compatible = "hisilicon,hi3716cv200-venc",
+ 	  .data = &histb_venc_v2_variant },
++	{ .compatible = "hisilicon,hi3798mv200-venc",
++	  .data = &histb_venc_v5_variant },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, histb_venc_of_match);
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/histb_venc_v5.h
+@@ -0,0 +1,326 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * HiSilicon HiSTB V500 encoder driver, internal contract.
++ *
++ * The core is a stateful encoder: raw pictures in, network abstraction layer
++ * data out, so it keeps reconstruction buffers and a coded-stream ring of its
++ * own, and the driver generates the parameter sets and the slice headers.
++ *
++ * A picture is handed over as a command image in DMA memory rather than as
++ * register writes; the ABI note lists the layout and its sources. The vendor's
++ * hardware layer keeps its state in two globals and cannot be re-entered, so
++ * one streaming context holds the core for a whole run.
++ */
++#ifndef HISTB_VENC_V5_H
++#define HISTB_VENC_V5_H
++
++#include <linux/clk.h>
++#include <linux/math.h>
++#include <linux/wait.h>
++#include <linux/io.h>
++#include <linux/reset.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-mem2mem.h>
++
++#include "histb_venc_v5_regs.h"
++
++/* ctx->fmt is indexed by the queue's role, as V4L2_TYPE_IS_OUTPUT says. */
++#define V500_FMT_CAPTURE	0
++#define V500_FMT_OUTPUT		1
++
++#define V500_STREAM_SLOTS		16
++/*
++ * Every slice writes into its own stream slot. The vendor build only fills
++ * four, but the core reports sixteen, so all sixteen get a slot: a slice that
++ * lands on an address-zero slot is a write to physical zero.
++ */
++#define V500_SLICE_BUFFERS		16
++#define V500_RECON_BUFFERS		2
++
++/*
++ * The ring keeps the two pointers the core advances in its first cell, so the
++ * coded bytes start after it rather than at the allocation's face.
++ */
++#define V500_POINT_READ			0
++#define V500_POINT_WRITE		16
++#define V500_RING_OFFSET		32
++#define V500_STREAM_BYTES		(V500_RING_OFFSET + SZ_4M)
++#define V500_RECON_BYTES		SZ_4M
++#define V500_PARAM_BYTES		SZ_64K
++#define V500_PARAM_WORDS		48
++/* Space the coded slice still needs after the joined parameter sets. */
++#define V500_PARAM_HEADROOM		SZ_1K
++/* Words in each of the image's two lambda tables. */
++#define V500_LAMBDA_WORDS		40
++/*
++ * The core's protocol selector, the value the vendor's own enum gives: the
++ * command image and the core control word both name the syntax this way.
++ */
++#define V500_PROTOCOL_H264		0
++#define V500_PROTOCOL_HEVC		2
++/* The H.264 profiles the image names, in the vendor's numbering. */
++#define V500_H264_PROFILE_BASELINE	0
++#define V500_H264_PROFILE_MAIN		1
++#define V500_H264_PROFILE_EXTENDED	2
++#define V500_H264_PROFILE_HIGH		3
++/*
++ * How the input planes are stored, in the form the image's format word takes:
++ * the vendor's layer turns semi-planar into zero, planar into three and a
++ * packed picture into six before it puts the value six bits up.
++ */
++#define V500_STORE_SEMI_PLANAR		0
++#define V500_STORE_PLANAR		3
++#define V500_STORE_PACKAGE		6
++/* The core works on whole blocks of this edge. */
++#define V500_BLOCK_ALIGN		16
++/* The interleaved pair's order, which is all the image's byte names there. */
++#define V500_SEMI_VU			0
++#define V500_SEMI_UV			1
++/* The byte a packed picture is named by: Y0 U Y1 V, and U Y0 V Y1. */
++#define V500_PACKAGE_YUYV		0xd8
++#define V500_PACKAGE_UYVY		0x8d
++/* The two HEVC profiles this core can be told to signal. */
++#define V500_HEVC_PROFILE_MAIN		0
++#define V500_HEVC_PROFILE_MSP		1
++/* The picture-type word's two forms. */
++#define V500_PICTURE_INTRA		0x26010200
++#define V500_PICTURE_INTER		0x02010200
++#define V500_SLICE_BYTES		SZ_4K
++/*
++ * One area covers every buffer the core only touches once the picture is not
++ * intra: it is handed addresses for them even for an intra picture, and a zero
++ * address there is a write to physical zero.
++ */
++#define V500_SCRATCH_BYTES		(SZ_128K * 8)
++
++struct histb_venc_v5_ctx;
++
++struct histb_venc_v5_buffer {
++	struct vb2_v4l2_buffer	vb;
++	struct histb_venc_v5_ctx	*ctx;
++	struct list_head	list;
++	enum vb2_buffer_state	state;
++	unsigned int		flags;
++};
++
++struct histb_venc_v5_dma {
++	void *va;
++	dma_addr_t dma;
++	size_t size;
++};
++
++struct histb_venc_v5 {
++	struct device		*dev;
++	void __iomem		*base;
++	int			irq;
++	struct clk_bulk_data	*clks;
++	int			nclks;
++	struct reset_control	*reset;
++	bool			clocks_on;
++	/* the core serves one context at a time */
++	struct mutex		lock;
++	struct histb_venc_v5_ctx	*ctx;
++	/* protocol the running stream codes, for the read-backs that move */
++	unsigned int		protocol;
++	struct v4l2_device	v4l2;
++	struct media_device	mdev;
++	struct video_device	vfd;
++	struct v4l2_m2m_dev	*m2m;
++	struct mutex		vdev_lock;
++	struct completion	done;
++	bool			removing;
++	atomic_t		open_count;
++	wait_queue_head_t	open_wq;
++	unsigned int		status;
++	struct histb_venc_v5_dma	image;
++	struct histb_venc_v5_dma	stream;
++	struct histb_venc_v5_dma	recon;
++	struct histb_venc_v5_dma	param;
++	struct histb_venc_v5_dma	slice;
++	struct histb_venc_v5_dma	scratch;
++};
++
++/*
++ * What one picture needs of the core, in the units the command image carries:
++ * bus addresses, bytes, and macroblock-relative counts.
++ */
++struct histb_venc_v5_frame {
++	unsigned int width;
++	unsigned int height;
++	unsigned int src_stride_y;
++	unsigned int src_stride_c;
++	unsigned int recon_stride_y;
++	unsigned int recon_stride_c;
++	dma_addr_t src_y;
++	dma_addr_t src_c;
++	dma_addr_t src_v;
++	unsigned int store;
++	unsigned int package;
++	dma_addr_t recon[V500_RECON_BUFFERS];
++	unsigned int recon_index;
++	dma_addr_t stream[V500_STREAM_SLOTS];
++	unsigned int stream_size[V500_STREAM_SLOTS];
++	dma_addr_t stream_read;
++	dma_addr_t stream_write;
++	dma_addr_t param;
++	size_t param_size;
++	u32 param_reg[V500_PARAM_WORDS];
++	unsigned int frame_num;
++	unsigned int idr_pic_id;
++	/* HEVC names pictures by a sixteen bit count instead of frame_num. */
++	unsigned int poc;
++	dma_addr_t slice_header;
++	unsigned int slice_header_bits;
++	dma_addr_t tmv[2];
++	dma_addr_t pme[2];
++	dma_addr_t pme_info[3];
++	dma_addr_t tunnel_cell;
++	unsigned int intra;
++	unsigned int target_bits;
++	/* The rate this picture is coded at, for the budget and the VUI. */
++	unsigned int bitrate;
++	unsigned int fps_num;
++	unsigned int fps_den;
++	unsigned int start_qp;
++	unsigned int min_qp;
++	unsigned int max_qp;
++	int qp_i_delta;
++	int qp_p_delta;
++	/* The H.264 profile in the image's own numbering. */
++	unsigned int profile;
++	unsigned int cabac;
++	unsigned int slice_split;
++	unsigned int slice_split_size;
++	unsigned int low_latency;
++	unsigned int parameter_set;
++	unsigned int protocol;
++	unsigned int hevc_profile;
++	unsigned int hevc_level;
++};
++
++/*
++ * The core codes whole blocks, so the picture it codes is the negotiated one
++ * rounded up to its own grid: macroblocks for H.264, 32-pixel coding trees for
++ * HEVC. The parameter sets crop the difference away.
++ */
++static inline unsigned int
++histb_venc_v5_coded_height(const struct histb_venc_v5_frame *frame)
++{
++	return ALIGN(frame->height,
++		     frame->protocol == V500_PROTOCOL_HEVC ? 32 : 16);
++}
++
++static inline unsigned int
++histb_venc_v5_block_rows(const struct histb_venc_v5_frame *frame)
++{
++	return DIV_ROUND_UP(frame->height,
++			    frame->protocol == V500_PROTOCOL_HEVC ? 32 : 16);
++}
++
++static inline unsigned int
++histb_venc_v5_blocks(const struct histb_venc_v5_frame *frame)
++{
++	return DIV_ROUND_UP(frame->width,
++			    frame->protocol == V500_PROTOCOL_HEVC ? 32 : 16) *
++	       histb_venc_v5_block_rows(frame);
++}
++
++struct histb_venc_v5_ctx {
++	struct v4l2_fh		fh;
++	struct histb_venc_v5	*enc;
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_m2m_ctx	*m2m_ctx;
++	/* Which syntax the capture queue asks the core to code. */
++	bool			hevc;
++	/* Negotiated format of each queue, by the V4L2_TYPE_IS_OUTPUT test. */
++	struct v4l2_format	fmt[2];
++	unsigned int		sequence;
++	unsigned int		gop;
++	unsigned int		bitrate;
++	unsigned int		bitrate_mode;
++	/* Pictures left before the next one opens a group; zero means now. */
++	unsigned int		gop_left;
++	/* The next picture is an IDR because the client asked for one. */
++	bool			force_idr;
++	/* H.264 entropy coder and profile, as the menus name them. */
++	unsigned int		cabac;
++	unsigned int		profile;
++	/* The two quantisers the constant-quality mode codes with. */
++	unsigned int		qp_i;
++	unsigned int		qp_p;
++	/* Bits spent in the group of pictures, for the VBR budget. */
++	u64			gop_bits;
++	/* Slice splitting: units of macroblocks, 0 = one slice a picture. */
++	unsigned int		slice_mb;
++	unsigned int		hevc_profile;
++	unsigned int		hevc_level;
++	unsigned int		fps_num;
++	unsigned int		fps_den;
++	unsigned int		rc_qp;
++	unsigned int		user_min_qp;
++	unsigned int		user_max_qp;
++	s64			rc_credit;
++	/* The OUTPUT queue's picture: the geometry a buffer is laid out with. */
++	unsigned int		src_w;
++	unsigned int		src_h;
++	/*
++	 * The sub-rectangle of that picture the core is told to code, or an all
++	 * zero rectangle for the whole of it.
++	 */
++	struct v4l2_rect	crop;
++	struct histb_venc_v5_frame frame;
++};
++
++static inline struct histb_venc_v5 *histb_venc_v5_of_ctx(struct histb_venc_v5_ctx *ctx)
++{
++	return ctx->enc;
++}
++
++static inline struct histb_venc_v5_buffer *vb_to_hbuf(struct vb2_v4l2_buffer *vb)
++{
++	return container_of(vb, struct histb_venc_v5_buffer, vb);
++}
++
++/* The three groups of slice-header words the core splices in front of the
++ * macroblock data, plus the bit counts of each. HEVC instead hands the core a
++ * short first segment and the rest as CABAC-side header words, in the same two
++ * bit counts: [0] for the first segment, [1] for the rest.
++ */
++struct histb_venc_v5_slice {
++	u32 header[4];
++	u32 reorder[2];
++	u32 marking[2];
++	u32 bits[2];
++	u32 part1;
++	u32 cabac[8];
++};
++
++/* histb_venc_v5_hw.c */
++int histb_venc_v5_buffers_alloc(struct histb_venc_v5 *enc);
++void histb_venc_v5_buffers_free(struct histb_venc_v5 *enc);
++void histb_venc_v5_image_pack(struct histb_venc_v5 *enc,
++			    const struct histb_venc_v5_frame *frame,
++			    const struct histb_venc_v5_slice *slice);
++void histb_venc_v5_launch(struct histb_venc_v5 *enc,
++		       const struct histb_venc_v5_frame *frame);
++unsigned int histb_venc_v5_slot_stride(struct histb_venc_v5 *enc);
++ssize_t histb_venc_v5_drain(struct histb_venc_v5 *enc,
++			  const struct histb_venc_v5_frame *frame,
++			  void *dst, size_t size);
++unsigned int histb_venc_v5_pic_bits(struct histb_venc_v5 *enc);
++unsigned int histb_venc_v5_status(struct histb_venc_v5 *enc);
++void histb_venc_v5_stop_core(struct histb_venc_v5 *enc);
++
++/* histb_venc_v5_bitstream.c */
++int histb_venc_v5_parameter_sets(struct histb_venc_v5_frame *frame,
++			       void *param_va, size_t room, u32 *words);
++void histb_venc_v5_slice_header(struct histb_venc_v5_frame *frame,
++			      struct histb_venc_v5_slice *slice);
++
++/* histb_venc_v5_v4l2.c */
++int histb_venc_v5_v4l2_init(struct histb_venc_v5 *enc);
++void histb_venc_v5_v4l2_exit(struct histb_venc_v5 *enc);
++
++#endif /* HISTB_VENC_V5_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_bitstream.c
+@@ -0,0 +1,676 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * HiSilicon HiSTB V500 encoder: the syntax the core does not generate.
++ *
++ * The core codes the macroblocks and the picture-level fields it is given in
++ * the command image, but it takes the parameter sets and the fixed part of the
++ * slice header from the driver. The parameter sets reach it as Annex-B bytes
++ * cut into words; the slice header reaches it in groups of up to 32 bits, the
++ * first bit of a full group at its top and a short last group right-aligned --
++ * the arrangement the core's own bit reader expects.
++ *
++ * The core adds the slice address and the fields that follow it (quantiser
++ * parameter, deblocking, entropy flags), the NAL header of each slice, and the
++ * escaping between what the driver writes and what it codes, so none of those
++ * appear here.
++ */
++
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "histb_venc_v5.h"
++
++#define NAL_SPS			7
++#define NAL_PPS			8
++#define NAL_HEVC_VPS		32
++#define NAL_HEVC_SPS		33
++#define NAL_HEVC_PPS		34
++
++struct histb_venc_v5_bits {
++	u8 data[96];
++	unsigned int count;
++	bool overflow;
++};
++
++static void histb_venc_v5_put(struct histb_venc_v5_bits *bits, u32 value,
++			    unsigned int count)
++{
++	unsigned int i;
++
++	if (bits->count + count > sizeof(bits->data) * 8) {
++		bits->overflow = true;
++		return;
++	}
++
++	for (i = 0; i < count; i++) {
++		unsigned int index = bits->count + i;
++		unsigned int shift = count - i - 1;
++
++		if ((value >> shift) & 1)
++			bits->data[index / 8] |= BIT(7 - index % 8);
++	}
++
++	bits->count += count;
++}
++
++/*
++ * Unsigned Exp-Golomb: as many zero bits as the length of value plus one
++ * demands, then that length's bits of value plus one. ue(2) is therefore the
++ * three bits 011, which is how the vendor's own writers spell it.
++ */
++static void histb_venc_v5_ue(struct histb_venc_v5_bits *bits, u32 value)
++{
++	u32 length = value + 1;
++	unsigned int zeros = fls(length) - 1;
++
++	histb_venc_v5_put(bits, 0, zeros);
++	histb_venc_v5_put(bits, length, zeros + 1);
++}
++
++static void histb_venc_v5_se(struct histb_venc_v5_bits *bits, s32 value)
++{
++	histb_venc_v5_ue(bits, value <= 0 ? -2 * (u32)value : 2 * (u32)value - 1);
++}
++
++static void histb_venc_v5_trailing(struct histb_venc_v5_bits *bits)
++{
++	histb_venc_v5_put(bits, 1, 1);
++
++	if (bits->count % 8)
++		histb_venc_v5_put(bits, 0, 8 - bits->count % 8);
++}
++
++/*
++ * Turn a segment into the words the image carries. Bits keep their order: the
++ * first of the segment is the top bit of the first word, and the word holding
++ * the short last group is shifted down so its own first bit ends up lowest.
++ */
++static void histb_venc_v5_words(struct histb_venc_v5_bits *bits, u32 *words,
++			      unsigned int word_count)
++{
++	unsigned int i;
++
++	memset(words, 0, word_count * sizeof(*words));
++
++	for (i = 0; i < bits->count; i++) {
++		u32 bit = (bits->data[i / 8] >> (7 - i % 8)) & 1;
++
++		words[i / 32] |= bit << (31 - i % 32);
++	}
++
++	if (bits->count > word_count * 32)
++		bits->overflow = true;
++	else if (bits->count % 32)
++		words[bits->count / 32] >>= 32 - bits->count % 32;
++}
++
++/*
++ * The level that names this picture, with the direct-8x8 flag that goes with
++ * it: ITU-T H.264 Table A-1, checked over the frame size, the macroblock rate
++ * and the bit rate at once. A picture the table cannot name is refused rather
++ * than given a level it may not be played at.
++ */
++struct venc_v2_level {
++	unsigned int max_fs;
++	unsigned int max_mbps;
++	unsigned int max_br_kbps;
++	u8 level_idc;
++};
++
++/*
++ * MaxBR is the Baseline/Main/Extended column, which the High column equals at
++ * every level this encoder reaches.
++ */
++static const struct venc_v2_level venc_v2_levels[] = {
++	{    99,    1485,     64, 10 }, {   396,    3000,    192, 11 },
++	{   396,    6000,    384, 12 }, {   396,   11880,    768, 13 },
++	{   396,   11880,   2000, 20 }, {   792,   19800,   4000, 21 },
++	{  1620,   40500,   4000, 22 }, {  1620,   40500,  10000, 30 },
++	{  3600,  108000,  14000, 31 }, {  5120,  216000,  20000, 32 },
++	{  8192,  245760,  20000, 40 }, {  8192,  245760,  50000, 41 },
++	{  8704,  522240,  50000, 42 }, { 22080,  589824, 135000, 50 },
++	{ 36864,  983040, 240000, 51 },
++};
++
++static u8 histb_venc_v5_level(unsigned int total_mb, unsigned int mbps,
++			      unsigned int br_kbps, bool *direct8x8)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(venc_v2_levels); i++) {
++		if (total_mb <= venc_v2_levels[i].max_fs &&
++		    mbps <= venc_v2_levels[i].max_mbps &&
++		    br_kbps <= venc_v2_levels[i].max_br_kbps) {
++			*direct8x8 = total_mb >= 1620;
++			return venc_v2_levels[i].level_idc;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * The syntax's own profile number, in the order the image names the profiles.
++ */
++static u8 histb_venc_v5_profile_idc(unsigned int profile)
++{
++	static const u8 idc[] = { 66, 77, 88, 100 };
++
++	return profile < ARRAY_SIZE(idc) ? idc[profile] : 66;
++}
++
++static void histb_venc_v5_sps(struct histb_venc_v5_bits *bits,
++			      const struct histb_venc_v5_frame *frame,
++			      u8 level, bool direct8x8)
++{
++	unsigned int mbw = DIV_ROUND_UP(frame->width, 16);
++	unsigned int mbh = DIV_ROUND_UP(frame->height, 16);
++	unsigned int width = frame->width;
++	unsigned int height = frame->height;
++	unsigned int fps_den = max_t(unsigned int, frame->fps_den, 1);
++	unsigned int fps = frame->fps_num;
++	unsigned int profile = frame->profile;
++
++	histb_venc_v5_put(bits, histb_venc_v5_profile_idc(profile), 8);
++	histb_venc_v5_put(bits, 0, 8);		/* constraint and reserved */
++	histb_venc_v5_put(bits, level, 8);
++	histb_venc_v5_ue(bits, 0);		/* seq_parameter_set_id */
++	/*
++	 * Only the High family declares chroma format, depth and scaling lists;
++	 * the vendor's own High writer leaves three of those five out, so this
++	 * one follows the syntax rather than the vendor.
++	 */
++	if (profile == V500_H264_PROFILE_HIGH) {
++		histb_venc_v5_ue(bits, 1);	/* chroma_format_idc: 4:2:0 */
++		histb_venc_v5_ue(bits, 0);	/* bit_depth_luma_minus8 */
++		histb_venc_v5_ue(bits, 0);	/* bit_depth_chroma_minus8 */
++		histb_venc_v5_put(bits, 0, 1);	/* qpprime_y_zero_transform_bypass */
++		histb_venc_v5_put(bits, 0, 1);	/* seq_scaling_matrix_present_flag */
++	}
++	/*
++	 * Neither Main nor High needs anything else before the picture geometry,
++	 * and the core codes no scaling list, so the declaration stops there.
++	 */
++	histb_venc_v5_ue(bits, 0);		/* log2_max_frame_num_minus4 */
++	histb_venc_v5_ue(bits, 2);		/* pic_order_cnt_type: implicit */
++	histb_venc_v5_ue(bits, 1);		/* num_ref_frames */
++	histb_venc_v5_put(bits, 0, 1);		/* gaps_in_frame_num_value */
++	histb_venc_v5_ue(bits, mbw - 1);
++	histb_venc_v5_ue(bits, mbh - 1);
++	histb_venc_v5_put(bits, 1, 1);		/* frame_mbs_only_flag */
++	histb_venc_v5_put(bits, direct8x8, 1);	/* direct_8x8_inference_flag */
++
++	/* The flag itself is unconditional; only its four offsets are. */
++	histb_venc_v5_put(bits, mbw * 16 != width || mbh * 16 != height, 1);
++	if (mbw * 16 != width || mbh * 16 != height) {
++		histb_venc_v5_ue(bits, 0);	/* left */
++		histb_venc_v5_ue(bits, (mbw * 16 - width) / 2);
++		histb_venc_v5_ue(bits, 0);	/* top */
++		histb_venc_v5_ue(bits, (mbh * 16 - height) / 2);
++	}
++
++	/*
++	 * A timing-only VUI: it names the picture rate and no signalling, so a
++	 * reader knows what frame interval the coded rate was matched to. One
++	 * tick per field, twice the frame rate of ticks in a second.
++	 */
++	histb_venc_v5_put(bits, 1, 1);	/* vui_parameters_present */
++	histb_venc_v5_put(bits, 0, 1);	/* aspect_ratio_info_present */
++	histb_venc_v5_put(bits, 0, 1);	/* overscan_info_present */
++	histb_venc_v5_put(bits, 0, 1);	/* video_signal_type_present */
++	histb_venc_v5_put(bits, 0, 1);	/* chroma_loc_info_present */
++	histb_venc_v5_put(bits, 1, 1);	/* timing_info_present */
++	histb_venc_v5_put(bits, 1, 32);	/* num_units_in_tick */
++	histb_venc_v5_put(bits, 2 * fps / fps_den, 32);	/* time_scale */
++	histb_venc_v5_put(bits, 1, 1);	/* fixed_frame_rate */
++	histb_venc_v5_put(bits, 0, 1);	/* nal_hrd_parameters_present */
++	histb_venc_v5_put(bits, 0, 1);	/* vcl_hrd_parameters_present */
++	histb_venc_v5_put(bits, 0, 1);	/* pic_struct_present */
++	histb_venc_v5_put(bits, 0, 1);	/* bitstream_restriction */
++	histb_venc_v5_trailing(bits);
++}
++
++/*
++ * The picture parameters. The core's High arrangement codes its first macroblock
++ * with the 8x8 luma prediction mode -- one bit longer a mb_type than the 16x16
++ * the other profiles use, and the same count of prediction modes after it -- so
++ * the High form has to carry the optional tail that lets a decoder read that
++ * type: the flag, no scaling matrices, and the second chroma offset it brings.
++ */
++static void histb_venc_v5_pps(struct histb_venc_v5_bits *bits, bool cabac, bool high)
++{
++	histb_venc_v5_ue(bits, 0);		/* pic_parameter_set_id */
++	histb_venc_v5_ue(bits, 0);		/* seq_parameter_set_id */
++	histb_venc_v5_put(bits, cabac, 1);	/* entropy_coding_mode_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* pic_order_present_flag */
++	histb_venc_v5_ue(bits, 0);		/* num_slice_groups_minus1 */
++	histb_venc_v5_ue(bits, 0);		/* num_ref_idx_l0_active_minus1 */
++	histb_venc_v5_ue(bits, 0);		/* num_ref_idx_l1_active_minus1 */
++	histb_venc_v5_put(bits, 0, 1);		/* weighted_pred_flag */
++	histb_venc_v5_put(bits, 0, 2);		/* weighted_bipred_idc */
++	histb_venc_v5_se(bits, 0);		/* pic_init_qp_minus26 */
++	histb_venc_v5_se(bits, 0);		/* pic_init_qs_minus26 */
++	histb_venc_v5_se(bits, 0);		/* chroma_qp_index_offset */
++	histb_venc_v5_put(bits, 1, 1);		/* deblocking_filter_control */
++	histb_venc_v5_put(bits, 0, 1);		/* constrained_intra_pred_flag */
++	histb_venc_v5_put(bits, 0, 1);	/* redundant_pic_cnt_present_flag */
++	if (high) {
++		histb_venc_v5_put(bits, 1, 1);	/* transform_8x8_mode_flag */
++		histb_venc_v5_put(bits, 0, 1);	/* pic_scaling_matrix_present */
++		histb_venc_v5_se(bits, 0);	/* second_chroma_qp_index_offset */
++	}
++	histb_venc_v5_trailing(bits);
++}
++
++/*
++ * The profile_tier_level block both HEVC parameter sets carry: Main profile and
++ * Main tier. The core's own writer leaves the level at zero, which names no
++ * level at all, so this one says 5.1.
++ */
++static void histb_venc_v5_hevc_ptl(struct histb_venc_v5_bits *bits, bool progressive,
++				 bool msp, unsigned int level_idc)
++{
++	histb_venc_v5_put(bits, 0, 2);		/* general_profile_space */
++	histb_venc_v5_put(bits, 0, 1);		/* general_tier_flag: Main */
++	histb_venc_v5_put(bits, msp ? 3 : 1, 5);	/* general_profile_idc */
++	histb_venc_v5_put(bits, msp ? 0x70000000 : 0x60000000, 32);
++	histb_venc_v5_put(bits, progressive, 1);
++	histb_venc_v5_put(bits, 0, 1);		/* general_interlaced_source_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* general_non_packed_constraint */
++	histb_venc_v5_put(bits, 0, 1);		/* general_frame_only_constraint */
++	histb_venc_v5_put(bits, 0, 32);		/* reserved constraint bits */
++	histb_venc_v5_put(bits, 0, 12);		/* the rest of the 44 bits */
++	histb_venc_v5_put(bits, level_idc, 8);
++}
++
++/* Level idc is 30 times the level; the menu order is the spec's. */
++static unsigned int histb_venc_v5_hevc_level_idc(unsigned int level)
++{
++	static const unsigned int idc[] = {
++		30, 60, 63, 90, 93, 120, 123, 150, 153, 156, 180, 183, 186,
++	};
++
++	return level < ARRAY_SIZE(idc) ? idc[level] : 153;
++}
++
++static void histb_venc_v5_hevc_vps(struct histb_venc_v5_bits *bits, bool msp,
++				 unsigned int level_idc)
++{
++	histb_venc_v5_put(bits, 0, 4);		/* vps_video_parameter_set_id */
++	histb_venc_v5_put(bits, 3, 2);		/* base layer internal/available */
++	histb_venc_v5_put(bits, 0, 6);		/* vps_max_layers_minus1 */
++	histb_venc_v5_put(bits, 0, 3);		/* vps_max_sub_layers_minus1 */
++	histb_venc_v5_put(bits, 1, 1);		/* vps_temporal_id_nesting_flag */
++	histb_venc_v5_put(bits, 0xffff, 16);
++	histb_venc_v5_hevc_ptl(bits, true, msp, level_idc);
++	histb_venc_v5_put(bits, 1, 1);		/* vps_sub_layer_ordering_present */
++	histb_venc_v5_ue(bits, msp ? 0 : 1);	/* vps_max_dec_pic_buffering_minus1 */
++	histb_venc_v5_ue(bits, 0);		/* vps_max_num_reorder_pics */
++	histb_venc_v5_ue(bits, 0);		/* vps_max_latency_increase_plus1 */
++	histb_venc_v5_put(bits, 0, 6);		/* vps_max_layer_id */
++	histb_venc_v5_ue(bits, 0);		/* vps_num_layer_sets_minus1 */
++	/*
++	 * The picture rate is not signalled here: the VPS timing block is the
++	 * one part of this syntax the published revisions disagree about, and
++	 * the reader-side convention is to take the rate from the sequence
++	 * parameter set's VUI (which is where x265 writes it too).
++	 */
++	histb_venc_v5_put(bits, 0, 1);		/* vps_timing_info_present_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* vps_extension_flag */
++	histb_venc_v5_trailing(bits);
++}
++
++/*
++ * The coding tree is 32x32 and the transform tree stops at 16x16, which is
++ * what the core's sizes require; one short-term reference one picture back,
++ * temporal motion vectors on, and PCM on because the vendor stream declares it.
++ */
++static void histb_venc_v5_hevc_sps(struct histb_venc_v5_bits *bits,
++				 unsigned int width, unsigned int height,
++				 bool msp, unsigned int level_idc,
++				 unsigned int fps_num, unsigned int fps_den)
++{
++	unsigned int coded_w = ALIGN(width, 8);
++	unsigned int coded_h = ALIGN(height, 8);
++	bool cropped = coded_w != width || coded_h != height;
++
++	histb_venc_v5_put(bits, 0, 4);		/* sps_video_parameter_set_id */
++	histb_venc_v5_put(bits, 0, 3);		/* sps_max_sub_layers_minus1 */
++	histb_venc_v5_put(bits, 1, 1);		/* sps_temporal_id_nesting_flag */
++	histb_venc_v5_hevc_ptl(bits, false, msp, level_idc);
++	histb_venc_v5_ue(bits, 0);		/* sps_seq_parameter_set_id */
++	histb_venc_v5_ue(bits, 1);		/* chroma_format_idc: 4:2:0 */
++	histb_venc_v5_ue(bits, coded_w);
++	histb_venc_v5_ue(bits, coded_h);
++	histb_venc_v5_put(bits, cropped, 1);	/* conformance_window_flag */
++	if (cropped) {
++		histb_venc_v5_ue(bits, 0);	/* conf_win_left_offset */
++		histb_venc_v5_ue(bits, (coded_w - width) / 2);
++		histb_venc_v5_ue(bits, 0);	/* conf_win_top_offset */
++		histb_venc_v5_ue(bits, (coded_h - height) / 2);
++	}
++	histb_venc_v5_ue(bits, 0);		/* bit_depth_luma_minus8 */
++	histb_venc_v5_ue(bits, 0);		/* bit_depth_chroma_minus8 */
++	histb_venc_v5_ue(bits, 12);		/* log2_max_pic_order_cnt_lsb_minus4 */
++	histb_venc_v5_put(bits, 1, 1);		/* sub_layer_ordering_present */
++	histb_venc_v5_ue(bits, msp ? 0 : 1);	/* sps_max_dec_pic_buffering_minus1 */
++	histb_venc_v5_ue(bits, 0);		/* sps_max_num_reorder_pics */
++	histb_venc_v5_ue(bits, 0);		/* sps_max_latency_increase_plus1 */
++	histb_venc_v5_ue(bits, 0);		/* log2_min_luma_coding_block_size_minus3 */
++	histb_venc_v5_ue(bits, 2);		/* log2_diff_max_min_luma_coding_block_size */
++	histb_venc_v5_ue(bits, 0);		/* log2_min_luma_transform_block_size_minus2 */
++	histb_venc_v5_ue(bits, 2);		/* log2_diff_max_min_transform_block_size */
++	histb_venc_v5_ue(bits, 0);		/* max_transform_hierarchy_depth_inter */
++	histb_venc_v5_ue(bits, 0);		/* max_transform_hierarchy_depth_intra */
++	histb_venc_v5_put(bits, 0, 1);		/* scaling_list_enabled_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* amp_enabled_flag */
++	histb_venc_v5_put(bits, 1, 1);		/* sample_adaptive_offset_enabled */
++	histb_venc_v5_put(bits, 1, 1);		/* pcm_enabled_flag */
++	histb_venc_v5_put(bits, 7, 4);		/* pcm_sample_bit_depth_luma_minus1 */
++	histb_venc_v5_put(bits, 7, 4);		/* pcm_sample_bit_depth_chroma_minus1 */
++	histb_venc_v5_ue(bits, 0);		/* log2_min_pcm_luma_block_size_minus3 */
++	histb_venc_v5_ue(bits, 0);		/* log2_diff_max_min_pcm_luma_block */
++	histb_venc_v5_put(bits, 0, 1);		/* pcm_loop_filter_disabled_flag */
++	if (!msp) {
++		histb_venc_v5_ue(bits, 1);	/* num_short_term_ref_pic_sets */
++		histb_venc_v5_ue(bits, 1);	/* num_negative_pics */
++		histb_venc_v5_ue(bits, 0);	/* num_positive_pics */
++		histb_venc_v5_ue(bits, 0);	/* delta_poc_s0_minus1 */
++		histb_venc_v5_put(bits, 1, 1);	/* used_by_curr_pic_s0_flag */
++	} else {
++		histb_venc_v5_ue(bits, 0);	/* num_short_term_ref_pic_sets */
++	}
++	histb_venc_v5_put(bits, 0, 1);		/* long_term_ref_pics_present_flag */
++	histb_venc_v5_put(bits, msp ? 0 : 1, 1);	/* sps_temporal_mvp_enabled_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* strong_intra_smoothing_enabled */
++	/*
++	 * A timing-only VUI, the sequence parameter set's counterpart of the
++	 * H.264 one: the clock is the picture rate itself, there is no signalling
++	 * and no buffering model, so a reader learns the interval the coded rate
++	 * was matched to and nothing else.
++	 */
++	histb_venc_v5_put(bits, 1, 1);		/* vui_parameters_present_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* aspect_ratio_info_present */
++	histb_venc_v5_put(bits, 0, 1);		/* overscan_info_present */
++	histb_venc_v5_put(bits, 0, 1);		/* video_signal_type_present */
++	histb_venc_v5_put(bits, 0, 1);		/* chroma_loc_info_present */
++	histb_venc_v5_put(bits, 0, 1);		/* neutral_chroma_indication */
++	histb_venc_v5_put(bits, 0, 1);		/* field_seq_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* frame_field_info_present */
++	histb_venc_v5_put(bits, 0, 1);		/* default_display_window_flag */
++	histb_venc_v5_put(bits, 1, 1);		/* vui_timing_info_present */
++	histb_venc_v5_put(bits, max_t(unsigned int, fps_den, 1), 32);
++	histb_venc_v5_put(bits, fps_num, 32);	/* num_units_in_tick, time_scale */
++	histb_venc_v5_put(bits, 0, 1);		/* vui_poc_proportional_to_timing */
++	histb_venc_v5_put(bits, 0, 1);		/* vui_hrd_parameters_present */
++	histb_venc_v5_put(bits, 0, 1);		/* bitstream_restriction_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* sps_extension_present_flag */
++	histb_venc_v5_trailing(bits);
++}
++
++/*
++ * One slice per picture, with the quantiser delta and the deblocking flags in
++ * the slice header; the deblocking control is present and the picture-level
++ * filter is left off, which the slice then overrides back on.
++ */
++static void histb_venc_v5_hevc_pps(struct histb_venc_v5_bits *bits)
++{
++	histb_venc_v5_ue(bits, 0);		/* pps_pic_parameter_set_id */
++	histb_venc_v5_ue(bits, 0);		/* pps_seq_parameter_set_id */
++	histb_venc_v5_put(bits, 0, 1);		/* dependent_slice_segments_enabled */
++	histb_venc_v5_put(bits, 0, 1);		/* output_flag_present_flag */
++	histb_venc_v5_put(bits, 0, 3);		/* num_extra_slice_header_bits */
++	histb_venc_v5_put(bits, 0, 1);		/* sign_data_hiding_enabled_flag */
++	histb_venc_v5_put(bits, 1, 1);		/* cabac_init_present_flag */
++	histb_venc_v5_ue(bits, 0);		/* num_ref_idx_l0_default_active_minus1 */
++	histb_venc_v5_ue(bits, 0);		/* num_ref_idx_l1_default_active_minus1 */
++	histb_venc_v5_se(bits, 0);		/* init_qp_minus26 */
++	histb_venc_v5_put(bits, 0, 1);		/* constrained_intra_pred_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* transform_skip_enabled_flag */
++	/*
++	 * The core codes no per-block quantiser delta, so the syntax must not
++	 * announce one: a decoder that expects it reads the residual bits as
++	 * deltas and the picture falls apart.
++	 */
++	histb_venc_v5_put(bits, 0, 1);		/* cu_qp_delta_enabled_flag */
++	histb_venc_v5_se(bits, 0);		/* pps_cb_qp_offset */
++	histb_venc_v5_se(bits, 0);		/* pps_cr_qp_offset */
++	histb_venc_v5_put(bits, 0, 1);		/* pps_slice_chroma_qp_offsets */
++	histb_venc_v5_put(bits, 0, 1);		/* weighted_pred_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* weighted_bipred_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* transquant_bypass_enabled_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* tiles_enabled_flag */
++	histb_venc_v5_put(bits, 0, 1);		/* entropy_coding_sync_enabled_flag */
++	histb_venc_v5_put(bits, 1, 1);		/* loop_filter_across_slices */
++	histb_venc_v5_put(bits, 1, 1);		/* deblocking_filter_control_present */
++	histb_venc_v5_put(bits, 1, 1);		/* deblocking_filter_override_enabled */
++	histb_venc_v5_put(bits, 1, 1);		/* pps_deblocking_filter_disabled */
++	histb_venc_v5_put(bits, 0, 1);		/* pps_scaling_list_data_present */
++	histb_venc_v5_put(bits, 0, 1);		/* lists_modification_present_flag */
++	histb_venc_v5_ue(bits, 0);		/* log2_parallel_merge_level_minus2 */
++	histb_venc_v5_put(bits, 0, 1);		/* slice_segment_header_ext_present */
++	histb_venc_v5_put(bits, 0, 1);		/* pps_extension_present_flag */
++	histb_venc_v5_trailing(bits);
++}
++
++/*
++ * Append one NAL with a four-byte start code, escaping a run of two zero bytes
++ * that would otherwise read as a start code. HEVC carries a two-byte header
++ * whose type sits above the layer and temporal fields; H.264 one byte holding
++ * the reference index above the type. Returns the bytes written, or zero when
++ * the buffer cannot hold the unit.
++ */
++static size_t histb_venc_v5_nal(u8 *dst, size_t room, unsigned int nal_type,
++			      bool hevc, const struct histb_venc_v5_bits *bits)
++{
++	size_t out = 0;
++	unsigned int zeros = 0;
++	unsigned int i;
++
++	if (room < 6 + bits->count / 8)
++		return 0;
++
++	dst[out++] = 0;
++	dst[out++] = 0;
++	dst[out++] = 0;
++	dst[out++] = 1;
++	if (hevc) {
++		/* forbidden 0, type, layer 0, temporal id plus one. */
++		dst[out++] = nal_type << 1;
++		dst[out++] = 1;
++	} else {
++		dst[out++] = nal_type | 0x60;	/* nal_ref_idc 3 */
++	}
++
++	for (i = 0; i * 8 < bits->count; i++) {
++		u8 value = bits->data[i];
++
++		dst[out++] = value;
++		if (value) {
++			zeros = 0;
++		} else if (++zeros == 2) {
++			dst[out++] = 3;
++			zeros = 0;
++		}
++	}
++
++	return out;
++}
++
++/*
++ * Build this picture's parameter sets into the device's parameter area, record
++ * their size, and cut the bytes into the words of the command image. The core
++ * does not prepend them on this part, so the driver joins these bytes in front
++ * of the coded slice; the words are kept because the vendor's build fills them.
++ */
++int histb_venc_v5_parameter_sets(struct histb_venc_v5_frame *frame,
++			       void *param_va, size_t room, u32 *words)
++{
++	struct histb_venc_v5_bits sps = { };
++	struct histb_venc_v5_bits pps = { };
++	struct histb_venc_v5_bits vps = { };
++	bool hevc = frame->protocol == V500_PROTOCOL_HEVC;
++	bool msp = frame->hevc_profile == V500_HEVC_PROFILE_MSP;
++	unsigned int level_idc = histb_venc_v5_hevc_level_idc(frame->hevc_level);
++	unsigned int first;
++	size_t used = 0;
++
++	if (hevc) {
++		histb_venc_v5_hevc_vps(&vps, msp, level_idc);
++		histb_venc_v5_hevc_sps(&sps, frame->width, frame->height, msp,
++				     level_idc,
++				     max_t(unsigned int, frame->fps_num, 1),
++				     frame->fps_den);
++		histb_venc_v5_hevc_pps(&pps);
++	} else {
++		unsigned int mbw = DIV_ROUND_UP(frame->width, 16);
++		unsigned int mbh = DIV_ROUND_UP(frame->height, 16);
++		unsigned int mbps = mbw * mbh * frame->fps_num /
++			max_t(unsigned int, frame->fps_den, 1);
++		bool direct8x8;
++		u8 level;
++
++		level = histb_venc_v5_level(mbw * mbh, mbps,
++					frame->bitrate / 1000, &direct8x8);
++		if (!level)
++			return -E2BIG;
++		histb_venc_v5_sps(&sps, frame, level, direct8x8);
++		histb_venc_v5_pps(&pps, frame->cabac,
++				frame->profile == V500_H264_PROFILE_HIGH);
++	}
++	if (vps.overflow || sps.overflow || pps.overflow)
++		return -EINVAL;
++
++	if (hevc) {
++		used = histb_venc_v5_nal(param_va, room, NAL_HEVC_VPS, true, &vps);
++		if (!used)
++			return -ENOSPC;
++	}
++
++	first = histb_venc_v5_nal((u8 *)param_va + used, room - used,
++				hevc ? NAL_HEVC_SPS : NAL_SPS, hevc, &sps);
++	if (!first)
++		return -ENOSPC;
++	used += first;
++
++	first = histb_venc_v5_nal((u8 *)param_va + used, room - used,
++				hevc ? NAL_HEVC_PPS : NAL_PPS, hevc, &pps);
++	if (!first)
++		return -ENOSPC;
++	used += first;
++
++	if (used > V500_PARAM_WORDS * 4)
++		return -ENOSPC;
++
++	memset((u8 *)param_va + used, 0, room - used);
++	memcpy(words, param_va, used);
++	frame->param_size = used;
++
++	return 0;
++}
++
++/*
++ * The HEVC slice header in the two pieces the core takes it in: the first
++ * segment, whose first-slice flag and address the core writes itself, and the
++ * rest, which travels with the CABAC side. The picture order count starts over
++ * at each IDR and advances by one, and the slice names it in sixteen bits.
++ */
++static void histb_venc_v5_hevc_slice_header(struct histb_venc_v5_frame *frame,
++					  struct histb_venc_v5_slice *slice)
++{
++	struct histb_venc_v5_bits part1 = { };
++	struct histb_venc_v5_bits cabac = { };
++	u32 word;
++
++	if (frame->intra)
++		frame->poc = 0;
++	else
++		frame->poc = (frame->poc + 1) & 0xffff;
++
++	if (frame->intra)
++		histb_venc_v5_put(&part1, 0, 1);	/* no_output_of_prior_pics_flag */
++	histb_venc_v5_ue(&part1, 0);		/* slice_pic_parameter_set_id */
++	histb_venc_v5_words(&part1, &word, 1);
++	slice->part1 = word << (16 - part1.count);
++	slice->bits[0] = part1.count;
++
++	histb_venc_v5_ue(&cabac, frame->intra ? 2 : 1);	/* slice_type */
++	if (!frame->intra) {
++		histb_venc_v5_put(&cabac, frame->poc, 16);
++		histb_venc_v5_put(&cabac, 1, 1);	/* short_term_ref_pic_set_sps */
++		histb_venc_v5_put(&cabac, 1, 1);	/* slice_temporal_mvp_enabled */
++	}
++	histb_venc_v5_put(&cabac, 1, 1);		/* slice_sao_luma_flag */
++	histb_venc_v5_put(&cabac, 1, 1);		/* slice_sao_chroma_flag */
++	if (!frame->intra) {
++		histb_venc_v5_put(&cabac, 1, 1);	/* num_ref_idx_active_override */
++		histb_venc_v5_ue(&cabac, 0);	/* num_ref_idx_l0_active_minus1 */
++		histb_venc_v5_put(&cabac, 0, 1);	/* cabac_init_flag */
++		/* One reference, so the collocated picture is the only l0 entry. */
++		histb_venc_v5_ue(&cabac, 3);	/* five_minus_max_num_merge_cand */
++	}
++	histb_venc_v5_se(&cabac, (s32)frame->start_qp - 26);
++	histb_venc_v5_put(&cabac, 1, 1);		/* deblocking_filter_override_flag */
++	histb_venc_v5_put(&cabac, 0, 1);		/* slice_deblocking_filter_disabled */
++	histb_venc_v5_se(&cabac, 0);		/* slice_beta_offset_div2 */
++	histb_venc_v5_se(&cabac, 0);		/* slice_tc_offset_div2 */
++	histb_venc_v5_put(&cabac, 1, 1);		/* loop_filter_across_slices */
++
++	histb_venc_v5_words(&cabac, slice->cabac, ARRAY_SIZE(slice->cabac));
++	slice->bits[1] = cabac.count;
++}
++
++/*
++ * The slice-header groups of one picture. An intra picture is always an IDR
++ * here, so it carries no reference-index override and its frame number is zero;
++ * both counters wrap modulo sixteen, the width the four-bit field gives them.
++ */
++void histb_venc_v5_slice_header(struct histb_venc_v5_frame *frame,
++			      struct histb_venc_v5_slice *slice)
++{
++	struct histb_venc_v5_bits core = { };
++
++	if (frame->protocol == V500_PROTOCOL_HEVC) {
++		histb_venc_v5_hevc_slice_header(frame, slice);
++		return;
++	}
++
++	struct histb_venc_v5_bits reorder = { };
++	struct histb_venc_v5_bits marking = { };
++
++	/*
++	 * frame_num names this picture in decode order, so an inter picture
++	 * advances the counter before writing it; an IDR starts the count over
++	 * at zero, which is also what makes the next P picture differ from it.
++	 */
++	if (frame->intra)
++		frame->frame_num = 0;
++	else
++		frame->frame_num = (frame->frame_num + 1) & 0xf;
++
++	histb_venc_v5_ue(&core, frame->intra ? 2 : 0);	/* slice_type */
++	histb_venc_v5_ue(&core, 0);			/* pic_parameter_set_id */
++	histb_venc_v5_put(&core, frame->intra ? 0 : frame->frame_num, 4);
++	if (frame->intra)
++		histb_venc_v5_ue(&core, frame->idr_pic_id);
++	else
++		histb_venc_v5_put(&core, 0, 1);	/* num_ref_idx override off */
++
++	/* RefPicListReordering: the single flag, saying there is none. */
++	histb_venc_v5_put(&reorder, 0, 1);
++
++	/* DecRefPicMarking: two flags for an IDR, one for the rest. */
++	histb_venc_v5_put(&marking, 0, frame->intra ? 2 : 1);
++
++	histb_venc_v5_words(&core, slice->header, ARRAY_SIZE(slice->header));
++	histb_venc_v5_words(&reorder, slice->reorder,
++			  ARRAY_SIZE(slice->reorder));
++	histb_venc_v5_words(&marking, slice->marking,
++			  ARRAY_SIZE(slice->marking));
++	slice->bits[0] = core.count | reorder.count << 8 |
++			 marking.count << 16;
++
++	if (frame->intra)
++		frame->idr_pic_id = (frame->idr_pic_id + 1) & 0xf;
++}
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_drv.c
+@@ -0,0 +1,149 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * HiSilicon HiSTB V500 encoder: device binding and lifetime.
++ */
++
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <media/media-device.h>
++#include <media/v4l2-device.h>
++
++#include "histb-venc.h"
++#include "histb_venc_v5.h"
++
++static int histb_venc_v5_claim(struct histb_venc_v5 *enc)
++{
++	/*
++	 * The block is reset by a request in the clock and reset generator, not
++	 * by a register of its own, and the vendor pulses it before any
++	 * configuration. Configure only after the request is released: the
++	 * registers do not retain anything written during the pulse.
++	 */
++	/*
++	 * The reset request is held un-pulsed for now: on the board, claiming it
++	 * and pulsing the bit the vendor's CRG35 layout names for this block cost
++	 * the neighbouring decoder its launches (a launch then reports no
++	 * interrupt and a busy state), so the bit number is not settled -- see the
++	 * ABI note. The block is already out of reset after the bootloader.
++	 */
++	if (enc->reset)
++		reset_control_deassert(enc->reset);
++
++	return histb_venc_v5_buffers_alloc(enc);
++}
++
++static int histb_venc_v5_runtime_resume(struct device *dev)
++{
++	struct histb_venc_v5 *enc = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_bulk_prepare_enable(enc->nclks, enc->clks);
++	if (ret)
++		return ret;
++	enc->clocks_on = true;
++	/* Nothing latched during the powered-down window may survive. */
++	writel(V500_INT_CLEAR_ALL, enc->base + V500_INT_CLEAR);
++	writel(V500_INT_ENABLE_DEFAULT, enc->base + V500_INT_ENABLE);
++
++	return 0;
++}
++
++static int histb_venc_v5_runtime_suspend(struct device *dev)
++{
++	struct histb_venc_v5 *enc = dev_get_drvdata(dev);
++
++	writel(0, enc->base + V500_INT_ENABLE);
++	writel(V500_INT_CLEAR_ALL, enc->base + V500_INT_CLEAR);
++	clk_bulk_disable_unprepare(enc->nclks, enc->clks);
++	enc->clocks_on = false;
++
++	return 0;
++}
++
++static void histb_venc_v5_release(struct histb_venc_v5 *enc)
++{
++	histb_venc_v5_buffers_free(enc);
++	if (enc->clocks_on) {
++		clk_bulk_disable_unprepare(enc->nclks, enc->clks);
++		enc->clocks_on = false;
++	};
++}
++
++int histb_venc_v5_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct histb_venc_v5 *enc;
++	int ret;
++
++	enc = devm_kzalloc_obj(dev, *enc);
++	if (!enc)
++		return -ENOMEM;
++
++	enc->dev = dev;
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "no 32-bit DMA aperture\n");
++	platform_set_drvdata(pdev, enc);
++	mutex_init(&enc->lock);
++
++	enc->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(enc->base))
++		return PTR_ERR(enc->base);
++
++	enc->irq = platform_get_irq(pdev, 0);
++	if (enc->irq < 0)
++		return enc->irq;
++
++	enc->nclks = devm_clk_bulk_get_all(dev, &enc->clks);
++	if (enc->nclks < 0)
++		return enc->nclks;
++
++	if (enc->nclks == 0)
++		return dev_err_probe(dev, -ENOENT, "no clocks given\n");
++
++	enc->reset = devm_reset_control_get_optional_exclusive(dev, NULL);
++	if (IS_ERR(enc->reset))
++		return dev_err_probe(dev, PTR_ERR(enc->reset),
++				     "failed to get reset\n");
++
++	ret = histb_venc_v5_claim(enc);
++	if (ret)
++		return ret;
++
++	pm_runtime_set_suspended(dev);
++	pm_runtime_enable(dev);
++
++	ret = histb_venc_v5_v4l2_init(enc);
++	if (ret)
++		goto release;
++
++	dev_info(dev, "V500 core claimed\n");
++
++	return 0;
++
++release:
++	pm_runtime_disable(dev);
++	histb_venc_v5_release(enc);
++	return ret;
++}
++
++void histb_venc_v5_remove(struct platform_device *pdev)
++{
++	struct histb_venc_v5 *enc = platform_get_drvdata(pdev);
++
++	histb_venc_v5_v4l2_exit(enc);
++	pm_runtime_disable(&pdev->dev);
++	histb_venc_v5_release(enc);
++}
++
++const struct histb_venc_variant histb_venc_v5_variant = {
++	.probe			= histb_venc_v5_probe,
++	.remove			= histb_venc_v5_remove,
++	.runtime_suspend	= histb_venc_v5_runtime_suspend,
++	.runtime_resume		= histb_venc_v5_runtime_resume,
++	.system_suspend		= pm_runtime_force_suspend,
++	.system_resume		= pm_runtime_force_resume,
++};
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_hw.c
+@@ -0,0 +1,738 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * HiSilicon HiSTB V500 encoder: command image and launch.
++ *
++ * A picture is described by one 4096 byte image in DMA memory, packed field by
++ * field here, plus the register writes that point at it and start the core. The
++ * ABI note carries the offsets with their sources; the fields this generation
++ * does not use are left at the zero the image is allocated with, as the vendor
++ * build leaves them for an intra picture.
++ */
++
++#include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/jiffies.h>
++#include <linux/slab.h>
++
++#include "histb_venc_v5.h"
++
++/*
++ * The image is little endian and word addressed, as the core reads it with the
++ * same word order the vendor's hardware layer stored it with.
++ */
++static void histb_venc_v5_word(void *image, unsigned int offset, u32 value)
++{
++	((__le32 *)image)[offset / 4] = cpu_to_le32(value);
++}
++
++/* Image offsets, as the core's own layout names them. */
++/* Some regions below are named by their word index; IMGW turns one into
++ * the byte offset the writer takes.
++ */
++#define IMGW(x)			((x) * 4)
++
++#define IMG_GEOMETRY		0x000
++#define IMG_SIZE		0x004
++#define IMG_SEARCH_RANGE	0x014
++#define IMG_SLICE_SPLIT		0x008
++#define IMG_QP			0x00c
++#define IMG_LAMBDA_SSD		0xad
++#define IMG_LAMBDA_SAD		0xd5
++#define IMG_RC_QP			0x270
++#define IMG_RC_TARGET		0x274
++#define IMG_STORE_FMT		0x3b	/* word index; the writer takes bytes */
++#define IMG_SRC_Y		0x068
++#define IMG_SRC_C		0x06c
++#define IMG_SRC_V		0x070
++#define IMG_SRC_STRIDES		0x07c
++#define IMG_RECON_Y		0x080
++#define IMG_RECON_C		0x084
++#define IMG_RECON_STRIDES	0x088
++#define IMG_REF_RECON_Y		0x098
++#define IMG_REF_RECON_C		0x09c
++#define IMG_REF_RECON_STRIDES	0x0a0
++#define IMG_STREAM_BASE		0x0e0
++#define IMG_STREAM_WRITE	0x0e4
++#define IMG_STREAM_READ		0x0e8
++#define IMG_STREAM_SIZES	0x14f
++#define IMG_STREAM_ADDRS	0x15f
++#define IMG_PARAM_ADDR		IMGW(0x16f)
++#define IMG_PARAM_GATE		IMGW(0x170)
++#define IMG_PARAM_WORDS		0x171
++#define IMG_PICTURE_TYPE		0x125
++#define IMG_SLICE_BITS		0x126
++#define IMG_SLICE_HEADERS		0x13a
++#define IMG_SLICE_REORDER	0x13e
++#define IMG_SLICE_MARKING	0x140
++#define IMG_SLICE_COUNTS		0x142
++#define IMG_PME_INFO			0x16
++#define IMG_TUNNEL_CELL		0x064
++#define IMG_PME_OTHER		0x0b0
++#define IMG_PME_CURRENT		0x0d0
++#define IMG_TMV_CURRENT		0x0d8
++#define IMG_TMV_OTHER		0x0dc
++
++
++/*
++ * The V500R001 lambda defaults for H.264: 40 SSD then 40 SAD words, indexed by
++ * the quantiser. The core costs its mode decision with these, so an image that
++ * leaves them zero has no quantiser-dependent decision to make.
++ */
++static const u32 v500_lambda_ssd[V500_LAMBDA_WORDS] = {
++	1, 1, 1, 2, 2, 3, 3, 4,
++	5, 7, 9, 11, 14, 17, 22, 27,
++	34, 43, 54, 69, 86, 109, 137, 173,
++	218, 274, 345, 435, 548, 691, 870, 1097,
++	1382, 1741, 2193, 2763, 3482, 4095, 4095, 4095,
++};
++
++static const u32 v500_lambda_sad[V500_LAMBDA_WORDS] = {
++	1, 1, 1, 1, 2, 2, 2, 2,
++	3, 3, 3, 4, 4, 4, 5, 6,
++	6, 7, 8, 9, 10, 11, 13, 14,
++	16, 18, 20, 23, 25, 29, 32, 36,
++	40, 45, 51, 57, 64, 72, 81, 91,
++};
++
++/* The same two tables for HEVC, whose quantiser costs start higher. */
++static const u32 v500_lambda_ssd_hevc[V500_LAMBDA_WORDS] = {
++	18, 22, 28, 36, 45, 57, 72, 91,
++	115, 145, 183, 231, 291, 367, 463, 583,
++	735, 926, 1167, 1470, 1853, 2334, 2941, 3706,
++	4669, 5883, 7412, 9338, 11766, 14824, 18677, 23532,
++	29649, 37355, 47065, 59298, 74711, 94130, 118596, 131071,
++};
++
++static const u32 v500_lambda_sad_hevc[V500_LAMBDA_WORDS] = {
++	193, 216, 243, 273, 306, 344, 386, 433,
++	487, 546, 613, 688, 773, 867, 974, 1093,
++	1227, 1377, 1546, 1735, 1948, 2186, 2454, 2755,
++	3092, 3471, 3896, 4373, 4908, 5510, 6184, 6942,
++	7792, 8746, 9817, 11020, 12369, 13884, 15584, 17493,
++};
++
++
++
++/*
++ * Words the vendor's hardware layer writes with the same value for every
++ * H.264 picture: read out of the reference backend and confirmed by
++ * sweeping size, quantiser, picture type and buffer layout, so only the
++ * words that move with the picture are packed below. Their fields are not
++ * attributed, so they are replayed exactly as the reference writes them.
++ */
++static const struct {
++	u16 word;
++	u32 value;
++} v500_image_defaults[] = {
++	{ 0x0005, 0x00000003 },
++	{ 0x0006, 0x00000001 },
++	{ 0x0007, 0x00007715 },
++	{ 0x0008, 0x00000003 },
++	{ 0x0009, 0x00000013 },
++	{ 0x000a, 0x006401f4 },
++	{ 0x000b, 0x05050f0f },
++	{ 0x000c, 0x02020000 },
++	{ 0x000d, 0x0000000f },
++	{ 0x000e, 0x00000002 },
++	{ 0x000f, 0x00000003 },
++	{ 0x0014, 0x000f001f },
++	{ 0x003b, 0x00010000 },
++	{ 0x0053, 0x00030080 },
++	{ 0x0056, 0x00030040 },
++	{ 0x0057, 0x00000001 },
++	{ 0x0059, 0x00040010 },
++	{ 0x005a, 0x00000001 },
++	{ 0x005c, 0x00040010 },
++	{ 0x005d, 0x00000001 },
++	{ 0x005f, 0x00040010 },
++	{ 0x0060, 0x00000001 },
++	{ 0x0072, 0x00000100 },
++	{ 0x0079, 0xff00ff00 },
++	{ 0x007a, 0x00000001 },
++	{ 0x007b, 0x00000014 },
++	{ 0x007c, 0x00000032 },
++	{ 0x007d, 0x00000096 },
++	{ 0x007f, 0x00301004 },
++	{ 0x0080, 0x000c0804 },
++	{ 0x0081, 0x0041e246 },
++	{ 0x0083, 0x0f0f0505 },
++	{ 0x0084, 0x83a06483 },
++	{ 0x0085, 0x0000000a },
++	{ 0x0086, 0x000002ff },
++	{ 0x0087, 0x00063220 },
++	{ 0x0088, 0x00017a03 },
++	{ 0x0089, 0x00800308 },
++	{ 0x008a, 0x00001026 },
++	{ 0x008b, 0x00080008 },
++	{ 0x008c, 0x00080008 },
++	{ 0x008d, 0x00100010 },
++	{ 0x008e, 0x00180018 },
++	{ 0x0094, 0x80800000 },
++	{ 0x0095, 0x003c0500 },
++	{ 0x0096, 0x00140000 },
++	{ 0x009e, 0x00000a20 },
++	{ 0x009f, 0x00002c0a },
++	{ 0x00a0, 0x0000300a },
++	{ 0x00a1, 0x0000300a },
++	{ 0x00a2, 0x0000300a },
++	{ 0x00a3, 0x0002330a },
++	{ 0x00a4, 0x00003300 },
++	{ 0x00a5, 0x00843300 },
++	{ 0x00a7, 0x07070700 },
++	{ 0x00a8, 0x120e0b09 },
++	{ 0x00a9, 0xffffff19 },
++	{ 0x00aa, 0x55555555 },
++	{ 0x00ab, 0x00000008 },
++	{ 0x00fe, 0x00044005 },
++	{ 0x0104, 0x00000002 },
++	{ 0x0105, 0x000f000f },
++	{ 0x0106, 0x000003c9 },
++	{ 0x0110, 0xffffffff },
++	{ 0x0111, 0xffffffff },
++	{ 0x0112, 0x00000007 },
++	{ 0x0113, 0xffffffff },
++	{ 0x0114, 0x00000007 },
++	{ 0x0115, 0x0000000f },
++	{ 0x011c, 0x00000001 },
++	{ 0x011d, 0x000055ab },
++	{ 0x014c, 0x007f3f3f },
++	{ 0x014e, 0x003d0900 },
++};
++
++int histb_venc_v5_buffers_alloc(struct histb_venc_v5 *enc)
++{
++	struct device *dev = enc->dev;
++	void *va;
++
++	/*
++	 * The image holds the bus addresses of everything else as plain words,
++	 * so the whole set has to sit below 4 GiB; the probe installs a 32-bit
++	 * DMA mask for that reason and these allocations honour it.
++	 */
++	va = dma_alloc_coherent(dev, V500_IMAGE_BYTES, &enc->image.dma,
++				 GFP_KERNEL);
++	if (!va)
++		return -ENOMEM;
++
++	enc->image.va = va;
++	enc->image.size = V500_IMAGE_BYTES;
++	memset(va, 0, V500_IMAGE_BYTES);
++
++	va = dma_alloc_coherent(dev, V500_STREAM_BYTES, &enc->stream.dma,
++				GFP_KERNEL);
++	if (!va)
++		goto free_image;
++
++	enc->stream.va = va;
++	enc->stream.size = V500_STREAM_BYTES;
++
++	/*
++	 * Two reconstruction buffers: the core writes the picture it codes and
++	 * reads back the one before it, and the picture it uses is selected by
++	 * an index in the image rather than by a second pair of addresses.
++	 */
++	va = dma_alloc_coherent(dev, V500_RECON_BYTES * V500_RECON_BUFFERS,
++				&enc->recon.dma, GFP_KERNEL);
++	if (!va)
++		goto free_stream;
++
++	enc->recon.va = va;
++	enc->recon.size = V500_RECON_BYTES * V500_RECON_BUFFERS;
++
++	va = dma_alloc_coherent(dev, V500_PARAM_BYTES, &enc->param.dma,
++				GFP_KERNEL);
++	if (!va)
++		goto free_recon;
++
++	enc->param.va = va;
++	enc->param.size = V500_PARAM_BYTES;
++
++	va = dma_alloc_coherent(dev, V500_SLICE_BYTES, &enc->slice.dma,
++				GFP_KERNEL);
++	if (!va)
++		goto free_param;
++
++	enc->slice.va = va;
++	enc->slice.size = V500_SLICE_BYTES;
++
++	/*
++	 * The core is handed addresses for the inter-picture areas even when the
++	 * picture is intra, so those get a real area rather than zero.
++	 */
++	va = dma_alloc_coherent(dev, V500_SCRATCH_BYTES, &enc->scratch.dma,
++				GFP_KERNEL);
++	if (!va)
++		goto free_slice;
++
++	enc->scratch.va = va;
++	enc->scratch.size = V500_SCRATCH_BYTES;
++
++	return 0;
++
++free_slice:
++	dma_free_coherent(dev, enc->slice.size, enc->slice.va, enc->slice.dma);
++free_param:
++	dma_free_coherent(dev, enc->param.size, enc->param.va, enc->param.dma);
++free_recon:
++	dma_free_coherent(dev, enc->recon.size, enc->recon.va,
++			  enc->recon.dma);
++free_stream:
++	dma_free_coherent(dev, enc->stream.size, enc->stream.va,
++			  enc->stream.dma);
++free_image:
++	dma_free_coherent(dev, enc->image.size, enc->image.va,
++			  enc->image.dma);
++	return -ENOMEM;
++}
++
++void histb_venc_v5_buffers_free(struct histb_venc_v5 *enc)
++{
++	struct device *dev = enc->dev;
++
++	dma_free_coherent(dev, enc->slice.size, enc->slice.va, enc->slice.dma);
++	dma_free_coherent(dev, enc->param.size, enc->param.va, enc->param.dma);
++	dma_free_coherent(dev, enc->scratch.size, enc->scratch.va,
++			  enc->scratch.dma);
++	dma_free_coherent(dev, enc->recon.size, enc->recon.va, enc->recon.dma);
++	dma_free_coherent(dev, enc->stream.size, enc->stream.va,
++			  enc->stream.dma);
++	dma_free_coherent(dev, enc->image.size, enc->image.va, enc->image.dma);
++}
++
++/*
++ * Fill the image for one picture. The geometry reaches the core twice: once as
++ * the pixel size, once as macroblock counts, and the counts are what the units
++ * that read the reconstruction work from.
++ */
++void histb_venc_v5_image_pack(struct histb_venc_v5 *enc,
++			    const struct histb_venc_v5_frame *frame,
++			    const struct histb_venc_v5_slice *slice)
++{
++	unsigned int i;
++	unsigned int coded = histb_venc_v5_coded_height(frame);
++	bool hevc = frame->protocol == V500_PROTOCOL_HEVC;
++
++	void *image = enc->image.va;
++	u32 word;
++
++	for (i = 0; i < ARRAY_SIZE(v500_image_defaults); i++)
++		histb_venc_v5_word(image,
++			 IMGW(v500_image_defaults[i].word),
++			 v500_image_defaults[i].value);
++
++	/*
++	 * Two of the vendor's fixed words move with the protocol: the motion
++	 * search window, and the low bits of the decision word that the search
++	 * depth rides in. The vendor's packing gives High and HEVC depth 7 and
++	 * every other H.264 profile 5. The second H.264 slice-header set is not
++	 * read at all for HEVC.
++	 */
++	histb_venc_v5_word(image, IMGW(0x0007),
++			 hevc || frame->profile == V500_H264_PROFILE_HIGH ?
++			 0x00007717 : 0x00007715);
++	histb_venc_v5_word(image, IMGW(IMG_SEARCH_RANGE),
++			 hevc ? 0x0013001b : 0x000f001f);
++	if (hevc) {
++		/*
++		 * The three decision words HEVC codes with: the vendor swaps
++		 * its per-size quantiser costs for the HEVC set, and the last
++		 * of them saturates.
++		 */
++		histb_venc_v5_word(image, IMGW(0x0087), 0x00063260);
++		histb_venc_v5_word(image, IMGW(0x00a7), 0x05050303);
++		histb_venc_v5_word(image, IMGW(0x00a8), 0xff140f0a);
++		histb_venc_v5_word(image, IMGW(0x00a9), 0xffffffff);
++		histb_venc_v5_word(image, IMGW(0x014c), 0);
++	}
++
++	/*
++	 * The core takes the coded size in macroblock units from this word as
++	 * well; the reference build leaves it zero, and the core then stops
++	 * coding inside the first macroblock row.
++	 */
++	if (!hevc) {
++		word = FIELD_PREP(GENMASK(24, 16),
++				  DIV_ROUND_UP(frame->height, 16) - 1) |
++		       FIELD_PREP(GENMASK(8, 0),
++				  DIV_ROUND_UP(frame->width, 16) - 1);
++		histb_venc_v5_word(image, IMG_GEOMETRY, word);
++	}
++
++	word = FIELD_PREP(GENMASK(28, 16), frame->height - 1) |
++	       FIELD_PREP(GENMASK(12, 0), frame->width - 1);
++	histb_venc_v5_word(image, IMG_SIZE, word);
++
++	/*
++	 * Slice splitting: the enable sits above a sixteen bit size, and bit 16
++	 * of that word is set by the vendor's packing even when splitting is
++	 * off.
++	 */
++	word = FIELD_PREP(BIT(17), frame->slice_split ? 1 : 0) |
++	       BIT(16) |
++	       FIELD_PREP(GENMASK(15, 0), frame->slice_split_size);
++	histb_venc_v5_word(image, IMG_SLICE_SPLIT, word);
++
++	word = FIELD_PREP(GENMASK(15, 10), frame->start_qp);
++	histb_venc_v5_word(image, IMG_QP, word);
++
++	/*
++	 * The rate-control bounds go in twice: the picture's own quantiser window
++	 * above, and here as the limits the search is allowed to move between,
++	 * with the per-macroblock bit target that the rate controller works from.
++	 */
++	histb_venc_v5_word(image, IMG_RC_QP,
++			 FIELD_PREP(GENMASK(13, 8), frame->max_qp) |
++			 FIELD_PREP(GENMASK(5, 0), frame->min_qp));
++	/* Rate control splits the picture by coding tree, 32 pixels for HEVC. */
++	word = frame->target_bits / histb_venc_v5_block_rows(frame);
++	histb_venc_v5_word(image, IMG_RC_TARGET,
++			 FIELD_PREP(GENMASK(30, 6), word) | BIT(1));
++
++	for (i = 0; i < V500_LAMBDA_WORDS; i++) {
++		histb_venc_v5_word(image, IMGW(IMG_LAMBDA_SSD + i),
++			 (hevc ? v500_lambda_ssd_hevc[i] : v500_lambda_ssd[i]) &
++			 GENMASK(19, 0));
++		histb_venc_v5_word(image, IMGW(IMG_LAMBDA_SAD + i),
++			 (hevc ? v500_lambda_sad_hevc[i] : v500_lambda_sad[i]) &
++			 GENMASK(19, 0));
++	}
++
++	/*
++	 * The input layout in the vendor's own encoding. A semi-planar picture
++	 * only ever names which sample of the interleaved pair comes first, in
++	 * one bit; the other two layouts carry the whole order byte there, and
++	 * YUYV is the value 0xd8 in it.
++	 */
++	word = FIELD_PREP(GENMASK(9, 6), frame->store);
++	if (frame->store == V500_STORE_SEMI_PLANAR)
++		word |= FIELD_PREP(BIT(16), frame->package == 0);
++	else
++		word |= FIELD_PREP(GENMASK(23, 16), frame->package);
++	histb_venc_v5_word(image, IMGW(IMG_STORE_FMT), word);
++
++	histb_venc_v5_word(image, IMG_SRC_Y, frame->src_y);
++	histb_venc_v5_word(image, IMG_SRC_C, frame->src_c);
++	/* Only a planar input has a third plane to point at. */
++	histb_venc_v5_word(image, IMG_SRC_V, frame->src_v);
++
++	/*
++	 * The source strides put the luma one high; the reconstruction strides
++	 * put it low, which is how the vendor's own packing writes the two
++	 * words.
++	 */
++	word = FIELD_PREP(GENMASK(31, 16), frame->src_stride_y) |
++	       FIELD_PREP(GENMASK(15, 0), frame->src_stride_c);
++	histb_venc_v5_word(image, IMG_SRC_STRIDES, word);
++
++	/*
++	 * The chroma plane follows the luma one by the core's own coded height,
++	 * which is the negotiated one rounded up to its block grid.
++	 */
++	histb_venc_v5_word(image, IMG_RECON_Y, frame->recon[frame->recon_index]);
++	histb_venc_v5_word(image, IMG_RECON_C,
++			 frame->recon[frame->recon_index] +
++			 frame->recon_stride_y * coded);
++
++	word = FIELD_PREP(GENMASK(15, 0), frame->recon_stride_y) |
++	       FIELD_PREP(GENMASK(31, 16), frame->recon_stride_c);
++	histb_venc_v5_word(image, IMG_RECON_STRIDES, word);
++
++	/*
++	 * The picture the core predicts from: the other reconstruction slot, with
++	 * its own address pair and its stride pair, whose halves sit in the
++	 * opposite order to the pair above. The chroma plane of a reconstruction
++	 * slot always starts at the same coded height, so the reference follows
++	 * the same offset the picture being written was given.
++	 */
++	histb_venc_v5_word(image, IMG_REF_RECON_Y,
++			 frame->recon[1 - frame->recon_index]);
++	histb_venc_v5_word(image, IMG_REF_RECON_C,
++			 frame->recon[1 - frame->recon_index] +
++			 frame->recon_stride_y * coded);
++	word = FIELD_PREP(GENMASK(31, 16), frame->recon_stride_y) |
++	       FIELD_PREP(GENMASK(15, 0), frame->recon_stride_c);
++	histb_venc_v5_word(image, IMG_REF_RECON_STRIDES, word);
++
++	histb_venc_v5_word(image, IMG_STREAM_BASE, frame->stream[0]);
++	histb_venc_v5_word(image, IMG_STREAM_WRITE, frame->stream_write);
++	histb_venc_v5_word(image, IMG_STREAM_READ, frame->stream_read);
++
++	/*
++	 * The inter-picture areas are read by rotation: the picture being coded
++	 * uses the entry the index names, the one it looks back at the other.
++	 */
++	histb_venc_v5_word(image, IMGW(IMG_PME_INFO),
++		 frame->pme_info[frame->recon_index]);
++	histb_venc_v5_word(image, IMGW(IMG_PME_INFO + 1),
++		 frame->pme_info[(frame->recon_index + 2) % 3]);
++	histb_venc_v5_word(image, IMGW(IMG_PME_INFO + 2),
++		 frame->pme_info[(frame->recon_index + 1) % 3]);
++	histb_venc_v5_word(image, IMG_TUNNEL_CELL, frame->tunnel_cell);
++	histb_venc_v5_word(image, IMG_PME_CURRENT,
++			 frame->pme[frame->recon_index]);
++	histb_venc_v5_word(image, IMG_PME_OTHER,
++			 frame->pme[1 - frame->recon_index]);
++	histb_venc_v5_word(image, IMG_TMV_CURRENT,
++			 frame->tmv[frame->recon_index]);
++	histb_venc_v5_word(image, IMG_TMV_OTHER,
++			 frame->tmv[1 - frame->recon_index]);
++
++	for (i = 0; i < V500_STREAM_SLOTS; i++) {
++		histb_venc_v5_word(image, IMGW(IMG_STREAM_SIZES + i),
++				 frame->stream_size[i]);
++		histb_venc_v5_word(image, IMGW(IMG_STREAM_ADDRS + i),
++				 frame->stream[i]);
++	}
++
++	/*
++	 * The parameter sets go in twice: the address of the area holding their
++	 * bytes, and the bytes themselves as words, so the core can prepend them
++	 * without reading the area at all. The gate says which of the two this
++	 * picture wants and how many bytes are worth taking.
++	 */
++	histb_venc_v5_word(image, IMG_PARAM_ADDR, frame->param);
++	/*
++	 * Only the constant bit goes here: with the core-side prepend armed, a
++	 * launch stops reporting anything at all on this part -- no interrupt, a
++	 * status word that stays zero -- while the driver joining the parameter
++	 * sets in front of the coded slice is what the header mode the node
++	 * advertises means. The address and the words stay written either way,
++	 * as the vendor's build fills them too.
++	 */
++	histb_venc_v5_word(image, IMG_PARAM_GATE, BIT(8));
++	if (frame->parameter_set) {
++		for (i = 0; i < V500_PARAM_WORDS; i++)
++			histb_venc_v5_word(image,
++					 IMGW(IMG_PARAM_WORDS + i),
++					 frame->param_reg[i]);
++	}
++
++	histb_venc_v5_word(image, IMGW(IMG_PICTURE_TYPE),
++		 frame->intra ? V500_PICTURE_INTRA : V500_PICTURE_INTER);
++
++	/*
++	 * The two bit counts travel in one word either way: the first segment
++	 * for HEVC, the whole header for H.264. What follows differs: H.264
++	 * hands over three groups of words, HEVC the first segment and then the
++	 * CABAC-side rest, each word top-aligned on the header's bit position.
++	 */
++	histb_venc_v5_word(image, IMGW(IMG_SLICE_BITS),
++			 FIELD_PREP(GENMASK(4, 0), slice->bits[0] & 0x1f) |
++			 FIELD_PREP(GENMASK(21, 16), slice->bits[1]));
++
++	if (hevc) {
++		/*
++		 * HEVC's header words sit straight after the count word: the
++		 * first segment, then the CABAC-side rest eight words wide.
++		 */
++		histb_venc_v5_word(image, IMGW(IMG_SLICE_BITS + 1), slice->part1);
++		for (i = 0; i < ARRAY_SIZE(slice->cabac); i++) {
++			u32 value = slice->cabac[i];
++			int room = (int)((i + 1) * 32) - (int)slice->bits[1];
++
++			if (slice->bits[1] <= i * 32 || room >= 32)
++				value = 0;
++			else if (room > 0)
++				value <<= room;
++			histb_venc_v5_word(image,
++					 IMGW(IMG_SLICE_BITS + 2 + i), value);
++		}
++	} else {
++		/*
++		 * Each of the three groups gets its bit count here, one below
++		 * the count, with the packed word's own low field taking the
++		 * whole triple less one.
++		 */
++		word = slice->bits[0];
++		histb_venc_v5_word(image, IMGW(IMG_SLICE_COUNTS),
++			 ((word - 1) & 0x7f) << 16 |
++			 (((word >> 8) - 1) & 0x3f) << 8 |
++			 (((word >> 16) - 1) & 0x3f));
++
++		for (i = 0; i < 4; i++)
++			histb_venc_v5_word(image, IMGW(IMG_SLICE_HEADERS + i),
++					 slice->header[i]);
++		for (i = 0; i < 2; i++) {
++			histb_venc_v5_word(image, IMGW(IMG_SLICE_REORDER + i),
++					 slice->reorder[i]);
++			histb_venc_v5_word(image, IMGW(IMG_SLICE_MARKING + i),
++					 slice->marking[i]);
++		}
++	}
++}
++
++/*
++ * Arm the core. The block also needs its own control word, not just the image:
++ * the mode bits that say a picture is coming from memory, that this is
++ * H.264 in the entropy arrangement the driver's parameter sets declare, and
++ * the per-macroblock bit target the rate controller divides its decisions by.
++ * Fields the vendor's build fills from its tuning table are left at the reset
++ * value, and the ABI note says which those are.
++ */
++
++/*
++ * Register words the vendor's layer writes with a fixed value for this
++ * protocol; the reference backend emits them for every picture and
++ * their fields are not attributed. Section 10 of the ABI note lists
++ * where the values were read from.
++ */
++static const struct {
++	u16 offset;
++	u32 value;
++} v500_fixed_regs[] = {
++	{ V500_TUNE_WORD(0x06), 0x02625a00 },
++	{ V500_TUNE_WORD(0x0d), 0x00370006 },
++	{ V500_TUNE_WORD(0x0e), 0x0000007f },
++	{ V500_TUNE_WORD(0x20), 0x00010001 },
++	{ V500_TUNE_WORD(0x94), 0x00000003 },
++};
++
++void histb_venc_v5_launch(struct histb_venc_v5 *enc,
++			const struct histb_venc_v5_frame *frame)
++{
++	void __iomem *base = enc->base;
++	bool hevc = frame->protocol == V500_PROTOCOL_HEVC;
++	unsigned int mbs = histb_venc_v5_blocks(frame);
++	unsigned int i;
++	u32 ctrl;
++
++	writel(V500_INT_CLEAR_ALL, base + V500_INT_CLEAR);
++	writel(V500_INT_ENABLE_DEFAULT, base + V500_INT_ENABLE);
++
++	/*
++	 * The protocol lives in its own bit and clears the three words that only
++	 * mean something to H.264: the profile constraint pair, the entropy
++	 * arrangement and the negative "not HEVC" marker itself.
++	 */
++	ctrl = V500_CORE_ALWAYS | V500_CORE_DDR_MODE;
++	if (hevc) {
++		ctrl |= V500_CORE_HEVC;
++	} else {
++		ctrl |= V500_CORE_NOT_HEVC;
++		if (frame->profile != V500_H264_PROFILE_HIGH)
++			ctrl |= FIELD_PREP(V500_CORE_NOT_HIGH, 1);
++		if (!frame->cabac)
++			ctrl |= V500_CORE_CAVLC;
++	}
++	ctrl |= frame->intra ? V500_CORE_INTRA : V500_CORE_INTER;
++	if (frame->low_latency)
++		ctrl |= V500_CORE_LOW_DELAY;
++
++	writel(ctrl, base + V500_CORE_CTRL);
++	writel(V500_SEARCH_CFG_DEFAULT, base + V500_SEARCH_CFG);
++	for (i = 0; i < ARRAY_SIZE(v500_fixed_regs); i++)
++		writel(v500_fixed_regs[i].value,
++			 base + v500_fixed_regs[i].offset);
++	writel((frame->target_bits / mbs) & GENMASK(19, 0),
++	       base + V500_MB_TARGET_BITS);
++
++	writel(lower_32_bits(enc->image.dma), base + V500_CMD_ADDR);
++	writel(1, base + V500_START);
++}
++
++unsigned int histb_venc_v5_status(struct histb_venc_v5 *enc)
++{
++	return readl(enc->base + V500_STATUS);
++}
++
++/*
++ * The vendor layer has no stop path, and the block's reset request is the one
++ * bit that costs the neighbouring decoder its launches. Mask the lines, drop
++ * the status and release the start bit so the next picture starts from a known
++ * interrupt state; whether the engine itself drains is not settled here.
++ */
++void histb_venc_v5_stop_core(struct histb_venc_v5 *enc)
++{
++	writel(0, enc->base + V500_INT_ENABLE);
++	writel(V500_INT_CLEAR_ALL, enc->base + V500_INT_CLEAR);
++	writel(0, enc->base + V500_START);
++}
++
++/* Code length of the finished picture, in bits. */
++/*
++ * The counter holds bytes, not bits: the vendor's read-back multiplies it by
++ * eight to get the picture's length in bits, and taking the register value as
++ * bits hands back an eighth of the picture.
++ */
++unsigned int histb_venc_v5_pic_bits(struct histb_venc_v5 *enc)
++{
++	void __iomem *reg = enc->protocol == V500_PROTOCOL_HEVC ?
++		enc->base + V500_PIC_BITS_HEVC : enc->base + V500_PIC_BITS_H264;
++
++	return readl(reg) << 3;
++}
++
++/* Stream slot geometry: the ring is cut into the vendor's slice buffers. */
++unsigned int histb_venc_v5_slot_stride(struct histb_venc_v5 *enc)
++{
++	unsigned int ring = enc->stream.size - V500_RING_OFFSET -
++			    V500_SLICE_BUFFERS * 64;
++
++	return ALIGN_DOWN(ring / V500_SLICE_BUFFERS, 64);
++}
++
++/*
++ * Copy the bytes the picture wrote into the ring. Without splitting the length
++ * is the count the core reports in its own register, which is where the vendor
++ * reads it from. With splitting each slice sits in its own slot and reports its
++ * own length; the copy walks the slots in slice order and stops at the one the
++ * core marks last.
++ */
++/*
++ * Four sample words of each reconstruction slot, printed around a launch. The
++ * core's own output layout is what the reference picture has to agree with, and
++ * the slots are the only place that question can be settled: the sample offsets
++ * name the luma start, the luma middle, the plane boundary and the chroma.
++ */
++ssize_t histb_venc_v5_drain(struct histb_venc_v5 *enc,
++			  const struct histb_venc_v5_frame *frame,
++			  void *dst, size_t size)
++{
++	unsigned int stride = histb_venc_v5_slot_stride(enc);
++	unsigned int slot;
++	size_t total = 0;
++
++	if (!frame->slice_split) {
++		unsigned int bits = histb_venc_v5_pic_bits(enc);
++		size_t bytes = (bits + 7) / 8;
++
++		if (!bytes)
++			return -EIO;
++
++		if (bytes > size ||
++		    bytes > enc->stream.size - V500_RING_OFFSET) {
++			dev_err(enc->dev, "picture wrote %zu bytes, room is %zu\n",
++				bytes, size);
++			return -ENOSPC;
++		}
++
++		memcpy(dst, enc->stream.va + V500_RING_OFFSET, bytes);
++
++		return bytes;
++	}
++
++	for (slot = 0; slot < V500_SLICE_BUFFERS; slot++) {
++		unsigned int first = readl(enc->base + V500_SLICE_BITS(slot));
++		unsigned int second = readl(enc->base + V500_SLICE_ADJUST(slot));
++		unsigned int bytes = (first & V500_SLICE_BITS_MASK) -
++				     (second & V500_SLICE_ADJUST_MASK);
++
++		if (!bytes)
++			break;
++		if (bytes > stride || total + bytes > size) {
++			dev_err(enc->dev,
++				"slice %u wrote %u bytes, room is %zu\n",
++				slot, bytes, size - total);
++			return -ENOSPC;
++		}
++
++		memcpy(dst + total,
++		       enc->stream.va + V500_RING_OFFSET + slot * stride, bytes);
++		total += bytes;
++
++		if (second & V500_SLICE_LAST)
++			break;
++	}
++
++	return total ? total : -EIO;
++}
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_regs.h
+@@ -0,0 +1,121 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * HiSilicon HiSTB V500 encoder: register image.
++ *
++ * The offsets and bit meanings follow the vendor's V500R001 register access
++ * layer, which is the build this SoC's clock part uses; the ABI note lists the
++ * sources and the evidence level of every entry here.
++ */
++#ifndef HISTB_VENC_V5_REGS_H
++#define HISTB_VENC_V5_REGS_H
++
++/*
++ * One window holds the encoder core and, 0xf000 bytes into it, the SMMU/TBU
++ * block the core sits behind. The vendor maps 0xf700 bytes, which is the last
++ * register it touches plus four.
++ */
++#define V500_WINDOW_SIZE			0x10000
++
++#define V500_INT_ENABLE				0x0000
++#define V500_INT_CLEAR				0x0004
++#define V500_START				0x0008
++#define V500_CMD_ADDR				0x0118
++
++/* Interrupt sources, in both the enable and the clear word. */
++#define V500_INT_PIC				BIT(0)
++#define V500_INT_SLICE				BIT(1)
++#define V500_INT_BUF_FULL			BIT(2)
++#define V500_INT_PBIT_OVERFLOW			BIT(3)
++#define V500_INT_TIMEOUT			BIT(6)
++/*
++ * The vendor unmasks 0xcd, which is PIC, BUF_FULL, PBIT_OVERFLOW, TIMEOUT and
++ * bit 7 together, and adds SLICE again when low-latency mode is on. Bit 7 is
++ * unmasked there but never decoded from the status word, so the interrupt
++ * handler clears any report it cannot name.
++ */
++#define V500_INT_ENABLE_DEFAULT			0xcd
++#define V500_INT_CLEAR_ALL			GENMASK(31, 0)
++
++/*
++ * Completion and rate-control read-backs. The end-of-picture and error bits are
++ * the same values as the interrupt sources.
++ */
++#define V500_STATUS				0x3004
++#define V500_STATUS_PIC				BIT(0)
++#define V500_STATUS_SLICE			BIT(1)
++#define V500_STATUS_BUF_FULL			BIT(2)
++#define V500_STATUS_PBIT_OVERFLOW		BIT(3)
++#define V500_STATUS_TIMEOUT			BIT(6)
++
++/*
++ * Code length of the finished picture, in bytes: the vendor's read-back takes
++ * bits as the register value shifted by three. Two offsets exist because the
++ * core moves it with the slice-report set; the vendor reads one of them
++ * according to the protocol in use.
++ */
++#define V500_PIC_BITS_A				0x37c0
++#define V500_PIC_BITS_B				0x3840
++#define V500_PIC_BITS_H264			V500_PIC_BITS_B
++#define V500_PIC_BITS_HEVC			V500_PIC_BITS_A
++
++/*
++ * Per-slice report, eight bytes apart for the sixteen slice slots: the running
++ * bit count and, next to it, an amount the vendor subtracts masked to seven
++ * bits. Bit 31 of the first word marks the slice as the last one.
++ */
++#define V500_SLICE_BITS(i)			(0x3844 + (i) * 8)
++#define V500_SLICE_ADJUST(i)			(0x3848 + (i) * 8)
++#define V500_SLICE_BITS_MASK			GENMASK(28, 0)
++#define V500_SLICE_ADJUST_MASK			GENMASK(6, 0)
++#define V500_SLICE_LAST				BIT(31)
++
++/* Rate-control statistics of the finished picture. */
++#define V500_RC_STAT_A				0x31c0
++#define V500_RC_STAT_B				0x31c4
++#define V500_RC_MADI				0x37c8
++#define V500_RC_MADP				0x37cc
++#define V500_RC_MB_BITS				0x3ac4
++#define V500_RC_QP_SUM				0x3ae4
++
++/*
++ * The core also takes register-side configuration while it reads the picture
++ * from the image. Only the words whose every field is derivable from the
++ * picture are written here; the rest keep the value the block comes up with.
++ * The ABI note lists which field each of these carries.
++ */
++#define V500_CORE_CTRL			0x001c
++#define  V500_CORE_ALWAYS		(BIT(1) | BIT(6) | BIT(7) | BIT(17))
++#define  V500_CORE_DDR_MODE		BIT(4)
++#define  V500_CORE_NOT_HEVC		BIT(2)
++#define  V500_CORE_HEVC			BIT(26)
++#define  V500_CORE_NOT_HIGH		GENMASK(19, 18)
++#define  V500_CORE_CAVLC		BIT(12)
++#define  V500_CORE_INTRA		BIT(16)
++#define  V500_CORE_INTER		BIT(10)
++#define  V500_CORE_LOW_DELAY		BIT(5)
++#define V500_TUNE_WORD(n)			((n) * 4)
++#define V500_SEARCH_CFG			0x0044
++#define  V500_SEARCH_CFG_DEFAULT	0x91b1
++#define V500_MB_TARGET_BITS		0x024c
++
++/* Sub-window at the top of the mapping, the core's own SMMU/TBU. */
++#define V500_SMMU_OFFSET			0xf000
++#define V500_SMMU_INT_STATUS			(V500_SMMU_OFFSET + 0x018)
++#define V500_SMMU_INT_CLEAR			(V500_SMMU_OFFSET + 0x01c)
++#define V500_SMMU_PAGE_BASE_NS			(V500_SMMU_OFFSET + 0x20c)
++#define V500_SMMU_ERR_WRITE_NS			(V500_SMMU_OFFSET + 0x308)
++#define V500_SMMU_ERR_READ_NS			(V500_SMMU_OFFSET + 0x304)
++#define V500_SMMU_FAULT_WRITE_S			(V500_SMMU_OFFSET + 0x330)
++#define V500_SMMU_FAULT_WRITE_NS		(V500_SMMU_OFFSET + 0x340)
++#define V500_SMMU_FAULT_READ_S			(V500_SMMU_OFFSET + 0x350)
++#define V500_SMMU_FAULT_READ_NS			(V500_SMMU_OFFSET + 0x360)
++
++/*
++ * The frame descriptor the core reads. The vendor packs it from a C structure
++ * of the same field set; the offsets here are that structure's words, as the
++ * command image holds them.
++ */
++#define V500_IMAGE_BYTES			4096
++#define V500_IMAGE_ALIGN			64
++
++#endif /* HISTB_VENC_V5_REGS_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/histb_venc_v5_v4l2.c
+@@ -0,0 +1,1699 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * HiSilicon HiSTB V500 encoder: the V4L2 mem2mem face.
++ *
++ * Raw pictures go into the OUTPUT queue and H.264 or HEVC network abstraction
++ * layer data comes out of the CAPTURE queue, so this is a stateful encoder: the
++ * client hands over a picture and the coding parameters the controls express,
++ * not slice headers or reference lists.
++ *
++ * The group of pictures is closed: the first picture of each group is an IDR
++ * and the rest predict from it, and the rate loop moves the quantiser from the
++ * bits the previous picture spent.
++ *
++ * The core serves one context at a time. Its vendor layer keeps state in two
++ * globals and cannot be re-entered, and the reconstruction buffers, the command
++ * image and the coded-stream ring here are one set per device, so a second
++ * context is refused when it starts streaming rather than queued and silently
++ * serialised.
++ */
++
++#include <linux/dma-buf.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/math64.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/videodev2.h>
++
++#include <media/media-device.h>
++#include <media/v4l2-ioctl.h>
++#include <media/media-entity.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-v4l2.h>
++
++#include "histb_venc_v5.h"
++#include "histb-venc.h"
++
++#define V500_TIMEOUT			msecs_to_jiffies(1000)
++#define V500_MAX_OUTPUT_BUFFERS		8
++#define V500_MAX_CAPTURE_BUFFERS	16
++
++static const u32 histb_venc_v5_ctrls[] = {
++	V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
++	V4L2_CID_MPEG_VIDEO_BITRATE,
++	V4L2_CID_MPEG_VIDEO_H264_PROFILE,
++	V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE,
++	V4L2_CID_MPEG_VIDEO_H264_MIN_QP,
++	V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
++	V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP,
++	V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP,
++	V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
++	V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
++	V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP,
++	V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP,
++	V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP,
++	V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP,
++	V4L2_CID_MPEG_VIDEO_GOP_SIZE,
++	V4L2_CID_MPEG_VIDEO_HEADER_MODE,
++	V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MODE,
++	V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_MB,
++	V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
++};
++
++static struct histb_venc_v5_ctx *file_to_ctx(struct file *filp)
++{
++	return container_of(file_to_v4l2_fh(filp), struct histb_venc_v5_ctx, fh);
++}
++
++/* --------------------------------------------------------------- formats */
++
++/*
++ * The input layouts this core stores pictures in. The two 4:2:2 ones are not
++ * coded as 4:2:2: the image carries no chroma sampling ratio, so the core reads
++ * the interleaved chroma plane at twice its own row pitch and therefore takes
++ * every other row, which is the vendor's own treatment of these formats -- the
++ * vendor driver's comment says it out loud.
++ */
++#define V500_IN_NV12		0
++#define V500_IN_YUV420		1
++#define V500_IN_YUYV		2
++#define V500_IN_NV21		3
++#define V500_IN_NV16		4
++#define V500_IN_NV61		5
++#define V500_IN_UYVY		6
++
++/*
++ * Whether a fourcc names one of the layouts this core can be handed. The node
++ * speaks only what ENUM_FMT lists: a picture in another layout is refused
++ * rather than read as NV12, which would take its chroma from the wrong place.
++ */
++static bool histb_venc_v5_is_input(unsigned int fourcc)
++{
++	switch (fourcc) {
++	case V4L2_PIX_FMT_NV12M:
++	case V4L2_PIX_FMT_NV12:
++	case V4L2_PIX_FMT_NV21M:
++	case V4L2_PIX_FMT_NV21:
++	case V4L2_PIX_FMT_YUV420M:
++	case V4L2_PIX_FMT_YUV420:
++	case V4L2_PIX_FMT_NV16M:
++	case V4L2_PIX_FMT_NV16:
++	case V4L2_PIX_FMT_NV61M:
++	case V4L2_PIX_FMT_NV61:
++	case V4L2_PIX_FMT_YUYV:
++	case V4L2_PIX_FMT_UYVY:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/*
++ * Both the single-plane and the multi-plane spelling of a layout name the same
++ * arrangement, and the node only ever speaks multi-plane.
++ */
++static unsigned int histb_venc_v5_input(unsigned int fourcc)
++{
++	switch (fourcc) {
++	case V4L2_PIX_FMT_YUV420M:
++	case V4L2_PIX_FMT_YUV420:
++		return V500_IN_YUV420;
++	case V4L2_PIX_FMT_YUYV:
++		return V500_IN_YUYV;
++	case V4L2_PIX_FMT_UYVY:
++		return V500_IN_UYVY;
++	case V4L2_PIX_FMT_NV21M:
++	case V4L2_PIX_FMT_NV21:
++		return V500_IN_NV21;
++	case V4L2_PIX_FMT_NV16M:
++	case V4L2_PIX_FMT_NV16:
++		return V500_IN_NV16;
++	case V4L2_PIX_FMT_NV61M:
++	case V4L2_PIX_FMT_NV61:
++		return V500_IN_NV61;
++	default:
++		return V500_IN_NV12;
++	}
++}
++
++static unsigned int histb_venc_v5_input_fourcc(unsigned int input)
++{
++	switch (input) {
++	case V500_IN_YUV420:
++		return V4L2_PIX_FMT_YUV420M;
++	case V500_IN_YUYV:
++		return V4L2_PIX_FMT_YUYV;
++	case V500_IN_UYVY:
++		return V4L2_PIX_FMT_UYVY;
++	case V500_IN_NV21:
++		return V4L2_PIX_FMT_NV21M;
++	case V500_IN_NV16:
++		return V4L2_PIX_FMT_NV16M;
++	case V500_IN_NV61:
++		return V4L2_PIX_FMT_NV61M;
++	default:
++		return V4L2_PIX_FMT_NV12M;
++	}
++}
++
++/* A packed layout is one plane of two bytes per luma sample and 4:2:2. */
++static bool histb_venc_v5_is_packed(unsigned int input)
++{
++	return input == V500_IN_YUYV || input == V500_IN_UYVY;
++}
++
++/* Semi-planar 4:2:2: a chroma plane as tall as the luma one. */
++static bool histb_venc_v5_is_semi422(unsigned int input)
++{
++	return input == V500_IN_NV16 || input == V500_IN_NV61;
++}
++
++/* The pitch a source plane of the negotiated picture is walked with. */
++static unsigned int histb_venc_v5_src_stride(const struct histb_venc_v5_ctx *ctx)
++{
++	return ALIGN(ctx->src_w, 16);
++}
++
++/*
++ * The rectangle the core codes: the selected one, or the whole picture when
++ * nothing is selected. Selection is stored already aligned to the core's block
++ * grid, so this is exact and the parameter set only trims the padding.
++ */
++static void histb_venc_v5_coded_dims(const struct histb_venc_v5_ctx *ctx,
++				     unsigned int *width, unsigned int *height)
++{
++	if (ctx->crop.width && ctx->crop.height) {
++		*width = ctx->crop.width;
++		*height = ctx->crop.height;
++	} else {
++		*width = ctx->src_w;
++		*height = ctx->src_h;
++	}
++}
++
++/* The frame descriptor codes the selected rectangle, not the whole picture. */
++static void histb_venc_v5_apply_geometry(struct histb_venc_v5_ctx *ctx)
++{
++	histb_venc_v5_coded_dims(ctx, &ctx->frame.width, &ctx->frame.height);
++}
++
++static int histb_venc_v5_try_fmt(struct histb_venc_v5_ctx *ctx,
++				 struct v4l2_format *fmt)
++{
++	struct v4l2_pix_format_mplane *pix = &fmt->fmt.pix_mp;
++	unsigned int width = ALIGN_DOWN(clamp(pix->width, 128u, 1920U), 2);
++	unsigned int height = ALIGN_DOWN(clamp(pix->height, 128u, 1088U), 2);
++	unsigned int stride = ALIGN(width, 16);
++	unsigned int coded = ALIGN(height, 32);
++	unsigned int chroma_stride;
++	unsigned int input = V500_IN_NV12;
++
++	pix->width = width;
++	pix->height = height;
++	if (fmt->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
++		if (!histb_venc_v5_is_input(pix->pixelformat))
++			return -EINVAL;
++		input = histb_venc_v5_input(pix->pixelformat);
++		pix->pixelformat = histb_venc_v5_input_fourcc(input);
++	} else if (pix->pixelformat != V4L2_PIX_FMT_HEVC) {
++		pix->pixelformat = V4L2_PIX_FMT_H264;
++	}
++	pix->field = V4L2_FIELD_NONE;
++	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
++	pix->plane_fmt[0].bytesperline = 0;
++
++	if (fmt->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
++		pix->num_planes = 1;
++		/*
++		 * The ring is sized for an all-intra picture, but a client
++		 * may ask for more room; the queue reports whichever is
++		 * larger and the drain refuses a frame that does not fit.
++		 */
++		if (!pix->plane_fmt[0].sizeimage ||
++		    pix->plane_fmt[0].sizeimage < width * height * 2)
++			pix->plane_fmt[0].sizeimage = width * height * 2;
++		return 0;
++	}
++
++	/*
++	 * The core works on whole blocks, so the planes are reported as the
++	 * coded picture rather than the visible one: the rows past the bottom
++	 * of the picture are read, and a buffer that stops at the visible edge
++	 * would leave those reads outside the allocation.
++	 */
++	chroma_stride = ALIGN(DIV_ROUND_UP(width, 2), 16);
++	switch (input) {
++	case V500_IN_YUV420:
++		pix->num_planes = 3;
++		pix->plane_fmt[0].bytesperline = stride;
++		pix->plane_fmt[0].sizeimage = stride * coded;
++		pix->plane_fmt[1].bytesperline = chroma_stride;
++		pix->plane_fmt[1].sizeimage = chroma_stride * coded / 2;
++		pix->plane_fmt[2].bytesperline = chroma_stride;
++		pix->plane_fmt[2].sizeimage = chroma_stride * coded / 2;
++		return 0;
++	case V500_IN_YUYV:
++	case V500_IN_UYVY:
++		pix->num_planes = 1;
++		pix->plane_fmt[0].bytesperline = ALIGN(width * 2, 16);
++		pix->plane_fmt[0].sizeimage = ALIGN(width * 2, 16) * coded;
++		return 0;
++	default:
++		break;
++	}
++
++	/*
++	 * Semi-planar: one luma plane and one plane of interleaved chroma
++	 * samples, the core reading both with the same pitch in bytes. A 4:2:2
++	 * picture's chroma plane carries a row per luma row rather than one per
++	 * pair, so it is exactly twice the size.
++	 */
++	pix->num_planes = 2;
++	pix->plane_fmt[0].bytesperline = stride;
++	pix->plane_fmt[0].sizeimage = stride * coded;
++	pix->plane_fmt[1].bytesperline = stride;
++	pix->plane_fmt[1].sizeimage = stride * coded /
++		(histb_venc_v5_is_semi422(input) ? 1 : 2);
++
++	return 0;
++}
++
++/*
++ * The capture queue's format is the coded window, so it follows the output
++ * picture whenever the queue is free to be set again. What the queue owns is
++ * which syntax to code, and that carries over.
++ */
++static void histb_venc_v5_reset_cap_fmt(struct histb_venc_v5_ctx *ctx)
++{
++	struct v4l2_format *cap = &ctx->fmt[V500_FMT_CAPTURE];
++	unsigned int fourcc = cap->fmt.pix_mp.pixelformat;
++
++	memset(cap, 0, sizeof(*cap));
++	cap->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	cap->fmt.pix_mp.pixelformat = fourcc;
++	histb_venc_v5_coded_dims(ctx, &cap->fmt.pix_mp.width,
++				 &cap->fmt.pix_mp.height);
++	histb_venc_v5_try_fmt(ctx, cap);
++}
++
++static int histb_venc_v5_querycap(struct file *file, void *priv,
++				struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, HISTB_VENC_NAME, sizeof(cap->driver));
++	strscpy(cap->card, "histb-venc", sizeof(cap->card));
++
++	return 0;
++}
++
++static int histb_venc_v5_enum_fmt(struct file *file, void *priv,
++				struct v4l2_fmtdesc *f)
++{
++	static const u32 inputs[] = {
++		V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV21M, V4L2_PIX_FMT_YUV420M,
++		V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_UYVY, V4L2_PIX_FMT_NV16M,
++		V4L2_PIX_FMT_NV61M,
++	};
++
++	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
++		if (f->index >= ARRAY_SIZE(inputs))
++			return -EINVAL;
++		f->pixelformat = inputs[f->index];
++		return 0;
++	}
++
++	if (f->index > 1)
++		return -EINVAL;
++	f->pixelformat = f->index ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
++
++	return 0;
++}
++
++static int histb_venc_v5_g_fmt(struct file *file, void *priv,
++			     struct v4l2_format *f)
++{
++	struct histb_venc_v5_ctx *ctx = file_to_ctx(file);
++
++	*f = ctx->fmt[V4L2_TYPE_IS_OUTPUT(f->type)];
++
++	return 0;
++}
++
++static int histb_venc_v5_s_fmt(struct file *file, void *priv,
++				     struct v4l2_format *f)
++{
++	struct histb_venc_v5_ctx *ctx = file_to_ctx(file);
++	struct vb2_queue *q = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
++	struct vb2_queue *peer;
++	u32 sizeimage;
++	int ret;
++
++	if (vb2_is_busy(q))
++		return -EBUSY;
++
++	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++		ret = histb_venc_v5_try_fmt(ctx, f);
++		if (ret)
++			return ret;
++		ctx->fmt[V500_FMT_OUTPUT] = *f;
++		/* A selection is a rectangle in the picture it was set
++		 * against; a new picture retires it.
++		 */
++		ctx->crop = (struct v4l2_rect){ 0 };
++		ctx->src_w = f->fmt.pix_mp.width;
++		ctx->src_h = f->fmt.pix_mp.height;
++		histb_venc_v5_apply_geometry(ctx);
++
++		/* The coded window follows the picture while it is free. */
++		peer = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
++				       V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++		if (!vb2_is_busy(peer))
++			histb_venc_v5_reset_cap_fmt(ctx);
++		return 0;
++	}
++
++	/*
++	 * Only the coded window is the capture format's own; the geometry is
++	 * the picture's and is changed through the output queue alone.
++	 */
++	sizeimage = f->fmt.pix_mp.plane_fmt[0].sizeimage;
++	f->fmt.pix_mp.width = ctx->frame.width;
++	f->fmt.pix_mp.height = ctx->frame.height;
++	ret = histb_venc_v5_try_fmt(ctx, f);
++	if (ret)
++		return ret;
++	if (sizeimage > f->fmt.pix_mp.plane_fmt[0].sizeimage)
++		f->fmt.pix_mp.plane_fmt[0].sizeimage = sizeimage;
++	ctx->hevc = f->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_HEVC;
++	ctx->fmt[V500_FMT_CAPTURE] = *f;
++
++	return 0;
++}
++
++static int histb_venc_v5_try_fmt_vidioc(struct file *file, void *priv,
++				      struct v4l2_format *f)
++{
++	return histb_venc_v5_try_fmt(file_to_ctx(file), f);
++}
++
++/*
++ * The selected rectangle is the part of the source picture the core codes. It
++ * belongs to the OUTPUT queue, whose buffers carry the whole picture, and the
++ * core has no crop register: the origin is the address the planes are read
++ * from and the extent the size the planes are walked for, so both are the
++ * driver's to compute.
++ */
++static int histb_venc_v5_g_selection(struct file *file, void *priv,
++				     struct v4l2_selection *s)
++{
++	struct histb_venc_v5_ctx *ctx = file_to_ctx(file);
++	struct v4l2_rect full = { 0, 0, ctx->src_w, ctx->src_h };
++
++	/* The core hands selection ioctls the plain buffer type, whatever the
++	 * client asked for (v4l_s_selection), so this queue is named that way.
++	 */
++	if (s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
++		return -EINVAL;
++
++	switch (s->target) {
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++		s->r = (ctx->crop.width && ctx->crop.height) ? ctx->crop : full;
++		break;
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		s->r = full;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int histb_venc_v5_s_selection(struct file *file, void *priv,
++				     struct v4l2_selection *s)
++{
++	struct histb_venc_v5_ctx *ctx = file_to_ctx(file);
++	unsigned int align = V500_BLOCK_ALIGN;
++	struct vb2_queue *vq;
++	struct v4l2_rect r = s->r;
++
++	if (s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT ||
++	    s->target != V4L2_SEL_TGT_CROP)
++		return -EINVAL;
++	if (!ctx->src_w || !ctx->src_h)
++		return -EINVAL;
++
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, s->type);
++	if (!vq)
++		return -EINVAL;
++	if (vb2_is_busy(vq))
++		return -EBUSY;
++
++	/*
++	 * The core walks the source in whole macroblocks, so the origin is
++	 * macroblock aligned and the extent rounded down to one; the parameter
++	 * set still trims the picture when the extent is not a whole number of
++	 * them. A planar chroma plane is addressed at half the luma rate, so its
++	 * horizontal origin has to stay a whole 16 bytes up too, which is the
++	 * alignment the reference asks of every source address.
++	 */
++	if (histb_venc_v5_input(ctx->fmt[V500_FMT_OUTPUT].fmt.pix_mp.pixelformat)
++	    == V500_IN_YUV420)
++		align = 2 * V500_BLOCK_ALIGN;
++	if (r.left < 0 || r.top < 0)
++		return -EINVAL;
++	r.left = round_down(r.left, align);
++	r.top = round_down(r.top, V500_BLOCK_ALIGN);
++	r.width = round_down(r.width, V500_BLOCK_ALIGN);
++	r.height = round_down(r.height, V500_BLOCK_ALIGN);
++	if (r.width < (ctx->hevc ? 128u : 256u) || r.height < 128 ||
++	    r.left + r.width > ctx->src_w || r.top + r.height > ctx->src_h)
++		return -EINVAL;
++	/*
++	 * The core reads whole padded rows from wherever it was pointed, so a
++	 * rectangle low in the picture has to leave those rows inside the buffer
++	 * the queue was allocated with. The buffer is padded to 32, which covers
++	 * both codecs' own rounding.
++	 */
++	if (r.top + ALIGN(r.height, 32) > ALIGN(ctx->src_h, 32))
++		return -EINVAL;
++
++	if (!r.left && !r.top && r.width == ctx->src_w &&
++	    r.height == ctx->src_h)
++		ctx->crop = (struct v4l2_rect){ 0 };
++	else
++		ctx->crop = r;
++	s->r = r;
++
++	histb_venc_v5_apply_geometry(ctx);
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
++			     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++	if (!vb2_is_busy(vq))
++		histb_venc_v5_reset_cap_fmt(ctx);
++
++	return 0;
++}
++
++static int histb_venc_v5_enum_framesizes(struct file *file, void *priv,
++				       struct v4l2_frmsizeenum *fsize)
++{
++	if (fsize->index > 0)
++		return -EINVAL;
++	if (!histb_venc_v5_is_input(fsize->pixel_format))
++		return -EINVAL;
++
++	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	/*
++	 * The block's own geometric face: two pixels either way, up to the
++	 * picture it can hold. Which codec allows the small end is the capture
++	 * format's business, and starting a stream says so.
++	 */
++	fsize->stepwise.min_width = 128;
++	fsize->stepwise.max_width = 1920;
++	fsize->stepwise.step_width = 2;
++	fsize->stepwise.min_height = 128;
++	fsize->stepwise.max_height = 1088;
++	fsize->stepwise.step_height = 2;
++
++	return 0;
++}
++
++/* --------------------------------------------------------------- buffers */
++
++static int histb_venc_v5_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
++				   unsigned int *num_planes, unsigned int sizes[],
++				   struct device *alloc_devs[])
++{
++	struct histb_venc_v5_ctx *ctx = vb2_get_drv_priv(q);
++	const struct v4l2_pix_format_mplane *pix =
++		&ctx->fmt[V4L2_TYPE_IS_OUTPUT(q->type)].fmt.pix_mp;
++	unsigned int i;
++
++	if (*num_planes) {
++		for (i = 0; i < *num_planes; i++) {
++			if (sizes[i] < pix->plane_fmt[i].sizeimage)
++				return -EINVAL;
++		}
++		return 0;
++	}
++
++	if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
++		if (*num_buffers > V500_MAX_OUTPUT_BUFFERS)
++			return -EINVAL;
++	} else if (*num_buffers > V500_MAX_CAPTURE_BUFFERS) {
++		return -EINVAL;
++	}
++
++	*num_planes = pix->num_planes;
++	for (i = 0; i < pix->num_planes; i++)
++		sizes[i] = pix->plane_fmt[i].sizeimage;
++
++	return 0;
++}
++
++static int histb_venc_v5_buf_prepare(struct vb2_buffer *vb)
++{
++	struct histb_venc_v5_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	const struct v4l2_pix_format_mplane *pix =
++		&ctx->fmt[V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type)].fmt.pix_mp;
++	unsigned int i;
++
++	for (i = 0; i < vb->num_planes; i++) {
++		if (vb2_plane_size(vb, i) < pix->plane_fmt[i].sizeimage)
++			return -EINVAL;
++
++		/*
++		 * The core reads and writes whole 16-byte lines, and its
++		 * addresses are declared in the image as plain words, so every
++		 * plane has to start on that boundary.
++		 */
++		if (vb2_dma_contig_plane_dma_addr(vb, i) % 16)
++			return -EINVAL;
++
++		/*
++		 * Those image words are 32 bits wide, so a plane ending above
++		 * 4 GiB would be read from a truncated address. The device's
++		 * 32-bit mask bounds its own allocations; an imported plane is
++		 * checked here rather than trusted.
++		 */
++		if ((u64)vb2_dma_contig_plane_dma_addr(vb, i) +
++		    vb2_plane_size(vb, i) - 1 > DMA_BIT_MASK(32))
++			return -ERANGE;
++
++		vb2_set_plane_payload(vb, i, 0);
++	}
++
++	return 0;
++}
++
++/* The end of a drained stream is said twice: in a buffer and as an event. */
++static const struct v4l2_event histb_venc_v5_eos_event = {
++	.type = V4L2_EVENT_EOS,
++};
++
++static int histb_venc_v5_subscribe_event(struct v4l2_fh *fh,
++				       const struct v4l2_event_subscription *sub)
++{
++	if (sub->type == V4L2_EVENT_EOS)
++		return v4l2_event_subscribe(fh, sub, 0, NULL);
++
++	return v4l2_ctrl_subscribe_event(fh, sub);
++}
++
++static void histb_venc_v5_buf_queue(struct vb2_buffer *vb)
++{
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	struct histb_venc_v5_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	unsigned int i;
++
++	/*
++	 * A drain asked for while nothing was queued has no picture to put the
++	 * end marker on, so the first capture buffer the client offers after it
++	 * is the marker: no bytes, the LAST flag, and the session stopped.
++	 */
++	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
++	    vb2_is_streaming(vb->vb2_queue) &&
++	    v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx)) {
++		for (i = 0; i < vb->num_planes; i++)
++			vb2_set_plane_payload(vb, i, 0);
++		vbuf->field = V4L2_FIELD_NONE;
++		v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, vbuf);
++		v4l2_event_queue_fh(&ctx->fh, &histb_venc_v5_eos_event);
++		return;
++	}
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
++}
++
++static int histb_venc_v5_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct histb_venc_v5_ctx *ctx = vb2_get_drv_priv(q);
++	struct histb_venc_v5 *enc = histb_venc_v5_of_ctx(ctx);
++	unsigned int lo = min(ctx->user_min_qp, ctx->user_max_qp);
++	unsigned int hi = max(ctx->user_min_qp, ctx->user_max_qp);
++	unsigned int min_width = ctx->hevc ? 128 : 256;
++	unsigned int height = ctx->frame.height;
++	unsigned int width = ctx->frame.width;
++	int ret = 0;
++
++	/*
++	 * The codecs differ at the small end: H.264 codes whole macroblock
++	 * pairs, so nothing below the picture it can name starts here. Say so
++	 * at the point the geometry is frozen rather than code a broken stream.
++	 */
++	if (width < min_width || height < 128)
++		return -EINVAL;
++
++	mutex_lock(&enc->lock);
++	if (!enc->ctx) {
++		enc->ctx = ctx;
++		/*
++		 * A new stream starts its GOP, frame numbering and rate-control
++		 * state over.
++		 */
++		ctx->sequence = 0;
++		ctx->gop_left = 0;
++		ctx->force_idr = false;
++		ctx->frame.frame_num = 0;
++		ctx->frame.idr_pic_id = 0;
++		ctx->frame.poc = 0;
++		ctx->rc_qp = (lo + hi) / 2;
++		ctx->rc_credit = 0;
++		ctx->gop_bits = 0;
++	} else if (enc->ctx != ctx) {
++		ret = -EBUSY;
++	}
++	mutex_unlock(&enc->lock);
++	/* A stream restarted after a drain is not the tail of the old one. */
++	if (!ret)
++		v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, q);
++
++	return ret;
++}
++
++static void histb_venc_v5_stop_streaming(struct vb2_queue *q)
++{
++	struct histb_venc_v5_ctx *ctx = vb2_get_drv_priv(q);
++	struct histb_venc_v5 *enc = histb_venc_v5_of_ctx(ctx);
++	unsigned int i;
++
++	while (true) {
++		struct vb2_v4l2_buffer *vbuf;
++
++		if (V4L2_TYPE_IS_OUTPUT(q->type))
++			vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++		else
++			vbuf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++
++		if (!vbuf)
++			break;
++
++		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
++	}
++
++	/* A buffer the mem2mem lists no longer carry is still ours to return. */
++	for (i = 0; i < vb2_get_num_buffers(q); i++) {
++		struct vb2_buffer *vb = vb2_get_buffer(q, i);
++
++		if (vb != NULL && vb->state == VB2_BUF_STATE_ACTIVE)
++			vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
++	}
++
++	mutex_lock(&enc->lock);
++	if (enc->ctx == ctx)
++		enc->ctx = NULL;
++	mutex_unlock(&enc->lock);
++	/*
++	 * A drain that had not finished still owes its caller the end marker,
++	 * and the capture queue's own teardown is what clears the session state.
++	 */
++	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
++}
++
++static const struct vb2_ops histb_venc_v5_vb2_ops = {
++	.queue_setup		= histb_venc_v5_queue_setup,
++	.buf_prepare		= histb_venc_v5_buf_prepare,
++	.buf_queue		= histb_venc_v5_buf_queue,
++	.start_streaming	= histb_venc_v5_start_streaming,
++	.stop_streaming		= histb_venc_v5_stop_streaming,
++};
++
++static int histb_venc_v5_queue_init(void *priv, struct vb2_queue *src_vq,
++				  struct vb2_queue *dst_vq)
++{
++	struct histb_venc_v5_ctx *ctx = priv;
++	struct histb_venc_v5 *enc = histb_venc_v5_of_ctx(ctx);
++	int ret;
++
++	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	src_vq->drv_priv = ctx;
++	src_vq->ops = &histb_venc_v5_vb2_ops;
++	src_vq->mem_ops = &vb2_dma_contig_memops;
++	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
++	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	src_vq->lock = &enc->vdev_lock;
++	src_vq->dev = enc->v4l2.dev;
++
++	ret = vb2_queue_init(src_vq);
++	if (ret)
++		return ret;
++
++	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	dst_vq->drv_priv = ctx;
++	dst_vq->ops = &histb_venc_v5_vb2_ops;
++	dst_vq->mem_ops = &vb2_dma_contig_memops;
++	/* The driver copies the coded bytes in, so it needs a kernel mapping. */
++	dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
++	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	dst_vq->lock = &enc->vdev_lock;
++	dst_vq->dev = enc->v4l2.dev;
++
++	return vb2_queue_init(dst_vq);
++}
++
++/* -------------------------------------------------------------- controls */
++
++/*
++ * The menu numbers the profiles in the syntax's order and the command image in
++ * the vendor's, so the two need naming apart.
++ */
++static unsigned int histb_venc_v5_vendor_profile(unsigned int profile)
++{
++	switch (profile) {
++	case V4L2_MPEG_VIDEO_H264_PROFILE_MAIN:
++		return V500_H264_PROFILE_MAIN;
++	case V4L2_MPEG_VIDEO_H264_PROFILE_HIGH:
++		return V500_H264_PROFILE_HIGH;
++	default:
++		return V500_H264_PROFILE_BASELINE;
++	}
++}
++
++static int histb_venc_v5_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct histb_venc_v5_ctx *ctx =
++		container_of(ctrl->handler, struct histb_venc_v5_ctx,
++			     ctrl_handler);
++
++	switch (ctrl->id) {
++	case V4L2_CID_MPEG_VIDEO_BITRATE:
++		ctx->bitrate = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_MIN_QP:
++	case V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP:
++		ctx->user_min_qp = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_MAX_QP:
++	case V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP:
++		ctx->user_max_qp = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
++		ctx->gop = ctrl->val;
++		break;
++	/*
++	 * The core splits at coding-unit rows, so the byte form has no exact
++	 * image; the menu only offers the unit-count form.
++	 */
++	case V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_MB:
++		ctx->slice_mb = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MODE:
++		if (ctrl->val == V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_SINGLE)
++			ctx->slice_mb = 0;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_PROFILE:
++		ctx->profile = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE:
++		ctx->cabac = ctrl->val == V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP:
++	case V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP:
++		ctx->qp_i = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP:
++	case V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP:
++		ctx->qp_p = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:
++		ctx->force_idr = true;
++		break;
++	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
++		ctx->hevc_profile = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_HEVC_LEVEL:
++		ctx->hevc_level = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_BITRATE_MODE:
++		ctx->bitrate_mode = ctrl->val;
++		break;
++	/* The menu only offers the one header mode this node implements. */
++	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops histb_venc_v5_ctrl_ops = {
++	.s_ctrl = histb_venc_v5_s_ctrl,
++};
++
++static int histb_venc_v5_init_ctrls(struct histb_venc_v5_ctx *ctx)
++{
++	struct v4l2_ctrl_handler *hdl = &ctx->ctrl_handler;
++	/* The two H.264 profiles this core is never told to code. */
++	const u32 profile_mask =
++		BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE) |
++		BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED);
++
++	v4l2_ctrl_handler_init(hdl, ARRAY_SIZE(histb_venc_v5_ctrls));
++
++	v4l2_ctrl_new_std_menu(hdl, &histb_venc_v5_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_H264_PROFILE,
++			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH, profile_mask,
++			       V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE);
++	/*
++	 * The entropy coder is the core's own switch, not a consequence of the
++	 * profile, so both forms are offered for every profile that allows it.
++	 */
++	v4l2_ctrl_new_std_menu(hdl, &histb_venc_v5_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE,
++			       V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC, 0,
++			       V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CAVLC);
++	v4l2_ctrl_new_std_menu(hdl, &histb_venc_v5_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
++			       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ, 0,
++			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR);
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops, V4L2_CID_MPEG_VIDEO_BITRATE,
++			  2000, 100000000, 1000, 4000000);
++	/*
++	 * The core's quantiser range is the syntax's, and the pair bounds the
++	 * rate control rather than fixing a value: an all-intra picture is
++	 * allowed the wider low end.
++	 */
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 1, 51, 1, 2);
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 1, 51, 1, 51);
++	/*
++	 * The two quantisers the constant-quality mode codes with, one per
++	 * picture type. The window above does not move them: nothing is looked
++	 * up from the bits the last picture spent in that mode.
++	 */
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP, 1, 51, 1, 28);
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP, 1, 51, 1, 28);
++	v4l2_ctrl_new_std_menu(hdl, &histb_venc_v5_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
++			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_STILL_PICTURE,
++			       BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10),
++			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
++	v4l2_ctrl_new_std_menu(hdl, &histb_venc_v5_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
++			       V4L2_MPEG_VIDEO_HEVC_LEVEL_6_2, 0,
++			       V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1);
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP, 0, 51, 1, 2);
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP, 0, 51, 1, 51);
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP, 0, 51, 1, 28);
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP, 0, 51, 1, 28);
++	v4l2_ctrl_new_std_menu(hdl, &histb_venc_v5_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_HEADER_MODE,
++			       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
++			       0, V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++		V4L2_CID_MPEG_VIDEO_GOP_SIZE, 1, 255, 1, 30);
++	v4l2_ctrl_new_std_menu(hdl, &histb_venc_v5_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MODE,
++			       V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_MAX_MB,
++			       BIT(V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_MAX_BYTES),
++			       V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_SINGLE);
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_MB,
++			  1, 8160, 1, 8160);
++	/* A press, not a setting: the next picture is the one it names. */
++	v4l2_ctrl_new_std(hdl, &histb_venc_v5_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
++	if (hdl->error)
++		return hdl->error;
++
++	ctx->fh.ctrl_handler = hdl;
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ run */
++
++static void histb_venc_v5_fill_frame(struct histb_venc_v5_ctx *ctx,
++				   struct vb2_v4l2_buffer *src,
++				   struct histb_venc_v5_frame *frame)
++{
++	const struct v4l2_pix_format_mplane *pix =
++		&ctx->fmt[V500_FMT_OUTPUT].fmt.pix_mp;
++	unsigned int src_stride = histb_venc_v5_src_stride(ctx);
++	unsigned int input = histb_venc_v5_input(pix->pixelformat);
++	unsigned int packed = histb_venc_v5_is_packed(input);
++	unsigned int semi422 = histb_venc_v5_is_semi422(input);
++	unsigned int vu = input == V500_IN_NV21 || input == V500_IN_NV61;
++	unsigned int lo, hi, qp;
++	unsigned int i;
++
++	frame->protocol = ctx->hevc ? V500_PROTOCOL_HEVC : V500_PROTOCOL_H264;
++	frame->profile = histb_venc_v5_vendor_profile(ctx->profile);
++	frame->cabac = !ctx->hevc && ctx->cabac;
++	frame->hevc_profile = ctx->hevc_profile;
++	frame->hevc_level = ctx->hevc_level;
++	/* The parameter sets name the rate and the budget with these. */
++	frame->bitrate = ctx->bitrate;
++	frame->fps_num = ctx->fps_num;
++	frame->fps_den = ctx->fps_den;
++
++	/*
++	 * The crop moves the read origin, and the picture the core codes is the
++	 * selected rectangle. A packed row carries two bytes per luma sample, so
++	 * its horizontal offset doubles; an interleaved chroma row is one byte per
++	 * luma sample, so its offset is the luma offset itself, while a planar one
++	 * covers two luma columns per sample. Vertically, a 4:2:2 chroma plane has
++	 * a row per luma row and a 4:2:0 one a row per pair.
++	 */
++	histb_venc_v5_apply_geometry(ctx);
++	frame->src_y = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0) +
++		       (dma_addr_t)ctx->crop.left * (packed ? 2 : 1) +
++		       (dma_addr_t)pix->plane_fmt[0].bytesperline * ctx->crop.top;
++	/*
++	 * Where the chroma of each layout lives. Only the planar one has a third
++	 * plane to name; a packed picture keeps its samples in the luma plane's
++	 * rows, and the interleaved one keeps both orders pointed at the same
++	 * plane, as the vendor build does.
++	 */
++	frame->src_v = frame->src_y;
++	frame->src_c = frame->src_y;
++	frame->src_stride_y = pix->plane_fmt[0].bytesperline;
++	frame->src_stride_c = src_stride;
++	switch (input) {
++	case V500_IN_YUV420:
++		frame->src_c = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 1) +
++			       ctx->crop.left / 2 +
++			       (dma_addr_t)pix->plane_fmt[1].bytesperline *
++				       (ctx->crop.top / 2);
++		frame->src_v = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 2) +
++			       ctx->crop.left / 2 +
++			       (dma_addr_t)pix->plane_fmt[2].bytesperline *
++				       (ctx->crop.top / 2);
++		frame->store = V500_STORE_PLANAR;
++		frame->package = 0;
++		frame->src_stride_y = pix->plane_fmt[0].bytesperline;
++		frame->src_stride_c = pix->plane_fmt[1].bytesperline;
++		break;
++	case V500_IN_YUYV:
++	case V500_IN_UYVY:
++		frame->store = V500_STORE_PACKAGE;
++		frame->package = input == V500_IN_UYVY ? V500_PACKAGE_UYVY :
++			V500_PACKAGE_YUYV;
++		frame->src_stride_y = pix->plane_fmt[0].bytesperline;
++		break;
++	default:
++		frame->src_c = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 1) +
++			       ctx->crop.left +
++			       (dma_addr_t)src_stride *
++				       (semi422 ? ctx->crop.top :
++						ctx->crop.top / 2);
++		frame->src_v = frame->src_c;
++		frame->store = V500_STORE_SEMI_PLANAR;
++		/*
++		 * The interleaved pair's order is the one bit of the format word
++		 * that names it. The verified UV path writes that bit clear, so
++		 * the VU path names it set; the board arm is the chroma-swapped
++		 * fixture, which has to give the same stream as the other order.
++		 */
++		frame->package = vu ? V500_SEMI_VU : V500_SEMI_UV;
++		/*
++		 * A 4:2:2 chroma plane is walked at twice its own row pitch, which
++		 * is how the reference feeds it and what makes the core take every
++		 * other chroma row.
++		 */
++		frame->src_stride_c = semi422 ? 2 * src_stride : src_stride;
++		break;
++	}
++
++	frame->recon[0] = ctx->enc->recon.dma;
++	frame->recon[1] = ctx->enc->recon.dma + V500_RECON_BYTES;
++	/*
++	 * The reconstruction surface is the core's own, so it is walked with the
++	 * stride of the picture it holds rather than the source's.
++	 */
++	frame->recon_stride_y = ALIGN(frame->width, 16);
++	frame->recon_stride_c = ALIGN(frame->width, 16);
++
++	/*
++	 * One intra picture every GOP, and the first picture of the stream
++	 * always is one: the reference chain starts from nothing. A key frame
++	 * asked for mid-group is coded at once, and the group then counts from
++	 * it rather than from where it was.
++	 */
++	frame->intra = ctx->gop_left == 0 || ctx->force_idr ||
++		(ctx->hevc &&
++		 ctx->hevc_profile ==
++		 V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_STILL_PICTURE);
++	ctx->force_idr = false;
++	/* Only gates the copy of the parameter bytes into the command image. */
++	frame->parameter_set = 1;
++
++	/*
++	 * The core splits between coding-unit rows, and its size word counts the
++	 * rows a slice keeps together minus one: a size of zero puts every row in
++	 * its own slice. The requested macroblock count therefore becomes a row
++	 * count with the picture's own unit width, minus one. One slice per
++	 * stream slot is the floor, so no picture asks for more slices than there
++	 * are slots to write them into.
++	 */
++	frame->slice_split = 0;
++	frame->slice_split_size = 0;
++	if (ctx->slice_mb) {
++		unsigned int unit = ctx->hevc ? 32 : 16;
++		unsigned int rows = DIV_ROUND_UP(ctx->frame.height, unit);
++		unsigned int per_row = DIV_ROUND_UP(ctx->frame.width, unit);
++		unsigned int slice_rows =
++			DIV_ROUND_UP(ctx->slice_mb, per_row) ?: 1;
++		unsigned int floor = DIV_ROUND_UP(rows, V500_SLICE_BUFFERS);
++
++		frame->slice_split = 1;
++		frame->slice_split_size =
++			max_t(unsigned int, slice_rows, floor) - 1;
++	}
++
++	/*
++	 * The quantiser the picture is coded with is the one named on its own,
++	 * so a request that pins a single value has to move it into the window
++	 * too; the vendor build writes the same value into all three.
++	 * Constant quality names the quantiser per picture type instead, and
++	 * nothing bounds it: the mode is the reason the client named it.
++	 */
++	lo = min(ctx->user_min_qp, ctx->user_max_qp);
++	hi = max(ctx->user_min_qp, ctx->user_max_qp);
++	if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CQ)
++		qp = frame->intra ? ctx->qp_i : ctx->qp_p;
++	else
++		qp = lo == hi ? lo : clamp_t(unsigned int, ctx->rc_qp, lo, hi);
++	frame->start_qp = qp;
++	frame->min_qp = frame->start_qp;
++	frame->max_qp = frame->start_qp;
++
++	/*
++	 * The core's rate control works from the bits one picture may spend.
++	 * CBR divides the configured rate by the frame rate. VBR spends the
++	 * group's budget where the pictures need it: each one is offered the
++	 * group's remaining bits over its remaining pictures, bounded to a
++	 * quarter of the average below and four times it above.
++	 */
++	{
++		u64 avg = div_u64((u64)ctx->bitrate * ctx->fps_den,
++				  ctx->fps_num);
++
++		if (frame->intra)
++			ctx->gop_bits = 0;
++
++		if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR &&
++		    ctx->gop) {
++			unsigned int left = ctx->gop_left + 1;
++			u64 budget = avg * ctx->gop;
++			u64 spend = budget > ctx->gop_bits ?
++				    budget - ctx->gop_bits : 0;
++			u64 target = clamp_t(u64, div64_u64(spend, left),
++					     avg / 2, avg * 4);
++
++			frame->target_bits = target;
++		} else {
++			frame->target_bits = avg;
++		}
++	}
++
++	/*
++	 * A split picture writes each slice into its own slot; unsplit work keeps
++	 * the whole ring for slot zero.
++	 */
++	if (frame->slice_split) {
++		unsigned int stride = histb_venc_v5_slot_stride(ctx->enc);
++
++		for (i = 0; i < V500_SLICE_BUFFERS; i++) {
++			frame->stream[i] = ctx->enc->stream.dma +
++				V500_RING_OFFSET + i * stride;
++			frame->stream_size[i] = stride;
++		}
++	} else {
++		frame->stream[0] = ctx->enc->stream.dma + V500_RING_OFFSET;
++		frame->stream_size[0] = ctx->enc->stream.size - V500_RING_OFFSET;
++	}
++	frame->stream_read = ctx->enc->stream.dma + V500_POINT_READ;
++	frame->stream_write = ctx->enc->stream.dma + V500_POINT_WRITE;
++
++	frame->param = ctx->enc->param.dma;
++
++	frame->tmv[0] = ctx->enc->scratch.dma;
++	frame->tmv[1] = ctx->enc->scratch.dma + SZ_128K;
++	frame->pme[0] = ctx->enc->scratch.dma + SZ_256K;
++	frame->pme[1] = ctx->enc->scratch.dma + SZ_384K;
++	frame->pme_info[0] = ctx->enc->scratch.dma + SZ_512K;
++	frame->pme_info[1] = ctx->enc->scratch.dma + SZ_512K * 2;
++	frame->pme_info[2] = ctx->enc->scratch.dma + SZ_512K * 3;
++	frame->tunnel_cell = ctx->enc->scratch.dma + SZ_512K * 4;
++	frame->slice_header = ctx->enc->slice.dma;
++}
++
++/*
++ * One picture's worth of the rate loop. The core gives no closed-loop CBR on
++ * this part: the image's target word only steers the mode decision, so the
++ * quantiser is chosen here from the bits the previous picture actually spent.
++ * The credit bank is one second deep, which lets an intra picture borrow from
++ * the pictures around it without letting a burst of them hold the average away
++ * from the target. The user's QP window bounds the choice.
++ */
++static void histb_venc_v5_rate_update(struct histb_venc_v5_ctx *ctx,
++				    unsigned int target_bits)
++{
++	unsigned int lo = min(ctx->user_min_qp, ctx->user_max_qp);
++	unsigned int hi = max(ctx->user_min_qp, ctx->user_max_qp);
++	unsigned int target = target_bits;
++	unsigned int fps = max_t(unsigned int, ctx->fps_num / ctx->fps_den,
++				 1);
++	unsigned int step = 1;
++	unsigned int depth = fps;
++	unsigned int act = histb_venc_v5_pic_bits(ctx->enc);
++	s64 limit;
++
++	/* Equal bounds are the fixed-quantiser mode, with no loop at all. */
++	if (lo >= hi)
++		return;
++	/* Constant quality took its quantiser from the client, not from bits. */
++	if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CQ)
++		return;
++	if (!target)
++		target = 1;
++	/*
++	 * VBR lets the rate swing: a deeper credit bank and larger quantiser
++	 * moves let one picture borrow from its neighbours, which is the point
++	 * of the mode. CBR keeps one step per picture.
++	 */
++	if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR) {
++		step = 3;
++		depth = fps * 2;
++	}
++	limit = (s64)target * depth;
++
++	ctx->rc_credit += (s64)target - act;
++	ctx->rc_credit = clamp_t(s64, ctx->rc_credit, -limit, limit);
++	if (ctx->rc_credit > (s64)target) {
++		ctx->rc_qp = ctx->rc_qp > lo + step ? ctx->rc_qp - step : lo;
++		ctx->rc_credit -= (s64)target;
++	} else if (ctx->rc_credit < -(s64)target) {
++		ctx->rc_qp = ctx->rc_qp + step < hi ? ctx->rc_qp + step : hi;
++		ctx->rc_credit += (s64)target;
++	}
++	ctx->rc_qp = clamp_t(unsigned int, ctx->rc_qp, lo, hi);
++	dev_dbg(ctx->enc->dev, "rc: act %u target %u credit %lld qp %u\n",
++		act, target, ctx->rc_credit, ctx->rc_qp);
++}
++
++static void histb_venc_v5_device_run(void *priv)
++{
++	struct histb_venc_v5_ctx *ctx = priv;
++	struct histb_venc_v5 *enc = histb_venc_v5_of_ctx(ctx);
++	struct vb2_v4l2_buffer *src, *dst;
++	struct histb_venc_v5_frame *frame = &ctx->frame;
++	struct histb_venc_v5_slice slice = { };
++	struct dma_buf *dbuf;
++	u8 *coded;
++	size_t bytes;
++	size_t head;
++	int ret;
++	bool pm = false;
++
++	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
++	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	if (!src || !dst)
++		return;
++
++	if (READ_ONCE(enc->removing)) {
++		v4l2_m2m_buf_done_and_job_finish(enc->m2m, ctx->fh.m2m_ctx,
++						 VB2_BUF_STATE_ERROR);
++		return;
++	}
++
++	ret = pm_runtime_resume_and_get(enc->dev);
++	if (ret) {
++		dev_dbg(enc->dev, "runtime resume failed: %d\n", ret);
++		goto failed;
++	}
++	pm = true;
++
++	histb_venc_v5_fill_frame(ctx, src, frame);
++	frame->recon_index = ctx->sequence % V500_RECON_BUFFERS;
++	enc->protocol = frame->protocol;
++
++	/*
++	 * The Baseline profile declares no context-adaptive coder, so a picture
++	 * told to be both names no syntax. Hand the job back with the reason in
++	 * the log instead of coding a stream no decoder is asked to accept.
++	 */
++	if (frame->profile == V500_H264_PROFILE_BASELINE && frame->cabac) {
++		dev_err(enc->dev, "baseline names no cabac, picture refused\n");
++		v4l2_m2m_buf_done_and_job_finish(enc->m2m, ctx->fh.m2m_ctx,
++						 VB2_BUF_STATE_ERROR);
++		pm_runtime_put(enc->dev);
++		return;
++	}
++
++	ret = histb_venc_v5_parameter_sets(frame, enc->param.va,
++						 enc->param.size, frame->param_reg);
++	if (ret) {
++		dev_err(enc->dev, "parameter sets refused (%d)\n", ret);
++		goto failed;
++	}
++
++	/*
++	 * The ring's two pointers are the core's to advance; both start at
++	 * the beginning of the space it was given for this picture.
++	 */
++	((__le32 *)enc->stream.va)[V500_POINT_READ / 4] = 0;
++	((__le32 *)enc->stream.va)[V500_POINT_WRITE / 4] = 0;
++
++	histb_venc_v5_slice_header(frame, &slice);
++
++	histb_venc_v5_image_pack(enc, frame, &slice);
++
++	mutex_lock(&enc->lock);
++	reinit_completion(&enc->done);
++	histb_venc_v5_launch(enc, frame);
++	if (!wait_for_completion_timeout(&enc->done, V500_TIMEOUT)) {
++		mutex_unlock(&enc->lock);
++		dev_err(enc->dev, "picture did not finish, status %#x\n",
++			histb_venc_v5_status(enc));
++		goto failed;
++	}
++	mutex_unlock(&enc->lock);
++
++	if (enc->status & (V500_STATUS_TIMEOUT | V500_STATUS_BUF_FULL |
++			   V500_STATUS_PBIT_OVERFLOW)) {
++		dev_err(enc->dev, "picture ended on status %#x\n", enc->status);
++		goto failed;
++	}
++
++	/* Any other report but the end of the picture is an unfinished block. */
++	if (!(enc->status & V500_STATUS_PIC)) {
++		dev_err(enc->dev, "no end of picture, status %#x\n",
++			enc->status);
++		goto failed;
++	}
++
++	coded = vb2_plane_vaddr(&dst->vb2_buf, 0);
++	if (!coded) {
++		dev_err(enc->dev, "capture plane has no kernel mapping\n");
++		goto failed;
++	}
++
++	/* The coded bytes are written through the CPU, not the core. */
++	dbuf = dst->vb2_buf.planes[0].dbuf;
++	if (dbuf)
++		dma_buf_begin_cpu_access(dbuf, DMA_TO_DEVICE);
++
++	head = 0;
++	if (frame->intra && frame->param_size + V500_PARAM_HEADROOM <=
++		    vb2_plane_size(&dst->vb2_buf, 0)) {
++		memcpy(coded, enc->param.va, frame->param_size);
++		head = frame->param_size;
++	}
++	bytes = histb_venc_v5_drain(enc, frame, coded + head,
++				  vb2_plane_size(&dst->vb2_buf, 0) - head);
++	if (IS_ERR_VALUE(bytes)) {
++		if (dbuf)
++			dma_buf_end_cpu_access(dbuf, DMA_TO_DEVICE);
++		dev_err(enc->dev, "no coded bytes: %zd\n", bytes);
++		goto failed;
++	}
++	bytes += head;
++
++	if (dbuf)
++		dma_buf_end_cpu_access(dbuf, DMA_TO_DEVICE);
++
++	v4l2_m2m_buf_copy_metadata(src, dst);
++	dst->sequence = ctx->sequence;
++	dst->flags |= frame->intra ? V4L2_BUF_FLAG_KEYFRAME :
++		V4L2_BUF_FLAG_PFRAME;
++	/* The picture the drain was waiting for carries the end marker. */
++	if (v4l2_m2m_is_last_draining_src_buf(ctx->fh.m2m_ctx, src)) {
++		dst->flags |= V4L2_BUF_FLAG_LAST;
++		v4l2_event_queue_fh(&ctx->fh, &histb_venc_v5_eos_event);
++		v4l2_m2m_mark_stopped(ctx->fh.m2m_ctx);
++	}
++	vb2_set_plane_payload(&dst->vb2_buf, 0, bytes);
++	ctx->gop_bits += (u64)histb_venc_v5_pic_bits(enc);
++	histb_venc_v5_rate_update(ctx, frame->target_bits);
++	/*
++	 * The group's position and the picture count move on only once the
++	 * picture is handed over, so a job that failed is retried against the
++	 * same reference and inside the same group slot, the way the v2 driver
++	 * rolls its counters back when it drops a frame.
++	 */
++	ctx->gop_left = frame->intra ? ctx->gop - 1 : ctx->gop_left - 1;
++	ctx->sequence++;
++	v4l2_m2m_buf_done_and_job_finish(enc->m2m, ctx->fh.m2m_ctx,
++					 VB2_BUF_STATE_DONE);
++	if (pm)
++		pm_runtime_put(enc->dev);
++
++	return;
++
++failed:
++	if (pm)
++		histb_venc_v5_stop_core(enc);
++	v4l2_m2m_buf_done_and_job_finish(enc->m2m, ctx->fh.m2m_ctx,
++					 VB2_BUF_STATE_ERROR);
++	if (pm)
++		pm_runtime_put(enc->dev);
++}
++
++/*
++ * device_run is synchronous: it keeps both buffers on the ready
++ * lists until it finishes, so STREAMOFF and close only wait for
++ * the frame already in flight instead of completing it from a
++ * second thread.
++ */
++static const struct v4l2_m2m_ops histb_venc_v5_m2m_ops = {
++	.device_run	= histb_venc_v5_device_run,
++};
++
++static irqreturn_t histb_venc_v5_irq(int irq, void *dev_id)
++{
++	struct histb_venc_v5 *enc = dev_id;
++	unsigned int status = histb_venc_v5_status(enc);
++
++	/*
++	 * The line is level-high and the enable word the vendor uses unmasks one
++	 * source this driver does not name, so any report but an empty status is
++	 * cleared and wakes the waiting job: an undecoded bit left on the line
++	 * would keep re-firing until the kernel switched the interrupt off. What
++	 * a report without the picture-end bit means is decided by the job.
++	 */
++	if (!status)
++		return IRQ_NONE;
++
++	writel(V500_INT_CLEAR_ALL, enc->base + V500_INT_CLEAR);
++	enc->status = status;
++	complete(&enc->done);
++
++	return IRQ_HANDLED;
++}
++
++/* ------------------------------------------------------------- ioctls */
++
++static int histb_venc_v5_g_parm(struct file *file, void *fh,
++			      struct v4l2_streamparm *p)
++{
++	struct histb_venc_v5_ctx *ctx = file_to_ctx(file);
++
++	if (p->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    p->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
++		return -EINVAL;
++
++	p->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
++	p->parm.capture.timeperframe.numerator = ctx->fps_den;
++	p->parm.capture.timeperframe.denominator = ctx->fps_num;
++
++	return 0;
++}
++
++static int histb_venc_v5_s_parm(struct file *file, void *fh,
++			      struct v4l2_streamparm *p)
++{
++	struct histb_venc_v5_ctx *ctx = file_to_ctx(file);
++	struct v4l2_fract *t;
++
++	if (p->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    p->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
++		return -EINVAL;
++
++	t = &p->parm.capture.timeperframe;
++	if (!t->numerator || !t->denominator ||
++	    t->denominator / t->numerator < 1 ||
++	    t->denominator / t->numerator > 120)
++		return -EINVAL;
++
++	ctx->fps_num = t->denominator;
++	ctx->fps_den = t->numerator;
++	p->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
++
++	return 0;
++}
++
++static int histb_venc_v5_encoder_cmd(struct file *file, void *priv,
++				   struct v4l2_encoder_cmd *cmd)
++{
++	struct histb_venc_v5_ctx *ctx = file_to_ctx(file);
++	int ret;
++
++	/*
++	 * The mem2m core owns the drain state: STOP records the last output
++	 * buffer, or - when none is queued - asks for the next capture buffer to
++	 * be the end marker, and START clears the stopped state so the same
++	 * stream runs on. The picture that carries the marker is tagged where it
++	 * completes, and the queue that is left empty afterwards is answered in
++	 * the capture buffer's own queue callback.
++	 */
++	ret = v4l2_m2m_encoder_cmd(file, ctx->fh.m2m_ctx, cmd);
++	/*
++	 * A drain with nothing left to code is finished by the core inside this
++	 * call, marker buffer and all, so the end of stream has to be said here:
++	 * a session that codes no further picture would never reach the
++	 * completion path that announces it.
++	 */
++	if (!ret && cmd->cmd == V4L2_ENC_CMD_STOP &&
++	    v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
++		v4l2_event_queue_fh(&ctx->fh, &histb_venc_v5_eos_event);
++
++	return ret;
++}
++
++static const struct v4l2_ioctl_ops histb_venc_v5_ioctl_ops = {
++
++	.vidioc_querycap = histb_venc_v5_querycap,
++	.vidioc_enum_framesizes = histb_venc_v5_enum_framesizes,
++	.vidioc_enum_fmt_vid_cap = histb_venc_v5_enum_fmt,
++	.vidioc_enum_fmt_vid_out = histb_venc_v5_enum_fmt,
++	.vidioc_g_fmt_vid_cap_mplane = histb_venc_v5_g_fmt,
++	.vidioc_g_fmt_vid_out_mplane = histb_venc_v5_g_fmt,
++	.vidioc_try_fmt_vid_cap_mplane = histb_venc_v5_try_fmt_vidioc,
++	.vidioc_try_fmt_vid_out_mplane = histb_venc_v5_try_fmt_vidioc,
++	.vidioc_s_fmt_vid_cap_mplane = histb_venc_v5_s_fmt,
++	.vidioc_s_fmt_vid_out_mplane = histb_venc_v5_s_fmt,
++	.vidioc_g_selection = histb_venc_v5_g_selection,
++	.vidioc_s_selection = histb_venc_v5_s_selection,
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++	.vidioc_encoder_cmd = histb_venc_v5_encoder_cmd,
++	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
++	.vidioc_g_parm = histb_venc_v5_g_parm,
++	.vidioc_s_parm = histb_venc_v5_s_parm,
++	.vidioc_subscribe_event = histb_venc_v5_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++static int histb_venc_v5_open(struct file *filp)
++{
++	struct histb_venc_v5 *enc = video_drvdata(filp);
++	struct histb_venc_v5_ctx *ctx;
++	int ret;
++
++	ctx = kzalloc_obj(*ctx);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->enc = enc;
++	ctx->frame.start_qp = 28;
++	ctx->frame.min_qp = 16;
++	ctx->frame.max_qp = 48;
++	ctx->bitrate = 4000000;
++	ctx->bitrate_mode = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
++	ctx->profile = V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE;
++	ctx->cabac = false;
++	ctx->qp_i = 28;
++	ctx->qp_p = 28;
++	ctx->hevc_profile = V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN;
++	ctx->hevc_level = V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1;
++	ctx->fps_num = 30;
++	ctx->fps_den = 1;
++	ctx->rc_qp = 28;
++	ctx->user_min_qp = 2;
++	ctx->user_max_qp = 51;
++	ctx->gop = 30;
++
++	v4l2_fh_init(&ctx->fh, video_devdata(filp));
++
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(enc->m2m, ctx,
++					    histb_venc_v5_queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		goto err_free;
++	}
++
++	ctx->fmt[V500_FMT_OUTPUT].type =
++		V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	ctx->fmt[V500_FMT_OUTPUT].fmt.pix_mp.pixelformat =
++		V4L2_PIX_FMT_NV12M;
++	ctx->fmt[V500_FMT_CAPTURE].type =
++		V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	histb_venc_v5_try_fmt(ctx, &ctx->fmt[V500_FMT_OUTPUT]);
++	histb_venc_v5_try_fmt(ctx, &ctx->fmt[V500_FMT_CAPTURE]);
++	ctx->src_w = ctx->fmt[V500_FMT_OUTPUT].fmt.pix_mp.width;
++	ctx->src_h = ctx->fmt[V500_FMT_OUTPUT].fmt.pix_mp.height;
++	histb_venc_v5_apply_geometry(ctx);
++
++	ret = histb_venc_v5_init_ctrls(ctx);
++	if (ret)
++		goto err_m2m;
++
++	v4l2_fh_add(&ctx->fh, filp);
++	atomic_inc(&enc->open_count);
++
++	return 0;
++
++err_m2m:
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++err_free:
++	v4l2_fh_exit(&ctx->fh);
++	kfree(ctx);
++	return ret;
++}
++
++static int histb_venc_v5_release(struct file *filp)
++{
++	struct histb_venc_v5_ctx *ctx = file_to_ctx(filp);
++	struct histb_venc_v5 *enc = ctx->enc;
++
++	v4l2_fh_del(&ctx->fh, filp);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
++	v4l2_fh_exit(&ctx->fh);
++	kfree(ctx);
++
++	mutex_lock(&enc->lock);
++	if (enc->ctx == ctx)
++		enc->ctx = NULL;
++	mutex_unlock(&enc->lock);
++
++	if (atomic_dec_and_test(&enc->open_count))
++		wake_up_all(&enc->open_wq);
++
++	return 0;
++}
++
++static const struct v4l2_file_operations histb_venc_v5_fops = {
++	.owner		= THIS_MODULE,
++	.open		= histb_venc_v5_open,
++	.release	= histb_venc_v5_release,
++	.poll		= v4l2_m2m_fop_poll,
++	.unlocked_ioctl	= video_ioctl2,
++	.mmap		= v4l2_m2m_fop_mmap,
++};
++
++/* --------------------------------------------------------- registration */
++
++void histb_venc_v5_v4l2_exit(struct histb_venc_v5 *enc)
++{
++	enc->removing = true;
++	video_unregister_device(&enc->vfd);
++	/*
++	 * An open file handle still owns driver state, and its release
++	 * needs the mem2mem context. Let the handles drain before the
++	 * memory they use is given back.
++	 */
++	if (!wait_event_timeout(enc->open_wq,
++				atomic_read(&enc->open_count) == 0,
++				msecs_to_jiffies(10000)))
++		dev_warn(enc->dev, "%d file handles still open at remove\n",
++			 atomic_read(&enc->open_count));
++	v4l2_m2m_suspend(enc->m2m);
++	disable_irq(enc->irq);
++	v4l2_m2m_unregister_media_controller(enc->m2m);
++	v4l2_m2m_release(enc->m2m);
++	v4l2_device_unregister(&enc->v4l2);
++	media_device_cleanup(&enc->mdev);
++}
++
++int histb_venc_v5_v4l2_init(struct histb_venc_v5 *enc)
++{
++	struct video_device *vfd = &enc->vfd;
++	int ret;
++
++	mutex_init(&enc->vdev_lock);
++	init_completion(&enc->done);
++	atomic_set(&enc->open_count, 0);
++	init_waitqueue_head(&enc->open_wq);
++
++	ret = devm_request_irq(enc->dev, enc->irq, histb_venc_v5_irq, 0,
++			       HISTB_VENC_NAME, enc);
++	if (ret)
++		return dev_err_probe(enc->dev, ret, "failed to get interrupt\n");
++
++	ret = v4l2_device_register(enc->dev, &enc->v4l2);
++	if (ret)
++		return dev_err_probe(enc->dev, ret, "failed to register v4l2 device\n");
++	enc->v4l2.mdev = &enc->mdev;
++
++	strscpy(enc->mdev.driver_name, HISTB_VENC_NAME,
++		sizeof(enc->mdev.driver_name));
++	strscpy(enc->mdev.model, "Hi3798MV200H VEDU", sizeof(enc->mdev.model));
++	snprintf(enc->mdev.bus_info, sizeof(enc->mdev.bus_info),
++		 "platform:%s", dev_name(enc->dev));
++	enc->mdev.dev = enc->dev;
++	media_device_init(&enc->mdev);
++
++	enc->m2m = v4l2_m2m_init(&histb_venc_v5_m2m_ops);
++	if (IS_ERR(enc->m2m)) {
++		ret = PTR_ERR(enc->m2m);
++		goto err_v4l2;
++	}
++
++	vfd->v4l2_dev = &enc->v4l2;
++	vfd->fops = &histb_venc_v5_fops;
++	vfd->ioctl_ops = &histb_venc_v5_ioctl_ops;
++	vfd->lock = &enc->vdev_lock;
++	vfd->release = video_device_release_empty;
++	vfd->vfl_dir = VFL_DIR_M2M;
++	vfd->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
++	strscpy(vfd->name, HISTB_VENC_NAME, sizeof(vfd->name));
++	video_set_drvdata(vfd, enc);
++
++	ret = video_register_device(vfd, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		goto err_m2m;
++
++	ret = v4l2_m2m_register_media_controller(enc->m2m, vfd,
++		MEDIA_ENT_F_PROC_VIDEO_ENCODER);
++	if (ret)
++		goto err_vdev;
++
++	ret = media_device_register(&enc->mdev);
++	if (ret)
++		goto err_mc;
++
++	dev_info(enc->dev, "video encoder, Hi3798MV200H VEDU\n");
++
++	return 0;
++
++err_mc:
++	v4l2_m2m_unregister_media_controller(enc->m2m);
++err_vdev:
++	video_unregister_device(vfd);
++err_m2m:
++	v4l2_m2m_release(enc->m2m);
++err_v4l2:
++	v4l2_device_unregister(&enc->v4l2);
++	media_device_cleanup(&enc->mdev);
++	return ret;
++}

@@ -1,0 +1,47 @@
+From 4bd37a5222f30e87156d25c16f7b4b524eeccd22 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 17:43:53 +0800
+Subject: [PATCH 2/4] media: rc: ir-hix5hd2: bind the Hi3716CV200 IR block
+
+The Hi3716CV200 IR receiver has no entry in this driver. Its register
+map and its gate (SYS_CTRL + 0x48, bit 4 enable, bit 5 reset) match the
+hix5hd2 data, and the value its boot leaves in the symbol-width field is
+the one this driver programs.
+
+Bind the compatible to that device data; it needs no extra power-enable
+bit.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/media/rc/ir-hix5hd2.c     | 9 +++++++++
+ drivers/media/rc/keymaps/Makefile | 1 +
+ 2 files changed, 10 insertions(+)
+
+--- a/drivers/media/rc/ir-hix5hd2.c
++++ b/drivers/media/rc/ir-hix5hd2.c
+@@ -243,6 +243,15 @@ static irqreturn_t hix5hd2_ir_rx_interru
+ static const struct of_device_id hix5hd2_ir_table[] = {
+ 	{ .compatible = "hisilicon,hix5hd2-ir", &hix5hd2_data, },
+ 	{ .compatible = "hisilicon,hi3796cv300-ir", &hi3796cv300_data, },
++	/*
++	 * Hi3716CV200 keeps the same register map and the same gate at
++	 * SYS_CTRL (0xf8000000) + 0x48, bit 4 enable / bit 5 reset. Its
++	 * boot leaves IR_CONFIG at 0x3e801f0b, whose bits 16..31 (0x3e80)
++	 * are the symbol-width field this driver programs; the vendor's
++	 * ir_enable() writes 0x1, not 0x101, so no extra power-enable bit
++	 * is needed and the hix5hd2 data is reused as is.
++	 */
++	{ .compatible = "hisilicon,hi3716cv200-ir", &hix5hd2_data, },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, hix5hd2_ir_table);
+--- a/drivers/media/rc/keymaps/Makefile
++++ b/drivers/media/rc/keymaps/Makefile
+@@ -107,6 +107,7 @@ obj-$(CONFIG_RC_MAP) += \
+ 			rc-real-audio-220-32-keys.o \
+ 			rc-reddo.o \
+ 			rc-siemens-gigaset-rc20.o \
++			rc-skyworth-yk.o \
+ 			rc-snapstream-firefly.o \
+ 			rc-streamzap.o \
+ 			rc-su3000.o \

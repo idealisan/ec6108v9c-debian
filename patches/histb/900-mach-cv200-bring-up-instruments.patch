@@ -1,0 +1,51 @@
+From 98152766a1db90e619c08487740a48e2467c67cd Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 00:17:21 +0800
+Subject: [PATCH] mach: cv200 bring-up instruments
+
+kept out of the submitted series on purpose.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ arch/arm/mach-hisi/Kconfig   | 11 +++++++++++
+ arch/arm/mach-hisi/Makefile  |  1 +
+ arch/arm/mach-hisi/platsmp.c |  1 +
+ 3 files changed, 13 insertions(+)
+
+--- a/arch/arm/mach-hisi/Kconfig
++++ b/arch/arm/mach-hisi/Kconfig
+@@ -65,6 +65,17 @@ config ARCH_HI3716CV200
+ 	  written and never counts, and the per-CPU clock events come from the
+ 	  SP804 channels instead.
+ 
++config HISTB_CV200_PMUDUMP
++	bool "Hi3716CV200 CPU PMU debugfs dump (bench only)"
++	depends on DEBUG_FS
++	help
++	  Dumps the ARMv7 PMU CP15 registers of every online CPU, plus a
++	  PMCCNTR delta measured over a short loop with interrupts off, and
++	  lets a mask be ORed into the Cortex-A9 auxiliary control register.
++
++	  Say N unless bring-up needs to see why the counters read zero; this
++	  is a test instrument and is not part of the port.
++
+ config ARCH_SD5203
+ 	bool "Hisilicon SD5203 family"
+ 	depends on ARCH_MULTI_V5
+--- a/arch/arm/mach-hisi/Makefile
++++ b/arch/arm/mach-hisi/Makefile
+@@ -8,3 +8,4 @@ CFLAGS_platmcpm.o	:= -march=armv7-a
+ obj-y	+= hisilicon.o
+ obj-$(CONFIG_MCPM)		+= platmcpm.o
+ obj-$(CONFIG_SMP)		+= platsmp.o hotplug.o
++obj-$(CONFIG_HISTB_CV200_PMUDUMP) += cv200-pmudump.o
+--- a/arch/arm/mach-hisi/platsmp.c
++++ b/arch/arm/mach-hisi/platsmp.c
+@@ -275,6 +275,7 @@ static void hi3798_smp_prepare_cpus(unsi
+ 	asm ("mrc p15, 1, %0, c9, c0, 2\n" : "=r" (l2ctlr));
+ 	ncores = ((l2ctlr >> 24) & 0x3) + 1;
+ 
++	pr_info("smp: %u cores detected\n", ncores);
+ 	if (ncores > max_cpus) {
+ 		pr_warn("smp: %u cores greater than maximum (%u), clipping\n",
+ 			ncores, max_cpus);

@@ -1,0 +1,60 @@
+From ee1c8407d410b7ef84006fdc6dd3a5f89acfaeb2 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sun, 25 Oct 2026 20:55:06 +0800
+Subject: [PATCH 3/5] watchdog: sp805: arm the counter from a block that can
+ still count
+
+wdt_config() wrote WDTLOAD, then WDTINTCLR, then WDTCONTROL when not
+pinging, and finished with WDTLOCK; on this integration that leaves the
+dog armed but stopped.
+
+The counter only advances while the block is unlocked and INT_ENABLE is
+set, and writing WDTLOCK right after a LOAD freezes WDTVALUE where it
+stands, which is what every feed path including the core's keepalive
+did; a locked arm is not a safety net.
+
+Clear the interrupt first, enable interrupt and reset, then load the
+counter, and leave the block unlocked; the UNLOCK write stays at the
+front because without it no write lands, and wdt_disable still locks so
+a stopped dog is not reprogrammable.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/watchdog/sp805_wdt.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+--- a/drivers/watchdog/sp805_wdt.c
++++ b/drivers/watchdog/sp805_wdt.c
+@@ -173,18 +173,29 @@ static int wdt_config(struct watchdog_de
+ 
+ 	spin_lock(&wdt->lock);
+ 
++	/*
++	 * The counter only reloads, and only advances, while the block is
++	 * unlocked, and it only advances with INT_ENABLE set: writing WDTLOCK
++	 * right after WDTLOAD freezes WDTVALUE where it stands, which is what
++	 * the previous order did on every framework keepalive.  A locked dog
++	 * cannot count, so a locked arm is not a safety net at all.
++	 *
++	 * So: clear the interrupt first, enable, then load the counter, and
++	 * leave the block unlocked.  The UNLOCK write stays -- without it no
++	 * write lands at all.  wdt_disable still locks, because a stopped dog
++	 * should not be reprogrammable.
++	 */
+ 	writel_relaxed(UNLOCK, wdt->base + WDTLOCK);
+-	writel_relaxed(wdt->load_val, wdt->base + WDTLOAD);
+ 	writel_relaxed(INT_MASK, wdt->base + WDTINTCLR);
+ 
+ 	if (!ping)
+ 		writel_relaxed(INT_ENABLE | RESET_ENABLE, wdt->base +
+ 				WDTCONTROL);
+ 
+-	writel_relaxed(LOCK, wdt->base + WDTLOCK);
++	writel_relaxed(wdt->load_val, wdt->base + WDTLOAD);
+ 
+ 	/* Flush posted writes. */
+-	readl_relaxed(wdt->base + WDTLOCK);
++	readl_relaxed(wdt->base + WDTLOAD);
+ 	spin_unlock(&wdt->lock);
+ 
+ 	return 0;

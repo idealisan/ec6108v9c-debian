@@ -1,0 +1,809 @@
+From 35525654e8a3c43f6e49ad0562aa2025c38e5e81 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 00:17:21 +0800
+Subject: [PATCH] media: histb-vdec bring-up bench
+
+Restore the bring-up bench for the decoder block on top of the submitted
+series: the debugfs pool window, the forced-VP8 lever and the live A/B
+parameters whose board question is still open.
+
+For the HEVC arm the settled bits are already folded into the submitted
+code and stay folded here: BIT(9) (PRC_CACHE_TYPE=2 as the vendor
+writes), BIT(10) (the HEVC timeout constant), BIT(15) (the CTB-grid pad
+behind the single-CTB-row refusal), BIT(16)/BIT(17) (the tile acceptance
+probe the E16 board question needs). For MPEG-2: BIT(0) (MPEG-1 sequence
+reading), BIT(3)/BIT(4)/BIT(6) (the SCD select-reset pulse, SCD_EMAR_ID
+bit16 and the wider interrupt mask, all still differing from the vendor
+firmware), and BIT(7)..BIT(11).
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../platform/hisilicon/histb-vdec/Makefile    |   3 +
+ .../hisilicon/histb-vdec/histb_vdec_core.c    |   4 +-
+ .../hisilicon/histb-vdec/histb_vdec_v2.h      |  26 ++-
+ .../hisilicon/histb-vdec/histb_vdec_v2_drv.c  |  26 ++-
+ .../hisilicon/histb-vdec/histb_vdec_v2_h264.c |  22 +-
+ .../hisilicon/histb-vdec/histb_vdec_v2_hevc.c | 200 +++++++++++++++---
+ .../hisilicon/histb-vdec/histb_vdec_v2_hw.c   |  62 ++++++
+ .../histb-vdec/histb_vdec_v2_mpeg2.c          |  38 +++-
+ .../histb-vdec/histb_vdec_v2_mpeg4.c          |   6 +-
+ .../hisilicon/histb-vdec/histb_vdec_v2_regs.h |  10 +-
+ .../hisilicon/histb-vdec/histb_vdec_v5.h      |   7 +
+ .../hisilicon/histb-vdec/histb_vdec_v5_drv.c  |  14 +-
+ .../hisilicon/histb-vdec/histb_vdec_v5_h264.c |   3 +-
+ 13 files changed, 351 insertions(+), 70 deletions(-)
+
+--- a/drivers/media/platform/hisilicon/histb-vdec/Makefile
++++ b/drivers/media/platform/hisilicon/histb-vdec/Makefile
+@@ -4,12 +4,15 @@ obj-$(CONFIG_VIDEO_HISTB_VDEC) += histb-
+ histb-vdec-y += histb_vdec_core.o
+ histb-vdec-y += histb_vdec_v2_drv.o
+ histb-vdec-y += histb_vdec_v2_hw.o
++histb-vdec-y += histb_vdec_v2_debug.o
+ histb-vdec-y += histb_vdec_v2_h264.o
+ histb-vdec-y += histb_vdec_v2_hevc.o
+ histb-vdec-y += histb_vdec_v2_mpeg2.o
+ histb-vdec-y += histb_vdec_v2_mpeg4.o
++histb-vdec-y += histb_vdec_v2_vp8.o
+ histb-vdec-y += histb_vdec_v5_drv.o
+ histb-vdec-y += histb_vdec_v5_hw.o
++histb-vdec-y += histb_vdec_v5_probe.o
+ histb-vdec-y += histb_vdec_v5_core.o
+ histb-vdec-y += histb_vdec_v5_h264.o
+ histb-vdec-y += histb_vdec_v5_hevc.o
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.c
+@@ -554,8 +554,8 @@ static int histb_vdec_queue_init(void *p
+ 	src_vq->ops = &histb_vdec_queue_ops;
+ 	src_vq->mem_ops = &vb2_dma_contig_memops;
+ 	/*
+-	 * The driver reads the bitstream in the kernel (slice delimitation and
+-	 * header parsing), so the plane must keep a kernel mapping;
++	 * The driver reads the bitstream in the kernel (slice delimitation, the
++	 * VP8 bool-decoder seed), so the plane must keep a kernel mapping;
+ 	 * DMA_ATTR_NO_KERNEL_MAPPING would leave vb2_plane_vaddr() NULL.
+ 	 */
+ 	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2.h
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2.h
+@@ -29,6 +29,7 @@
+ #include "histb_vdec_core.h"
+ #include "histb_vdec_v2_regs.h"
+ 
++struct dentry;
+ struct regmap;
+ 
+ #define HISTB_VDEC_NAME			"histb-vdec"
+@@ -133,11 +134,12 @@ static inline unsigned int histb_vdec_he
+ 
+ /*
+  * Frame-buffer geometry of the 1D (tiled) write path, measured on the board
+- * and matched to the geometry the firmware programs for H.264. The VDM writes
+- * tiles of 256 bytes by 16 picture rows: inside a band the line pitch is the
+- * tile width, VDM_YSTRIDE_1D carries the pitch *between* bands, and the chroma
+- * tiles start behind the whole luma band array plus a per-picture 1D area. The
+- * band count rounds up to an even number because field coding reserves a pair.
++ * with the all-I_PCM probe and matched to the geometry the vendor firmware
++ * programs for H.264. The VDM writes tiles of 256 bytes by 16 picture rows:
++ * inside a band the line pitch is the tile width, VDM_YSTRIDE_1D carries the
++ * pitch *between* bands, and the chroma tiles start behind the whole luma band
++ * array plus a per-picture 1D area. The band count rounds up to an even number
++ * because field coding always reserves a pair.
+  */
+ static inline unsigned int histb_vdec_band_bytes(unsigned int tile_stride)
+ {
+@@ -234,6 +236,8 @@ struct histb_vdec_dev {
+ 	struct histb_vdec_msgpool pool;
+ 	bool			job_running;
+ 
++	/* debugfs bring-up window, see histb_vdec_debug.c */
++	struct dentry		*dbgfs;
+ 	struct regmap		*crg;
+ };
+ 
+@@ -300,6 +304,7 @@ typedef struct histb_vdec_chip histb_vde
+ extern const histb_vdec_fmt_desc histb_vdec_h264_fmt;
+ extern const histb_vdec_fmt_desc histb_vdec_hevc_fmt;
+ extern const histb_vdec_fmt_desc histb_vdec_mpeg2_fmt;
++extern const histb_vdec_fmt_desc histb_vdec_vp8_fmt;
+ extern const histb_vdec_fmt_desc histb_vdec_mpeg4_fmt;
+ extern const histb_vdec_fmt_desc histb_vdec_h263_fmt;
+ 
+@@ -326,6 +331,14 @@ void histb_vdec_hw_kick(struct histb_vde
+ 			enum histb_vdec_vidstd std);
+ /* Program the constant tables once at probe. */
+ void histb_vdec_hw_init_tables(struct histb_vdec_dev *dev);
++/* debugfs bring-up counters over the table area, see histb_vdec_debug.c. */
++unsigned int histb_vdec_hw_check_tables(const struct histb_vdec_dev *dev,
++					unsigned int *first_bad);
++unsigned int histb_vdec_hw_scratch_usage(const struct histb_vdec_dev *dev,
++					 unsigned int idx, unsigned int *first);
++
++/* debug.c: register and message-pool dump window for bring-up measurements. */
++void histb_vdec_debugfs_init(struct histb_vdec_dev *dev);
+ 
+ static inline void vdm_write(struct histb_vdec_dev *dev, unsigned int reg,
+ 			     u32 val)
+@@ -411,4 +424,7 @@ static inline u32 histb_vdec_trail_zero_
+ #define HISTB_TABLE_OFF_SCRATCH(i)	(HISTB_TABLE_OFF_SCRATCH_BASE + \
+ 					 (i) * HISTB_VDEC_SCRATCH_SIZE)
+ 
++/* Bytes of each scratch block the debugfs usage probe inspects. */
++#define HISTB_VDEC_SCRATCH_PROBE	(16 * 1024)
++
+ #endif /* HISTB_VDEC_H */
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_drv.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_drv.c
+@@ -69,15 +69,27 @@ static const histb_vdec_fmt_desc *const
+ 	&histb_vdec_mpeg2_fmt,
+ 	&histb_vdec_mpeg4_fmt,
+ 	&histb_vdec_h263_fmt,
++	/*
++	 * VP8 is implemented (histb_vdec_vp8.c) but deliberately not
++	 * registered: the VDM seeds its macroblock-layer bool decoder from a
++	 * live 24-bit residue plus a count that depends on the symbol history
++	 * (measured on the board: with both injected, the reference frame
++	 * reproduces fully), and struct v4l2_vp8_entropy_coder_state carries
++	 * only 8 bits of value, so no driver can compute the seed from the
++	 * control. Doing it properly needs that control to carry the full live
++	 * coder value and the count its header parse stops at.
++	 */
+ };
+ 
+ /*
+- * Hi3716CV200 runs an older VDH generation than Hi3798MV100. Its register
+- * offsets and every message block this driver programs are the same, but HEVC
+- * is missing outright: that generation has no HEVC header at all, its report
+- * word keeps the two CTB-size bits reserved, and the chip's own capability
+- * list is the Hi3798MV100 list without HEVC. So this list is the one above
+- * minus HEVC, and the first entry stays the default fourcc for both.
++ * Hi3716CV200 runs an older VDH generation (the vendor build selects
++ * VDH_DIR := HiVDHV200R004 for it, against HiVDHV300R001 for
++ * Hi3798MV100). Its register offsets and every message block this driver
++ * programs are the same, but HEVC is missing outright: that generation has no
++ * HEVC header at all, its report word keeps the two CTB-size bits reserved, and
++ * the chip's own capability list (the vendor's SupportedStd
++ * block) is the Hi3798MV100 list without VFMW_HEVC. So this list is the one
++ * above minus HEVC, and the first entry stays the default fourcc for both.
+  */
+ static const histb_vdec_fmt_desc *const histb_vdec_fmt_list_cv200[] = {
+ 	&histb_vdec_h264_fmt,
+@@ -936,6 +948,7 @@ int histb_vdec_v2_probe(struct platform_
+ 	if (ret)
+ 		goto err_assert_reset;
+ 
++	histb_vdec_debugfs_init(dev);
+ 
+ 	dev_info(&pdev->dev, "video decoder, %s\n", dev->chip->model);
+ 	pm_runtime_put_autosuspend(&pdev->dev);
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_h264.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_h264.c
+@@ -402,10 +402,11 @@ static void histb_h264_pack_declist(u32
+  *
+  * Board-measured, and the reason this stays shaped like the firmware's rather
+  * than like the uAPI: with the key switched between bare apc (word D36 reads
+- * 0x00000020 for tx_m2) and 2 * apc + field (0x00008400) - both forms read
+- * back from the live message - the decoded pixels do not move at all, four
+- * frames each. The engine indexes references through the 5-bit list slots the
+- * macroblock layer carries, not through this map.
++ * 0x00000020 for tx_m2) and 2 * apc + field (0x00008400) - both confirmed in
++ * the debugfs pool readback of the live message - the decoded pixels do not
++ * move at all, in the same boot, four forms each (measure c91). The engine
++ * indexes references through the 5-bit list slots the macroblock layer carries,
++ * not through this map.
+  */
+ static void histb_h264_pack_apc_ref_idx(u32 *slot,
+ 					const struct v4l2_h264_reference *list,
+@@ -850,10 +851,11 @@ static void histb_h264_program_regs(stru
+ 	 * The 1D path writes 256x16-byte tiles, so the stride it is given is
+ 	 * the pitch of a whole 16-row band, not of a picture line: the firmware
+ 	 * puts its decoded-picture stride there and computes the chroma offset
+-	 * as two bands' worth of that stride plus the 1D area. Measured on the
+-	 * board: with the picture-line stride here, band b+1 landed exactly on
+-	 * band b's rows 3..15, so only the first three lines of every 16-row
+-	 * band survived and the frame looked "truncated at 8-20%".
++	 * as two bands' worth of that stride plus the 1D area. Measured on c24
++	 * with the all-I_PCM probe: with the picture-line stride here, band b+1
++	 * landed exactly on band b's rows 3..15, so only the first three lines
++	 * of every 16-row band survived and the frame looked "truncated at
++	 * 8-20%".
+ 	 */
+ 	vdm_write(dev, VDM_YSTRIDE_1D, histb_vdec_band_bytes(run->tile_stride));
+ 	vdm_write(dev, VDM_UVOFFSET_1D,
+@@ -1059,8 +1061,8 @@ static void histb_vdec_h264_stop(struct
+ /*
+  * Hand the engine the slice span without its emulation-prevention bytes.
+  *
+- * The VDM decodes the bytes it is given literally: measured with a picture
+- * whose samples contain 00 00 00, the conformant Annex-B form
++ * The VDM decodes the bytes it is given literally: measured with an all-I_PCM
++ * picture whose samples contain 00 00 00 (c30), the conformant Annex-B form
+  * (four 03 bytes inserted in the slice data) lands 31 of 4096 luma lines, while
+  * the same RBSP written without prevention bytes is byte-exact and reports no
+  * error. The uAPI delivers the escaped form for both start-code modes
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_hevc.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_hevc.c
+@@ -34,6 +34,20 @@
+ #include "histb_vdec_v2.h"
+ 
+ /*
++ * On-board A/B instrument for the HEVC shapes still open on the bench:
++ *   BIT(9)  write VDM+0x98 (PRC_CACHE_TYPE) = 2, as the vendor does for HEVC
++ *   BIT(10) use the HEVC timeout constant instead of the one the other codecs
++ *           use, which is what the vendor sets for HEVC
++ *   BIT(15) pad the CTB grid by one row (single-CTB-row bottom-line probe)
++ *   BIT(16) lift the tile refusal and put the raster-scan address into the
++ *           slice words that carry one (D8/D9/D43)
++ *   BIT(17) with BIT(16), also write the slice's own tile address into D6
++ */
++static unsigned int histb_vdec_hevc_ab;
++module_param(histb_vdec_hevc_ab, uint, 0644);
++MODULE_PARM_DESC(histb_vdec_hevc_ab, "HEVC message A/B bits (0 = as derived)");
++
++/*
+  * PMV slot geometry: 32 bytes per 16x16 macroblock row-column, 128-byte
+  * aligned, floored at the 1080p image the vendor reserves even for small
+  * streams. Unlike the H.264 layer the pool is not fixed at the largest
+@@ -456,6 +470,55 @@ static int histb_hevc_pack_weights(u32 *
+ 	return 0;
+ }
+ 
++/*
++ * Tile-scan to raster-scan CTB address of H.265 6.5.1: walk the tile grid in
++ * tile order and index inside each tile in raster order. The vendor keeps such
++ * a map in its CPU-side context and writes the converted value into the slice
++ * message, so the address words of a tiled picture are not in the order the
++ * uAPI's slice_segment_addr uses. The grid comes from the control's
++ * column_width_minus1[]/row_height_minus1[], whose last entries close the
++ * picture; the counts are clamped so the implicit final column and row keep the
++ * array reads in bounds.
++ */
++static u32 histb_hevc_tile_to_raster(const struct v4l2_ctrl_hevc_pps *pps,
++				     unsigned int w_ctbs, unsigned int h_ctbs,
++				     u32 addr)
++{
++	unsigned int cols = min_t(unsigned int,
++				  (unsigned int)pps->num_tile_columns_minus1 + 1,
++				  ARRAY_SIZE(pps->column_width_minus1) + 1);
++	unsigned int rows = min_t(unsigned int,
++				  (unsigned int)pps->num_tile_rows_minus1 + 1,
++				  ARRAY_SIZE(pps->row_height_minus1) + 1);
++	unsigned int y0 = 0, tile_addr = addr, tr, tc;
++
++	for (tr = 0; tr < rows; tr++) {
++		unsigned int rowh = tr + 1 < rows ?
++			(unsigned int)pps->row_height_minus1[tr] + 1 :
++			h_ctbs - y0;
++		unsigned int x0 = 0;
++
++		if (!rowh)
++			return addr;
++		for (tc = 0; tc < cols; tc++) {
++			unsigned int colw = tc + 1 < cols ?
++				(unsigned int)pps->column_width_minus1[tc] + 1 :
++				w_ctbs - x0;
++			unsigned int n = colw * rowh;
++
++			if (!colw)
++				return addr;
++			if (tile_addr < n)
++				return (y0 + tile_addr / colw) * w_ctbs + x0 +
++				       tile_addr % colw;
++			tile_addr -= n;
++			x0 += colw;
++		}
++		y0 += rowh;
++	}
++	return addr;
++}
++
+ static int histb_hevc_assemble_slice(struct histb_vdec_dev *dev,
+ 				     struct histb_vdec_ctx *ctx,
+ 				     struct histb_vdec_hevc_ctx *hevc,
+@@ -473,10 +536,20 @@ static int histb_hevc_assemble_slice(str
+ 	unsigned int count0 = 0, count1 = 0;
+ 	unsigned int end_ctb, i;
+ 	/*
+-	 * Tiles are refused in histb_vdec_hevc_run, so every picture reaching
+-	 * here is untiled and the tile-scan and raster-scan CTB orders coincide.
++	 * Under tiles_enabled the vendor does not put the uAPI's tile-scan
++	 * address into the raster-domain words: its HAL writes the
++	 * tile-scan-to-raster converted value into D8/D9/D43 and the raw
++	 * tile-scan address into D10/D44. BIT(16) makes this driver follow that
++	 * split; without it, or without tiles, the two orders coincide and the
++	 * default path is untouched.
+ 	 */
++	bool tiled = (pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) &&
++		     (histb_vdec_hevc_ab & BIT(16));
+ 	unsigned int tile_addr = slice->slice_segment_addr;
++	unsigned int raster_addr = tiled ?
++		histb_hevc_tile_to_raster(pps, run->width_ctbs,
++					  run->height_ctbs, tile_addr) :
++		tile_addr;
+ 	bool is_low_delay;
+ 	bool is_b = slice->slice_type == V4L2_HEVC_SLICE_TYPE_B;
+ 	bool is_p = slice->slice_type == V4L2_HEVC_SLICE_TYPE_P;
+@@ -635,8 +708,7 @@ static int histb_hevc_assemble_slice(str
+ 	 * as the other codecs). Leaving it in does not only set the error flag
+ 	 * -- the engine also decodes a few CTB columns from stale band state:
+ 	 * with the untrimmed length r2 reaches 5/12 byte-exact frames, bs1
+-	 * 10/12 and 512x240 0/12, all 12/12 once the trailing bits are
+-	 * trimmed.
++	 * 10/12 and 512x240 0/12, all 12/12 once the trailing bits are trimmed.
+ 	 */
+ 	{
+ 		u32 trail = histb_vdec_trail_zero_bits(run->stream_va,
+@@ -656,7 +728,10 @@ static int histb_hevc_assemble_slice(str
+ 	 * construct for "this slot carries no data" is the one-bit dummy slice
+ 	 * it inserts in front of a chain whose first slice starts mid-picture -
+ 	 * an explicit length of one bit - and that is explicit padding, not an
+-	 * emptied real slice.
++	 * emptied real slice. TODO: program one slice with D2 = 0 and read the
++	 * up-message CTB counter and the timeout counter; if the engine skips
++	 * such a slot and still reports the picture done, this refusal can
++	 * become a clamp.
+ 	 */
+ 	if (!valid_bits)
+ 		return -EINVAL;
+@@ -692,6 +767,17 @@ static int histb_hevc_assemble_slice(str
+ 		  (is_low_delay ? BIT(27) : 0) |
+ 		  ((slice->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT) ?
+ 		   BIT(26) : 0);
++	/*
++	 * The vendor additionally ors a per-slice address into bits 17:0 of
++	 * this word. Which field of its slice-parameter struct that value is
++	 * has not been pinned down, so BIT(17) writes it as an arm of its own
++	 * rather than folding it into the BIT(16) address-domain split.
++	 */
++	if ((histb_vdec_hevc_ab & BIT(17)) &&
++	    (pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) &&
++	    !(slice->flags &
++	      V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT))
++		slot[6] |= tile_addr & GENMASK(17, 0);
+ 	slot[7] = histb_hevc_slice_type_code(slice->slice_type) |
+ 		  (count0 << 2) | (count1 << 8) |
+ 		  ((slice->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_MVD_L1_ZERO) ?
+@@ -718,14 +804,13 @@ static int histb_hevc_assemble_slice(str
+ 		slot[23] = lower_32_bits(hevc->pmv_dma[col_pmv]);
+ 	}
+ 
+-	/* D8/D9 carry the slice's start CTB in raster order and the
+-	 * coordinates derived from it; D10 carries the same value in tile
+-	 * order. For the untiled pictures this driver accepts the two orders
+-	 * are equal.
+-	 */
+-	slot[8] = tile_addr;
+-	slot[9] = ((tile_addr / run->width_ctbs) << 16) |
+-		  (tile_addr % run->width_ctbs);
++	/* D8/D9 carry the raster address and the coordinates derived from it,
++	 * D10 the tile-scan address of the slice start, which is what the
++	 * vendor writes there.
++	 */
++	slot[8] = raster_addr;
++	slot[9] = ((raster_addr / run->width_ctbs) << 16) |
++		  (raster_addr % run->width_ctbs);
+ 	slot[10] = tile_addr;
+ 	slot[11] = (((u32)slice->slice_cb_qp_offset & 31) << 8) |
+ 		   ((u32)slice->slice_cr_qp_offset & 31);
+@@ -771,7 +856,9 @@ static int histb_hevc_assemble_slice(str
+ 	 */
+ 	end_ctb = index < last ? run->slices[index + 1].slice_segment_addr - 1 :
+ 		  run->ctu_count - 1;
+-	slot[43] = end_ctb;
++	slot[43] = tiled ? histb_hevc_tile_to_raster(pps, run->width_ctbs,
++						    run->height_ctbs, end_ctb) :
++			  end_ctb;
+ 	/* D44 is the tile-scan version of the same end; the vendor converts
+ 	 * only the raster word.
+ 	 */
+@@ -817,7 +904,10 @@ static void histb_hevc_program_regs(stru
+ 
+ 	/* one timeout per pipeline stage, windows 0x3c..0x54 only */
+ 	for (i = 1; i <= 7; i++)
+-		vdm_write(dev, VDM_TO(i), VDM_TIMEOUT_MOD);
++		vdm_write(dev, VDM_TO(i), (histb_vdec_hevc_ab & BIT(10)) ?
++			  VDM_TIMEOUT_HEVC : VDM_TIMEOUT_MOD);
++	if (histb_vdec_hevc_ab & BIT(9))
++		vdm_write(dev, VDM_PRC_CACHE_TYPE, 2);
+ 
+ 	vdm_write(dev, VDM_YSTADDR_1D, lower_32_bits(run->dst_dma));
+ 	/*
+@@ -888,8 +978,8 @@ static void histb_vdec_hevc_stop(struct
+ /*
+  * Hand the engine the slice span without its emulation-prevention bytes, the
+  * staging the byte-exact H.264 layer also performs: the VDM decodes the bytes
+- * it is given literally (histb_h264_pack_rbsp() records the measurement that
+- * shows it), and the uAPI delivers the escaped form.
++ * it is given literally (histb_h264_pack_rbsp() records the all-I_PCM
++ * measurement that shows it), and the uAPI delivers the escaped form.
+  *
+  * A 0x03 is dropped only when the two preceding raw bytes are zero, which is
+  * the decoder's own rule and so keeps a coded 0x03 that directly follows a
+@@ -1024,25 +1114,50 @@ static int histb_vdec_hevc_run(struct hi
+ 
+ 	/*
+ 	 * The VDM reconstructs NV21 16x16 tiles: 8-bit 4:2:0 only, because CFG1
+-	 * of this decoder generation has no 10-bit enable field. These are
+-	 * judged per job, not in a control .try_ctrl(): the handler holds an
+-	 * all-zero default which TRY_EXT_CTRLS reads back as if a client had
+-	 * set it, and chroma_format_idc 0 is such a default.
++	 * of this decoder generation has no 10-bit enable field.
++	 *
++	 * Tiled pictures are refused (BIT(16) lifts the refusal only as the
++	 * tile address-domain probe): with V4L2_HEVC_PPS_FLAG_TILES_ENABLED the
++	 * engine stops after a partial first frame for every grid shape tried
++	 * on the board, whether or not the tile info image is written, and each
++	 * such job costs a frame decode timeout, which on an older build used
++	 * to wedge the block for the other protocols; measured here it no
++	 * longer does, so the refusal is about the picture, not about the
++	 * lock-up.
++	 *
++	 * These are judged per job, not in a control .try_ctrl(): the handler
++	 * holds an all-zero default which TRY_EXT_CTRLS reads back as if a
++	 * client had set it, and chroma_format_idc 0 is such a default.
+ 	 */
+ 	if (run.sps->bit_depth_luma_minus8 || run.sps->bit_depth_chroma_minus8 ||
+ 	    run.sps->chroma_format_idc != 1 ||
+ 	    (run.sps->flags & V4L2_HEVC_SPS_FLAG_SEPARATE_COLOUR_PLANE))
+ 		return -EINVAL;
+ 	/*
+-	 * Tiled pictures are refused: with V4L2_HEVC_PPS_FLAG_TILES_ENABLED the
+-	 * engine stops after a partial first frame for every grid shape tried
+-	 * on the board, whether or not the tile info image is written. Accepting
+-	 * them would need the raster/tile address split the vendor applies, but
+-	 * both local encoders emit a single slice per tiled picture, where the
+-	 * two orders coincide, so the corpus cannot exercise the split and the
+-	 * refusal is the delivered disposition.
++	 * The refusal above the tile probe arm is the delivered disposition,
++	 * and it happens before the doorbell: with the flag set and BIT(16)
++	 * clear, the board reads three refusals, no "job programmed" line, no
++	 * timeout, and the capture buffer comes back with bytesused 0. What
++	 * accepting tiles needs is the raster/tile address split, not a longer
++	 * timeout: the vendor converts four of the six address-bearing slice
++	 * words through its CPU-side tile-scan-to-raster map when tiles are on
++	 * (D8, D9, D43 get the raster address, D10 and D44 the tile-scan one,
++	 * and D6 bits17:0 carry an independent-slice address the driver has no
++	 * value for), and BIT(16)/BIT(17) are the arms that try to follow that.
++	 * The arms do not decode either: the 2x2 grid wrote 0 of 4800 luma
++	 * lines on all three frames and each job ran to the watchdog, and the
++	 * best any tiled shape has done on the board is 1156/4800 luma plus
++	 * 568/2400 chroma on a first frame, nothing after it. Judging the
++	 * address split needs a tiled picture carried by more than one slice,
++	 * because a single-slice picture makes both orders equal; neither local
++	 * encoder will produce one (kvazaar emits one slice per tiled picture
++	 * and refuses a slice start that is not on a tile-column edge, x265
++	 * only does multi-slice with wavefront, which it treats as exclusive
++	 * with tiles), so the corpus cannot close this and the disposition
++	 * stays a refusal.
+ 	 */
+-	if (run.pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED)
++	if ((run.pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) &&
++	    !(histb_vdec_hevc_ab & BIT(16)))
+ 		return -EINVAL;
+ 	/*
+ 	 * A picture whose SPS declares scaling lists is not decodable here.
+@@ -1092,7 +1207,7 @@ static int histb_vdec_hevc_run(struct hi
+ 	 * there is no span to hand the engine and no end to bound any slice's
+ 	 * declared length by. Padding the declaration is not an option: the VDM
+ 	 * decodes the bytes it is given and does not re-synchronise on its own
+-	 * (histb_h264_pack_rbsp carries the measurement that shows
++	 * (histb_h264_pack_rbsp carries the all-I_PCM measurement that shows
+ 	 * it), so an empty span cannot be stretched into a decodable slice. A
+ 	 * truncated access unit reaches this line only if it carries no slice
+ 	 * NAL at all; the slice scan below otherwise refuses it on the count.
+@@ -1234,16 +1349,31 @@ static int histb_vdec_hevc_run(struct hi
+ 	run.width_ctbs = (run.width + (1u << run.ctb_log2) - 1) >> run.ctb_log2;
+ 	run.height_ctbs = (run.height + (1u << run.ctb_log2) - 1) >> run.ctb_log2;
+ 	/*
++	 * The bottom lines of a single-CTB-row picture are only written once a
++	 * further CTB-row boundary is reached; measured on the board on 1536x64
++	 * with CTU size 64: the missing constant 5 luma lines (plus 3 chroma
++	 * lines) never appear in the capture buffer. Padding the grid here
++	 * leaves the programmed luma height alone - pic[54] still carries
++	 * run.height - so the CTB budget in pic[0]/CFG0 is the only thing that
++	 * changes, which separates "where does the picture end" (deblocking)
++	 * from "what flushes the line pipeline".
++	 */
++	if (histb_vdec_hevc_ab & BIT(15))
++		run.height_ctbs++;
++	/*
+ 	 * The last CTB row's tail only comes out when another row boundary
+ 	 * follows it, so a picture one CTB row tall is delivered missing a
+ 	 * constant 1280 bytes per 256-byte luma tile column - 11 of its 16 rows
+ 	 * written - plus 3 of every chroma tile's 8 rows, and those bytes are
+-	 * not present anywhere else in the capture buffer, so a limited parse
+-	 * plus a copy cannot rebuild the tail either. Two CTB rows, or a coded
+-	 * height that lands mid-row, are byte-exact, so this is not a general
+-	 * bottom-edge defect and there is nothing to work around at one row.
+-	 * Refuse the job instead of delivering a frame short by a band: the
+-	 * caller falls back to software.
++	 * not present anywhere else in the capture buffer. The grid padding arm
++	 * above showed that the deblocking picture-bottom follows the padded
++	 * grid, so a limited parse plus a copy cannot rebuild the tail either.
++	 * Two CTB rows, or a coded height that lands mid-row, are byte-exact,
++	 * so this is not a general bottom-edge defect and there is nothing to
++	 * work around at one row. Refuse the job instead of delivering a frame
++	 * that is short by a band: the caller falls back to software. The
++	 * BIT(15) probe above still reaches the engine, so the mechanism stays
++	 * reproducible on the same boot.
+ 	 */
+ 	if (run.height_ctbs < 2)
+ 		return -EINVAL;
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_hw.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_hw.c
+@@ -131,3 +131,65 @@ void histb_vdec_hw_init_tables(struct hi
+ 	       HISTB_VDEC_TILE_INFO_SIZE);
+ }
+ 
++/**
++ * histb_vdec_hw_check_tables() - verify the read-only protocol tables survived
++ * @dev: decoder device
++ * @first_bad: output, pool-relative offset of the first differing word
++ *
++ * The H.264 CABAC M/N table is written once at probe and the VDM only reads it,
++ * so a difference means some address handed to the VDM points back into the
++ * table area. Returns the number of differing words.
++ */
++unsigned int histb_vdec_hw_check_tables(const struct histb_vdec_dev *dev,
++					unsigned int *first_bad)
++{
++	const u32 *tables = histb_vdec_tables_base(&dev->pool);
++	unsigned int bad = 0;
++	unsigned int i;
++
++	for (i = 0; i < HISTB_VDEC_CABAC_MN_H264_WORDS; i++) {
++		if (tables[HISTB_TABLE_OFF_CABAC_MN_H264 / 4 + i] ==
++		    histb_vdec_cabac_mn_h264[i])
++			continue;
++		if (!bad)
++			*first_bad = HISTB_TABLE_OFF_CABAC_MN_H264 + i * 4;
++		bad++;
++	}
++
++	return bad;
++}
++
++/**
++ * histb_vdec_hw_scratch_usage() - report writes into the head of a scratch block
++ * @dev: decoder device
++ * @idx: enum histb_vdec_scratch index
++ * @first: output, offset of the first non-zero byte
++ *
++ * Only the VDM writes these blocks, from the addresses carried by the picture
++ * and slice descriptors, so an untouched head means the descriptor address is
++ * not the one the VDM used. The table area is write-combined and reads are
++ * slow, so the scan stops after HISTB_VDEC_SCRATCH_PROBE bytes; a block that
++ * was used further into its window can still read zero here. Returns the number
++ * of non-zero bytes inside that window.
++ */
++unsigned int histb_vdec_hw_scratch_usage(const struct histb_vdec_dev *dev,
++					 unsigned int idx, unsigned int *first)
++{
++	static const unsigned int probe = HISTB_VDEC_SCRATCH_PROBE;
++	const u8 *base = histb_vdec_tables_base(&dev->pool) +
++			 HISTB_TABLE_OFF_SCRATCH(idx);
++	unsigned int nz = 0;
++	unsigned int i;
++
++	*first = UINT_MAX;
++	for (i = 0; i < probe; i++) {
++		if (!base[i])
++			continue;
++		if (nz == 0)
++			*first = i;
++		nz++;
++	}
++
++	return nz;
++}
++
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_mpeg2.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_mpeg2.c
+@@ -73,6 +73,17 @@ histb_vdec_mpeg2_slc_slot_dma(const stru
+ }
+ 
+ /*
++ * On-board A/B instrument for the MPEG-2 register differences against the
++ * vendor firmware, still open on the bench: BIT(3) the SCD VDH select/reset
++ * pulse the firmware's per-picture prepare path issues, BIT(4) SCD_EMAR_ID
++ * bit16 which its MPEG-2 path forces for pictures of at most 120 MB rows,
++ * and BIT(6) the wider interrupt mask (the H.264 path's ~5 rather than ~1).
++ */
++static unsigned int histb_vdec_mpeg2_ab;
++module_param(histb_vdec_mpeg2_ab, uint, 0644);
++MODULE_PARM_DESC(histb_vdec_mpeg2_ab, "MPEG-2 message A/B bits (0 = as derived)");
++
++/*
+  * MPEG-1 has no per-picture f_code: 11172-1 keeps one forward and one
+  * backward code in the GOP header, and the encoders in use write 1. A
+  * control that leaves the field 0 says nothing about the picture, and
+@@ -896,7 +907,7 @@ static int histb_vdec_mpeg2_run(struct h
+ 	       FIELD_PREP(GENMASK(24, 16), mb_height - 1);
+ 	histb_vdec_mpeg2_detect(ctx, histb_vdec_src_va(&src->vb2_buf),
+ 				vb2_get_plane_payload(&src->vb2_buf, 0));
+-	mpeg1 = ctx->mpeg1;
++	mpeg1 = ctx->mpeg1 || (histb_vdec_mpeg2_ab & BIT(0));
+ 	if (mpeg1)
+ 		w[0] |= BIT(25);
+ 
+@@ -1068,6 +1079,16 @@ static int histb_vdec_mpeg2_run(struct h
+ 	 * lands at the same pixels as without the arms, so the inter gap is not
+ 	 * a CFG1 programming choice.
+ 	 */
++	if (histb_vdec_mpeg2_ab & BIT(7))
++		cfg1 |= VDM_CFG1_MV_OUT_EN;
++	if (histb_vdec_mpeg2_ab & BIT(8))
++		cfg1 |= VDM_CFG1_LINE_NUM_OUT_EN;
++	if (histb_vdec_mpeg2_ab & BIT(9))
++		cfg1 |= VDM_CFG1_PPFD_EN;
++	if (histb_vdec_mpeg2_ab & BIT(10))
++		cfg1 &= ~VDM_CFG1_FST_SLC_GRP;
++	if (histb_vdec_mpeg2_ab & BIT(11))
++		cfg1 |= BIT(22);
+ 	vdm_write(dev, VDM_CFG1, cfg1);
+ 	vdm_write(dev, VDM_AVM_ADDR, pool->dma & ~15U);
+ 	vdm_write(dev, VDM_VAM_ADDR, histb_vdec_up_msgs_dma(pool) & ~15U);
+@@ -1091,7 +1112,20 @@ static int histb_vdec_mpeg2_run(struct h
+ 	for (i = 1; i <= 7; i++)
+ 		vdm_write(dev, VDM_TO(i), VDM_TIMEOUT_MOD);
+ 	vdm_write(dev, VDM_INT_STATE, 0xffffffff);
+-	vdm_write(dev, VDM_INT_MASK, 0xfffffffe);
++	vdm_write(dev, VDM_INT_MASK,
++		  histb_vdec_mpeg2_ab & BIT(6) ? 0xfffffffa : 0xfffffffe);
++	/*
++	 * A/B arms for the register differences against the vendor firmware:
++	 * BIT(3) the SCD VDH select/reset pulse that the firmware's per-picture
++	 * decoder prepare path issues, BIT(4) SCD_EMAR_ID bit16 which its
++	 * MPEG-2 path forces whenever the picture has at most 120 MB rows,
++	 * BIT(6) the wider interrupt mask (the H.264 path's ~5 rather than ~1).
++	 */
++	if (histb_vdec_mpeg2_ab & BIT(3))
++		writel(BIT(0), dev->scd + SCD_VDH_SELRST);
++	if ((histb_vdec_mpeg2_ab & BIT(4)) && mb_height <= 120)
++		writel(readl(dev->scd + SCD_EMAR_ID) | BIT(16),
++		       dev->scd + SCD_EMAR_ID);
+ 
+ 	histb_vdec_hw_kick(dev, ctx->desc->vidstd);
+ 
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_mpeg4.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_mpeg4.c
+@@ -1839,7 +1839,11 @@ static int histb_vdec_mpeg4_run(struct h
+ 	 * and an MPEG-4 VOP header is of the same order - so a buffer this
+ 	 * short holds no header at all, and anything longer is answered by the
+ 	 * span checks the parsers carry themselves rather than by this
+-	 * constant.
++	 * constant. TODO: to settle the number, run the MPEG-4 and H.263
++	 * fixtures at descending payload floors and record, per fourcc, the
++	 * shortest access unit that still decodes inside the rounding band;
++	 * that is what belongs here - or the gate goes if the parsers' own
++	 * bounds checks already refuse every shorter submission.
+ 	 */
+ 	if (bytesused < 32)
+ 		return -EINVAL;
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_regs.h
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_regs.h
+@@ -107,14 +107,15 @@
+  * data path does not use the SCD. The firmware pokes these registers
+  * around its VDM starts, and the live paths here follow it for the VDH
+  * gate on every picture (histb_vdec_hw.c) and for the MPEG-4 width bit of
+- * EMAR_ID (histb_vdec_mpeg4.c); AVS_FLAG and SELRST are not written by any
+- * live path.
++ * EMAR_ID (histb_vdec_mpeg4.c); AVS_FLAG is never written, and SELRST is
++ * only reached by the MPEG-2 A/B instrument.
+  */
+ #define SCD_AVS_FLAG			0x000
+ #define SCD_EMAR_ID			0x004
+ /*
+  * VDH select/reset. The vendor firmware's decoder start path writes 1 here
+- * before every picture; no live path in this driver touches the offset.
++ * before every picture; no live path in this driver touches the offset, so it
++ * is only ever reachable through the MPEG-2 A/B instrument.
+  */
+ #define SCD_VDH_SELRST			0x008
+ #define SCD_VDH_CK_GT			0x00c
+@@ -134,7 +135,7 @@
+ /*
+  * Firmware channel type codes (dispatch table); the VDM_CFG1_VID_STD register
+  * field carries its own per-protocol codes, which each codec source defines
+- * separately (they disagree for HEVC).
++ * separately (they disagree for HEVC and VP8).
+  */
+ enum histb_vdec_vidstd {
+ 	HISTB_VIDSTD_H264	= 0,
+@@ -150,6 +151,7 @@ enum histb_vdec_vidstd {
+ 	HISTB_VIDSTD_VP6F	= 10,
+ 	HISTB_VIDSTD_VP6	= 11,
+ 	HISTB_VIDSTD_VP6A	= 12,
++	HISTB_VIDSTD_VP8	= 13,
+ 	HISTB_VIDSTD_HEVC	= 17,
+ };
+ 
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5.h
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5.h
+@@ -17,6 +17,7 @@
+ #include <linux/wait.h>
+ #include <linux/videodev2.h>
+ 
++struct dentry;
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-fh.h>
+@@ -233,9 +234,11 @@ struct histb_vdec_v5 {
+ 	struct completion	done;
+ 	u32			int_state;
+ 	u32			last_state;
++	struct dentry		*dbgfs;
+ 	struct regmap		*crg;
+ 	atomic_t		open_count;
+ 	wait_queue_head_t	open_wq;
++	void			*probe;	/* bring-up measurement state */
+ };
+ 
+ static inline void *histb_vdec_v5_slot(struct histb_vdec_v5 *dec,
+@@ -270,6 +273,10 @@ struct histb_vdec_v5_job {
+ 	void		*slice;		/* packed first slice slot */
+ };
+ 
++/* probe.c, the bring-up measurement; not part of the driver's contract */
++int histb_vdec_v5_probe_init(struct histb_vdec_v5 *dec);
++void histb_vdec_v5_probe_exit(struct histb_vdec_v5 *dec);
++
+ /* hw.c */
+ void histb_vdec_v5_clocks(struct histb_vdec_v5 *dec, bool on);
+ int histb_vdec_v5_pool_alloc(struct histb_vdec_v5 *dec);
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_drv.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_drv.c
+@@ -2,8 +2,9 @@
+ /*
+  * HiSilicon HiSTB video decoder driver, V5R6 generation.
+  *
+- * Claims the block, checks its clock-enable, reset and interrupt contract
+- * on the board and hands frames to the protocol sources.
++ * Bring-up stage: claim the block, prove its clock-enable, reset and
++ * interrupt contract on the board, and host the probe that measures the geometry
++ * the vendor documentation leaves open.
+  */
+ #include <linux/bitfield.h>
+ #include <linux/mfd/syscon.h>
+@@ -169,15 +170,21 @@ int histb_vdec_v5_probe(struct platform_
+ 	if (ret)
+ 		goto disable_pm;
+ 	enable_irq(dec->irq);
+-	ret = histb_vdec_core_init(&dec->common, pdev, gen);
++	ret = histb_vdec_v5_probe_init(dec);
+ 	if (ret)
+ 		goto put_pm;
+ 
++	ret = histb_vdec_core_init(&dec->common, pdev, gen);
++	if (ret)
++		goto probe_exit;
++
+ 	dev_info(dev, "V5R6 core claimed\n");
+ 	pm_runtime_put(dev);
+ 
+ 	return 0;
+ 
++probe_exit:
++	histb_vdec_v5_probe_exit(dec);
+ put_pm:
+ 	pm_runtime_put(dev);
+ 	pm_runtime_set_suspended(dev);
+@@ -206,5 +213,6 @@ void histb_vdec_v5_remove(struct platfor
+ 	disable_irq(dec->irq);
+ 	cancel_delayed_work_sync(&dec->common.watchdog);
+ 	histb_vdec_core_exit(&dec->common);
++	histb_vdec_v5_probe_exit(dec);
+ 	pm_runtime_disable(&pdev->dev);
+ }
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_h264.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_h264.c
+@@ -1370,8 +1370,7 @@ static const u32 histb_vdec_v5_h264_req_
+ /* A surface the capture queue dropped no longer holds slots of either kind.
+  */
+ static void histb_vdec_v5_h264_buf_release(struct histb_vdec_v5_ctx *ctx,
+-					   unsigned int index)
+-{
++					   unsigned int index){
+ 	struct histb_vdec_v5_h264 *h264 = ctx->priv;
+ 
+ 	/* Before the first job there are no slot tables to give back. */

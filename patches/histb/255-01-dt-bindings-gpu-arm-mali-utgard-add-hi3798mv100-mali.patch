@@ -1,0 +1,23 @@
+From c418c752b85db2835f9ba2af1fe05703d81311ef Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 20:06:06 +0800
+Subject: [PATCH] dt-bindings: gpu: arm,mali-utgard: add hi3798mv100 mali
+
+The mv100 Mali GPU had no matching binding entry. Add the
+hisilicon,hi3798mv100-mali compatible to the Mali schema.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ Documentation/devicetree/bindings/gpu/arm,mali-utgard.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/Documentation/devicetree/bindings/gpu/arm,mali-utgard.yaml
++++ b/Documentation/devicetree/bindings/gpu/arm,mali-utgard.yaml
+@@ -44,6 +44,7 @@ properties:
+               - amlogic,meson8b-mali
+               - amlogic,meson-gxbb-mali
+               - amlogic,meson-gxl-mali
++              - hisilicon,hi3798mv100-mali
+               - hisilicon,hi6220-mali
+               - mediatek,mt7623-mali
+               - rockchip,rk3328-mali

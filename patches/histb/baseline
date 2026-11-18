@@ -1,0 +1,7 @@
+# Baseline every patch in this store is written against. KERNEL_VERSION also
+# names the bucket directories (<bucket>-<major.minor>), and BASE_SHA is the
+# commit to extract a working tree from:
+#
+#     git -C <kernel source repository> archive <BASE_SHA> | tar -x -C <tree>
+KERNEL_VERSION := 7.4-rc2
+BASE_SHA := fd9230005e85472b81c1c7c16afe93dd878996b1

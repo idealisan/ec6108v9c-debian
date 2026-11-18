@@ -1,0 +1,52 @@
+From 9dd0f0d209dceea16b672ef3f2df7fa52a805349 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 21 Oct 2026 23:02:36 +0800
+Subject: [PATCH 1/4] net: hix5hd2: connect a fixed link declared on the mac
+ node
+
+A port wired directly to another MAC has no PHY on its MDIO bus, so the
+link has to come from the device tree; the driver still failed probe
+when the node carried no phy-handle.
+
+Register the fixed link of the mac node at probe and use the node itself
+as the phy device's of_node, which is what of_phy_connect() matches a
+fixed phy_device against. Ports with a PHY on the bus keep using
+phy-handle.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/net/ethernet/hisilicon/hix5hd2_gmac.c | 23 +++++++++++++++----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c
++++ b/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c
+@@ -1199,11 +1199,24 @@ static int hix5hd2_dev_probe(struct plat
+ 		goto err_mdiobus;
+ 	}
+ 
+-	priv->phy_node = of_parse_phandle(node, "phy-handle", 0);
+-	if (!priv->phy_node) {
+-		netdev_err(ndev, "not find phy-handle\n");
+-		ret = -EINVAL;
+-		goto err_mdiobus;
++	/*
++	 * A port wired straight to another MAC has no PHY on its MDIO bus, so the
++	 * link is declared in the node instead; the fixed phy_device then registers
++	 * against this node and of_phy_connect() finds it by of_node, which is why
++	 * phy_node becomes the ethernet node here.
++	 */
++	if (of_phy_is_fixed_link(node)) {
++		ret = of_phy_register_fixed_link(node);
++		if (ret < 0)
++			goto err_mdiobus;
++		priv->phy_node = of_node_get(node);
++	} else {
++		priv->phy_node = of_parse_phandle(node, "phy-handle", 0);
++		if (!priv->phy_node) {
++			netdev_err(ndev, "not find phy-handle\n");
++			ret = -EINVAL;
++			goto err_mdiobus;
++		}
+ 	}
+ 
+ 	ndev->irq = platform_get_irq(pdev, 0);

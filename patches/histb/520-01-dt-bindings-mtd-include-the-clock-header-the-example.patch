@@ -1,0 +1,29 @@
+From 57bf8019f70ea564d7a6325c699a413165f450cf Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Mon, 26 Oct 2026 13:36:23 +0800
+Subject: [PATCH 1/4] dt-bindings: mtd: include the clock header the example
+ uses
+
+The clock id split left histb-clock.h as a forwarding shim that emits a
+warning, and the dw-mshc example still includes it, so every
+dt_binding_check run pays for that warning.
+
+Include the CRG header of the SoC the example describes; the four clock
+ids it takes already live there under the same HISTB_ names.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../devicetree/bindings/mmc/hisilicon,hi3798cv200-dw-mshc.yaml  | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/Documentation/devicetree/bindings/mmc/hisilicon,hi3798cv200-dw-mshc.yaml
++++ b/Documentation/devicetree/bindings/mmc/hisilicon,hi3798cv200-dw-mshc.yaml
+@@ -71,7 +71,7 @@ unevaluatedProperties: false
+ 
+ examples:
+   - |
+-    #include <dt-bindings/clock/histb-clock.h>
++    #include <dt-bindings/clock/hisilicon,hi3798cv200-crg.h>
+     #include <dt-bindings/interrupt-controller/arm-gic.h>
+ 
+     mmc@9830000 {

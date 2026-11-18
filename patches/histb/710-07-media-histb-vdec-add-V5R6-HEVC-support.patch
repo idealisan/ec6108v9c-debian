@@ -1,0 +1,1371 @@
+From 435c379d2cde3e1e478490f39e595277fd0b4fa7 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 3 Nov 2026 14:41:30 +0800
+Subject: [PATCH 7/10] media: histb-vdec: add V5R6 HEVC support
+
+This generation's HEVC message is 320 words wide, so its slot stride is
+not the H.264 one and every address word is a 16-byte granule index; the
+picture message carries the CTU grid, the SPS/PPS limits and the
+reference surfaces, and each slice follows as a slot of its own naming
+the CTU range it covers. The slice data is handed over with its
+emulation prevention bytes removed, because the block fetches the bytes
+literally.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../platform/hisilicon/histb-vdec/Makefile    |    1 +
+ .../hisilicon/histb-vdec/histb_vdec_v5_core.c |    1 +
+ .../hisilicon/histb-vdec/histb_vdec_v5_hevc.c | 1330 +++++++++++++++++
+ 3 files changed, 1332 insertions(+)
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_hevc.c
+
+--- a/drivers/media/platform/hisilicon/histb-vdec/Makefile
++++ b/drivers/media/platform/hisilicon/histb-vdec/Makefile
+@@ -12,3 +12,4 @@ histb-vdec-y += histb_vdec_v5_drv.o
+ histb-vdec-y += histb_vdec_v5_hw.o
+ histb-vdec-y += histb_vdec_v5_core.o
+ histb-vdec-y += histb_vdec_v5_h264.o
++histb-vdec-y += histb_vdec_v5_hevc.o
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_core.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_core.c
+@@ -66,6 +66,7 @@ struct histb_vdec_v5 *histb_vdec_v5_of_c
+  */
+ static const histb_vdec_v5_fmt_desc *const histb_vdec_v5_fmt_list[] = {
+ 	&histb_vdec_v5_h264_fmt,
++	&histb_vdec_v5_hevc_fmt,
+ };
+ 
+ static const struct histb_vdec_chip histb_vdec_v5_chip_mv200h = {
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_hevc.c
+@@ -0,0 +1,1330 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * HiSilicon HiSTB V5R6 stateless HEVC decoder.
++ *
++ * The core takes fully parsed syntax: the picture message carries the CTU grid,
++ * the SPS/PPS limits and the reference surfaces, and every slice follows it as
++ * a slot of its own naming the CTU range it covers and the slice segment data
++ * it consumes. This generation's message is 320 words wide, so the slot stride
++ * is not the H.264 one, and every address word is a 16-byte granule index.
++ *
++ * A slice's data is handed over with its emulation prevention bytes removed:
++ * the core fetches the bytes literally, so a span that still carried 00 00 03
++ * would decode as three bytes of syntax instead of two.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/dma-mapping.h>
++#include <linux/slab.h>
++
++#include <media/videobuf2-dma-contig.h>
++
++#include "histb_vdec_v5.h"
++
++/* One HEVC message slot is 320 words; the report, picture and slices follow. */
++#define V5R6_HEVC_SLOT_WORDS		320
++#define V5R6_HEVC_SLOT_BYTES		(V5R6_HEVC_SLOT_WORDS * 4)
++#define V5R6_HEVC_UP_SLOT		0
++#define V5R6_HEVC_PIC_SLOT		4
++#define V5R6_HEVC_SLICE_SLOT		5
++#define V5R6_HEVC_MAX_SLICES		200
++
++/* The message area ends where the device pool's own map begins. */
++#define V5R6_HEVC_MSG_END \
++	((V5R6_HEVC_SLICE_SLOT + V5R6_HEVC_MAX_SLICES) * V5R6_HEVC_SLOT_BYTES)
++static_assert(V5R6_HEVC_MSG_END <= V5R6_POOL_SED_LEFT_PHY,
++	      "the HEVC message area does not fit ahead of the pool");
++
++#define V5R6_HEVC_MAX_TILE_COLUMNS	10
++#define V5R6_HEVC_MAX_TILE_ROWS		11
++#define V5R6_HEVC_TILE_INFO_BYTES	2048
++
++/* The bytes the core may fetch past the valid stream bits of a picture. */
++#define V5R6_HEVC_STREAM_GUARD		64
++
++#define V5R6_HEVC_CFG0			0x01000000u
++#define V5R6_HEVC_CFG1			0x0003c00du
++
++struct histb_vdec_v5_hevc_tiles {
++	u32	columns;
++	u32	rows;
++	u32	column_bd[V5R6_HEVC_MAX_TILE_COLUMNS + 1];
++	u32	row_bd[V5R6_HEVC_MAX_TILE_ROWS + 1];
++};
++
++struct histb_vdec_v5_hevc_stream {
++	u32	data_offset;
++	u32	valid_bits;
++};
++
++struct histb_vdec_v5_hevc_run {
++	const struct v4l2_ctrl_hevc_sps		*sps;
++	const struct v4l2_ctrl_hevc_pps		*pps;
++	const struct v4l2_ctrl_hevc_decode_params *dec;
++	const struct v4l2_ctrl_hevc_scaling_matrix *scaling;
++	const struct v4l2_ctrl_hevc_slice_params *slices;
++	struct histb_vdec_v5_frame *frame;
++	unsigned int	num_slices;
++	unsigned int	ctb_log2;
++	unsigned int	ctb_width;
++	unsigned int	ctb_height;
++	unsigned int	ctbs;
++	u8		dpb2apc[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
++	u8		dpb2pmv[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
++	u32		img_addr[V5R6_MAX_DPB_SLOTS];
++	s32		dpb_poc[V5R6_MAX_DPB_SLOTS];
++	dma_addr_t	stream_dma;
++	struct histb_vdec_v5_hevc_stream streams[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
++	struct histb_vdec_v5_hevc_tiles tiles;
++};
++
++struct histb_vdec_v5_hevc_nal {
++	u32	hdr;
++	u32	end;
++	u8	type;
++};
++
++struct histb_vdec_v5_hevc {
++	u8			apc_map[V5R6_MAX_FRAMES];
++	u8			pmv_map[V5R6_MAX_FRAMES];
++	void			*rbsp_va;
++	dma_addr_t		rbsp_dma;
++	size_t			rbsp_size;
++	void			*tile_va;
++	dma_addr_t		tile_dma;
++	struct histb_vdec_v5_hevc_nal nal[V5R6_HEVC_MAX_SLICES + 64];
++	struct histb_vdec_v5_hevc_run run;
++};
++
++static void *histb_vdec_v5_hevc_slot(struct histb_vdec_v5 *dec, unsigned int index)
++{
++	return dec->pool.va + index * V5R6_HEVC_SLOT_BYTES;
++}
++
++static dma_addr_t histb_vdec_v5_hevc_slot_dma(struct histb_vdec_v5 *dec,
++					    unsigned int index)
++{
++	return dec->pool.dma + (dma_addr_t)index * V5R6_HEVC_SLOT_BYTES;
++}
++
++static u32 histb_vdec_v5_hevc_pool_addr(struct histb_vdec_v5 *dec, unsigned int off)
++{
++	return histb_vdec_v5_addr_at(dec->pool.dma + off, V5R6_ADDR_SHIFT);
++}
++
++static dma_addr_t histb_vdec_v5_hevc_pmv_dma(const struct histb_vdec_v5_ctx *ctx,
++					   unsigned int slot)
++{
++	return ctx->pmv.dma + (dma_addr_t)slot * ctx->pmv.slot_bytes;
++}
++
++static unsigned int histb_vdec_v5_hevc_apc_alloc(struct histb_vdec_v5_ctx *ctx,
++					       unsigned int index)
++{
++	struct histb_vdec_v5_hevc *hevc = ctx->priv;
++	u8 id = hevc->apc_map[index];
++
++	if (id == 0) {
++		id = ctx->apc_next % V5R6_MAX_DPB_SLOTS + 1;
++		ctx->apc_next++;
++		hevc->apc_map[index] = id;
++	}
++
++	return id - 1;
++}
++
++static unsigned int histb_vdec_v5_hevc_pmv_alloc(struct histb_vdec_v5_ctx *ctx,
++					       unsigned int index)
++{
++	struct histb_vdec_v5_hevc *hevc = ctx->priv;
++	u8 id = hevc->pmv_map[index];
++
++	if (id == 0) {
++		id = ctx->pmv_next % ctx->pmv.slots + 1;
++		ctx->pmv_next++;
++		hevc->pmv_map[index] = id;
++	}
++
++	return id - 1;
++}
++
++static bool
++histb_vdec_v5_hevc_long_term_ok(const struct v4l2_ctrl_hevc_decode_params *dec,
++			      unsigned int index)
++{
++	unsigned int i;
++
++	for (i = 0; i < dec->num_poc_lt_curr; i++)
++		if (dec->poc_lt_curr[i] == index)
++			return true;
++
++	return false;
++}
++
++/* ------------------------------------------------------------ tiles */
++
++static int histb_vdec_v5_hevc_init_tiles(const struct v4l2_ctrl_hevc_pps *pps,
++				       unsigned int ctb_width,
++				       unsigned int ctb_height,
++				       struct histb_vdec_v5_hevc_tiles *tiles)
++{
++	bool enabled = pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED;
++	bool uniform = pps->flags & V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING;
++	unsigned int i;
++
++	memset(tiles, 0, sizeof(*tiles));
++	tiles->columns = enabled ? pps->num_tile_columns_minus1 + 1 : 1;
++	tiles->rows = enabled ? pps->num_tile_rows_minus1 + 1 : 1;
++	if (!tiles->columns || tiles->columns > V5R6_HEVC_MAX_TILE_COLUMNS ||
++	    tiles->columns > ctb_width ||
++	    !tiles->rows || tiles->rows > V5R6_HEVC_MAX_TILE_ROWS ||
++	    tiles->rows > ctb_height)
++		return -EINVAL;
++
++	if (!enabled) {
++		tiles->column_bd[1] = ctb_width;
++		tiles->row_bd[1] = ctb_height;
++	} else if (uniform) {
++		for (i = 0; i <= tiles->columns; i++)
++			tiles->column_bd[i] = i * ctb_width / tiles->columns;
++		for (i = 0; i <= tiles->rows; i++)
++			tiles->row_bd[i] = i * ctb_height / tiles->rows;
++	} else {
++		for (i = 0; i + 1 < tiles->columns; i++) {
++			u32 width = pps->column_width_minus1[i] + 1;
++
++			if (width > ctb_width - tiles->column_bd[i] -
++				    (tiles->columns - i - 1))
++				return -EINVAL;
++			tiles->column_bd[i + 1] = tiles->column_bd[i] + width;
++		}
++		tiles->column_bd[tiles->columns] = ctb_width;
++		for (i = 0; i + 1 < tiles->rows; i++) {
++			u32 height = pps->row_height_minus1[i] + 1;
++
++			if (height > ctb_height - tiles->row_bd[i] -
++				     (tiles->rows - i - 1))
++				return -EINVAL;
++			tiles->row_bd[i + 1] = tiles->row_bd[i] + height;
++		}
++		tiles->row_bd[tiles->rows] = ctb_height;
++	}
++
++	if (tiles->column_bd[tiles->columns] != ctb_width ||
++	    tiles->row_bd[tiles->rows] != ctb_height)
++		return -EINVAL;
++
++	return 0;
++}
++
++static u32 histb_vdec_v5_hevc_rs_to_ts(const struct histb_vdec_v5_hevc_tiles *tiles,
++				     unsigned int ctb_width, u32 rs)
++{
++	u32 x = rs % ctb_width;
++	u32 y = rs / ctb_width;
++	unsigned int column, row;
++	u32 ts;
++
++	for (column = 0; column + 1 < tiles->columns &&
++	     x >= tiles->column_bd[column + 1]; column++)
++		;
++	for (row = 0; row + 1 < tiles->rows &&
++	     y >= tiles->row_bd[row + 1]; row++)
++		;
++
++	ts = tiles->row_bd[row] * ctb_width;
++	for (x = 0; x < column; x++)
++		ts += (tiles->column_bd[x + 1] - tiles->column_bd[x]) *
++		      (tiles->row_bd[row + 1] - tiles->row_bd[row]);
++	ts += (y - tiles->row_bd[row]) *
++	      (tiles->column_bd[column + 1] - tiles->column_bd[column]);
++	ts += rs % ctb_width - tiles->column_bd[column];
++
++	return ts;
++}
++
++static u32 histb_vdec_v5_hevc_ts_to_rs(const struct histb_vdec_v5_hevc_tiles *tiles,
++				     unsigned int ctb_width, u32 ts)
++{
++	unsigned int column, row;
++
++	for (row = 0; row < tiles->rows; row++) {
++		u32 height = tiles->row_bd[row + 1] - tiles->row_bd[row];
++
++		for (column = 0; column < tiles->columns; column++) {
++			u32 width = tiles->column_bd[column + 1] -
++				    tiles->column_bd[column];
++			u32 area = width * height;
++
++			if (ts < area)
++				return (tiles->row_bd[row] + ts / width) *
++					ctb_width + tiles->column_bd[column] +
++					ts % width;
++			ts -= area;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * The tile map the core reads: one byte per 16-pixel CTU column in the first
++ * half and one per 16-pixel CTU row in the second, then the closed position
++ * pairs. The image is 2048 bytes and lives in its own buffer: the pool's
++ * tile/segment area is the 1024 bytes at 0x42c00, and the 928-byte HEVC CABAC
++ * table starts at 0x43000.
++ */
++static void histb_vdec_v5_hevc_tile_info(struct histb_vdec_v5_hevc *hevc,
++				       const struct histb_vdec_v5_hevc_run *run)
++{
++	u8 *data = hevc->tile_va;
++	__le32 *column_pos = (__le32 *)(data + 1024);
++	__le32 *row_pos = (__le32 *)(data + 1104);
++	const struct histb_vdec_v5_hevc_tiles *tiles = &run->tiles;
++	u32 scale = BIT(run->ctb_log2 - 4);
++	unsigned int i, j;
++
++	memset(data, 0, V5R6_HEVC_TILE_INFO_BYTES);
++	for (i = 0; i < tiles->columns; i++) {
++		for (j = tiles->column_bd[i] * scale;
++		     j < tiles->column_bd[i + 1] * scale; j++)
++			data[j] = i;
++		column_pos[i] = cpu_to_le32(tiles->column_bd[i] |
++			((tiles->column_bd[i + 1] - 1) << 16));
++	}
++	for (i = 0; i < tiles->rows; i++) {
++		for (j = tiles->row_bd[i] * scale;
++		     j < tiles->row_bd[i + 1] * scale; j++)
++			data[512 + j] = i;
++		row_pos[i] = cpu_to_le32(tiles->row_bd[i] |
++			((tiles->row_bd[i + 1] - 1) << 16));
++	}
++}
++
++/* --------------------------------------------------------- quantiser */
++
++static u32 histb_vdec_v5_hevc_pack4(const u8 *m, unsigned int a,
++				  unsigned int b, unsigned int c,
++				  unsigned int d)
++{
++	return m[a] | m[b] << 8 | m[c] << 16 | m[d] << 24;
++}
++
++/*
++ * Scaling lists, picture words 64 to 313: each row is four coefficients per
++ * word, the two diagonals interleaving.
++ */
++static void
++histb_vdec_v5_hevc_qmatrix(u32 *pic,
++			 const struct v4l2_ctrl_hevc_scaling_matrix *scaling)
++{
++	const u8 *dc16 = scaling->scaling_list_dc_coef_16x16;
++	const u8 *dc32 = scaling->scaling_list_dc_coef_32x32;
++	unsigned int list, row, base;
++
++	memset(&pic[64], 0, 256 * sizeof(*pic));
++	for (list = 0; list < ARRAY_SIZE(scaling->scaling_list_8x8); list++) {
++		const u8 *m = scaling->scaling_list_8x8[list];
++
++		base = 64 + 16 * list;
++		for (row = 0; row < 8; row++) {
++			pic[base + 2 * row] =
++				histb_vdec_v5_hevc_pack4(m, row, 16 + row,
++						       32 + row, 48 + row);
++			pic[base + 2 * row + 1] =
++				histb_vdec_v5_hevc_pack4(m, 8 + row, 24 + row,
++						       40 + row, 56 + row);
++		}
++	}
++	for (list = 0; list < ARRAY_SIZE(scaling->scaling_list_16x16); list++) {
++		const u8 *m = scaling->scaling_list_16x16[list];
++
++		base = 160 + 16 * list;
++		for (row = 0; row < 8; row++) {
++			pic[base + 2 * row] =
++				histb_vdec_v5_hevc_pack4(m, row, 8 + row,
++						       16 + row, 24 + row);
++			pic[base + 2 * row + 1] =
++				histb_vdec_v5_hevc_pack4(m, 32 + row, 40 + row,
++						       48 + row, 56 + row);
++		}
++	}
++	for (list = 0; list < ARRAY_SIZE(scaling->scaling_list_32x32); list++) {
++		const u8 *m = scaling->scaling_list_32x32[list];
++
++		base = 256 + 16 * list;
++		for (row = 0; row < 8; row++) {
++			pic[base + 2 * row] =
++				histb_vdec_v5_hevc_pack4(m, row, 8 + row,
++						       16 + row, 24 + row);
++			pic[base + 2 * row + 1] =
++				histb_vdec_v5_hevc_pack4(m, 32 + row, 40 + row,
++						       48 + row, 56 + row);
++		}
++	}
++	for (list = 0; list < ARRAY_SIZE(scaling->scaling_list_4x4); list++) {
++		const u8 *m = scaling->scaling_list_4x4[list];
++
++		base = 288 + 4 * list;
++		for (row = 0; row < 4; row++)
++			pic[base + row] = histb_vdec_v5_hevc_pack4(m, row,
++								 8 + row,
++								 4 + row,
++								 12 + row);
++	}
++	pic[312] = histb_vdec_v5_hevc_pack4(dc16, 0, 1, 2, 3);
++	pic[313] = dc16[4] | dc16[5] << 8 | dc32[0] << 16 | dc32[1] << 24;
++}
++
++/* ---------------------------------------------------------- validation */
++
++static int histb_vdec_v5_hevc_check_syntax(struct histb_vdec_v5 *dec,
++					 struct histb_vdec_v5_hevc_run *run)
++{
++	const struct v4l2_ctrl_hevc_sps *sps = run->sps;
++	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
++	const struct v4l2_ctrl_hevc_decode_params *decp = run->dec;
++	unsigned int i;
++
++	if (sps->chroma_format_idc != 1 ||
++	    sps->bit_depth_luma_minus8 != 0 ||
++	    sps->bit_depth_chroma_minus8 != 0 ||
++	    (sps->flags & V4L2_HEVC_SPS_FLAG_SEPARATE_COLOUR_PLANE)) {
++		dev_dbg(dec->dev, "only 8-bit 4:2:0 reaches this core\n");
++		return -EINVAL;
++	}
++
++	if (!sps->pic_width_in_luma_samples ||
++	    !sps->pic_height_in_luma_samples) {
++		dev_dbg(dec->dev, "picture size is zero\n");
++		return -EINVAL;
++	}
++
++	run->ctb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3 +
++			sps->log2_diff_max_min_luma_coding_block_size;
++	if (run->ctb_log2 < 4 || run->ctb_log2 > 6) {
++		dev_dbg(dec->dev, "CTB size 2^%u is not expressible\n",
++			run->ctb_log2);
++		return -EINVAL;
++	}
++	run->ctb_width = DIV_ROUND_UP(sps->pic_width_in_luma_samples,
++				      BIT(run->ctb_log2));
++	run->ctb_height = DIV_ROUND_UP(sps->pic_height_in_luma_samples,
++				       BIT(run->ctb_log2));
++	run->ctbs = run->ctb_width * run->ctb_height;
++	if (!run->ctbs || run->ctbs > BIT(20)) {
++		dev_dbg(dec->dev, "CTU grid %ux%u out of range\n",
++			run->ctb_width, run->ctb_height);
++		return -EINVAL;
++	}
++
++	if (decp->num_active_dpb_entries > V4L2_HEVC_DPB_ENTRIES_NUM_MAX) {
++		dev_dbg(dec->dev, "%u DPB entries exceed the table\n",
++			decp->num_active_dpb_entries);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < decp->num_active_dpb_entries; i++) {
++		if (decp->dpb[i].flags &
++		    ~V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE) {
++			dev_dbg(dec->dev, "DPB entry %u has unknown flags\n", i);
++			return -EINVAL;
++		}
++	}
++
++	for (i = 0; i < run->num_slices; i++) {
++		const struct v4l2_ctrl_hevc_slice_params *slice = &run->slices[i];
++		unsigned int n0, n1, j;
++
++		if (slice->slice_type != V4L2_HEVC_SLICE_TYPE_I &&
++		    slice->slice_type != V4L2_HEVC_SLICE_TYPE_P &&
++		    slice->slice_type != V4L2_HEVC_SLICE_TYPE_B) {
++			dev_dbg(dec->dev, "slice type %u is not I/P/B\n",
++				slice->slice_type);
++			return -EINVAL;
++		}
++		if (slice->slice_segment_addr >= run->ctbs) {
++			dev_dbg(dec->dev, "slice %u starts past the CTU grid\n",
++				i);
++			return -EINVAL;
++		}
++
++		n0 = slice->slice_type == V4L2_HEVC_SLICE_TYPE_I ? 0 :
++			slice->num_ref_idx_l0_active_minus1 + 1;
++		n1 = slice->slice_type == V4L2_HEVC_SLICE_TYPE_B ?
++			slice->num_ref_idx_l1_active_minus1 + 1 : 0;
++		for (j = 0; j < n0; j++) {
++			unsigned int idx = slice->ref_idx_l0[j];
++
++			if (idx >= decp->num_active_dpb_entries) {
++				dev_dbg(dec->dev, "list 0 reference %u is empty\n",
++					idx);
++				return -EINVAL;
++			}
++			if ((decp->dpb[idx].flags &
++			     V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE) &&
++			    !histb_vdec_v5_hevc_long_term_ok(decp, idx)) {
++				dev_dbg(dec->dev,
++					"long-term reference %u is not in the set\n",
++					idx);
++				return -EINVAL;
++			}
++		}
++		for (j = 0; j < n1; j++) {
++			unsigned int idx = slice->ref_idx_l1[j];
++
++			if (idx >= decp->num_active_dpb_entries) {
++				dev_dbg(dec->dev, "list 1 reference %u is empty\n",
++					idx);
++				return -EINVAL;
++			}
++		}
++	}
++
++	if (histb_vdec_v5_hevc_init_tiles(pps, run->ctb_width, run->ctb_height,
++					&run->tiles)) {
++		dev_dbg(dec->dev, "tile grid does not close the CTU grid\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/* --------------------------------------------------------- bitstream */
++
++/*
++ * Copy every slice NAL into one coherent span with its emulation prevention
++ * bytes removed, and record where each slice's data starts and how many bits of
++ * it are valid.
++ *
++ * Without start codes the submitted bytes are the slice NALs end to end, and
++ * each control's bit_size delimits its own. With Annex-B start codes the units
++ * have to be located first: only VCL units get a slot, and a unit ends where the
++ * next start code begins.
++ */
++static int histb_vdec_v5_hevc_copy_stream(struct histb_vdec_v5 *dec,
++					struct histb_vdec_v5_hevc *hevc,
++					struct histb_vdec_v5_hevc_run *run,
++					const u8 *src, size_t payload,
++					unsigned long start_code)
++{
++	size_t required = payload + V5R6_HEVC_STREAM_GUARD;
++	size_t src_offset = 0, dst_offset = 0;
++	unsigned int i, count = 0, vcl = 0;
++	bool annexb = start_code == V4L2_STATELESS_HEVC_START_CODE_ANNEX_B;
++	u8 *dst;
++
++	if (hevc->rbsp_size < required) {
++		size_t want = round_up(required, 64 * 1024);
++
++		if (hevc->rbsp_va != NULL)
++			dma_free_coherent(dec->dev, hevc->rbsp_size,
++					  hevc->rbsp_va, hevc->rbsp_dma);
++		hevc->rbsp_va = dma_alloc_coherent(dec->dev, want,
++						   &hevc->rbsp_dma, GFP_KERNEL);
++		if (hevc->rbsp_va == NULL) {
++			hevc->rbsp_size = 0;
++			return -ENOMEM;
++		}
++		hevc->rbsp_size = want;
++	}
++	dst = hevc->rbsp_va;
++
++	if (annexb) {
++		u32 pos;
++
++		for (pos = 0; pos + 4 < payload; pos++) {
++			if (src[pos] || src[pos + 1] || src[pos + 2] != 1)
++				continue;
++			if (count >= ARRAY_SIZE(hevc->nal))
++				return -EINVAL;
++			hevc->nal[count].hdr = pos + 3;
++			hevc->nal[count].type = (src[pos + 3] >> 1) & 0x3f;
++			if (count)
++				hevc->nal[count - 1].end = pos;
++			count++;
++			pos += 3;
++		}
++		if (!count)
++			return -EINVAL;
++		hevc->nal[count - 1].end = payload;
++		for (i = 0; i < count; i++)
++			if (hevc->nal[i].type <= 31)
++				vcl++;
++		if (vcl != run->num_slices)
++			return -EINVAL;
++	}
++
++	for (i = 0; i < run->num_slices; i++) {
++		const struct v4l2_ctrl_hevc_slice_params *slice = &run->slices[i];
++		size_t nal_start, nal_end, nal_size;
++		size_t out = dst_offset;
++		unsigned int zeros = 0;
++		size_t j;
++
++		if (annexb) {
++			unsigned int n, seen = 0;
++
++			nal_start = 0;
++			nal_end = 0;
++			for (n = 0; n < count; n++) {
++				if (hevc->nal[n].type > 31)
++					continue;
++				if (seen++ != i)
++					continue;
++				nal_start = hevc->nal[n].hdr;
++				nal_end = hevc->nal[n].end;
++				break;
++			}
++			nal_size = nal_end - nal_start;
++		} else {
++			nal_size = DIV_ROUND_UP(slice->bit_size, 8);
++			nal_start = src_offset;
++		}
++
++		if (!nal_size || nal_start + nal_size > payload ||
++		    slice->data_byte_offset >= nal_size)
++			return -EINVAL;
++
++		for (j = 0; j < nal_size; j++) {
++			u8 byte = src[nal_start + j];
++
++			if (zeros >= 2 && byte == 0x03) {
++				zeros = 0;
++				continue;
++			}
++			dst[out++] = byte;
++			zeros = byte != 0 ? 0 : min(zeros + 1, 2u);
++		}
++
++		run->streams[i].data_offset = dst_offset + slice->data_byte_offset;
++		/* The span starts at the NAL header, so the slice header the
++		 * control skips comes off the RBSP byte count, not the raw one.
++		 */
++		run->streams[i].valid_bits =
++			((out - dst_offset) - slice->data_byte_offset) * 8;
++		if (!annexb)
++			src_offset += nal_size;
++		dst_offset = out;
++	}
++
++	if (!annexb && src_offset != payload)
++		return -EINVAL;
++
++	memset(dst + dst_offset, 0, V5R6_HEVC_STREAM_GUARD);
++	run->stream_dma = hevc->rbsp_dma;
++
++	return 0;
++}
++
++/* ------------------------------------------------------- reference map */
++
++static int histb_vdec_v5_hevc_map_refs(struct histb_vdec_v5 *dec,
++				     struct histb_vdec_v5_ctx *ctx,
++				     struct histb_vdec_v5_hevc_run *run,
++				     struct vb2_v4l2_buffer *dst)
++{
++	const struct v4l2_ctrl_hevc_decode_params *decp = run->dec;
++	struct vb2_queue *cap_q;
++	struct histb_vdec_v5_frame *frame;
++	unsigned long owned = 0;
++	unsigned int i;
++
++	frame = histb_vdec_v5_frame_of(ctx, dst->vb2_buf.index);
++	if (frame == NULL) {
++		dev_dbg(dec->dev, "no frame record for buffer %u\n",
++			dst->vb2_buf.index);
++		return -EINVAL;
++	}
++	frame->apc_slot = histb_vdec_v5_hevc_apc_alloc(ctx, dst->vb2_buf.index);
++	frame->pmv_slot = histb_vdec_v5_hevc_pmv_alloc(ctx, dst->vb2_buf.index);
++	run->frame = frame;
++	owned = BIT(frame->apc_slot);
++
++	for (i = 0; i < V5R6_MAX_DPB_SLOTS; i++) {
++		run->img_addr[i] = histb_vdec_v5_addr_at(frame->dma,
++						       V5R6_ADDR_SHIFT);
++		run->dpb_poc[i] = 0;
++	}
++
++	cap_q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++	for (i = 0; i < decp->num_active_dpb_entries; i++) {
++		const struct v4l2_hevc_dpb_entry *entry = &decp->dpb[i];
++		struct histb_vdec_v5_frame *ref;
++		struct vb2_buffer *vb;
++
++		run->dpb2apc[i] = 0xff;
++		run->dpb2pmv[i] = 0xff;
++
++		vb = vb2_find_buffer(cap_q, entry->timestamp);
++		if (vb == NULL || vb->index >= V5R6_MAX_FRAMES) {
++			dev_dbg(dec->dev, "reference %u names no buffer\n", i);
++			return -EINVAL;
++		}
++		ref = histb_vdec_v5_frame_of(ctx, vb->index);
++		if (ref == NULL) {
++			dev_dbg(dec->dev, "reference %u has no record\n", i);
++			return -EINVAL;
++		}
++
++		run->dpb2apc[i] = histb_vdec_v5_hevc_apc_alloc(ctx, vb->index);
++		run->dpb2pmv[i] = histb_vdec_v5_hevc_pmv_alloc(ctx, vb->index);
++		ref->apc_slot = run->dpb2apc[i];
++		ref->pmv_slot = run->dpb2pmv[i];
++		owned |= BIT(run->dpb2apc[i]);
++		run->img_addr[run->dpb2apc[i]] =
++			histb_vdec_v5_addr_at(ref->dma, V5R6_ADDR_SHIFT);
++		run->dpb_poc[run->dpb2apc[i]] = entry->pic_order_cnt_val;
++	}
++
++	/*
++	 * A slot no surface owns still has to hold an address the core may
++	 * lawfully fetch; a zero word is a real DMA target, so those repeat the
++	 * first one.
++	 */
++	for (i = 0; i < V5R6_MAX_DPB_SLOTS; i++) {
++		if ((owned & BIT(i)) == 0)
++			run->img_addr[i] = run->img_addr[0];
++	}
++
++	return 0;
++}
++
++/* --------------------------------------------------------- messages */
++
++static void histb_vdec_v5_hevc_pack_pic(struct histb_vdec_v5 *dec,
++				      const struct histb_vdec_v5_ctx *ctx,
++				      const struct histb_vdec_v5_hevc_run *run,
++				      u32 *pic)
++{
++	const struct v4l2_ctrl_hevc_sps *sps = run->sps;
++	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
++	const struct histb_vdec_v5_hevc *hevc = ctx->priv;
++	unsigned int min_cb_log2 =
++		sps->log2_min_luma_coding_block_size_minus3 + 3;
++	unsigned int min_tb_log2 =
++		sps->log2_min_luma_transform_block_size_minus2 + 2;
++	unsigned int max_tb_log2 = min_tb_log2 +
++		sps->log2_diff_max_min_luma_transform_block_size;
++	bool pcm = sps->flags & V4L2_HEVC_SPS_FLAG_PCM_ENABLED;
++	unsigned int min_pcm_log2 = pcm ?
++		sps->log2_min_pcm_luma_coding_block_size_minus3 + 3 : 0;
++	unsigned int max_pcm_log2 = pcm ? min_pcm_log2 +
++		sps->log2_diff_max_min_pcm_luma_coding_block_size : 0;
++	unsigned int i;
++
++	memset(pic, 0, V5R6_HEVC_SLOT_BYTES);
++
++	pic[0] = ((sps->flags & V4L2_HEVC_SPS_FLAG_STRONG_INTRA_SMOOTHING_ENABLED) ?
++		  BIT(25) : 0) |
++		 ((sps->flags & V4L2_HEVC_SPS_FLAG_SCALING_LIST_ENABLED) ?
++		  BIT(24) : 0) |
++		 ((pcm && (sps->flags &
++			   V4L2_HEVC_SPS_FLAG_PCM_LOOP_FILTER_DISABLED)) ?
++		  BIT(23) : 0) |
++		 ((sps->flags & V4L2_HEVC_SPS_FLAG_SAMPLE_ADAPTIVE_OFFSET) ?
++		  BIT(22) : 0) |
++		 ((sps->flags & V4L2_HEVC_SPS_FLAG_AMP_ENABLED) ? BIT(21) : 0) |
++		 (sps->chroma_format_idc << 19) | (pcm << 18) |
++		 ((run->ctb_height - 1) << 9) | (run->ctb_width - 1);
++	pic[1] = run->dec->pic_order_cnt_val;
++
++	pic[2] = (pps->log2_parallel_merge_level_minus2 << 29) |
++		 ((pps->flags & V4L2_HEVC_PPS_FLAG_WEIGHTED_BIPRED) ?
++		  BIT(28) : 0) |
++		 ((pps->flags & V4L2_HEVC_PPS_FLAG_WEIGHTED_PRED) ?
++		  BIT(27) : 0) |
++		 (sps->max_transform_hierarchy_depth_inter << 24) |
++		 (sps->max_transform_hierarchy_depth_intra << 21) |
++		 (min_pcm_log2 << 18) | (max_pcm_log2 << 15) |
++		 (min_tb_log2 << 12) | (max_tb_log2 << 9) |
++		 (sps->log2_diff_max_min_luma_coding_block_size << 6) |
++		 (min_cb_log2 << 3) | run->ctb_log2;
++
++	pic[3] = (6 * sps->bit_depth_chroma_minus8) << 22 |
++		 (6 * sps->bit_depth_luma_minus8) << 16 |
++		 ((pcm ? sps->pcm_sample_bit_depth_chroma_minus1 + 1 : 0) << 12) |
++		 ((pcm ? sps->pcm_sample_bit_depth_luma_minus1 + 1 : 0) << 8) |
++		 ((sps->bit_depth_chroma_minus8 + 8) << 4) |
++		 (sps->bit_depth_luma_minus8 + 8);
++
++	/*
++	 * The neighbour-history areas. This generation's own map puts the
++	 * motion-history top and left, the reconstructed-top image and the
++	 * tile map in named pool areas, several of which share a span at
++	 * different times; the ones a picture writes at once are kept apart by
++	 * the per-picture table block, as the H.264 path does.
++	 */
++	pic[4] = 0;
++	pic[5] = histb_vdec_v5_hevc_pool_addr(dec, V5R6_TBL_PMV_TOP);
++	pic[6] = histb_vdec_v5_addr_at(
++		histb_vdec_v5_hevc_pmv_dma(ctx, run->frame->pmv_slot),
++		V5R6_ADDR_SHIFT);
++	pic[7] = histb_vdec_v5_hevc_pool_addr(dec, V5R6_TBL_RCNT_TOP);
++
++	for (i = 0; i < V5R6_MAX_DPB_SLOTS; i++)
++		pic[8 + i] = run->img_addr[i];
++
++	pic[25] = histb_vdec_v5_hevc_pool_addr(dec, V5R6_POOL_CABAC_MN_HEVC);
++	for (i = 0; i < V5R6_MAX_DPB_SLOTS; i++)
++		pic[26 + i] = (u32)run->dpb_poc[i];
++
++	pic[43] = histb_vdec_v5_hevc_pool_addr(dec, V5R6_POOL_SED_LEFT_PHY);
++	pic[54] = sps->pic_height_in_luma_samples << 16 |
++		  sps->pic_width_in_luma_samples;
++	pic[55] = histb_vdec_v5_addr_at(hevc->tile_dma, V5R6_ADDR_SHIFT);
++	pic[56] = histb_vdec_v5_hevc_pool_addr(dec, V5R6_POOL_DBLKTOP_PHY);
++	pic[57] = histb_vdec_v5_hevc_pool_addr(dec, V5R6_POOL_DBLKLEFT_PHY);
++	pic[58] = histb_vdec_v5_hevc_pool_addr(dec, V5R6_POOL_SAO_TOP_PHY);
++	pic[59] = histb_vdec_v5_hevc_pool_addr(dec, V5R6_POOL_DBLKTOP_PHY);
++
++	pic[60] = ((pps->flags &
++		    V4L2_HEVC_PPS_FLAG_LOOP_FILTER_ACROSS_TILES_ENABLED) ?
++		   BIT(24) : 0) |
++		  ((pps->flags & V4L2_HEVC_PPS_FLAG_TRANSFORM_SKIP_ENABLED) ?
++		   BIT(23) : 0) |
++		  ((pps->flags & V4L2_HEVC_PPS_FLAG_SIGN_DATA_HIDING_ENABLED) ?
++		   BIT(22) : 0) |
++		  ((pps->flags & V4L2_HEVC_PPS_FLAG_ENTROPY_CODING_SYNC_ENABLED) ?
++		   BIT(21) : 0) |
++		  ((pps->flags & V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING) ?
++		   BIT(20) : 0) |
++		  ((pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) ?
++		   BIT(19) : 0) |
++		  ((run->ctb_log2 - pps->diff_cu_qp_delta_depth) << 16) |
++		  (pps->diff_cu_qp_delta_depth << 13) |
++		  ((pps->flags & V4L2_HEVC_PPS_FLAG_CU_QP_DELTA_ENABLED) ?
++		   BIT(12) : 0) |
++		  ((pps->flags & V4L2_HEVC_PPS_FLAG_TRANSQUANT_BYPASS_ENABLED) ?
++		   BIT(11) : 0) |
++		  ((pps->flags & V4L2_HEVC_PPS_FLAG_CONSTRAINED_INTRA_PRED) ?
++		   BIT(10) : 0) |
++		  ((pps->pps_cb_qp_offset & 0x1f) << 5) |
++		  (pps->pps_cr_qp_offset & 0x1f);
++	pic[61] = pps->num_tile_rows_minus1 << 16 |
++		  pps->num_tile_columns_minus1;
++	pic[63] = histb_vdec_v5_addr_at(
++		histb_vdec_v5_hevc_slot_dma(dec, V5R6_HEVC_SLICE_SLOT),
++		V5R6_ADDR_SHIFT);
++
++	if (sps->flags & V4L2_HEVC_SPS_FLAG_SCALING_LIST_ENABLED)
++		histb_vdec_v5_hevc_qmatrix(pic, run->scaling);
++	else
++		for (i = 64; i < 314; i++)
++			pic[i] = 0x10101010;
++}
++
++static void
++histb_vdec_v5_hevc_weights(u32 *msg,
++			 const struct v4l2_hevc_pred_weight_table *w,
++			 unsigned int list, unsigned int refs)
++{
++	const s8 *delta_luma = list ? w->delta_luma_weight_l1 :
++				      w->delta_luma_weight_l0;
++	const s8 *luma_offset = list ? w->luma_offset_l1 : w->luma_offset_l0;
++	const s8 (*delta_chroma)[2] = list ? w->delta_chroma_weight_l1 :
++					     w->delta_chroma_weight_l0;
++	const s8 (*chroma_offset)[2] = list ? w->chroma_offset_l1 :
++					      w->chroma_offset_l0;
++	s32 luma_denom = w->luma_log2_weight_denom;
++	s32 chroma_denom = luma_denom + w->delta_chroma_log2_weight_denom;
++	unsigned int i;
++
++	for (i = 0; i < refs; i++) {
++		s32 luma_weight = BIT(luma_denom) + delta_luma[i];
++		s32 chroma_weight[2];
++		unsigned int index = list * 16 + i;
++
++		chroma_weight[0] = BIT(chroma_denom) + delta_chroma[i][0];
++		chroma_weight[1] = BIT(chroma_denom) + delta_chroma[i][1];
++
++		msg[64 + index] = ((luma_offset[i] & 0xff) << 12) |
++				  ((luma_weight & 0x1ff) << 3) |
++				  (luma_denom & 7);
++		msg[128 + index] = ((chroma_offset[i][0] & 0xff) << 12) |
++				   ((chroma_weight[0] & 0x1ff) << 3) |
++				   (chroma_denom & 7);
++		msg[160 + index] = (chroma_weight[1] & 0x1ff) |
++				   ((chroma_offset[i][1] & 0xff) << 9);
++	}
++}
++
++static int histb_vdec_v5_hevc_pack_slice(struct histb_vdec_v5 *dec,
++				       struct histb_vdec_v5_ctx *ctx,
++				       struct histb_vdec_v5_hevc_run *run,
++				       unsigned int index, unsigned int count,
++				       u32 end_rs, u32 end_ts,
++				       u32 independent_addr)
++{
++	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
++	const struct v4l2_ctrl_hevc_slice_params *slice = &run->slices[index];
++	const struct histb_vdec_v5_hevc_stream *stream = &run->streams[index];
++	u32 *msg = histb_vdec_v5_hevc_slot(dec, V5R6_HEVC_SLICE_SLOT + index);
++	dma_addr_t stream_dma = run->stream_dma + stream->data_offset;
++	dma_addr_t mv_addr =
++		histb_vdec_v5_hevc_pmv_dma(ctx, run->frame->pmv_slot);
++	bool p = slice->slice_type == V4L2_HEVC_SLICE_TYPE_P;
++	bool b = slice->slice_type == V4L2_HEVC_SLICE_TYPE_B;
++	bool temporal = (p || b) && (slice->flags &
++		V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED);
++	unsigned int refs0 = (p || b) ?
++		slice->num_ref_idx_l0_active_minus1 + 1 : 0;
++	unsigned int refs1 = b ? slice->num_ref_idx_l1_active_minus1 + 1 : 0;
++	bool low_delay = true;
++	u32 qp = 26 + pps->init_qp_minus26 + slice->slice_qp_delta;
++	u32 value;
++	unsigned int i;
++
++	memset(msg, 0, V5R6_HEVC_SLOT_BYTES);
++
++	msg[0] = ((stream_dma & ~15u) - (run->stream_dma & ~15u)) >>
++		 V5R6_ADDR_SHIFT;
++	msg[1] = (stream_dma & 0xf) * 8;
++	msg[2] = stream->valid_bits;
++
++	for (i = 0; i < refs0; i++) {
++		unsigned int idx = slice->ref_idx_l0[i];
++		u8 slot = run->dpb2apc[idx];
++
++		if (slot == 0xff)
++			return -EINVAL;
++		if (run->dec->dpb[idx].pic_order_cnt_val >
++		    run->dec->pic_order_cnt_val)
++			low_delay = false;
++		if (run->dec->dpb[idx].flags &
++		    V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE)
++			msg[13] |= BIT(i);
++		msg[15 + i / 8] |= (u32)slot << (4 * (i % 8));
++	}
++	for (i = 0; i < refs1; i++) {
++		unsigned int idx = slice->ref_idx_l1[i];
++		u8 slot = run->dpb2apc[idx];
++
++		if (slot == 0xff)
++			return -EINVAL;
++		if (run->dec->dpb[idx].pic_order_cnt_val >
++		    run->dec->pic_order_cnt_val)
++			low_delay = false;
++		if (run->dec->dpb[idx].flags &
++		    V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE)
++			msg[14] |= BIT(i);
++		msg[17 + i / 8] |= (u32)slot << (4 * (i % 8));
++	}
++
++	msg[6] = (low_delay ? BIT(27) : 0) |
++		 ((slice->flags &
++		   V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT) ?
++		  BIT(26) : 0) |
++		 ((qp & 0x7f) << 19) |
++		 ((slice->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_CABAC_INIT) ?
++		  BIT(18) : 0) |
++		 independent_addr;
++
++	value = 2 - slice->slice_type;
++	if (p || b) {
++		value |= (5 - slice->five_minus_max_num_merge_cand) << 24 |
++			 ((refs1 ? refs1 - 1 : 0) << 20) |
++			 ((refs0 - 1) << 16) | (refs1 << 8) | (refs0 << 2) |
++			 ((slice->flags &
++			   V4L2_HEVC_SLICE_PARAMS_FLAG_MVD_L1_ZERO) ?
++			  BIT(14) : 0) |
++			 (temporal ? BIT(15) : 0);
++	}
++	if (temporal) {
++		unsigned int col_idx = slice->collocated_ref_idx;
++		bool from_l0 = slice->flags &
++			V4L2_HEVC_SLICE_PARAMS_FLAG_COLLOCATED_FROM_L0;
++		unsigned int col_dpb;
++		u8 slot;
++
++		if (from_l0) {
++			if (col_idx >= refs0)
++				return -EINVAL;
++			col_dpb = slice->ref_idx_l0[col_idx];
++		} else {
++			if (col_idx >= refs1)
++				return -EINVAL;
++			col_dpb = slice->ref_idx_l1[col_idx];
++		}
++		slot = run->dpb2apc[col_dpb];
++		if (slot == 0xff)
++			return -EINVAL;
++		mv_addr = histb_vdec_v5_hevc_pmv_dma(ctx,
++						   run->dpb2pmv[col_dpb]);
++		value |= (u32)slot << 28 | (u32)from_l0 << 27;
++	}
++
++	msg[23] = histb_vdec_v5_addr_at(mv_addr, V5R6_ADDR_SHIFT);
++	msg[24] = 0x400a | (3 * run->sps->bit_depth_luma_minus8) << 8;
++	msg[7] = value;
++	msg[8] = slice->slice_segment_addr;
++	msg[9] = (slice->slice_segment_addr / run->ctb_width) << 16 |
++		 (slice->slice_segment_addr % run->ctb_width);
++	msg[10] = histb_vdec_v5_hevc_rs_to_ts(&run->tiles, run->ctb_width,
++					    slice->slice_segment_addr);
++	msg[11] = (slice->slice_cb_qp_offset & 0x1f) << 8 |
++		  (slice->slice_cr_qp_offset & 0x1f);
++	msg[12] = (slice->slice_tc_offset_div2 & 0xf) << 16 |
++		  (slice->slice_beta_offset_div2 & 0xf) << 8 |
++		  ((slice->flags &
++		    V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_LUMA) ? BIT(3) : 0) |
++		  ((slice->flags &
++		    V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_CHROMA) ? BIT(2) : 0) |
++		  ((slice->flags &
++		    V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_DEBLOCKING_FILTER_DISABLED) ?
++		   BIT(1) : 0) |
++		  ((slice->flags &
++		    V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED) ?
++		   BIT(0) : 0);
++	msg[43] = end_rs;
++	msg[44] = end_ts;
++	if (index + 1 < count)
++		msg[63] = histb_vdec_v5_addr_at(
++			histb_vdec_v5_hevc_slot_dma(dec,
++						  V5R6_HEVC_SLICE_SLOT +
++						  index + 1),
++			V5R6_ADDR_SHIFT);
++
++	if (p && (pps->flags & V4L2_HEVC_PPS_FLAG_WEIGHTED_PRED))
++		histb_vdec_v5_hevc_weights(msg, &slice->pred_weight_table, 0,
++					 refs0);
++	if (b && (pps->flags & V4L2_HEVC_PPS_FLAG_WEIGHTED_BIPRED)) {
++		histb_vdec_v5_hevc_weights(msg, &slice->pred_weight_table, 0,
++					 refs0);
++		histb_vdec_v5_hevc_weights(msg, &slice->pred_weight_table, 1,
++					 refs1);
++	}
++
++	return 0;
++}
++
++/* ------------------------------------------------------------- job */
++
++static int histb_vdec_v5_hevc_run(struct histb_vdec_v5_ctx *ctx,
++				struct vb2_v4l2_buffer *src,
++				struct vb2_v4l2_buffer *dst)
++{
++	struct histb_vdec_v5 *dec = histb_vdec_v5_of_ctx(ctx);
++	struct histb_vdec_v5_hevc_run *run;
++	struct histb_vdec_v5_hevc *hevc = ctx->priv;
++	struct histb_vdec_v5_job job = {
++		.to_val		= V5R6_TIMEOUT_DEFAULT,
++		.reg_shift	= V5R6_ADDR_SHIFT,
++		.cfg0		= V5R6_HEVC_CFG0,
++		.cfg1		= V5R6_HEVC_CFG1,
++	};
++	struct v4l2_ctrl *ctrl;
++	struct histb_vdec_v5_frame *dst_frame;
++	unsigned int n_slices, i, pitch, lines, uv_offset, mbs;
++	unsigned long bytes, start_code;
++	const u8 *src_va;
++	u32 *pic;
++	int ret;
++
++	if (hevc == NULL) {
++		hevc = kzalloc_obj(*hevc);
++		if (hevc == NULL)
++			return -ENOMEM;
++		hevc->tile_va = dma_alloc_coherent(dec->dev,
++						   V5R6_HEVC_TILE_INFO_BYTES,
++						   &hevc->tile_dma, GFP_KERNEL);
++		if (hevc->tile_va == NULL) {
++			kfree(hevc);
++			return -ENOMEM;
++		}
++		ctx->priv = hevc;
++	}
++	run = &hevc->run;
++	memset(run, 0, sizeof(*run));
++
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SPS);
++	run->sps = ctrl != NULL ? ctrl->p_cur.p_hevc_sps : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_PPS);
++	run->pps = ctrl != NULL ? ctrl->p_cur.p_hevc_pps : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
++	run->dec = ctrl != NULL ? ctrl->p_cur.p : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_HEVC_SCALING_MATRIX);
++	run->scaling = ctrl != NULL ? ctrl->p_cur.p : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_HEVC_SLICE_PARAMS);
++	run->slices = ctrl != NULL ? ctrl->p_cur.p_hevc_slice_params : NULL;
++	n_slices = ctrl != NULL ? ctrl->new_elems : 0;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_HEVC_START_CODE);
++	start_code = ctrl != NULL ? ctrl->cur.val :
++		V4L2_STATELESS_HEVC_START_CODE_ANNEX_B;
++
++	if (run->sps == NULL || run->pps == NULL || run->dec == NULL ||
++	    run->slices == NULL || !n_slices) {
++		dev_dbg(dec->dev, "no controls for this access unit\n");
++		return -EINVAL;
++	}
++	if (n_slices > V5R6_HEVC_MAX_SLICES ||
++	    n_slices > ARRAY_SIZE(run->streams)) {
++		dev_dbg(dec->dev, "%u slices exceed the %u a chain holds\n",
++			n_slices, V5R6_HEVC_MAX_SLICES);
++		return -EINVAL;
++	}
++	run->num_slices = n_slices;
++
++	bytes = vb2_get_plane_payload(&src->vb2_buf, 0);
++	if (bytes <= src->vb2_buf.planes[0].data_offset) {
++		dev_dbg(dec->dev, "submission carries no bitstream\n");
++		return -EINVAL;
++	}
++	bytes -= src->vb2_buf.planes[0].data_offset;
++	src_va = vb2_plane_vaddr(&src->vb2_buf, 0);
++	if (src_va == NULL) {
++		dev_dbg(dec->dev, "OUTPUT queue has no mapping\n");
++		return -EINVAL;
++	}
++	src_va += src->vb2_buf.planes[0].data_offset;
++
++	dst_frame = histb_vdec_v5_frame_of(ctx, dst->vb2_buf.index);
++	if (dst_frame == NULL)
++		return -EINVAL;
++
++	ret = histb_vdec_v5_hevc_check_syntax(dec, run);
++	if (ret)
++		return ret;
++
++	/*
++	 * The coded picture has to stay inside the grid the capture format was
++	 * agreed for: the engine writes the coded picture and the motion
++	 * history areas are sized from the CTU grid.
++	 */
++	if (run->sps->pic_width_in_luma_samples > V5R6_MAX_WIDTH ||
++	    run->sps->pic_height_in_luma_samples > V5R6_MAX_HEIGHT) {
++		dev_dbg(dec->dev, "coded size %ux%u beyond this core\n",
++			run->sps->pic_width_in_luma_samples,
++			run->sps->pic_height_in_luma_samples);
++		return -EINVAL;
++	}
++	histb_vdec_v5_buf_geom(ctx, &pitch, &lines, &uv_offset);
++	if (V5R6_BAND_PITCH(run->sps->pic_width_in_luma_samples) > pitch ||
++	    ALIGN(run->sps->pic_height_in_luma_samples,
++		  ctx->desc->grid_align) > lines ||
++	    vb2_get_plane_payload(&dst->vb2_buf, 0) <
++	    histb_vdec_v5_linear_size(run->sps->pic_width_in_luma_samples,
++				    run->sps->pic_height_in_luma_samples)) {
++		dev_dbg(dec->dev, "capture grid too small for %ux%u coded\n",
++			run->sps->pic_width_in_luma_samples,
++			run->sps->pic_height_in_luma_samples);
++		return -EINVAL;
++	}
++
++	mbs = (ALIGN(run->sps->pic_width_in_luma_samples, BIT(run->ctb_log2)) /
++	       16) *
++	      (ALIGN(run->sps->pic_height_in_luma_samples, BIT(run->ctb_log2)) /
++	       16);
++	ret = histb_vdec_v5_pmv_alloc(dec, ctx, mbs);
++	if (ret)
++		return ret;
++
++	ret = histb_vdec_v5_hevc_copy_stream(dec, hevc, run, src_va, bytes,
++					    start_code);
++	if (ret) {
++		dev_dbg(dec->dev, "slice spans do not tile the payload\n");
++		return ret;
++	}
++
++	ret = histb_vdec_v5_hevc_map_refs(dec, ctx, run, dst);
++	if (ret)
++		return ret;
++
++	memset(histb_vdec_v5_hevc_slot(dec, V5R6_HEVC_UP_SLOT), 0,
++	       V5R6_HEVC_SLOT_BYTES);
++	memset(histb_vdec_v5_hevc_slot(dec, V5R6_HEVC_PIC_SLOT), 0,
++	       V5R6_HEVC_SLOT_BYTES);
++	for (i = 0; i < n_slices; i++)
++		memset(histb_vdec_v5_hevc_slot(dec, V5R6_HEVC_SLICE_SLOT + i), 0,
++		       V5R6_HEVC_SLOT_BYTES);
++
++	/*
++	 * The neighbour areas and the CABAC initialisation image are consumed
++	 * by a launch, so they are seeded again for every one.
++	 */
++	histb_vdec_v5_pool_seed(dec);
++	histb_vdec_v5_hevc_tile_info(hevc, run);
++
++	pic = histb_vdec_v5_hevc_slot(dec, V5R6_HEVC_PIC_SLOT);
++	histb_vdec_v5_hevc_pack_pic(dec, ctx, run, pic);
++
++	for (i = 0; i < n_slices; i++) {
++		u32 end_ts = i + 1 < n_slices ?
++			histb_vdec_v5_hevc_rs_to_ts(&run->tiles, run->ctb_width,
++				run->slices[i + 1].slice_segment_addr) - 1 :
++			run->ctbs - 1;
++		u32 end_rs = histb_vdec_v5_hevc_ts_to_rs(&run->tiles,
++						       run->ctb_width, end_ts);
++		u32 independent = run->slices[i].slice_segment_addr;
++
++		ret = histb_vdec_v5_hevc_pack_slice(dec, ctx, run, i, n_slices,
++						  end_rs, end_ts, independent);
++		if (ret) {
++			dev_dbg(dec->dev, "slice %u references nothing\n", i);
++			return ret;
++		}
++	}
++
++	job.pic_dma = histb_vdec_v5_hevc_slot_dma(dec, V5R6_HEVC_PIC_SLOT);
++	job.up_dma = histb_vdec_v5_hevc_slot_dma(dec, V5R6_HEVC_UP_SLOT);
++	job.pitch = pitch;
++	job.stream = run->stream_dma;
++	job.recon = dst_frame->dma;
++	job.uv_offset = uv_offset;
++	job.pic = pic;
++	job.slice = histb_vdec_v5_hevc_slot(dec, V5R6_HEVC_SLICE_SLOT);
++	job.cfg0 |= (run->ctbs - 1) & V5R6_CFG0_MBAMT;
++	if (run->sps->flags & V4L2_HEVC_SPS_FLAG_SCALING_LIST_ENABLED)
++		job.cfg0 |= V5R6_CFG0_LD_QMATRIX;
++
++	/*
++	 * The H.264-style report-coverage check reads a per-macroblock total
++	 * this message does not carry, so it stays out of this protocol.
++	 */
++	ctx->mbs = 0;
++	ctx->slices = n_slices;
++
++	dev_dbg(dec->dev, "hevc pic %08x %08x %08x ctu=%ux%u slices=%u\n",
++		pic[0], pic[1], pic[2], run->ctb_width, run->ctb_height,
++		n_slices);
++	dev_dbg(dec->dev,
++		"hevc ctl ppsf=%#llx sl0 type=%u fm=%u qpd=%d dbo=%u bits=%u flags=%#llx wden=%d\n",
++		(unsigned long long)run->pps->flags, run->slices[0].slice_type,
++		run->slices[0].five_minus_max_num_merge_cand,
++		run->slices[0].slice_qp_delta,
++		run->slices[0].data_byte_offset, run->slices[0].bit_size,
++		(unsigned long long)run->slices[0].flags,
++		run->slices[0].pred_weight_table.luma_log2_weight_denom);
++	{
++		const u32 *s = (const u32 *)job.slice;
++
++		dev_dbg(dec->dev, "hevc slc %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			s[0], s[1], s[2], s[6], s[7], s[8], s[10], s[44]);
++	}
++
++	ret = histb_vdec_v5_launch(dec, &job);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int histb_vdec_v5_hevc_try_ctrl(struct v4l2_ctrl *ctrl)
++{
++	const struct v4l2_ctrl_hevc_sps *sps;
++
++	if (ctrl->id != V4L2_CID_STATELESS_HEVC_SPS)
++		return 0;
++
++	sps = ctrl->p_new.p_hevc_sps;
++	if (sps->chroma_format_idc != 1 ||
++	    sps->bit_depth_luma_minus8 != 0 ||
++	    sps->bit_depth_chroma_minus8 != 0 ||
++	    (sps->flags & V4L2_HEVC_SPS_FLAG_SEPARATE_COLOUR_PLANE))
++		return -EINVAL;
++
++	return 0;
++}
++
++static void histb_vdec_v5_hevc_stop(struct histb_vdec_v5_ctx *ctx)
++{
++	struct histb_vdec_v5_hevc *hevc = ctx->priv;
++	struct histb_vdec_v5 *dec;
++
++	if (hevc == NULL)
++		return;
++
++	dec = histb_vdec_v5_of_ctx(ctx);
++	histb_vdec_v5_pmv_free(ctx);
++	if (hevc->rbsp_va != NULL)
++		dma_free_coherent(dec->dev, hevc->rbsp_size, hevc->rbsp_va,
++				  hevc->rbsp_dma);
++	if (hevc->tile_va != NULL)
++		dma_free_coherent(dec->dev, V5R6_HEVC_TILE_INFO_BYTES,
++				  hevc->tile_va, hevc->tile_dma);
++	kfree(hevc);
++	ctx->priv = NULL;
++	ctx->apc_next = 0;
++	ctx->pmv_next = 0;
++}
++
++static void histb_vdec_v5_hevc_buf_release(struct histb_vdec_v5_ctx *ctx,
++					 unsigned int index)
++{
++	struct histb_vdec_v5_hevc *hevc = ctx->priv;
++
++	if (hevc == NULL || index >= V5R6_MAX_FRAMES)
++		return;
++
++	hevc->apc_map[index] = 0;
++	hevc->pmv_map[index] = 0;
++}
++
++static const struct histb_vdec_v5_codec_ops histb_vdec_v5_hevc_ops = {
++	.run		= histb_vdec_v5_hevc_run,
++	.try_ctrl	= histb_vdec_v5_hevc_try_ctrl,
++	.stop		= histb_vdec_v5_hevc_stop,
++	.buf_release	= histb_vdec_v5_hevc_buf_release,
++};
++
++static unsigned int histb_vdec_v5_hevc_stride(unsigned int width)
++{
++	return V5R6_BAND_PITCH(width);
++}
++
++static const struct v4l2_ctrl_config histb_vdec_v5_hevc_ctrls[] = {
++	{
++		.id = V4L2_CID_STATELESS_HEVC_SPS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_HEVC_PPS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_HEVC_SCALING_MATRIX,
++	},
++	{
++		.id = V4L2_CID_STATELESS_HEVC_DECODE_PARAMS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
++		.name = "HEVC Slice Parameters",
++		.type = V4L2_CTRL_TYPE_HEVC_SLICE_PARAMS,
++		.dims = { 16 },
++		.flags = V4L2_CTRL_FLAG_DYNAMIC_ARRAY,
++	},
++	{
++		.id = V4L2_CID_STATELESS_HEVC_DECODE_MODE,
++		.min = V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED,
++		.max = V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED,
++		.def = V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED,
++	},
++	{
++		.id = V4L2_CID_STATELESS_HEVC_START_CODE,
++		.min = V4L2_STATELESS_HEVC_START_CODE_NONE,
++		.max = V4L2_STATELESS_HEVC_START_CODE_ANNEX_B,
++		.def = V4L2_STATELESS_HEVC_START_CODE_ANNEX_B,
++	},
++};
++
++static const u32 histb_vdec_v5_hevc_req_ctrls[] = {
++	V4L2_CID_STATELESS_HEVC_SPS,
++	V4L2_CID_STATELESS_HEVC_PPS,
++	V4L2_CID_STATELESS_HEVC_DECODE_PARAMS,
++	V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
++};
++
++const histb_vdec_v5_fmt_desc histb_vdec_v5_hevc_fmt = {
++	.fourcc		= V4L2_PIX_FMT_HEVC_SLICE,
++	.vidstd		= 13,
++	.num_ctrls	= ARRAY_SIZE(histb_vdec_v5_hevc_ctrls),
++	.ctrls		= histb_vdec_v5_hevc_ctrls,
++	.ops		= &histb_vdec_v5_hevc_ops,
++	.stride		= histb_vdec_v5_hevc_stride,
++	.grid_align	= 64,
++	.req_ctrls	= histb_vdec_v5_hevc_req_ctrls,
++	.num_req	= ARRAY_SIZE(histb_vdec_v5_hevc_req_ctrls),
++};

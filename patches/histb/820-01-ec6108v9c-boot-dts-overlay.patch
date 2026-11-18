@@ -1,0 +1,65 @@
+From 82001ec6108v9c Mon Sep 17 00:00:00 2001
+From: ec6108v9c-debian
+Date: Tue, 18 Nov 2026 22:00:00 +0800
+Subject: [PATCH] ARM: dts: hisilicon: ec6108v9c boot overlay
+
+Pin the 6.x boot constraints on top of the 810-03 board DTS:
+mmc0/mmc1 aliases, /memory@0, /chosen/bootargs placeholder, and a
+ramoops node inside the existing reserved-memory container.
+
+---
+ arch/arm/boot/dts/hisilicon/hi3798mv100-ec6108v9c.dts | 26 +++++++++
+ 1 file changed, 26 insertions(+)
+
+--- a/arch/arm/boot/dts/hisilicon/hi3798mv100-ec6108v9c.dts
++++ b/arch/arm/boot/dts/hisilicon/hi3798mv100-ec6108v9c.dts
+@@ -14,8 +14,19 @@
+ 	compatible = "hisilicon,hi3798mv100-ec6108v9c",
+ 		     "hisilicon,hi3798mv100";
+ 
++	/* Upstream board has no /memory node; ARM_APPENDED_DTB needs one
++	 * so early_init_dt_scan_nodes() calls memblock_add(). */
++	memory@0 {
++		device_type = "memory";
++		reg = <0x0 __MEM_SIZE__>;
++	};
++
+ 	aliases {
+ 		serial0 = &uart0;
++		/* Pin eMMC=mmc0: blkdevparts/root=/dev/mmcblk0p8 must stay
++		 * valid under async dw_mmc probe (else random unknown-block panic). */
++		mmc0 = &emmc;
++		mmc1 = &sd;
+ 	};
+ 
+ 	thermal-zones {
+@@ -50,6 +61,10 @@
+ 
+ 	chosen {
+ 		stdout-path = "serial0:115200n8";
++		/* APPENDED_DTB: DT cmdline overrides the bootloader args.
++		 * The bootargs placeholder is filled by apply-dts-placeholders.py
++		 * from configs/partition-layout.env (also fed to p2 runtime env). */
++		bootargs = "__CMDLINE__";
+ 	};
+ 
+ 	i2c_hdmi: i2c-hdmi {
+@@ -138,6 +153,18 @@
+ 			size = <0x0a000000>;
+ 			alignment = <0x00400000>;
+ 		};
++		/* pstore/ramoops: survives a boot dark on HDMI+SSH.
++		 * Static inside 810-03 container; NO __FB_BLOCK__ (media_cma
++		 * already provides CMA; a 2nd reserved-memory node would clash). */
++		ramoops@30000000 {
++			compatible = "ramoops";
++			reg = <0x30000000 0x100000>;
++			record-size = <0x20000>;
++			console-size = <0x20000>;
++			pmsg-size = <0x20000>;
++			ecc-size = <0>;
++			no-map;
++		};
+ 	};
+ 
+ 	leds {

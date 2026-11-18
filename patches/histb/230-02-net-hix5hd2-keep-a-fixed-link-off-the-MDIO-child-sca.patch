@@ -1,0 +1,43 @@
+From 29afd93d02e5303c923d0bfc52bd2cb4275f9300 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Fri, 23 Oct 2026 07:50:47 +0800
+Subject: [PATCH 2/4] net: hix5hd2: keep a fixed link off the MDIO child scan
+
+A node that declares a fixed link has no PHY address, yet
+of_mdiobus_register() treated every child without a reg property as a
+PHY candidate: it warns about the missing address, then walks all 32
+addresses printing a line each.
+
+Register the bus with the scan masked out when the node declares a fixed
+link, the same mask of_mdiobus_register() applies before it parses its
+children, so the lifecycle of the bus pointer stays as it is. With the
+mask applied the 33 lines are not printed and eth0 still registers with
+the address from the device tree.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/net/ethernet/hisilicon/hix5hd2_gmac.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c
++++ b/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c
+@@ -1189,7 +1189,18 @@ static int hix5hd2_dev_probe(struct plat
+ 	snprintf(bus->id, MII_BUS_ID_SIZE, "%s-mii", dev_name(&pdev->dev));
+ 	priv->bus = bus;
+ 
+-	ret = of_mdiobus_register(bus, node);
++	/*
++	 * A fixed link names no PHY on this bus, and of_mdiobus_register() would
++	 * treat the fixed-link child as a PHY candidate with no reg property and
++	 * walk all 32 addresses printing a line per address, so register the bus
++	 * with the scan masked out instead.
++	 */
++	if (of_phy_is_fixed_link(node)) {
++		bus->phy_mask = ~0;
++		ret = mdiobus_register(bus);
++	} else {
++		ret = of_mdiobus_register(bus, node);
++	}
+ 	if (ret)
+ 		goto err_free_mdio;
+ 

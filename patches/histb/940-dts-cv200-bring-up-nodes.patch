@@ -1,0 +1,317 @@
+From c310fdb3bee971ba741364cc633522fdc2b0be96 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 00:17:21 +0800
+Subject: [PATCH] dts: cv200 bring-up nodes
+
+The PL022 loopback descriptor, the SD host enablement the bench round
+needed and the four spare serial ports stay here.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../boot/dts/hisilicon/hi3716cv200-ar513w.dts |  11 ++
+ arch/arm/boot/dts/hisilicon/hi3716cv200.dtsi  | 132 ++++++++++++++++--
+ 2 files changed, 129 insertions(+), 14 deletions(-)
+
+--- a/arch/arm/boot/dts/hisilicon/hi3716cv200-ar513w.dts
++++ b/arch/arm/boot/dts/hisilicon/hi3716cv200-ar513w.dts
+@@ -14,6 +14,17 @@
+ 	compatible = "hisilicon,ar513w", "hisilicon,hi3716cv200";
+ };
+ 
++/*
++ * All four extra serial ports are turned on for the bring-up
++ * bench. The PL011 internal loopback (UARTCR.LBE) does not
++ * close on this IP, so the arm is the drain test: write 16
++ * bytes with LBE off and check that FR returns to idle. The
++ * console stays uart0.
++ */
++&uart1 { status = "okay"; };
++&uart2 { status = "okay"; };
++&uart3 { status = "okay"; };
++&uart4 { status = "okay"; };
+ 
+ /* The JPEG codec pair: transfers ran on this board. */
+ &jpgd { status = "okay"; };
+--- a/arch/arm/boot/dts/hisilicon/hi3716cv200.dtsi
++++ b/arch/arm/boot/dts/hisilicon/hi3716cv200.dtsi
+@@ -2,6 +2,10 @@
+ /*
+  * HiSilicon Hi3716CV200 (2x Cortex-A9, 32-bit).
+  *
++ * The node set is the one the AR513W board proves, taken
++ * from the vendor board description for this part. Gates
++ * and resets come from the CRG at 0xf8a22000; sources
++ * with no documented PLL encoding are fixed clocks.
+  */
+ 
+ #include <dt-bindings/clock/hisilicon,hi3716cv200-crg.h>
+@@ -67,16 +71,27 @@
+ 	};
+ 
+ 	/*
++	 * The cores' performance monitor. There is no register to describe
++	 * here: the counters live in the CPU bank the driver reaches through
++	 * the cp15 accessors, and what the device tree carries is where the
++	 * overflow interrupt goes. The Cortex-A9 TRM puts it on private
++	 * peripheral 6 (GIC INTID 38), and the board keeps that wiring: with
++	 * it described, /proc/interrupts lists the arm-pmu row on INTID 38.
+ 	 */
+ 	pmu {
+ 		compatible = "arm,cortex-a9-pmu";
+ 		/*
+ 		 * The node sits at the root, where no interrupt-parent is inherited
++		 * from, so the parent has to be named here.
+ 		 */
+ 		interrupt-parent = <&gic>;
+ 		interrupts = <GIC_PPI 6 IRQ_TYPE_LEVEL_HIGH>;
+ 		interrupt-affinity = <&cpu0>, <&cpu1>;
+ 		/*
++		 * The board is booted by the vendor fastboot with no
++		 * trusted-firmware layer, so the kernel runs in secure SVC: the SDER
++		 * access this property enables executes without trapping, and SDER
++		 * reads back with SUNIDEN set.
+ 		 */
+ 		secure-reg-access;
+ 	};
+@@ -92,7 +107,14 @@
+ 	};
+ 
+ 	/*
+-	 * defaults apply.
++	 * The integrated L2C-310 at 0xf8a10000: CacheID 0x410000C9 (PL310
++	 * r3p2), CacheType 0x9e240240, AuxCtrl 0x00000000 -- every boot,
++	 * vendor and ours, leaves the controller disabled with only its clock
++	 * up (CRG20 bit 4 l2_clkoff_sys = 0). No interrupt is described
++	 * because the combi IRQ wiring is unknown and the l2x0 driver does
++	 * not need one; the vendor kernels run with CONFIG_CACHE_L2X0 unset,
++	 * so there is no vendor register word to copy the aux settings from
++	 * and the driver reset defaults apply.
+ 	 */
+ 	L2: cache-controller@f8a10000 {
+ 		compatible = "arm,pl310-cache";
+@@ -637,6 +659,7 @@
+ 		 * Its clock gate is CRG27 bit 0 with the reset at bit 1 -- the family's sixth
+ 		 * slot (drivers/clk/hisilicon/clk-hix5hd2.c:124) and the one pair the boot hands
+ 		 * over held in reset along with the other five. Nothing is known to hang off
++		 * this bus on this package, and no consumer is described here.
+ 		 */
+ 		i2c5: i2c@f8b17000 {
+ 			compatible = "hisilicon,hix5hd2-i2c";
+@@ -660,7 +683,6 @@
+ 		 * The same clock id feeds both names because CRG28 has one gate per
+ 		 * port and no separate APB gate: sspclk is what the driver asks for and
+ 		 * apb_pclk is the binding's second name for the same access.
+-		 *
+ 		 */
+ 		ssp0: spi@f8b1a000 {
+ 			compatible = "arm,pl022", "arm,primecell";
+@@ -671,6 +693,12 @@
+ 			clock-names = "sspclk", "apb_pclk";
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
++
++			bench_spi: spidev@0 {
++				compatible = "rohm,dh2228fv";
++				reg = <0>;
++				spi-max-frequency = <1000000>;
++			};
+ 		};
+ 
+ 		ssp1: spi@f8007000 {
+@@ -755,6 +783,10 @@
+ 		};
+ 
+ 		/*
++		 * The USB2 device controller. The block is a Synopsys DWC2 core:
++		 * dwc2 binds to it, reads the endpoint count, the fifo split and
++		 * the SPRAM depth out of the hardware and registers a UDC. The
++		 * vendor system wraps the same window in its private hiudc driver.
+ 		 */
+ 		usb4: usb@f98c0000 {
+ 			compatible = "snps,dwc2";
+@@ -835,12 +867,33 @@
+ 
+ 		/*
+ 		 * The two DesignWare MSH hosts the vendor calls SDIO0 and SDIO1
++		 * (drivers/mmc/host/himciv200/, CONFIG_HIMCIV200_SDIO{0,1}_IOBASE).
++		 * Both windows decode: writing 0x200 then 0x2AA to BLKSIZ (0x1c)
++		 * reads back two distinct values, and VERID (0x6c) says 0x5342250A
++		 * on both. Under dw_mmc a host gets to CMD0 completing clean and
++		 * every response-bearing command ending CMD_DONE|RTO with all-zero
++		 * response words while the block is powered, clocked and issuing --
++		 * the bus has nothing to answer, and the vendor system's own boot
++		 * log on this board reports "eMMC/MMC/SD Device NOT detected!" for
++		 * both hosts. Neither host has a card here, so both are described
++		 * and left disabled, and enabling one is a one-property change for
++		 * a variant that fits an eMMC or a slot with a card in it.
+ 		 *
++		 * The interrupt cells are the two hi_mci lines the vendor system
++		 * reports at INTID 66 and 67, less the SPI offset; the 67 one is
++		 * confirmed by this driver's own handler counting. HCON (0x70)
++		 * reads 0x00E44C81, so bits 17..16 select the block's internal DMA
++		 * manager and no external DMA is on this path -- the on-chip DMAC
++		 * chain-transfer problem is not a dependency of the card.
+ 		 *
+-		 *
+-		 *
+-		 *
+-		 *
++		 * CRG39/CRG40 carry, next to the gate, the card-clock select (bits
++		 * 8..9: 75, 100, 50, 24 MHz) and the sample/driver phase fields (the
++		 * vendor host driver). The clock provider exposes one id per host
++		 * covering both enable bits, so "biu" and "ciu" name the same cell
++		 * -- which is also all the dw-mshc binding allows
++		 * (synopsys-dw-mshc.yaml: clocks minItems/maxItems 2, names "biu"
++		 * and "ciu"). The card clock dw_mmc divides is the rate that id
++		 * reports.
+ 		 */
+ 		sdio0: mmc@f9820000 {
+ 			compatible = "snps,dw-mshc";
+@@ -853,15 +906,19 @@
+ 			max-frequency = <50000000>;
+ 			cap-sd-highspeed;
+ 			/*
+-			 * broken-cd, not non-removable: a card sits in the slot while
+-			 * dw_mci_get_cd() -- !(CDETECT & BIT(0)), dw_mmc.c:897 -- keeps
+-			 * answering "absent", so the core would never even
+-			 * try to initialise it. The detect line is therefore not usable, which is
+-			 * exactly what this property means, and polling on a slot a human can
+-			 * empty is the honest description; non-removable would instead claim the
+-			 * card can never leave.
++			 * The detect line is not usable here: dw_mci_get_cd() returns
++			 * !(CDETECT & BIT(0)) (dw_mmc.c:897), and on this board that reads
++			 * "absent" whether or not a card sits in the slot, so without this
++			 * property the core never tries to initialise one. The slot is one
++			 * a human can empty, so polling is the honest description;
++			 * non-removable would claim the opposite.
+ 			 */
+ 			broken-cd;
++			/*
++			 * Enabled here only so the bench can reach the host end to end
++			 * (0xf9820000 is the SD slot, 0xf9830000 the 8-bit MMC one);
++			 * the card is mounted read-only while a round runs.
++			 */
+ 			status = "okay";
+ 		};
+ 
+@@ -876,6 +933,10 @@
+ 			max-frequency = <50000000>;
+ 			cap-mmc-highspeed;
+ 			/*
++			 * No non-removable: dw_mci_get_cd() returns !(CDETECT & BIT(0))
++			 * (dw_mmc.c:897), the databook polarity, so a pulled-high
++			 * unconnected detect reads "absent" and forcing the host to claim a
++			 * card would only end every rescan in CMD_DONE|RTO.
+ 			 */
+ 			/*
+ 			 * The rail word (0xf8a2011c) reads 0x60, the vendor SDIO
+@@ -884,7 +945,13 @@
+ 			 */
+ 			no-1-8-v;
+ 			/*
+-			 *
++			 * Left disabled. The production system's /proc/mtd names
++			 * `block2mtd: /dev/block/mmcblk0p3`, but that line is an artifact
++			 * of that image's own init -- its /proc/cmdline has no
++			 * block2mtd= -- and the same system's boot log reports no device
++			 * on this host with both hi_mci interrupt rows at zero. Enabling it
++			 * would add a stream of command timeouts to every boot for no
++			 * device.
+ 			 */
+ 			status = "disabled";
+ 		};
+@@ -892,21 +959,34 @@
+ 		/*
+ 		 * Port 1 of the gigabit switch fabric, the one wired to the Hi3620 side
+ 		 * of this board (the vendor fastboot tftp path, and the vendor Linux
++		 * eth1). Same register map as the upstream
+ 		 * hix5hd2_gmac driver: STATION_ADDR_LOW 0x0, MAC_DUPLEX_HALF_CTRL 0x8,
+ 		 * PORT_MODE 0x40, PORT_EN 0x44, REC_FILT_CONTROL 0x64, RX_FQ_* 0x500+
+ 		 * match the vendor fastboot's MAC register list one for one, so no
+ 		 * new driver is needed. The interrupt is the gmac line the vendor
+ 		 * system's own /proc/interrupts reports (103 for gmac0, 104 for gmac1:
++		 * the vendor system's own table dump), i.e. SPI 71/72.
+ 		 * The vendor machine header is not usable as a
+ 		 * table for this chip -- it puts INTNR_ETH at 32 + 51 = 83 and gives
+ 		 * I2C2/I2C3 the same numbers as I2C0/I2C1.
+ 		 */
+ 		/*
++		 * Port 0 is where the PHY actually hangs: a single-command MDIO read
++		 * of address 1 register 2 issued to 0xf98403c0 answers at
++		 * 0xf98403c4 (0x0004, past the 16-bit shift the controller applies),
++		 * while the identical transaction on port 1 (0xf98413c0/0xf98413c4)
++		 * reads back 0xFFFF. START (bit 20) self-clears on both, so one bus
++		 * has a device and the other does not. PORT_MODE here reads
++		 * 1 = PORT_MOD_100M_MII (the vendor register header), what the
++		 * bootloader left for this port.
+ 		 */
+ 		gmac0: ethernet@f9840000 {
+ 			compatible = "hisilicon,hi3716cv200-gmac",
+ 				     "hisilicon,hisi-gmac-v1";
+ 			/*
++			 * Disabled: the device at address 1 reads an all-zero ID and the
++			 * port stays link-down, and this board's route to the Hi3620 is
++			 * the other port.
+ 			 */
+ 			status = "disabled";
+ 			reg = <0xf9840000 0x1000>, <0xf984300c 0x4>;
+@@ -944,6 +1024,7 @@
+ 			      <0xf9843004 0x4>;
+ 			/*
+ 			 * GIC interrupt ID 104. Taken from the vendor system's own
++			 * /proc/interrupts on this board (the vendor system's own
+ 			 * boot log, where uart-pl011 is 81 -- the value my kernel
+ 			 * measures for the same device -- so that table is in interrupt
+ 			 * IDs, not Linux virtual numbers): gmac0 is 103, gmac1 is 104.
+@@ -954,6 +1035,15 @@
+ 			clocks = <&crg HI3716CV200_GMAC1_CLK>;
+ 			clock-names = "mac_core";
+ 			/*
++			 * CRG51 bit 11 is gsf_mac1_srst_req, which the vendor pulses around
++			 * every mac_if write (`v |= 1 << (ld->index + 10)`, commented
++			 * "bit10 mac_if0"), so it is the interface reset, not the
++			 * core one. The port reset is bit 9 (gsf_p1_srst_req) and stays
++			 * unowned: the vendor code does pulse bits 9 and 11 together
++			 * (0x5 << (index + 8), hold 50 us) in higmac_restart(), but only
++			 * after fwd_resume() has re-applied the fabric configuration, and
++			 * holding that pair across a reopen stopped both directions on this
++			 * board.
+ 			 */
+ 			resets = <&crg 0xcc 11>;
+ 			reset-names = "mac_ifc";
+@@ -1088,7 +1178,14 @@
+ 		};
+ 
+ 		/*
++		 * The SiI9134 core behind the flattened window: DEV_ID reads 0x9334
++		 * at 0xf8ce0008, i.e. byte offset 4 * register number. The reset
++		 * bits are the ones the mv100 node uses: CRG67[9]
++		 * hdmitx_ctrl_srst_req, CRG67[8] hdmitx_ctrl_bus_srst_req and
++		 * CRG68[4] hdmitx_phy_srst_req, and
++		 * the s40 interrupt is 88 + 32, but
+ 		 * The vendor HDMI glue polls HPD
++		 * instead. The transmitter also exports the HDMI audio codec DAI,
+ 		 */
+ 		/*
+ 		 * The output channel (vdp_v1_0 "DHD0"). Its register file is the VDP
+@@ -1178,6 +1275,11 @@
+ 	};
+ 
+ 	/*
++	 * The AIAO card. The playback link's I2S master is the AIAO
++	 * transmit port and its codec is the transmitter's DAI, the way
++	 * the vendor routes HDMI audio; the capture links tap their own
++	 * transmit streams back in, which is why the card is not a
++	 * simple-audio-card.
+ 	 */
+ 	sound {
+ 		compatible = "hisilicon,hi3716cv200-aiao-card";
+@@ -1210,6 +1312,8 @@
+ 		};
+ 
+ 		/*
++		 * The tap of the line the DAC listens to, so the transmit side of
++		 * that link has a reader on the same board.
+ 		 */
+ 		dac-capture {
+ 			cpu {

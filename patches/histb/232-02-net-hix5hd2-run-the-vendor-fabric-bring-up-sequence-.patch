@@ -1,0 +1,353 @@
+From 8c2321716063e161862fff574a5b0c00c13452dd Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sun, 15 Nov 2026 01:24:22 +0800
+Subject: [PATCH 2/2] net: hix5hd2: run the vendor fabric bring-up sequence on
+ the Hi3716CV200
+
+This SoC puts a switch fabric in front of both MACs. On warm restarts
+the fabric keeps state the bootloader hands over differently every
+time, and the stock bring-up then loses the port entirely: the receive
+ring publishes lines the pipeline has not written yet, cache
+maintenance runs against the address the consumer ring publishes
+instead of the buffer that actually carries the frame, and every
+received packet is dropped.
+
+Bring the port up the way the vendor driver does:
+
+  - write the fabric CRF acknowledge threshold (a third optional reg
+    window, 0xf9843004) before the first MAC register write;
+  - select the GSF clock source (PERI_CRG51 bit 6, left unowned by the
+    CRG clock driver) and pulse the fabric port reset together with
+    the MAC core reset (bits 9 and 11), through a raw mapping -- the
+    CRG syscon regmap caches, and a cached read-modify-write races
+    the clock driver's direct register writes (the reset-framework
+    deassert cleared the clock-source bit exactly that way);
+  - latch the port mode through MODE_CHANGE_EN first and hold the
+    MAC interface reset across the interface control write, the
+    order the vendor's higmac_set_macif() uses;
+  - publish the station address at open time instead of only on the
+    SIOCSIFADDRESS ioctl;
+  - record the dma address of every receive buffer at refill and
+    unmap from that table, never from the consumer ring's published
+    copy.
+
+The forwarding control block at 0xf9842000 is deliberately left as
+the bootloader hands it over: the live vendor system runs FW_CTRL=0
+and the loader hands over FW_CTRL=0x330/MAC_TCTRL=0x542a, and
+programming the STANDALONE pair from the vendor's forwarding setup
+killed the path on the board.
+
+Board-verified on the AR513W: without this sequence a warm restart
+loses the port (20/20 pings lost, the fabric never answers even a
+direct ping from the router); with it two consecutive warm-restart
+boots pass 20/20 pings through the fabric with 0 dropped.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/net/ethernet/hisilicon/hix5hd2_gmac.c | 178 ++++++++++++++++--
+ 1 file changed, 161 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c
++++ b/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c
+@@ -154,6 +154,21 @@
+ #define RX_FIFO_PKT_IN_NUM		0x05fc
+ #define RX_FIFO_PKT_OUT_NUM		0x0600
+ 
++/*
++ * The Hi3716CV200 switch fabric sits in front of both MACs. The vendor driver
++ * programs two fabric-level windows this driver never touched: the CRF
++ * acknowledge threshold (0xf9843004, the very first write of the vendor
++ * bring-up -- higmac_hw_mac_core_init()) and the forwarding control block at
++ * 0xf9842000, whose fwd_setup() clears the MAC table and programs the
++ * STANDALONE FW_CTRL/MAC_TCTRL pair in the vendor forwarding code.
++ */
++/*
++ * The Hi3716CV200 switch fabric sits in front of both MACs: the CRF
++ * acknowledge threshold (0xf9843004) is the very first write of the vendor
++ * bring-up -- higmac_hw_mac_core_init().
++ */
++#define HI3716CV200_CRF_ACK_TH_VAL	0xe
++
+ #define RGMII_SPEED_1000		0x2c
+ #define RGMII_SPEED_100			0x2f
+ #define RGMII_SPEED_10			0x2d
+@@ -249,9 +264,29 @@ struct hix5hd2_priv {
+ 
+ 	void __iomem *base;
+ 	void __iomem *ctrl_base;
++	/*
++	 * Hi3716CV200 fabric windows, absent on the other SoCs wired to this
++	 * driver. The CRG bits are reached through a raw mapping, not through
++	 * the CRG syscon regmap: that regmap caches, and a cached
++	 * read-modify-write races the clock driver's direct register writes --
++	 * the reset-framework deassert cleared the clock-source bit exactly
++	 * that way on this board.
++	 */
++	void __iomem *crf_ack_base;
++	void __iomem *gsf_crg_base;
++	u32 gsf_clk_sel_bit;
++	u32 gsf_port_rst_bit;
++	u32 gsf_mac_rst_bit;
+ 
+ 	struct sk_buff *tx_skb[TX_DESC_NUM];
+ 	struct sk_buff *rx_skb[RX_DESC_NUM];
++	/*
++	 * What refill mapped, slot by slot. The consumer ring's buff_addr is a
++	 * copy the block publishes itself and a warm restart can leave it
++	 * stale; unmapping from this table is immune to whatever the pipeline
++	 * publishes.
++	 */
++	dma_addr_t rx_dma_addr[RX_DESC_NUM];
+ 
+ 	struct device *dev;
+ 	struct net_device *netdev;
+@@ -275,6 +310,8 @@ struct hix5hd2_priv {
+ 	struct work_struct tx_timeout_task;
+ };
+ 
++static void hix5hd2_gsf_crg_rmw(struct hix5hd2_priv *priv, u32 mask, u32 set);
++
+ static inline void hix5hd2_mac_interface_reset(struct hix5hd2_priv *priv)
+ {
+ 	if (!priv->mac_ifc_rst)
+@@ -287,7 +324,7 @@ static inline void hix5hd2_mac_interface
+ static void hix5hd2_config_port(struct net_device *dev, u32 speed, u32 duplex)
+ {
+ 	struct hix5hd2_priv *priv = netdev_priv(dev);
+-	u32 val;
++	u32 mode, val;
+ 
+ 	priv->speed = speed;
+ 	priv->duplex = duplex;
+@@ -295,38 +332,59 @@ static void hix5hd2_config_port(struct n
+ 	switch (priv->phy_mode) {
+ 	case PHY_INTERFACE_MODE_RGMII:
+ 		if (speed == SPEED_1000)
+-			val = RGMII_SPEED_1000;
++			mode = RGMII_SPEED_1000;
+ 		else if (speed == SPEED_100)
+-			val = RGMII_SPEED_100;
++			mode = RGMII_SPEED_100;
+ 		else
+-			val = RGMII_SPEED_10;
++			mode = RGMII_SPEED_10;
+ 		break;
+ 	case PHY_INTERFACE_MODE_MII:
+ 		if (speed == SPEED_100)
+-			val = MII_SPEED_100;
++			mode = MII_SPEED_100;
+ 		else
+-			val = MII_SPEED_10;
++			mode = MII_SPEED_10;
+ 		break;
+ 	default:
+ 		netdev_warn(dev, "not supported mode\n");
+-		val = MII_SPEED_10;
++		mode = MII_SPEED_10;
+ 		break;
+ 	}
+ 
+ 	if (duplex)
+-		val |= GMAC_FULL_DUPLEX;
+-	writel_relaxed(val, priv->ctrl_base);
+-	hix5hd2_mac_interface_reset(priv);
++		mode |= GMAC_FULL_DUPLEX;
+ 
+-	writel_relaxed(BIT_MODE_CHANGE_EN, priv->base + MODE_CHANGE_EN);
+ 	if (speed == SPEED_1000)
+ 		val = GMAC_SPEED_1000;
+ 	else if (speed == SPEED_100)
+ 		val = GMAC_SPEED_100;
+ 	else
+ 		val = GMAC_SPEED_10;
+-	writel_relaxed(val, priv->base + PORT_MODE);
+-	writel_relaxed(0, priv->base + MODE_CHANGE_EN);
++
++	if (priv->gsf_crg_base) {
++		/*
++		 * vendor higmac_set_macif() order: latch the port mode
++		 * through MODE_CHANGE_EN first, then write the interface
++		 * control register with the mac_if reset held and release
++		 * the reset only after the write -- the interface latches
++		 * its mode in that window.
++		 */
++		writel_relaxed(BIT_MODE_CHANGE_EN, priv->base + MODE_CHANGE_EN);
++		writel_relaxed(val, priv->base + PORT_MODE);
++		writel_relaxed(0, priv->base + MODE_CHANGE_EN);
++
++		hix5hd2_gsf_crg_rmw(priv, BIT(priv->gsf_mac_rst_bit),
++				    BIT(priv->gsf_mac_rst_bit));
++		writel_relaxed(mode, priv->ctrl_base);
++		hix5hd2_gsf_crg_rmw(priv, BIT(priv->gsf_mac_rst_bit), 0);
++	} else {
++		writel_relaxed(mode, priv->ctrl_base);
++		hix5hd2_mac_interface_reset(priv);
++
++		writel_relaxed(BIT_MODE_CHANGE_EN, priv->base + MODE_CHANGE_EN);
++		writel_relaxed(val, priv->base + PORT_MODE);
++		writel_relaxed(0, priv->base + MODE_CHANGE_EN);
++	}
++
+ 	writel_relaxed(duplex, priv->base + MAC_DUPLEX_HALF_CTRL);
+ }
+ 
+@@ -522,6 +580,7 @@ static void hix5hd2_rx_refill(struct hix
+ 
+ 		desc = priv->rx_fq.desc + pos;
+ 		desc->buff_addr = cpu_to_le32(addr);
++		priv->rx_dma_addr[pos] = addr;
+ 		priv->rx_skb[pos] = skb;
+ 		desc->cmd = cpu_to_le32(DESC_VLD_FREE |
+ 					(len - 1) << DESC_BUFF_LEN_OFF);
+@@ -540,7 +599,6 @@ static int hix5hd2_rx(struct net_device
+ 	struct hix5hd2_priv *priv = netdev_priv(dev);
+ 	struct sk_buff *skb;
+ 	struct hix5hd2_desc *desc;
+-	dma_addr_t addr;
+ 	u32 start, end, num, pos, i, len;
+ 
+ 	/* software read pointer */
+@@ -562,11 +620,20 @@ static int hix5hd2_rx(struct net_device
+ 		priv->rx_skb[pos] = NULL;
+ 
+ 		desc = priv->rx_bq.desc + pos;
++
++		/*
++		 * Unmap from the refill-time table, never from the address the
++		 * consumer ring publishes: the block can publish a stale line
++		 * (a warm restart leaves the pipeline holding the previous
++		 * boot's slots) and cache maintenance against that address
++		 * corrupts the buffer that actually carries the frame.
++		 */
++		dma_unmap_single(priv->dev, priv->rx_dma_addr[pos],
++				 MAC_MAX_FRAME_SIZE, DMA_FROM_DEVICE);
++		priv->rx_dma_addr[pos] = 0;
++
+ 		len = (le32_to_cpu(desc->cmd) >> DESC_DATA_LEN_OFF) &
+ 		       DESC_DATA_MASK;
+-		addr = le32_to_cpu(desc->buff_addr);
+-		dma_unmap_single(priv->dev, addr, MAC_MAX_FRAME_SIZE,
+-				 DMA_FROM_DEVICE);
+ 
+ 		skb_put(skb, len);
+ 		if (skb->len > MAC_MAX_FRAME_SIZE) {
+@@ -855,6 +922,7 @@ static void hix5hd2_release_rx_buffers(s
+ 
+ 		desc = priv->rx_fq.desc + i;
+ 		addr = le32_to_cpu(desc->buff_addr);
++		priv->rx_dma_addr[i] = 0;
+ 		dma_unmap_single(priv->dev, addr,
+ 				 MAC_MAX_FRAME_SIZE, DMA_FROM_DEVICE);
+ 		dev_kfree_skb_any(skb);
+@@ -933,6 +1001,43 @@ static void hix5hd2_reset_tx_pointers(st
+ 	memset(priv->tx_skb, 0, sizeof(priv->tx_skb));
+ }
+ 
++/*
++ * The vendor bring-up sequence for the switch fabric in front of this MAC
++ * (higmac_hw_mac_core_reset()): select the DPLL for the GSF
++ * clocks (a bit the CRG clock driver leaves unowned), then pulse the fabric
++ * port reset and the MAC core reset together. Skipped warm restarts leave the
++ * fabric's descriptor pipeline publishing stale receive lines -- measured on
++ * this board, the stock bring-up then loses the whole port (the vendor
++ * sequence restores it).
++ */
++static void hix5hd2_gsf_crg_rmw(struct hix5hd2_priv *priv, u32 mask, u32 set)
++{
++	u32 v = readl_relaxed(priv->gsf_crg_base);
++
++	v = (v & ~mask) | (set & mask);
++	writel_relaxed(v, priv->gsf_crg_base);
++}
++
++static void hix5hd2_gsf_port_init(struct hix5hd2_priv *priv)
++{
++	u32 rst_mask;
++
++	if (!priv->gsf_crg_base)
++		return;
++
++	if (priv->crf_ack_base)
++		writel_relaxed(HI3716CV200_CRF_ACK_TH_VAL,
++			       priv->crf_ack_base);
++
++	hix5hd2_gsf_crg_rmw(priv, BIT(priv->gsf_clk_sel_bit),
++			    BIT(priv->gsf_clk_sel_bit));
++
++	rst_mask = BIT(priv->gsf_port_rst_bit) | BIT(priv->gsf_mac_rst_bit);
++	hix5hd2_gsf_crg_rmw(priv, rst_mask, rst_mask);
++	udelay(50);
++	hix5hd2_gsf_crg_rmw(priv, rst_mask, 0);
++}
++
+ static int hix5hd2_net_open(struct net_device *dev)
+ {
+ 	BUILD_BUG_ON(sizeof(struct hix5hd2_desc) != DESC_SIZE);
+@@ -943,6 +1048,8 @@ static int hix5hd2_net_open(struct net_d
+ 
+ 	priv->port_need_config = true;
+ 
++	hix5hd2_gsf_port_init(priv);
++
+ 	ret = clk_prepare_enable(priv->mac_core_clk);
+ 	if (ret < 0) {
+ 		netdev_err(dev, "failed to enable mac core clk %d\n", ret);
+@@ -966,6 +1073,16 @@ static int hix5hd2_net_open(struct net_d
+ 
+ 	phy_start(phy);
+ 	hix5hd2_hw_init(priv);
++	/*
++	 * the vendor driver comments "setup mac_addr after fwd_setup()" --
++	 * publish the station address at open; the fabric forwarding block is
++	 * deliberately left as the bootloader handed it over: the live vendor
++	 * system runs FW_CTRL=0 (measured), the loader hands over
++	 * FW_CTRL=0x330/MAC_TCTRL=0x542a, and programming the STANDALONE
++	 * 0xbb0/0 pair in the vendor forwarding setup broke the path on this
++	 * board.
++	 */
++	hix5hd2_hw_set_mac_addr(dev);
+ 	hix5hd2_reset_tx_pointers(priv);
+ 	hix5hd2_rx_refill(priv);
+ 
+@@ -1221,6 +1338,8 @@ static int hix5hd2_dev_probe(struct plat
+ 	struct net_device *ndev;
+ 	struct hix5hd2_priv *priv;
+ 	struct mii_bus *bus;
++	struct resource *res;
++	u32 gsf_crg_cells[4];
+ 	int ret;
+ 
+ 	ndev = alloc_etherdev(sizeof(struct hix5hd2_priv));
+@@ -1247,6 +1366,32 @@ static int hix5hd2_dev_probe(struct plat
+ 		goto out_free_netdev;
+ 	}
+ 
++	/*
++	 * The Hi3716CV200 fabric window is optional: the other SoCs wired to
++	 * this driver describe neither, and without it the bring-up sequence
++	 * below is skipped.
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
++	if (res) {
++		priv->crf_ack_base = devm_ioremap_resource(dev, res);
++		if (IS_ERR(priv->crf_ack_base)) {
++			ret = PTR_ERR(priv->crf_ack_base);
++			goto out_free_netdev;
++		}
++	}
++
++	if (!of_property_read_u32_array(node, "hisi,gsf-crg",
++					gsf_crg_cells, 4)) {
++		priv->gsf_crg_base = devm_ioremap(dev, gsf_crg_cells[0], 0x4);
++		if (!priv->gsf_crg_base) {
++			ret = -ENOMEM;
++			goto out_free_netdev;
++		}
++		priv->gsf_clk_sel_bit = gsf_crg_cells[1];
++		priv->gsf_port_rst_bit = gsf_crg_cells[2];
++		priv->gsf_mac_rst_bit = gsf_crg_cells[3];
++	}
++
+ 	priv->mac_core_clk = devm_clk_get(&pdev->dev, "mac_core");
+ 	if (IS_ERR(priv->mac_core_clk)) {
+ 		netdev_err(ndev, "failed to get mac core clk\n");

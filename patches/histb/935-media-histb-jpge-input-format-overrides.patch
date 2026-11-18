@@ -1,0 +1,73 @@
+From 51c9c21cac5d450087d32768c5ffd98dfadc9c05 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 00:17:21 +0800
+Subject: [PATCH] media: histb-jpge input-format overrides
+
+kept out of the submitted series on purpose. The yuvFmt override and the
+PICFG bit and clip-window sweeps stay live for bring-up; the strFmt,
+packageSel, SrcCStride, SRC_V and SOS-order arms were decided on the
+board and are folded into the submitted driver as plain code.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/media/platform/hisilicon/histb-jpge.c | 37 ++++++++++++++++---
+ 1 file changed, 31 insertions(+), 6 deletions(-)
+
+--- a/drivers/media/platform/hisilicon/histb-jpge.c
++++ b/drivers/media/platform/hisilicon/histb-jpge.c
+@@ -261,11 +261,32 @@ static const u32 histb_jpge_out_fmts[] =
+  *	     @int_done to one writer and one reader
+  */
+ /*
+- * PICFG bits the driver never sets: the top three are reserved, and the block
+- * ignores the clip window while its enable bit is clear, so both stay at the
+- * reset value here.
++ * Bring-up overrides for the input-format register. -1 leaves a field as the
++ * driver computes it; picfg_set and picfg_clr force individual bits of the
++ * finished word, which is how chnId, roundEn, timeoutEn, configlockEn and the
++ * clip enable get swept without a rebuild per arm. The clip window itself is
++ * only written when clip_set is non-zero, because the block ignores it while the
++ * enable is clear and its reset value is unknown here.
+  */
+-#define JPGE_PICFG_RESERVED		GENMASK(31, 29)
++static int yuvfmt = -1;
++module_param(yuvfmt, int, 0644);
++MODULE_PARM_DESC(yuvfmt, "override PICFG.yuvFmt: -1 as driver, 0 4:2:0, 1 4:2:2, 2 4:4:4");
++
++static uint picfg_set;
++module_param(picfg_set, uint, 0644);
++MODULE_PARM_DESC(picfg_set, "bits forced to 1 in PICFG");
++
++static uint picfg_clr = 0xe0000000;
++module_param(picfg_clr, uint, 0644);
++MODULE_PARM_DESC(picfg_clr, "bits forced to 0 in PICFG (default: the reserved top three)");
++
++static uint clip_thr = 0xf010eb10;
++module_param(clip_thr, uint, 0644);
++MODULE_PARM_DESC(clip_thr, "clip window written with clip_set: luma 16..235, chroma 16..240");
++
++static uint clip_set;
++module_param(clip_set, uint, 0644);
++MODULE_PARM_DESC(clip_set, "1: write clip_thr and set the clip enable bit");
+ 
+ struct histb_jpge {
+ 	struct device		*dev;
+@@ -592,12 +613,16 @@ static void histb_jpge_program(struct hi
+ 
+ 	picfg = FIELD_PREP(JPGE_PICFG_STR_FMT, JPGE_PICFG_STR_PLANAR) |
+ 		FIELD_PREP(JPGE_PICFG_YUV_FMT,
+-			   histb_jpge_yuv_fmt(pic->fourcc)) |
++			   yuvfmt < 0 ? histb_jpge_yuv_fmt(pic->fourcc) : yuvfmt) |
+ 		FIELD_PREP(JPGE_PICFG_CLK_GATE, 2) |
+ 		JPGE_PICFG_MEM_GATE |
+ 		FIELD_PREP(JPGE_PICFG_PKG_SEL, histb_jpge_pkg_sel(pic->fourcc));
+-	picfg &= ~JPGE_PICFG_RESERVED;
++	picfg = (picfg & ~picfg_clr) | (picfg_set & picfg_clr);
+ 
++	if (clip_set) {
++		writel(clip_thr, jpge->regs + JPGE_CLIP_THR);
++		picfg |= JPGE_PICFG_CLIP_EN;
++	}
+ 
+ 	writel(picfg, jpge->regs + JPGE_PICFG);
+ 	/*

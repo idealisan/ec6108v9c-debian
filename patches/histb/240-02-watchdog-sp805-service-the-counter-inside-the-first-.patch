@@ -1,0 +1,39 @@
+From 4a1ff5a4820a3ff831d545c8fedd72ed52c09cec Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sun, 25 Oct 2026 20:55:06 +0800
+Subject: [PATCH 2/5] watchdog: sp805: service the counter inside the first
+ countdown window
+
+WDTLOAD counts down twice before the reset line asserts: the first
+underflow raises an interrupt, the second one is what resets, and this
+driver never requests that interrupt line. With max_hw_heartbeat_ms
+unset the core sizes its keepalive by the whole timeout, which for this
+block is the window up to the unclaimed interrupt and not the one up to
+the reset, and the heartbeat worker is only requested once the driver
+declares a hardware maximum smaller than what userspace asked for.
+Declare the first countdown as the limit, max_hw_heartbeat_ms = timeout
+* 500, so the core feeds at a quarter of the programmed window and keeps
+feeding on its own for longer requests.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/watchdog/sp805_wdt.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/drivers/watchdog/sp805_wdt.c
++++ b/drivers/watchdog/sp805_wdt.c
+@@ -111,6 +111,14 @@ static int wdt_setload(struct watchdog_d
+ 	wdt->load_val = load;
+ 	/* roundup timeout to closest positive integer value */
+ 	wdd->timeout = div_u64((load + 1) * 2 + (rate / 2), rate);
++	/*
++	 * WDTLOAD counts down twice: the first underflow raises the interrupt,
++	 * the second one is what resets.  This driver never requests the
++	 * interrupt line, so nothing claims the first underflow -- the
++	 * framework has to service the counter strictly inside the first
++	 * window, not at its edge: its keepalive is max_hw_heartbeat_ms / 2.
++	 */
++	wdd->max_hw_heartbeat_ms = wdd->timeout * 500;
+ 	spin_unlock(&wdt->lock);
+ 
+ 	return 0;

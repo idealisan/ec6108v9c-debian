@@ -1,0 +1,36 @@
+From 2975f2e2897d8ffe8ec26c5ed740f66c81a8c75e Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 00:17:21 +0800
+Subject: [PATCH] drm: histb read-only register snapshot
+
+Restore the read-only display-pipeline snapshot tool kept out of the
+submitted series on purpose.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/gpu/drm/histb/Kconfig  | 9 +++++++++
+ drivers/gpu/drm/histb/Makefile | 1 +
+ 2 files changed, 10 insertions(+)
+
+--- a/drivers/gpu/drm/histb/Kconfig
++++ b/drivers/gpu/drm/histb/Kconfig
+@@ -31,3 +31,12 @@ config DRM_HISTB_HDMI
+ 	  link.
+ 
+ 	  If in doubt, say N.
++
++config DRM_HISTB_VODUMP
++	bool "Read-only VDP/HDMI register snapshot"
++	depends on DRM && OF && ARM
++	help
++	  Snapshot the display pipeline exactly as the
++	  vendor fastboot left it while scanning out its
++	  boot logo, without writing any device register.
++	  For diffing against the DRM drivers; say N for normal use.
+--- a/drivers/gpu/drm/histb/Makefile
++++ b/drivers/gpu/drm/histb/Makefile
+@@ -2,3 +2,4 @@
+ obj-$(CONFIG_DRM_HISTB_VDP) += histb-vdp.o
+ histb-vdp-y := histb-vdp-core.o histb-vdp2.o histb-vdp4.o
+ obj-$(CONFIG_DRM_HISTB_HDMI) += histb-hdmi.o
++obj-$(CONFIG_DRM_HISTB_VODUMP) += histb-vodump.o

@@ -1,0 +1,53 @@
+From c514219d26ace7d5fa677a667830c378d3c9199a Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Thu, 22 Oct 2026 04:09:28 +0800
+Subject: [PATCH 2/4] phy: hisilicon: inno-usb2: support the Hi3798MV200 ports
+
+Hi3798MV200 has no test-port window: its register base is the first
+register of the port's own register file, so the setup word that the
+other variants strobe into port register 0x06 is a plain write to that
+register and resets the board. Give these ports a type of their own,
+which skips that write and leaves the reference clock and the node's
+resets to do the work.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/phy/hisilicon/phy-hisi-inno-usb2.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+--- a/drivers/phy/hisilicon/phy-hisi-inno-usb2.c
++++ b/drivers/phy/hisilicon/phy-hisi-inno-usb2.c
+@@ -24,6 +24,8 @@
+ 
+ #define PHY_TYPE_0	0
+ #define PHY_TYPE_1	1
++/* Hi3798MV200: no test port, so clocks and resets are all the phy needs */
++#define PHY_TYPE_2	2
+ 
+ #define PHY_TEST_DATA		GENMASK(7, 0)
+ #define PHY_TEST_ADDR_OFFSET	8
+@@ -86,6 +88,15 @@ static void hisi_inno_phy_write_reg(stru
+ 
+ static void hisi_inno_phy_setup(struct hisi_inno_phy_priv *priv)
+ {
++	/*
++	 * Hi3798MV200 has no test port: the window base is the first register
++	 * of the port's own register file, so strobing a test word there is a
++	 * plain write to it and resets the board.  Its ports come up with only
++	 * the reference clock and the resets below.
++	 */
++	if (priv->type == PHY_TYPE_2)
++		return;
++
+ 	/* The phy clk is controlled by the port0 register 0x06. */
+ 	hisi_inno_phy_write_reg(priv, 0, 0x06, PHY_CLK_ENABLE);
+ 	msleep(PHY_CLK_STABLE_TIME);
+@@ -197,6 +208,8 @@ static const struct of_device_id hisi_in
+ 	  .data = (void *) PHY_TYPE_0 },
+ 	{ .compatible = "hisilicon,hi3798mv100-usb2-phy",
+ 	  .data = (void *) PHY_TYPE_1 },
++	{ .compatible = "hisilicon,hi3798mv200-usb2-phy",
++	  .data = (void *) PHY_TYPE_2 },
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, hisi_inno_phy_of_match);

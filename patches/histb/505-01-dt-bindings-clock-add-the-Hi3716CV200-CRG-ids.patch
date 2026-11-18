@@ -1,0 +1,337 @@
+From ac37ae77834230b71da8a080b46650305cff06d5 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 21 Oct 2026 15:55:16 +0800
+Subject: [PATCH 1/2] dt-bindings: clock: add the Hi3716CV200 CRG ids
+
+The Hi3716CV200 core CRG needs its clock ids published. Number the ids
+by (register offset, field low bit) over the fields the register
+descriptions name, the way the Hi3798MV100 header does, append-only so
+describing another block later cannot renumber an existing one. Only
+fields whose consumer is driven by this port are published, together
+with the fixed sources the driver registers for the gates that divide
+their parent; the one clock modelled as a rate rather than a gate is
+described from the per-mode display register pairs, because no authority
+states what the hpll_ctrl0 fields mean on this part. Add the id header.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../clock/hisilicon,hi3716cv200-crg.h         | 313 ++++++++++++++++++
+ 1 file changed, 313 insertions(+)
+ create mode 100644 include/dt-bindings/clock/hisilicon,hi3716cv200-crg.h
+
+--- /dev/null
++++ b/include/dt-bindings/clock/hisilicon,hi3716cv200-crg.h
+@@ -0,0 +1,313 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/*
++ * Clocks provided by the core CRG of the HiSilicon Hi3716CV200
++ * SoC.  Generated from the vendor register file and ordered by
++ * (register offset, field low bit); do not renumber by hand.
++ */
++
++#ifndef __DT_BINDINGS_CLOCK_HI3716CV200_CRG_H
++#define __DT_BINDINGS_CLOCK_HI3716CV200_CRG_H
++
++/* Sources with no CRG register of their own. */
++#define HI3716CV200_CLK_OSC24M		0
++#define HI3716CV200_CLK_3M		1
++#define HI3716CV200_CLK_83P3M		2
++#define HI3716CV200_CLK_I2C100M		3
++#define HI3716CV200_CLK_SDIO75M		4
++#define HI3716CV200_CLK_SDIO50M		5
++#define HI3716CV200_CLK_NAND200M		6
++
++/* PERI_CRG0 (0x000) */
++#define HI3716CV200_CPU_PLL_CLK		7
++
++/* PERI_CRG2 (0x008) */
++#define HI3716CV200_BPLL_CLK		8
++
++/* PERI_CRG4 (0x010) */
++#define HI3716CV200_DDR_PLL_CLK		9
++
++/* PERI_CRG8 (0x020) */
++#define HI3716CV200_VPLL_CLK		10
++
++/* PERI_CRG10 (0x028) */
++#define HI3716CV200_CLK_VO_HD		11
++
++/* PERI_CRG12 (0x030) */
++#define HI3716CV200_EPLL_CLK		12
++
++/* PERI_CRG16 (0x040) */
++#define HI3716CV200_QPLL_CLK		13
++
++/* PERI_CRG18 (0x048) */
++#define HI3716CV200_CPU_FREQ_SEL_CFG_CRG		14
++#define HI3716CV200_CPU_FREQ_DIV_CFG_CRG		15
++
++/* PERI_CRG20 (0x050) */
++#define HI3716CV200_A9_PCLKDBG_CLK		16
++#define HI3716CV200_A9_PERI_CLK		17
++
++/* PERI_CRG21 (0x054) */
++#define HI3716CV200_L2_CLK_DIV		18
++#define HI3716CV200_PERI_CLK_DIV		19
++
++/* PERI_CRG22 (0x058) */
++#define HI3716CV200_CORE_BUS_CLK_SEL		20
++#define HI3716CV200_MDE0_CLK_SEL		21
++#define HI3716CV200_MDE1_CLK_SEL		22
++#define HI3716CV200_MDE2_CLK_SEL		23
++#define HI3716CV200_MDE3_CLK_SEL		24
++#define HI3716CV200_CORE_BUS_CLK_DIV		25
++
++/* PERI_CRG23 (0x05C) */
++#define HI3716CV200_SFC_CLK		26
++#define HI3716CV200_SFC_CLK_SEL		27
++
++/* PERI_CRG24 (0x060) */
++#define HI3716CV200_NAND_CLK		28
++#define HI3716CV200_NF_CLK_SEL		29
++
++/* PERI_CRG25 (0x064) */
++#define HI3716CV200_DDR_CLK		30
++#define HI3716CV200_DDRPHY_CLK		31
++#define HI3716CV200_HIPACK_CLK		32
++#define HI3716CV200_DDRC_CLK		33
++#define HI3716CV200_DDRPHY_CLK_SEL		34
++#define HI3716CV200_DDRT_CLK		35
++
++/* PERI_CRG26 (0x068) */
++#define HI3716CV200_UART1_CLK		36
++#define HI3716CV200_UART2_CLK		37
++#define HI3716CV200_UART3_CLK		38
++#define HI3716CV200_UART4_CLK		39
++
++/* PERI_CRG27 (0x06C) */
++#define HI3716CV200_I2C5_CLK		40
++#define HI3716CV200_I2C0_CLK		41
++#define HI3716CV200_I2C1_CLK		42
++#define HI3716CV200_I2C2_CLK		43
++#define HI3716CV200_I2C3_CLK		44
++#define HI3716CV200_I2C4_CLK		45
++
++/* PERI_CRG28 (0x070) */
++#define HI3716CV200_SSP0_CLK		46
++#define HI3716CV200_SSP1_CLK		47
++
++/* PERI_CRG29 (0x074) */
++#define HI3716CV200_SCI0_CLK		48
++#define HI3716CV200_SCI1_CLK		49
++
++/* PERI_CRG30 (0x078) */
++#define HI3716CV200_VDH_CLK		50
++#define HI3716CV200_VDHDSP_CLK		51
++#define HI3716CV200_VDH_CLK_SEL		52
++
++/* PERI_CRG31 (0x07C) */
++#define HI3716CV200_JPGD_CLK		53
++#define HI3716CV200_JPGD_CLK_SEL		54
++
++/* PERI_CRG33 (0x084) */
++#define HI3716CV200_PGD_CLK		55
++
++/* PERI_CRG34 (0x088) */
++#define HI3716CV200_BPD_CLK		56
++
++/* PERI_CRG35 (0x08C) */
++#define HI3716CV200_VENC_CLK		57
++#define HI3716CV200_VENC_CLK_SEL		58
++#define HI3716CV200_VENC_CLK_SEL_BUS		59
++
++/* PERI_CRG36 (0x090) */
++#define HI3716CV200_JPGE_CLK		60
++#define HI3716CV200_JPGE_CLK_SEL		61
++#define HI3716CV200_JPGE_CLK_SEL_BUS		62
++
++/* PERI_CRG37 (0x094) */
++#define HI3716CV200_TDE_CLK		63
++#define HI3716CV200_TDE_CLK_SEL		64
++
++/* PERI_CRG39 (0x09C) */
++#define HI3716CV200_SDIO0_CLK		65
++#define HI3716CV200_SDIO0_CLK_SEL		66
++#define HI3716CV200_SDIO0_SAP_PS_SEL		67
++#define HI3716CV200_SDIO0_DRV_PS_SEL		68
++
++/* PERI_CRG40 (0x0A0) */
++#define HI3716CV200_SDIO1_CLK		69
++#define HI3716CV200_SDIO1_CLK_SEL		70
++#define HI3716CV200_SDIO1_SAP_PS_SEL		71
++#define HI3716CV200_SDIO1_DRV_PS_SEL		72
++
++/* PERI_CRG41 (0x0A4) */
++#define HI3716CV200_DMAC_CLK		73
++
++/* PERI_CRG42 (0x0A8) */
++#define HI3716CV200_SATA_BUS_CLK		74
++
++/* PERI_CRG43 (0x0AC) */
++#define HI3716CV200_SATA_PHY_CLK		75
++#define HI3716CV200_SATA_PHY_REFCLK_SEL		76
++
++/* PERI_CRG46 (0x0B8) */
++#define HI3716CV200_USB_BUS_CLK		77
++
++/* PERI_CRG47 (0x0BC) */
++#define HI3716CV200_USB_PHY_CLK		78
++#define HI3716CV200_USB2_PHY0_REFCLK_SEL		79
++#define HI3716CV200_USB2_PHY1_REFCLK_SEL		80
++#define HI3716CV200_USB2_PHY2_REFCLK_SEL		81
++
++/* PERI_CRG48 (0x0C0) */
++#define HI3716CV200_CA_CI_CLK_SEL		82
++
++/* PERI_CRG49 (0x0C4) */
++#define HI3716CV200_SHA_CLK		83
++
++/* PERI_CRG50 (0x0C8) */
++#define HI3716CV200_PMC_CLK		84
++
++/* PERI_CRG51 (0x0CC) */
++#define HI3716CV200_GSF_BUS_S_CLK		85
++#define HI3716CV200_GSF_BUS_M0_CLK		86
++#define HI3716CV200_GSF_BUS_M1_CLK		87
++#define HI3716CV200_GMAC0_CLK		88
++#define HI3716CV200_GMAC1_CLK		89
++#define HI3716CV200_GSF_PUB_CLK		90
++#define HI3716CV200_GSF_CLK_SEL		91
++#define HI3716CV200_GSF_RMII0_CLK_SEL		92
++#define HI3716CV200_GSF_RMII1_CLK_SEL		93
++#define HI3716CV200_GSF_RMII2_CLK_SEL		94
++
++/* PERI_CRG52 (0x0D0) */
++#define HI3716CV200_DSP_CLK		95
++#define HI3716CV200_DSP0_CLK		96
++#define HI3716CV200_DSP_CLK_SEL		97
++
++/* PERI_CRG53 (0x0D4) */
++#define HI3716CV200_GPU_CLK		98
++
++/* PERI_CRG54 (0x0D8) */
++#define HI3716CV200_VO_CLK		99
++#define HI3716CV200_VO_SD_CLK_SEL		100
++#define HI3716CV200_VO_SD_CLK_DIV		101
++#define HI3716CV200_VO_HD_CLK_SEL		102
++#define HI3716CV200_VO_HD_CLK_DIV		103
++#define HI3716CV200_VDAC_CH0_CLK_SEL		104
++#define HI3716CV200_VDAC_CH1_CLK_SEL		105
++#define HI3716CV200_VDAC_CH2_CLK_SEL		106
++#define HI3716CV200_VDAC_CH3_CLK_SEL		107
++#define HI3716CV200_VO_CLKOUT_SEL		108
++#define HI3716CV200_HDMI_CLK_SEL		109
++#define HI3716CV200_VO_SD_HDMI_CLK_SEL		110
++#define HI3716CV200_VDP_CLK_SEL		111
++#define HI3716CV200_VO_HD_HDMI_CLK_SEL		112
++
++/* PERI_CRG55 (0x0DC) */
++#define HI3716CV200_VI_BUS_CLK		113
++#define HI3716CV200_VI0_CLK		114
++#define HI3716CV200_VICAP_CLK_SEL		115
++
++/* PERI_CRG56 (0x0E0) */
++#define HI3716CV200_QTC_BUS_CLK		116
++#define HI3716CV200_QTC_CLK		117
++
++/* PERI_CRG57 (0x0E4) */
++#define HI3716CV200_QAM_2X_CLK		118
++#define HI3716CV200_QAM_1X_CLK		119
++#define HI3716CV200_QAM_J83B_CLK		120
++#define HI3716CV200_QAM_J83AC_CLK		121
++#define HI3716CV200_QAM_ADS_CLK		122
++#define HI3716CV200_QAM_TS_CLK		123
++#define HI3716CV200_QAM_TSOUT_CLK		124
++#define HI3716CV200_QAM_TS_CLK_SEL		125
++#define HI3716CV200_QAM_TS_CLK_DIV		126
++#define HI3716CV200_QAM2X_CLK_SEL		127
++
++/* PERI_CRG58 (0x0E8) */
++#define HI3716CV200_QAMADC_CLK_SEL		128
++#define HI3716CV200_QAMCTRL_CLK_SEL		129
++#define HI3716CV200_QAMCTRL_CLK_DIV		130
++
++/* PERI_CRG59 (0x0EC) */
++#define HI3716CV200_SCD_CLK		131
++
++/* PERI_CRG60 (0x0F0) */
++#define HI3716CV200_VPSS_CLK		132
++#define HI3716CV200_VPSS_CLK_SEL		133
++
++/* PERI_CRG61 (0x0F4) */
++#define HI3716CV200_HWC_CLK		134
++#define HI3716CV200_HWC_CLK_SEL		135
++
++/* PERI_CRG62 (0x0F8) */
++#define HI3716CV200_BOOTMEM_CLK		136
++
++/* PERI_CRG63 (0x0FC) */
++#define HI3716CV200_PVR_BUS_CLK		137
++#define HI3716CV200_PVR_DMX_CLK		138
++#define HI3716CV200_PVR_27M_CLK		139
++#define HI3716CV200_PVR_TSI1_CLK		140
++#define HI3716CV200_PVR_TSI2_CLK		141
++#define HI3716CV200_PVR_TSI3_CLK		142
++#define HI3716CV200_PVR_TSI4_CLK		143
++#define HI3716CV200_PVR_TSI5_CLK		144
++#define HI3716CV200_PVR_TS0_CLK		145
++#define HI3716CV200_PVR_TS1_CLK		146
++#define HI3716CV200_PVR_TSOUT0_CLK		147
++#define HI3716CV200_PVR_TSOUT1_CLK		148
++
++/* PERI_CRG64 (0x100) */
++#define HI3716CV200_PVR_DMX_CLK_SEL		149
++#define HI3716CV200_SW_DMX_CLK_DIV		150
++#define HI3716CV200_PVR_TS0_CLK_SEL		151
++#define HI3716CV200_PVR_TS1_CLK_SEL		152
++#define HI3716CV200_PVR_TS0_CLK_DIV		153
++#define HI3716CV200_PVR_TS1_CLK_DIV		154
++
++/* PERI_CRG67 (0x10C) */
++#define HI3716CV200_HDMITX_CTRL_CLK		155
++#define HI3716CV200_HDMITX_CTRL_CEC_CLK_SEL		156
++#define HI3716CV200_HDMITX_CTRL_OSCLK_SEL		157
++#define HI3716CV200_HDMITX_CTRL_ASCLK_SEL		158
++
++/* PERI_CRG68 (0x110) */
++#define HI3716CV200_HDMITX_PHY_CLK		159
++
++/* PERI_CRG69 (0x114) */
++#define HI3716CV200_ADAC_CLK		160
++
++/* PERI_CRG70 (0x118) */
++#define HI3716CV200_AIAO_CLK		161
++#define HI3716CV200_AIAO_CLK_SEL		162
++#define HI3716CV200_AIAO_MCLK_SEL		163
++
++/* PERI_CRG71 (0x11C) */
++#define HI3716CV200_VDAC_RCT_CLK		164
++#define HI3716CV200_VDAC_BG_CLK		165
++#define HI3716CV200_VDAC_BG_CLK_DIV		166
++
++/* PERI_CRG72 (0x120) */
++#define HI3716CV200_FEPHY_CLK		167
++#define HI3716CV200_FEPHY_CLK_SEL		168
++
++/* PERI_CRG73 (0x124) */
++#define HI3716CV200_GPU_FREQ_SEL_CFG_CRG		169
++#define HI3716CV200_GPU_FREQ_DIV_CFG_CRG		170
++
++/* PERI_CRG74 (0x128) */
++#define HI3716CV200_DDR_FREQ_SEL_CFG_CRG		171
++#define HI3716CV200_DDR_FREQ_DIV_CFG_CRG		172
++
++/* PERI_CRG94 (0x178) */
++#define HI3716CV200_WDT0_CLK		173
++#define HI3716CV200_WDG1_CLK		174
++#define HI3716CV200_WDG2_CLK		175
++#define HI3716CV200_WDG3_CLK		176
++
++/* PERI_CRG95 (0x17C) */
++#define HI3716CV200_PLL_TEST_EN		177
++#define HI3716CV200_TEST_CLK_SEL		178
++
++#define HI3716CV200_CRG_CLK_COUNT		179
++
++#endif	/* __DT_BINDINGS_CLOCK_HI3716CV200_CRG_H */
++

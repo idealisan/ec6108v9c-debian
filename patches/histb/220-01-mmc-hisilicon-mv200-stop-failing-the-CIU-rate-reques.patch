@@ -1,0 +1,49 @@
+From cb540a7333204e6a1416844fbc8a38c037c84dca Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 02:42:35 +0800
+Subject: [PATCH] mmc: hisilicon: mv200: stop failing the CIU rate request
+
+dw_mci_hi3798mv200_set_ios() asked the CIU clock for the card clock on
+every call and printed a warning whenever the clock framework refused.
+The refusals are ordinary transitions: three controllers, the 400 kHz
+identification clock that the mux behind the CIU does not offer, and the
+ios->clock == 0 call with which the MMC core powers the slot off. A
+warning that fires on a normal transition observes nothing.
+
+Ask for the rate only when there is one, and read the CIU rate back
+either way, so dw_mmc's own divider always gets the rate the framework
+actually settled on.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/mmc/host/dw_mmc-hi3798mv200.c | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+--- a/drivers/mmc/host/dw_mmc-hi3798mv200.c
++++ b/drivers/mmc/host/dw_mmc-hi3798mv200.c
+@@ -53,15 +53,19 @@ static void dw_mci_hi3798mv200_set_ios(s
+ 		val &= ~SDMMC_DDR_HS400;
+ 	mci_writel(host, DDR_REG, val);
+ 
+-	if (clk_set_rate(host->ciu_clk, ios->clock))
+-		dev_warn(host->dev, "Failed to set rate to %u\n", ios->clock);
+-	else
++	if (ios->clock) {
+ 		/*
+-		 * CLK_MUX_ROUND_NEAREST is enabled for this clock
+-		 * The actual clock rate is not what we set, but a rounded value
+-		 * so we should get the rate once again
++		 * The CIU sits behind a mux that only offers 25/50/100/150/200 MHz,
++		 * so asking for the card clock does not always land on it -- the
++		 * identification clock is 400 kHz. Asking is still worth it when the
++		 * mux can serve the rate, because the controller's own divider only
++		 * halves, and whatever the framework settled on is the divider input,
++		 * so read the rate back either way. ios->clock == 0 here means the
++		 * core is powering the slot off and there is no rate to ask for.
+ 		 */
++		clk_set_rate(host->ciu_clk, ios->clock);
+ 		host->bus_hz = clk_get_rate(host->ciu_clk);
++	}
+ 
+ 	if (phase.valid) {
+ 		clk_set_phase(priv->drive_clk, phase.out_deg);

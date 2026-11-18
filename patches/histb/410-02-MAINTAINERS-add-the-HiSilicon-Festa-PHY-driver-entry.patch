@@ -1,0 +1,33 @@
+From 9bd13cf0a50988526687e89467c448be3d38e3d0 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 16:52:22 +0800
+Subject: [PATCH 2/2] MAINTAINERS: add the HiSilicon Festa PHY driver entry
+
+The Festa Ethernet PHY integrated in the HiSilicon STB SoCs has no
+maintainer entry.
+
+Its microcode download and Wake-on-LAN paths are the parts that need a
+listed reviewer.
+
+Register the driver under netdev.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ MAINTAINERS | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -12039,6 +12039,12 @@ L:	dmaengine@vger.kernel.org
+ S:	Maintained
+ F:	drivers/dma/hisi_dma.c
+ 
++HISILICON FESTA PHY DRIVER
++M:	David Yang <mmyangfl@gmail.com>
++L:	netdev@vger.kernel.org
++S:	Maintained
++F:	drivers/net/phy/hisi-festa.c
++
+ HISILICON GPIO DRIVER
+ M:	Yang Shen <shenyang39@huawei.com>
+ L:	linux-gpio@vger.kernel.org

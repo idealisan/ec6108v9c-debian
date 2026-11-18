@@ -1,0 +1,226 @@
+From d5ac049f436d26a8a17e9b35c15eeae8fd6c2146 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Mon, 5 Oct 2026 04:22:54 +0800
+Subject: [PATCH 2/4] ARM: hisi: add Hi3798MV100 SMP support
+
+The Hi3798MV100 is a four Cortex-A7 ARMv7 part with no PSCI and no power
+controller firmware, so the kernel brings the secondary cores up itself.
+The reset requests of cores 1..3 are still asserted when Linux first
+looks, so a core only starts running when its own reset is dropped and
+no holding pen is needed; hotplug that lets the dying core reset itself
+hangs the cluster after a handful of cycles because the broadcast cache
+maintenance the other cores issue loses its respondent.
+
+Release a core by dropping its arm, cluster_dbg and arm_por resets
+around a CPU_SW_BEGIN pulse through the 0xffff0000 trampoline page, park
+the dying core in WFI held in reset by the surviving core, and wait
+briefly in cpu_kill since the CRG has no parked-status bit.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ arch/arm/mach-hisi/core.h      |  4 ++
+ arch/arm/mach-hisi/hisilicon.c |  9 ++++
+ arch/arm/mach-hisi/hotplug.c   | 98 +++++++++++++++++++++++++++++++++-
+ arch/arm/mach-hisi/platsmp.c   | 39 ++++++++++++++
+ 4 files changed, 149 insertions(+), 1 deletion(-)
+
+--- a/arch/arm/mach-hisi/hotplug.c
++++ b/arch/arm/mach-hisi/hotplug.c
+@@ -64,6 +64,21 @@
+ #define HIP01_PERI9                    0x50
+ #define PERI9_CPU1_RESET               (1 << 1)
+ 
++/*
++ * Hi3798 core release, in the CRG (the same block the clock driver uses): CRG18
++ * switches the CPU clock and, with its bit 10, starts the cluster logic; CRG20
++ * holds three per-core reset requests (arm, cluster_dbg, arm_por) which all
++ * have to be released before a core fetches from the boot vector. Of CRG18 only
++ * bit 10 is documented; the other fields are written with it as one value
++ * (CRG18_CPU_CLK).
++ */
++#define HI3798_PERI_CRG18		0x48
++#define CRG18_CPU_SW_BEGIN		BIT(10)
++#define CRG18_CPU_CLK			0x306
++#define HI3798_PERI_CRG20		0x50
++#define CRG20_ARM_POR_SRST(i)		BIT((i) + 12)
++#define CRG20_CLUSTER_DBG_SRST(i)	BIT((i) + 20)
++
+ enum {
+ 	HI3620_CTRL,
+ 	ERROR_CTRL,
+@@ -246,6 +261,56 @@ void hip01_set_cpu(int cpu, bool enable)
+ 	}
+ }
+ 
++void hi3798_set_cpu(int cpu, bool enable)
++{
++	u32 val;
++	u32 val_crg18;
++
++	if (!ctrl_base) {
++		if (!hix5hd2_hotplug_init()) {
++			WARN(1, "CPU%u: no cpuctrl node to release it\n", cpu);
++			return;
++		}
++	}
++
++	if (enable) {
++		val_crg18 = readl_relaxed(ctrl_base + HI3798_PERI_CRG18);
++		writel_relaxed(CRG18_CPU_CLK, ctrl_base + HI3798_PERI_CRG18);
++		writel_relaxed(CRG18_CPU_CLK | CRG18_CPU_SW_BEGIN,
++			       ctrl_base + HI3798_PERI_CRG18);
++		/* unreset arm_por_srst_req */
++		val = readl_relaxed(ctrl_base + HI3798_PERI_CRG20);
++		val &= ~CRG20_ARM_POR_SRST(cpu);
++		writel_relaxed(val, ctrl_base + HI3798_PERI_CRG20);
++		/* unreset cluster_dbg_srst_req */
++		val = readl_relaxed(ctrl_base + HI3798_PERI_CRG20);
++		val &= ~CRG20_CLUSTER_DBG_SRST(cpu);
++		writel_relaxed(val, ctrl_base + HI3798_PERI_CRG20);
++		/* unreset */
++		val = readl_relaxed(ctrl_base + HI3798_PERI_CRG20);
++		val &= ~CRG20_ARM_SRST(cpu);
++		writel_relaxed(val, ctrl_base + HI3798_PERI_CRG20);
++		/* restore freq */
++		val = val_crg18 & ~CRG18_CPU_SW_BEGIN;
++		writel_relaxed(val, ctrl_base + HI3798_PERI_CRG18);
++		writel_relaxed(val_crg18, ctrl_base + HI3798_PERI_CRG18);
++	} else {
++		/* reset */
++		val = readl_relaxed(ctrl_base + HI3798_PERI_CRG20);
++		val |= CRG20_ARM_SRST(cpu);
++		writel_relaxed(val, ctrl_base + HI3798_PERI_CRG20);
++		/* reset cluster_dbg_srst_req */
++		val = readl_relaxed(ctrl_base + HI3798_PERI_CRG20);
++		val |= CRG20_CLUSTER_DBG_SRST(cpu);
++		writel_relaxed(val, ctrl_base + HI3798_PERI_CRG20);
++		/* reset arm_por_srst_req */
++		val = readl_relaxed(ctrl_base + HI3798_PERI_CRG20);
++		val |= CRG20_ARM_POR_SRST(cpu);
++		writel_relaxed(val, ctrl_base + HI3798_PERI_CRG20);
++	}
++}
++
++#ifdef CONFIG_HOTPLUG_CPU
+ static inline void cpu_enter_lowpower(void)
+ {
+ 	unsigned int v;
+@@ -267,7 +332,6 @@ static inline void cpu_enter_lowpower(vo
+ 	  : "cc");
+ }
+ 
+-#ifdef CONFIG_HOTPLUG_CPU
+ void hi3xxx_cpu_die(unsigned int cpu)
+ {
+ 	cpu_enter_lowpower();
+@@ -294,4 +358,36 @@ void hix5hd2_cpu_die(unsigned int cpu)
+ 	flush_cache_all();
+ 	hix5hd2_set_cpu(cpu, false);
+ }
++
++void hi3798_cpu_die(unsigned int cpu)
++{
++	/*
++	 * Leave cache coherency and idle here - this core must not reset
++	 * itself, because the surviving cores may still have a broadcast
++	 * maintenance operation in flight that expects it to answer.
++	 * ->cpu_kill() holds it in reset, and ->smp_boot_secondary() releases
++	 * it again on the next online, where it re-enters through the boot
++	 * vector. A spurious wake-up just idles again.
++	 */
++	cpu_enter_lowpower();
++
++	while (1)
++		cpu_do_idle();
++}
++
++int hi3798_cpu_kill(unsigned int cpu)
++{
++	unsigned long timeout = jiffies + msecs_to_jiffies(5);
++
++	/*
++	 * Give the dying core a window to settle into WFI before it is taken
++	 * out of the cluster; the CRG has no "core is parked" status bit to
++	 * poll for, so this can only be a deadline.
++	 */
++	while (time_before(jiffies, timeout))
++		cpu_relax();
++
++	hi3798_set_cpu(cpu, false);
++	return 1;
++}
+ #endif
+--- a/arch/arm/mach-hisi/core.h
++++ b/arch/arm/mach-hisi/core.h
+@@ -16,4 +16,8 @@ extern void hix5hd2_set_cpu(int cpu, boo
+ extern void hix5hd2_cpu_die(unsigned int cpu);
+ 
+ extern void hip01_set_cpu(int cpu, bool enable);
++
++void hi3798_set_cpu(int cpu, bool enable);
++void hi3798_cpu_die(unsigned int cpu);
++int hi3798_cpu_kill(unsigned int cpu);
+ #endif
+--- a/arch/arm/mach-hisi/hisilicon.c
++++ b/arch/arm/mach-hisi/hisilicon.c
+@@ -50,3 +50,12 @@ DT_MACHINE_START(HI3620, "Hisilicon Hi36
+ 	.map_io		= hi3620_map_io,
+ 	.dt_compat	= hi3xxx_compat,
+ MACHINE_END
++
++static const char *const hi3798mv100_compat[] __initconst = {
++	"hisilicon,hi3798mv100",
++	NULL,
++};
++
++DT_MACHINE_START(HI3798MV100, "HiSilicon Hi3798MV100 (Flattened Device Tree)")
++	.dt_compat	= hi3798mv100_compat,
++MACHINE_END
+--- a/arch/arm/mach-hisi/platsmp.c
++++ b/arch/arm/mach-hisi/platsmp.c
+@@ -182,6 +182,45 @@ static const struct smp_operations hip01
+ 	.smp_boot_secondary     = hip01_boot_secondary,
+ };
+ 
++static void hi3798_smp_prepare_cpus(unsigned int max_cpus)
++{
++	unsigned int i;
++	unsigned int l2ctlr;
++	unsigned int ncores;
++
++	asm ("mrc p15, 1, %0, c9, c0, 2\n" : "=r" (l2ctlr));
++	ncores = ((l2ctlr >> 24) & 0x3) + 1;
++
++	if (ncores > max_cpus) {
++		pr_warn("smp: %u cores greater than maximum (%u), clipping\n",
++			ncores, max_cpus);
++		ncores = max_cpus;
++	}
++	for (i = 0; i < ncores; i++)
++		set_cpu_possible(i, true);
++
++	/* Put the boot address in this magic register */
++	hix5hd2_set_scu_boot_addr(HIX5HD2_BOOT_ADDRESS,
++				  __pa_symbol(secondary_startup));
++}
++
++static int hi3798_boot_secondary(unsigned int cpu, struct task_struct *idle)
++{
++	hi3798_set_cpu(cpu, true);
++	arch_send_wakeup_ipi_mask(cpumask_of(cpu));
++	return 0;
++}
++
++static const struct smp_operations hi3798_smp_ops __initconst = {
++	.smp_prepare_cpus	= hi3798_smp_prepare_cpus,
++	.smp_boot_secondary	= hi3798_boot_secondary,
++#ifdef CONFIG_HOTPLUG_CPU
++	.cpu_die		= hi3798_cpu_die,
++	.cpu_kill		= hi3798_cpu_kill,
++#endif
++};
++
+ CPU_METHOD_OF_DECLARE(hi3xxx_smp, "hisilicon,hi3620-smp", &hi3xxx_smp_ops);
+ CPU_METHOD_OF_DECLARE(hix5hd2_smp, "hisilicon,hix5hd2-smp", &hix5hd2_smp_ops);
+ CPU_METHOD_OF_DECLARE(hip01_smp, "hisilicon,hip01-smp", &hip01_smp_ops);
++CPU_METHOD_OF_DECLARE(hi3798_smp, "hisilicon,hi3798-smp", &hi3798_smp_ops);

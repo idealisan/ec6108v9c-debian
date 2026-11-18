@@ -1,0 +1,764 @@
+From b655f5bed1279706b995f5e776e43ed674f4b3c2 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 00:17:21 +0800
+Subject: [PATCH] drm: vdp4 bring-up instruments
+
+Keep the OEM-word arm mask, the register snapshot dump and the sysfs arm
+out of the submitted series on purpose.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/gpu/drm/histb/histb-vdp4-regs.h |  56 ++-
+ drivers/gpu/drm/histb/histb-vdp4.c      | 510 +++++++++++++++++++++++-
+ 2 files changed, 550 insertions(+), 16 deletions(-)
+
+--- a/drivers/gpu/drm/histb/histb-vdp4-regs.h
++++ b/drivers/gpu/drm/histb/histb-vdp4-regs.h
+@@ -64,6 +64,29 @@
+  * channel block showed what writing an unverified offset does (nothing, and no
+  * way to tell).
+  */
++/*
++ * Write-back capture and the cycle buffer: the two blocks in this VDP that can
++ * DMA *into* RAM.  Their place in this register file comes from the OEM
++ * kernel's own stores, not from the mv200 C header: VDP_WBC_SetEnable/
++ * SetAutoSt/SetOutIntf/SetUpdMode all store to base+0x6000 (wbc_en bit 31,
++ * upd_mode bit 29, mode_out bits 23:22, vp_connection bits 25:24) with the
++ * instance step at 0x400, VDP_WBC_SetRegUp stores to +0x6004, and the DMA side
++ * is a separate block at base+0x9200 -- YaddrH/L +0x50/+0x54, CaddrH/L
++ * +0x58/+0x5c, Ystride +0x60, Cstride +0x64, mmu bypass +0x14, low-delay lines
++ * +0x20, width/height +0xb8, ctrl +0x00 (ckgt 14, chksum 11, flip 9, uv 8,
++ * data_width 4), length/req_interval +0x04.
++ * The header's WBC_DHD0_* at 0x9000 does not decode on this board at all.
++ *
++ * Two board-measured constraints on writing this family: the address words are
++ * store-only (VDP_WBC_SetLayerAddr never reads them back), and a whole-word
++ * store of all-ones is dropped outright -- only field-wise values are taken.
++ * Both blocks are dumped rather than programmed here, so a boot can say what the
++ * loader left.
++ */
++#define WBC0_CTRL		0x6000
++#define WBC0_REGUP		0x6004
++#define CYCBUF_GFX_BIND		0x8600
++#define CYCBUF_MODE		0x8700
+ 
+ #define GFX0_BASE			0x8a00
+ #define   GFX0_STEP			0x200	/* per fetch unit (lsl #9) */
+@@ -73,8 +96,8 @@
+ #define   GFX0_REQ_CTRL			(GFX0_BASE + 0x04)
+ #define   GFX0_REQ_EXT		(GFX0_BASE + 0x08)
+ /*
+- * Live value of the fetch unit's third word on the system that displays
+-: this driver never wrote the offset and reads back 0.
++ * Live value of the fetch unit's third word on the system that displays:
++ * this driver never wrote the offset and reads back 0.
+  * The fields are not decoded here, so the word is programmed verbatim.
+  */
+ #define     GFX0_REQ_EXT_LIVE		0x703
+@@ -159,21 +182,21 @@
+ 					 FIELD_PREP(VP0_GALPHA, 0xff))
+ /*
+  * The commit word.  This block's configuration registers are shadowed: the
+- * vendor's VDP_GFX_SetParaUpd(arg) reads base+0xf00 and ORs
++ * vendor's VDP_GFX_SetParaUpd(arg) (0xc06b5224) reads base+0xf00 and ORs
+  * bit(17 + arg) back -- so the graphics surface's address/stride/format/geometry
+  * only take effect after that pulse -- and VDP_GP_SetRegUp writes the same word,
+  * which is why naming it after one block misleads.  VDP_DISP_SetParaUpd turned
+  * out to be a trace stub in this build (it tail-calls a print helper), so only
+- * the graphics bit matters for this driver.  No read-back here proves that
+- * the latch self-clears.
++ * the graphics bit matters for this driver.  Nothing here claimed a read-back
++ * proves the latch: the word is dumped as `para` so a boot can say whether bit
++ * 17 self-clears.
+  */
+ #define PARA_UPD			0x0f00
+ #define   PARA_UPD_GFX(n)		BIT(17 + (n))
+ 
+ /*
+  * Mixer slot words, read out of this part's own VDP_CBM_SetMixerPrio text
+- * (read from the OEM image's own text, whose switch is on the header's
+- * VDP_CBM_MIX_E
++ * (the OEM vmlinux at 0xc06b4a48, whose switch is on the header's VDP_CBM_MIX_E
+  * ids -- the vendor's enum table, where MIX0 is commented "MIX0-DHD0" and the
+  * vendor's live XDP_DRV_SetVidCBM passes MIX0 = 4):
+  *
+@@ -199,7 +222,7 @@
+  * it.  Field meanings beyond the slot ids are still not established.
+  *
+  * The background word is the 10-bit triple Y[9:0] Cb[19:10] Cr[29:20], per the
+- * bfi shifts in this part's VDP_CBM_SetMixerBkg.  Left at its reset
++ * bfi shifts in this part's VDP_CBM_SetMixerBkg (0xc06b48d8).  Left at its reset
+  * 0 the uncovered area is YCbCr(0,0,0), which panels render as solid green, so a
+  * green screen says no surface was admitted rather than that black was written.
+  * A displaying OEM does not leave it at 0 and does not hold pure black either:
+@@ -233,8 +256,8 @@
+  * VDP_DISP_SetIntfEnable and VDP_DISP_OpenIntf compute
+  * base + 0xc200 + (chn << 9), and their stores use 16-bit halves where that
+  * header declares 12/10/10 fields.  The words at 0xc200 also read back what
+- * was written -- in the OEM while it displays and in our own kernel after a
+- * write from this driver -- while
++ * was written -- in the
++ * OEM while it displays and in our own kernel after a bench write -- while
+  * 0xc000 answers only four odd bit masks and holds 0 in a displaying system.
+  *
+  * Positions this part's channel block is documented to have but no store has
+@@ -315,7 +338,8 @@
+  * code).  The OEM
+  * image actually running on this box disagrees: while it displays, VO_MUX is 0x1
+  * -- hdmi_sel clear, so id 0 -- and the channel it programs is the one at
+- * base+0xc200, i.e. id 0.  A board verdict that has not been retracted decides
++ * base+0xc200, i.e. id 0, both read live off the running system.  A board
++ * verdict that has not been retracted decides
+  * HD_CHN; nothing else may name a channel.
+  *
+  * Channels are HD_CHN_OFFSET apart -- 0x200, the shift the OEM's OpenIntf
+@@ -337,6 +361,14 @@
+ #define HD_PWR			(DHD0_PWR + HD_CHN * HD_CHN_OFFSET)
+ #define HD_VTTHD3		(DHD0_VTTHD3 + HD_CHN * HD_CHN_OFFSET)
+ #define HD_VTTHD		(DHD0_VTTHD + HD_CHN * HD_CHN_OFFSET)
++#define HD_VBLANK_STATE		(DHD0_VBLANK_STATE + HD_CHN * HD_CHN_OFFSET)
++/*
++ * Not a configuration word: VDP_DISP_GetDHD0VblankState reads exactly this word
++ * of the channel (base+0xc2a0), so it is the one place the channel says whether
++ * it is counting.  A displaying OEM system holds 0x00f404d8 there while our
++ * kernel holds 0x01000006 unchanged across seconds.
++ */
++#define DHD0_VBLANK_STATE	0xc2a0
+ 
+ /* hdmi_sel holds the id of the channel that reaches the interface, so both this
+  * bit and the threshold source come out of HD_CHN and cannot disagree with it.
+@@ -352,7 +384,7 @@
+  * vtthd1 armed the channel asserted VOMSKINTSTA bit 1 -- dhd0vtthd2_int -- and
+  * the driver logged it as "unexpected status 00000002" while
+  * drm_crtc_handle_vblank() never ran and every commit ended in
+- * "vblank wait timed out".
++ * "vblank wait timed out" (round of 2026-10-24, serial log).
+  */
+ #define HD_INT_VBLANK		(HD_CHN ? VO_INT_DHD1_VTTHD2 : VO_INT_DHD0_VTTHD2)
+ #define HD_MUX_HDMI_SEL		(HD_CHN ? VO_MUX_HDMI_SEL : 0)
+--- a/drivers/gpu/drm/histb/histb-vdp4.c
++++ b/drivers/gpu/drm/histb/histb-vdp4.c
+@@ -40,6 +40,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
++#include <linux/sysfs.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -157,7 +158,10 @@ struct histb_vdp4 {
+ 
+ 	struct regmap		*crg;
+ 
++	void __iomem		*mark;
++
+ 	int			irq;
++	unsigned long		vblank_seen;
+ 
+ 	struct histb_vdp4_display	*disp;	/* NULL unless the pipeline is bound */
+ };
+@@ -434,6 +438,378 @@ static const struct drm_plane_funcs hist
+  * One-time display pipeline setup: route GP0 into the DHD0 mixer, set the AXI
+  * outstanding limits and enable the block's clock gate.
+  */
++/*
++ * Board test instrument, not for submission.  The mask picks which of the words
++ * the displaying OEM holds -- and this driver never programs -- go in at
++ * configuration time; one unbind/bind per bit therefore answers every one of
++ * them from a single build.  The values are the OEM's live readings, taken with
++ * it displaying.
++ */
++static const struct {
++	u32 off;
++	u32 val;
++	const char *name;
++} histb_vdp4_arms[] = {
++	{ CYCBUF_GFX_BIND, 0x00000800, "cycbuf-gfx-bind" },
++	{ 0x8608,	    0x00000001, "cycbuf-8608" },
++	{ CYCBUF_MODE,	    0x00000010, "cycbuf-mode" },
++	{ 0x8750,	    0x00000101, "cycbuf-8750" },
++	{ 0x8a74,	    0x00f17a00, "fetch-8a74" },
++	{ 0xca10,	    0x84010040, "intf-ca10" },
++	{ 0xce00,	    0x008400dc, "date-coeff0" },
++	{ 0xce54,	    0x00653421, "date-coeff21" },
++	{ 0xcee4,	    0x80808181, "date-cee4" },
++	{ 0xceec,	    0x00000113, "date-ceec" },
++	{ 0xb000,	    0x00000013, "pq-coef-b000" },
++	{ 0xd500,	    0x00000001, "pq-gmm-d500" },
++	{ 0xb004,	    0x00001000, "csc1-diag-0" },
++	{ 0xb014,	    0x00001000, "csc1-diag-1" },
++	{ 0xb024,	    0x00001000, "csc1-diag-2" },
++	{ 0xd514,	    0x00007528, "gmm-d514" },
++	{ 0xd520,	    0x00007338, "gmm-d520" },
++	{ 0xd528,	    0x00000005, "gmm-d528" },
++	{ 0xd538,	    0x00000040, "gmm-d538" },
++	{ 0xd53c,	    0x00000200, "gmm-d53c" },
++};
++
++/*
++ * Board test instrument, not for submission: every word where the displaying OEM
++ * holds a value this driver does not, taken from the whole-register-file diff
++ * where both sides were read live: 288 configuration differences, 0 gating
++ * differences.
++ *
++ * The low two bits of the parameter pick which class is applied:
++ *   bit 0 -- configuration words: enables, update modes, formats, masks;
++ *   bit 1 -- mode-carrying words: the OEM's own surface size, stride, position,
++ *            channel timing and vertical thresholds.  Those are numbers for a
++ *            1280x2160 surface and its timing, so they are wrong for this board
++ *            if taken alone -- they exist here to complete the aggregate.
++ * Words whose role is a memory address (the OEM's parameter-table and buffer
++ * pointers, VDP+0xe04-0xe9c, 0x5000-0x500c, 0x6a04, 0x8250-0x8340, 0x8a54,
++ * 0x9250-0x928c) are not in the table at all: copying one points an engine of
++ * this board at memory our kernel owns.  Status and counter words are left out
++ * for the mirror-image reason -- they are what the other system measures, not
++ * something a driver programs.
++ *
++ * This exists because a live write into a running latched block changes nothing:
++ * the same hand-armed state measured a white/black difference of 65 and then 5
++ * measured on the board, so only a configuration-time arm can answer it.  The
++ * driver is built in, so the parameter has to arrive as
++ * `histb_vdp4.vdp_oem_copy=1` on the kernel command line.
++ */
++struct histb_vdp4_copy {
++	u32 off;
++	u32 val;
++	u8 mode;
++};
++
++static const struct histb_vdp4_copy histb_vdp4_oem_copy[] = {
++	{ 0x00060, 0x000dd4eb, 0 },
++	{ 0x00104, 0x00000000, 0 },
++	{ 0x00120, 0x00200000, 0 },
++	{ 0x00134, 0x00000370, 0 },
++	{ 0x00150, 0x00004080, 0 },
++	{ 0x02000, 0x600000ff, 1 },
++	{ 0x02008, 0x086f0fff, 1 },
++	{ 0x02018, 0x600000ff, 0 },
++	{ 0x02084, 0x086f0fff, 1 },
++	{ 0x0208c, 0x086f0fff, 1 },
++	{ 0x02090, 0x00080200, 0 },
++	{ 0x02094, 0x000000ff, 0 },
++	{ 0x02098, 0x04080200, 0 },
++	{ 0x0209c, 0x086f0fff, 1 },
++	{ 0x020a4, 0x086f0fff, 1 },
++	{ 0x020ac, 0x086f0fff, 1 },
++	{ 0x020b0, 0x00080200, 0 },
++	{ 0x020b4, 0x000000ff, 0 },
++	{ 0x020b8, 0x04080200, 0 },
++	{ 0x020bc, 0x086f0fff, 1 },
++	{ 0x020c4, 0x086f0fff, 1 },
++	{ 0x020cc, 0x086f0fff, 1 },
++	{ 0x020d0, 0x00080200, 0 },
++	{ 0x020d4, 0x000000ff, 0 },
++	{ 0x020d8, 0x04080200, 0 },
++	{ 0x020dc, 0x086f0fff, 1 },
++	{ 0x020e4, 0x086f0fff, 1 },
++	{ 0x020ec, 0x086f0fff, 1 },
++	{ 0x020f0, 0x00080200, 0 },
++	{ 0x020f4, 0x000000ff, 0 },
++	{ 0x020f8, 0x04080200, 0 },
++	{ 0x020fc, 0x086f0fff, 1 },
++	{ 0x022c0, 0xc70aaaaa, 1 },
++	{ 0x022d8, 0xc1880001, 0 },
++	{ 0x022dc, 0x00000aaa, 0 },
++	{ 0x022e0, 0x0000fe00, 1 },
++	{ 0x022e4, 0x0000fe00, 1 },
++	{ 0x022e8, 0x0437077f, 0 },
++	{ 0x022f8, 0x0002e020, 1 },
++	{ 0x022fc, 0x00030000, 1 },
++	{ 0x02300, 0x0002e020, 1 },
++	{ 0x02304, 0x00030000, 0 },
++	{ 0x024c0, 0xc6078000, 1 },
++	{ 0x024d8, 0xc1880001, 0 },
++	{ 0x024dc, 0x00000800, 1 },
++	{ 0x024e8, 0x086f0fff, 1 },
++	{ 0x024f8, 0x0002e020, 1 },
++	{ 0x024fc, 0x00030000, 1 },
++	{ 0x02500, 0x0002e020, 1 },
++	{ 0x02504, 0x00030000, 0 },
++	{ 0x02600, 0x00000016, 0 },
++	{ 0x03000, 0x600000ff, 0 },
++	{ 0x03018, 0x600000ff, 0 },
++	{ 0x04008, 0x086f0fff, 1 },
++	{ 0x04010, 0x086f0fff, 1 },
++	{ 0x04018, 0xa00000ff, 0 },
++	{ 0x04084, 0x086f0fff, 1 },
++	{ 0x0408c, 0x086f0fff, 1 },
++	{ 0x04094, 0x000000ff, 0 },
++	{ 0x0409c, 0x086f0fff, 1 },
++	{ 0x040a4, 0x086f0fff, 1 },
++	{ 0x040ac, 0x086f0fff, 1 },
++	{ 0x040b4, 0x000000ff, 0 },
++	{ 0x040bc, 0x086f0fff, 1 },
++	{ 0x040c4, 0x086f0fff, 1 },
++	{ 0x040cc, 0x086f0fff, 1 },
++	{ 0x040d4, 0x000000ff, 0 },
++	{ 0x040dc, 0x086f0fff, 1 },
++	{ 0x040e4, 0x086f0fff, 1 },
++	{ 0x040ec, 0x086f0fff, 1 },
++	{ 0x040f4, 0x000000ff, 0 },
++	{ 0x040fc, 0x086f0fff, 1 },
++	{ 0x05800, 0x600000ff, 0 },
++	{ 0x05808, 0x00f30002, 0 },
++	{ 0x05818, 0x600000ff, 0 },
++	{ 0x06000, 0x68000004, 1 },
++	{ 0x06008, 0x0fff086f, 1 },
++	{ 0x0680c, 0x086f0fff, 1 },
++	{ 0x06810, 0x02cf04ff, 1 },
++	{ 0x06884, 0x086f0fff, 1 },
++	{ 0x0688c, 0x086f0fff, 1 },
++	{ 0x0689c, 0x086f0fff, 1 },
++	{ 0x068a4, 0x086f0fff, 1 },
++	{ 0x068ac, 0x086f0fff, 1 },
++	{ 0x068bc, 0x086f0fff, 1 },
++	{ 0x068c4, 0x086f0fff, 1 },
++	{ 0x068cc, 0x086f0fff, 1 },
++	{ 0x068dc, 0x086f0fff, 1 },
++	{ 0x068e4, 0x086f0fff, 1 },
++	{ 0x068ec, 0x086f0fff, 1 },
++	{ 0x068fc, 0x086f0fff, 1 },
++	{ 0x06a00, 0x00010fff, 1 },
++	{ 0x06a10, 0x0000086f, 1 },
++	{ 0x06a14, 0xf1800000, 0 },
++	{ 0x06a18, 0x00000555, 0 },
++	{ 0x07028, 0x00000feb, 0 },
++	{ 0x0702c, 0x7665642f, 0 },
++	{ 0x07030, 0x04756e2f, 0 },
++	{ 0x07034, 0x0020006c, 0 },
++	{ 0x07038, 0x00202020, 0 },
++	{ 0x0703c, 0x20202020, 0 },
++	{ 0x07040, 0x20202020, 0 },
++	{ 0x07044, 0x06302020, 0 },
++	{ 0x07048, 0x00003636, 0 },
++	{ 0x08000, 0x0000772f, 0 },
++	{ 0x08004, 0x00000511, 0 },
++	{ 0x08200, 0x00120011, 0 },
++	{ 0x08204, 0x80000001, 0 },
++	{ 0x08214, 0x04080200, 0 },
++	{ 0x08220, 0x00000000, 0 },
++	{ 0x08240, 0x00000002, 0 },
++	{ 0x08244, 0x02cf04ff, 1 },
++	{ 0x0824c, 0x02cf04ff, 1 },
++	{ 0x08290, 0x05000500, 0 },
++	{ 0x082c0, 0x00000001, 0 },
++	{ 0x082ec, 0x0e5252a0, 0 },
++	{ 0x082f4, 0x0000e100, 0 },
++	{ 0x082f8, 0x00801000, 0 },
++	{ 0x082fc, 0x00007080, 0 },
++	{ 0x08300, 0x0000e100, 0 },
++	{ 0x08304, 0x0002f548, 0 },
++	{ 0x08308, 0x00007080, 0 },
++	{ 0x0830c, 0x000177eb, 0 },
++	{ 0x08310, 0x0000e100, 0 },
++	{ 0x08314, 0x0002f95e, 0 },
++	{ 0x08318, 0x00007080, 0 },
++	{ 0x0831c, 0x00017eb4, 0 },
++	{ 0x08320, 0x02cf04ff, 1 },
++	{ 0x08324, 0x00730000, 0 },
++	{ 0x08328, 0x00467b00, 0 },
++	{ 0x0832c, 0x00475c00, 0 },
++	{ 0x08330, 0x00120011, 0 },
++	{ 0x08334, 0x00000000, 0 },
++	{ 0x08404, 0x80000001, 0 },
++	{ 0x08420, 0x00000000, 0 },
++	{ 0x084c0, 0x00000001, 0 },
++	{ 0x08524, 0x00710002, 0 },
++	{ 0x08534, 0x00000000, 0 },
++	{ 0x08a04, 0x00000000, 0 },
++	{ 0x08a20, 0x00000000, 0 },
++	{ 0x08a28, 0x0000ff00, 0 },
++	{ 0x08a40, 0x00100068, 0 },
++	{ 0x08a60, 0x00b000b0, 0 },
++	{ 0x08a74, 0x00adfa00, 0 },
++	{ 0x08a84, 0x008eb000, 0 },
++	{ 0x08a88, 0x00010001, 0 },
++	{ 0x08a94, 0x00adcd00, 0 },
++	{ 0x08ac0, 0x00000001, 0 },
++	{ 0x08b24, 0x00fb0002, 0 },
++	{ 0x08b28, 0x0008edd0, 0 },
++	{ 0x08b34, 0x00000000, 0 },
++	{ 0x08c20, 0x00000000, 0 },
++	{ 0x08cc0, 0x00000001, 0 },
++	{ 0x08d24, 0x00f10002, 0 },
++	{ 0x08d34, 0x00000000, 0 },
++	{ 0x09200, 0x00000800, 0 },
++	{ 0x09214, 0x00000004, 0 },
++	{ 0x0b000, 0x00000013, 1 },
++	{ 0x0b004, 0x00001000, 0 },
++	{ 0x0b014, 0x00001000, 0 },
++	{ 0x0b024, 0x00001000, 0 },
++	{ 0x0b04c, 0x00000044, 0 },
++	{ 0x0b050, 0x000007c0, 0 },
++	{ 0x0b054, 0x00000600, 0 },
++	{ 0x0b058, 0x00000600, 0 },
++	{ 0x0b05c, 0x00000040, 0 },
++	{ 0x0b060, 0x00000200, 0 },
++	{ 0x0b064, 0x00000200, 0 },
++	{ 0x0b084, 0x03ff03ff, 0 },
++	{ 0x0b800, 0xf0000000, 0 },
++	{ 0x0b804, 0x00400000, 0 },
++	{ 0x0c004, 0x00002000, 1 },
++	{ 0x0c208, 0x0051086f, 1 },
++	{ 0x0c20c, 0x00000007, 1 },
++	{ 0x0c210, 0x00d70fff, 1 },
++	{ 0x0c214, 0x00000057, 1 },
++	{ 0x0c220, 0x00090057, 1 },
++	{ 0x0c224, 0x000180e1, 1 },
++	{ 0x0c228, 0x87b98465, 1 },
++	{ 0x0c808, 0x80000000, 1 },
++	{ 0x0c810, 0x00000000, 1 },
++	{ 0x0ca08, 0x00000006, 1 },
++	{ 0x0ca10, 0x84010040, 1 },
++	{ 0x0ce00, 0x008400dc, 1 },
++	{ 0x0ce54, 0x00653421, 1 },
++	{ 0x0ce58, 0x000000ba, 1 },
++	{ 0x0cec8, 0x000007f9, 1 },
++	{ 0x0cecc, 0x0000020e, 1 },
++	{ 0x0ced4, 0x079f0014, 1 },
++	{ 0x0ced8, 0x014d014d, 1 },
++	{ 0x0cee4, 0x80808181, 1 },
++	{ 0x0ceec, 0x00000113, 1 },
++	{ 0x0d500, 0x00000001, 0 },
++	{ 0x0d504, 0x000005e0, 0 },
++	{ 0x0d508, 0x000013a8, 0 },
++	{ 0x0d50c, 0x000001f8, 0 },
++	{ 0x0d510, 0x00007cc8, 0 },
++	{ 0x0d514, 0x00007528, 0 },
++	{ 0x0d518, 0x00000e10, 0 },
++	{ 0x0d51c, 0x00000e10, 0 },
++	{ 0x0d520, 0x00007338, 0 },
++	{ 0x0d524, 0x00007eb8, 0 },
++	{ 0x0d528, 0x00000005, 0 },
++	{ 0x0d538, 0x00000040, 0 },
++	{ 0x0d53c, 0x00000200, 0 },
++	{ 0x0d540, 0x00000200, 0 },
++	{ 0x0d548, 0x000003ff, 0 },
++	{ 0x0d600, 0x00000001, 0 },
++	{ 0x0d604, 0x000005e0, 0 },
++	{ 0x0d608, 0x000013a8, 0 },
++	{ 0x0d60c, 0x000001f8, 0 },
++	{ 0x0d610, 0x00007cc8, 0 },
++	{ 0x0d614, 0x00007528, 0 },
++	{ 0x0d618, 0x00000e10, 0 },
++	{ 0x0d61c, 0x00000e10, 0 },
++	{ 0x0d620, 0x00007338, 0 },
++	{ 0x0d624, 0x00007eb8, 0 },
++	{ 0x0d628, 0x00000005, 0 },
++	{ 0x0d638, 0x00000040, 0 },
++	{ 0x0d63c, 0x00000200, 0 },
++	{ 0x0d640, 0x00000200, 0 },
++	{ 0x0d648, 0x000003ff, 0 },
++	{ 0x0d700, 0x00000001, 0 },
++	{ 0x0d704, 0x000005e0, 0 },
++	{ 0x0d708, 0x000013a8, 0 },
++	{ 0x0d70c, 0x000001f8, 0 },
++	{ 0x0d710, 0x00007cc8, 0 },
++	{ 0x0d714, 0x00007528, 0 },
++	{ 0x0d718, 0x00000e10, 0 },
++	{ 0x0d71c, 0x00000e10, 0 },
++	{ 0x0d720, 0x00007338, 0 },
++	{ 0x0d724, 0x00007eb8, 0 },
++	{ 0x0d728, 0x00000005, 0 },
++	{ 0x0d738, 0x00000040, 0 },
++	{ 0x0d73c, 0x00000200, 0 },
++	{ 0x0d740, 0x00000200, 0 },
++	{ 0x0d748, 0x000003ff, 0 },
++};
++
++/* the commit strobes, in the order the vendor's own helpers use them */
++static const u32 histb_vdp4_copy_latches[] = {
++	0x0f00, 0x4004, 0x5004, 0x6004, 0x6804, 0x8604, 0xc200,
++};
++#define COPY_PARA_UPD	((1 << 17) | (1 << 18) | (1 << 25))
++
++static u32 vdp_oem_copy;
++module_param(vdp_oem_copy, uint, 0);
++MODULE_PARM_DESC(vdp_oem_copy, "board test instrument, not for submission: bit 0 applies the "
++		 "displaying OEM's configuration words and bit 1 its mode-carrying words at "
++		 "configuration time, when the blocks are not yet started -- live writes into a "
++		 "running latched window change nothing");
++
++static void histb_vdp4_apply_oem_copy(struct histb_vdp4 *vdp)
++{
++	unsigned int applied = 0;
++	int i;
++
++	if (!vdp_oem_copy)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(histb_vdp4_oem_copy); i++) {
++		const struct histb_vdp4_copy *w = &histb_vdp4_oem_copy[i];
++
++		if (!(vdp_oem_copy & (w->mode ? BIT(1) : BIT(0))))
++			continue;
++		vo_write(vdp, w->off, w->val);
++		applied++;
++	}
++	for (i = 0; i < ARRAY_SIZE(histb_vdp4_copy_latches); i++) {
++		u32 off = histb_vdp4_copy_latches[i];
++		/* 0xf00 is the shared parameter-update word with one bit per block;
++		 * the others are a block's own one-bit commit strobe */
++		u32 mask = off == 0x0f00 ? COPY_PARA_UPD : 1;
++		u32 cur = vo_read(vdp, off);
++
++		vo_write(vdp, off, cur | mask);
++		vo_write(vdp, off, cur & ~mask);
++	}
++	dev_info(vdp->dev, "oem-copy: %u words applied, mask %#x\n",
++		 applied, vdp_oem_copy);
++}
++
++static u32 vdp_arm;
++module_param(vdp_arm, uint, 0644);
++MODULE_PARM_DESC(vdp_arm, "board test instrument, not for submission: bit N of this mask "
++		 "programs one OEM-held VDP word at configuration time; the command line is the "
++		 "only way to do that without a re-mode-set, which this driver's transmitter path "
++		 "does not survive");
++
++static ssize_t histb_vdp4_arm_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%#x\n", vdp_arm);
++}
++
++static ssize_t histb_vdp4_arm_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int ret;
++
++	ret = kstrtou32(buf, 0, &vdp_arm);
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_RW(histb_vdp4_arm);
+ 
+ /*
+  * One-time pipeline setup before the channel starts: the AXI master limits and
+@@ -444,6 +820,7 @@ static const struct drm_plane_funcs hist
+  */
+ static void histb_vdp4_pipeline_init(struct histb_vdp4 *vdp)
+ {
++	unsigned int i;
+ 	u32 ctrl;
+ 
+ 	/* Clock gate first: writes into a gated VDP domain are dropped. */
+@@ -464,6 +841,73 @@ static void histb_vdp4_pipeline_init(str
+ 	vo_write(vdp, MIXG0_SLOT, 1);
+ 	vo_write(vdp, CBM0_BKG, 0);
+ 	vo_write(vdp, CBM0_SLOT, 2);
++
++	/*
++	 * Board test instrument, not for submission: the words the displaying
++	 * OEM holds and this driver has no code for, programmed here so they
++	 * are in place before the channel starts rather than pasted into a
++	 * running one.
++	 */
++	for (i = 0; i < ARRAY_SIZE(histb_vdp4_arms); i++) {
++		if (!(vdp_arm & BIT(i)))
++			continue;
++		vo_write(vdp, histb_vdp4_arms[i].off, histb_vdp4_arms[i].val);
++		dev_info(vdp->dev, "arm %u %s: off %#x val %08x reads %08x\n",
++			 i, histb_vdp4_arms[i].name, histb_vdp4_arms[i].off,
++			 histb_vdp4_arms[i].val, vo_read(vdp, histb_vdp4_arms[i].off));
++	}
++	/* the same words the displaying OEM holds, if the instrument is armed */
++	histb_vdp4_apply_oem_copy(vdp);
++}
++
++/*
++ * Board test instrument, not for submission: the vblank question is "did the
++ * channel ever tick", and the board cannot hand /dev/mem to us here, so the
++ * decision values go to the console.  Both HD channels are printed: the driver
++ * owns the one HD_CHN names, and a non-zero value on the other says somebody
++ * else still drives the output.
++ */
++static void histb_vdp4_dump(struct histb_vdp4 *vdp, const char *tag)
++{
++	dev_info(vdp->dev,
++		 "vdpdump %s: VOCTRL %08x VO_MUX %08x INTMSK %08x MSKINTSTA %08x INTSTA %08x\n",
++		 tag, vo_read(vdp, VO_CTRL), vo_read(vdp, MV310_VO_MUX),
++		 vo_read(vdp, VO_INTMSK), vo_read(vdp, VO_MSKINTSTA),
++		 vo_read(vdp, VO_INTSTA));
++	dev_info(vdp->dev,
++		 "vdpdump %s: HD_CHN %u state %08x faddr %08x fstride %08x ffmt %08x lctrl %08x "
++		 "cbm %08x cbkbkg %08x\n",
++		 tag, HD_CHN, vo_read(vdp, HD_VBLANK_STATE),
++		 vo_read(vdp, GFX0_ADDR), vo_read(vdp, GFX0_STRIDE),
++		 vo_read(vdp, GFX0_FMT), vo_read(vdp, L0_CTRL),
++		 vo_read(vdp, CBM0_SLOT), vo_read(vdp, CBM0_BKG));
++	dev_info(vdp->dev,
++		 "vdpdump %s: wbc %08x wbcup %08x cycbuf %08x cycmode %08x para %08x\n",
++		 tag, vo_read(vdp, WBC0_CTRL),
++		 vo_read(vdp, WBC0_REGUP), vo_read(vdp, CYCBUF_GFX_BIND),
++		 vo_read(vdp, CYCBUF_MODE), vo_read(vdp, PARA_UPD));
++	dev_info(vdp->dev,
++		 "vdpdump %s: vp0 %08x gp0 %08x gpup %08x mixg %08x intf %08x gires %08x\n",
++		 tag, vo_read(vdp, VP0_CTRL), vo_read(vdp, GP0_CTRL),
++		 vo_read(vdp, GP0_REGUP), vo_read(vdp, MIXG0_SLOT),
++		 vo_read(vdp, MV310_INTF_HDMI_CTRL), vo_read(vdp, GP0_IRESO));
++	dev_info(vdp->dev,
++		 "vdpdump %s: DHD0 CTRL %08x PWR %08x VTTHD %08x VSYNC %08x VFB %08x HSYNC1 %08x "
++		 "HSYNC2 %08x\n",
++		 tag, vo_read(vdp, DHD0_CTRL), vo_read(vdp, DHD0_PWR),
++		 vo_read(vdp, MV310_DHD0_VTTHD), vo_read(vdp, DHD0_VSYNC),
++		 vo_read(vdp, DHD0_VSYNC_VFB), vo_read(vdp, DHD0_HSYNC1),
++		 vo_read(vdp, DHD0_HSYNC2));
++	dev_info(vdp->dev,
++		 "vdpdump %s: DHD1 CTRL %08x PWR %08x VTTHD %08x VSYNC %08x VFB %08x HSYNC1 %08x "
++		 "HSYNC2 %08x\n",
++		 tag, vo_read(vdp, DHD0_CTRL + HD_CHN_OFFSET),
++		 vo_read(vdp, DHD0_PWR + HD_CHN_OFFSET),
++		 vo_read(vdp, MV310_DHD0_VTTHD + HD_CHN_OFFSET),
++		 vo_read(vdp, DHD0_VSYNC + HD_CHN_OFFSET),
++		 vo_read(vdp, DHD0_VSYNC_VFB + HD_CHN_OFFSET),
++		 vo_read(vdp, DHD0_HSYNC1 + HD_CHN_OFFSET),
++		 vo_read(vdp, DHD0_HSYNC2 + HD_CHN_OFFSET));
+ }
+ 
+ /*
+@@ -602,6 +1046,15 @@ static void histb_vdp4_crtc_setup_timing
+ 	/* Latch the timing again; the interface is enabled once G0 is up. */
+ 	vo_write(vdp, HD_CTRL, ctrl);
+ 
++	dev_info(vdp->dev,
++		 "vdpdump: mode %dx%d clk=%d htot %d vtot %d | hbb %d hfb %d hpw %d vbb %d vfb %d "
++		 "vpw %d\n",
++		 mode->hdisplay, mode->vdisplay, mode->clock, mode->htotal,
++		 mode->vtotal, hbb, hfb, hpw, vbb, vfb, vpw);
++
++	histb_vdp4_dump(vdp, "enable");
++	msleep(1000);
++	histb_vdp4_dump(vdp, "enable+1s");
+ }
+ 
+ static enum drm_mode_status histb_vdp4_crtc_mode_valid(struct drm_crtc *crtc,
+@@ -827,8 +1280,18 @@ static irqreturn_t histb_vdp4_irq_handle
+ 				     sta);
+ 
+ 	/* the line stays requested across an aggregate unbind, no CRTC then */
+-	if (disp && (sta & HD_INT_VBLANK))
++	if (disp && (sta & HD_INT_VBLANK)) {
+ 		drm_crtc_handle_vblank(&disp->base.crtc);
++		/*
++		 * Own-progress witness: "did the frame event arrive again" is the only
++		 * question that distinguishes a channel that free-runs from one that
++		 * asserted once at enable time -- and it must not lean on the panel or
++		 * on a capture card, neither of which this board has attached.
++		 */
++		if (!(++vdp->vblank_seen % 50))
++			dev_info(vdp->dev, "vdp vblank: %lu frames seen\n",
++				 vdp->vblank_seen);
++	}
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -853,6 +1316,26 @@ static const struct drm_mode_config_func
+  * histb_vdp4_runtime_resume(). The reset has to be held before it is released
+  * and the block needs settling time afterwards, so the pulse comes with delays.
+  */
++/*
++ * Board test instrument, not for submission.  A bus lock during probe takes the
++ * console with it, so the enable steps are counted into the trampoline's no-map
++ * window, which the watchdog reset leaves intact: after the box is back in
++ * fastboot, "md.l 0x200e000 8" says which step ran last and what the block
++ * reported.  Word 4 is VOCTRL, 5 the channel control word before the VOU pulse,
++ * 6 the same after it, 7 VO_INTMSK.
++ */
++#define MARK_PHYS	0x0200e000
++
++static void histb_vdp4_mark(struct histb_vdp4 *vdp, u32 step, u32 off)
++{
++	if (!vdp->mark)
++		return;
++
++	writel(step, vdp->mark);
++	if (off)
++		writel(vo_read(vdp, off), vdp->mark + 16);
++	wmb();			/* the reader is a different boot */
++}
+ 
+ /*
+  * Put the block into the reset state a clocked access survives and then hand it
+@@ -877,11 +1360,11 @@ static int histb_vdp4_reset_release(stru
+ 	 * and then deasserts for one stated reason: to drop every display state
+ 	 * inherited from the boot-logo pipeline.  This port only ever deasserted, so
+ 	 * whatever the vendor fastboot left inside the VDP state machines has been
+-	 * carried into every boot since.
++	 * carried into every round of this bring-up.
+ 	 *
+ 	 * The pulse is deliberately not interrupted by a read.  That driver polls
+ 	 * VDPVERSION1/2 for reset completion, but on this part both words read the
+-	 * constant date stamp 0x20170929, so
++	 * constant date stamp 0x20170929, read on the board, so
+ 	 * such a poll could only time out -- and reading the register file while a
+ 	 * VDP reset is held is the access shape that already locked the bus once
+ 	 * here, with the wider VOU request.  mb() plus 10 us is that
+@@ -899,6 +1382,8 @@ static int histb_vdp4_reset_release(stru
+ 	mb();
+ 	udelay(10);
+ 
++	histb_vdp4_mark(vdp, 5, HD_CTRL);
++
+ 	return 0;
+ }
+ 
+@@ -922,6 +1407,8 @@ static int histb_vdp4_runtime_resume(str
+ 	struct histb_vdp4 *vdp = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	histb_vdp4_mark(vdp, 1, 0);
++
+ 	/*
+ 	 * Clocks first, then the reset edge.  HiSilicon's own histb port enables the
+ 	 * clocks before it asserts and deasserts the VDP reset, and that order is a
+@@ -935,10 +1422,18 @@ static int histb_vdp4_runtime_resume(str
+ 	if (ret)
+ 		return ret;
+ 
++	histb_vdp4_mark(vdp, 2, 0);
++
+ 	ret = histb_vdp4_reset_release(vdp);
+ 	if (ret)
+ 		return ret;
+ 
++	histb_vdp4_mark(vdp, 3, VO_CTRL);
++
++	dev_info(dev, "vdp4mark: resumed, VOCTRL %08x HD_CTRL %08x INTMSK %08x\n",
++		 vo_read(vdp, VO_CTRL), vo_read(vdp, HD_CTRL),
++		 vo_read(vdp, VO_INTMSK));
++
+ 	return 0;
+ }
+ 
+@@ -962,6 +1457,10 @@ static int histb_vdp4_probe(struct platf
+ 	if (IS_ERR(vdp->regs))
+ 		return dev_err_probe(dev, PTR_ERR(vdp->regs), "ioremap failed\n");
+ 
++	vdp->mark = memremap(MARK_PHYS, 32, MEMREMAP_WB);
++	if (vdp->mark)
++		writel(0, vdp->mark);
++
+ 	/*
+ 	 * "pix" is the HD channel pixel clock that histb_vdp4_set_pixclk()
+ 	 * programs through the display PLL and CRG54's select and divider; "bus"
+@@ -1027,7 +1526,7 @@ static int histb_vdp4_probe(struct platf
+ 	 * physically -- the VDP does have its own MMU (the vendor's VDP_SMMU_*
+ 	 * family, at VDP+0xe000 here rather than the header's 0xf000) but this
+ 	 * board's boot leaves its global bypass raised, read as SCR = 0x1, and
+-	 * the port keeps that state.  So an imported
++	 * the port keeps that state, read from the board's boot.  So an imported
+ 	 * buffer is refused unless its scatter/gather
+ 	 * table covers the whole object. Bind the pool named by the
+ 	 * "memory-region" property, which keeps them out of the default CMA
+@@ -1060,6 +1559,9 @@ static int histb_vdp4_probe(struct platf
+ 		}
+ 	}
+ 
++	/* board test instrument, not for submission */
++	device_create_file(dev, &dev_attr_histb_vdp4_arm);
++
+ 	return 0;
+ 
+ err_pm_put:

@@ -1,0 +1,47 @@
+From 8c8be0900524867075d31ed8975dbb32b623cd38 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 7 Oct 2026 06:23:21 +0800
+Subject: [PATCH 4/4] net: ethernet: hisilicon: assign the netdev ops before
+ the PHY attach
+
+hisi_femac_drv_probe() connected to the PHY before filling in
+ndev->netdev_ops, and phy_attach_direct() -> phy_link_topo_add_phy()
+asks netdev_need_ops_lock(), which with CONFIG_NET_SHAPER=y reads
+dev->netdev_ops->net_shaper_ops: a NULL pointer read that oopses at
+boot.
+
+Move the ops tables ahead of the attach. Attaching a PHY before
+register_netdev() is supported, so this driver just has to publish its
+operations first.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/net/ethernet/hisilicon/hisi_femac.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/hisilicon/hisi_femac.c
++++ b/drivers/net/ethernet/hisilicon/hisi_femac.c
+@@ -829,7 +829,13 @@ static int hisi_femac_drv_probe(struct p
+ 		hisi_femac_phy_reset(priv);
+ 	}
+ 
++	/* attach asks the core whether this netdev serialises its ops, and that
++	 * check reads ->netdev_ops, so the tables go in first
++	 */
++	ndev->watchdog_timeo = 6 * HZ;
++	ndev->priv_flags |= IFF_UNICAST_FLT;
+ 	ndev->netdev_ops = &hisi_femac_netdev_ops;
++	ndev->ethtool_ops = &hisi_femac_ethtools_ops;
+ 
+ 	phy = of_phy_get_and_connect(ndev, node, hisi_femac_adjust_link);
+ 	if (!phy) {
+@@ -849,9 +855,6 @@ static int hisi_femac_drv_probe(struct p
+ 			 ndev->dev_addr);
+ 	}
+ 
+-	ndev->watchdog_timeo = 6 * HZ;
+-	ndev->priv_flags |= IFF_UNICAST_FLT;
+-	ndev->ethtool_ops = &hisi_femac_ethtools_ops;
+ 	netif_napi_add_weight(ndev, &priv->napi, hisi_femac_poll,
+ 			      FEMAC_POLL_WEIGHT);
+ 

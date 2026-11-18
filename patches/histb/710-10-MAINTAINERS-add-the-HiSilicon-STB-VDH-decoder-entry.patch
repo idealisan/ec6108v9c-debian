@@ -1,0 +1,33 @@
+From c7bc7767468c3f5dada442f8fcf05eb6f058c3b6 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 16:52:24 +0800
+Subject: [PATCH 10/10] MAINTAINERS: add the HiSilicon STB VDH decoder entry
+
+The VDH stateless decoder has no maintainer entry. The driver is a
+media-platform driver of this family.
+
+Register the driver with the binding that describes it under
+linux-media.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ MAINTAINERS | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -12233,6 +12233,14 @@ F:	Documentation/devicetree/bindings/clo
+ F:	drivers/clk/hisilicon/crg-hi3798mv100.c
+ F:	include/dt-bindings/clock/hisilicon,hi3798mv100-*.h
+ 
++HISILICON STB VDH VIDEO DECODER DRIVER
++M:	David Yang <mmyangfl@gmail.com>
++L:	linux-media@vger.kernel.org
++L:	linux-arm-kernel@lists.infradead.org
++S:	Maintained
++F:	Documentation/devicetree/bindings/media/hisilicon,hi3716cv200-vdec.yaml
++F:	drivers/media/platform/hisilicon/histb-vdec/
++
+ HISILICON STB VOLTAGE REGULATOR DRIVER
+ M:	David Yang <mmyangfl@gmail.com>
+ L:	linux-kernel@vger.kernel.org

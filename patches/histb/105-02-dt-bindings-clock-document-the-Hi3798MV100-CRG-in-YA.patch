@@ -1,0 +1,30 @@
+From 623d4e3bab6b1ff4b9287eb7a7c37852a66ce0ef Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sun, 4 Oct 2026 04:29:11 +0800
+Subject: [PATCH 2/4] dt-bindings: clock: document the Hi3798MV100 CRG in YAML
+
+The Hi3798MV100 clock and reset generator has no place in the schema.
+Add the part's CRG compatibles to hisilicon,hisi-crg.yaml; the per-SoC
+clock id headers come with the driver block.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ Documentation/devicetree/bindings/clock/hisilicon,hisi-crg.yaml | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/Documentation/devicetree/bindings/clock/hisilicon,hisi-crg.yaml
++++ b/Documentation/devicetree/bindings/clock/hisilicon,hisi-crg.yaml
+@@ -21,11 +21,13 @@ properties:
+           - enum:
+               - hisilicon,hi3516cv300-sysctrl
+               - hisilicon,hi3798cv200-sysctrl
++              - hisilicon,hi3798mv100-sysctrl
+           - const: syscon
+       - items:
+           - enum:
+               - hisilicon,hi3516cv300-crg
+               - hisilicon,hi3798cv200-crg
++              - hisilicon,hi3798mv100-crg
+           - const: syscon
+           - const: simple-mfd
+ 

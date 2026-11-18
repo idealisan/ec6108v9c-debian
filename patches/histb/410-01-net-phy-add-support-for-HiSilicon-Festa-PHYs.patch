@@ -1,0 +1,768 @@
+From 78ad1f86f33494b9661bf28277a5294d1040f402 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sun, 4 Oct 2026 03:29:48 +0800
+Subject: [PATCH 1/2] net: phy: add support for HiSilicon Festa PHYs
+
+HiSilicon STB SoCs integrate a Festa Ethernet PHY whose behaviour is
+defined by microcode; boards whose bootloader does not load the image
+from an external EEPROM need someone to inject it over MDIO.
+
+The device only accepts microcode while powered down, and its expanded
+MDIO window lets the entry point be written last so the core can never
+fetch a half loaded instruction. The microcode is optional: a PHY with
+no image installed keeps running whatever the firmware started it with,
+so a missing firmware file is not an error, a failed download is.
+
+The v330, v331, s28v112 and s28v113 parts also implement link change
+interrupts and Wake-on-LAN (magic, unicast, broadcast and ARP matches,
+with a dedicated wake interrupt), and the v220 and v212 parts report no
+100baseT EEE capability although they implement it.
+
+Add a driver matching the known Festa IDs.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/net/phy/Kconfig      |  10 +
+ drivers/net/phy/Makefile     |   1 +
+ drivers/net/phy/hisi-festa.c | 706 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 717 insertions(+)
+ create mode 100644 drivers/net/phy/hisi-festa.c
+
+--- a/drivers/net/phy/Kconfig
++++ b/drivers/net/phy/Kconfig
+@@ -252,6 +252,16 @@ config DAVICOM_PHY
+ 	help
+ 	  Currently supports dm9161e and dm9131
+ 
++config HISI_FESTA_PHY
++	tristate "HiSilicon Festa PHYs"
++	help
++	  Currently supports the HiSilicon Festa v200, v220, v212, v300, v330,
++	  v331, s28v112 and s28v113 PHYs, which are the Ethernet PHYs integrated
++	  in HiSilicon STB SoCs. The driver supports link change interrupts and
++	  Wake-on-LAN on the parts that implement them, and optionally loads PHY
++	  microcode over MDIO for boards whose firmware does not install an
++	  image.
++
+ config ICPLUS_PHY
+ 	tristate "ICPlus PHYs"
+ 	help
+--- a/drivers/net/phy/Makefile
++++ b/drivers/net/phy/Makefile
+@@ -64,6 +64,7 @@ obj-$(CONFIG_DP83TC811_PHY)	+= dp83tc811
+ obj-$(CONFIG_DP83TD510_PHY)	+= dp83td510.o
+ obj-$(CONFIG_DP83TG720_PHY)	+= dp83tg720.o
+ obj-$(CONFIG_FIXED_PHY)		+= fixed_phy.o
++obj-$(CONFIG_HISI_FESTA_PHY)	+= hisi-festa.o
+ obj-$(CONFIG_ICPLUS_PHY)	+= icplus.o
+ obj-$(CONFIG_INTEL_XWAY_PHY)	+= intel-xway.o
+ obj-$(CONFIG_LSI_ET1011C_PHY)	+= et1011c.o
+--- /dev/null
++++ b/drivers/net/phy/hisi-festa.c
+@@ -0,0 +1,706 @@
++// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++/*
++ * Driver for HiSilicon Festa PHYs
++ *
++ * The Festa PHYs are the Ethernet PHYs integrated in HiSilicon STB SoCs.
++ * Their behaviour comes from microcode that is either held in an external
++ * EEPROM or injected over MDIO; this driver only implements the latter, so a
++ * PHY which already has its image loaded is left untouched.
++ *
++ * The v330, v331, s28v112 and s28v113 parts additionally implement link
++ * change interrupts and Wake-on-LAN, and the v220 and v212 parts need their
++ * PCS capability register to be told about the 100baseT EEE support they
++ * actually have.
++ *
++ * Copyright (c) 2023 David Yang
++ */
++
++#include <linux/ethtool.h>
++#include <linux/etherdevice.h>
++#include <linux/firmware.h>
++#include <linux/mii.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/of_irq.h>
++#include <linux/phy.h>
++
++#define PHY_ID_HISILICON_FESTAV200	0x20669813
++#define PHY_ID_HISILICON_FESTAV220	0x20669823
++#define PHY_ID_HISILICON_FESTAV212	0x20669833
++#define PHY_ID_HISILICON_FESTAV300	0x20669843
++#define PHY_ID_HISILICON_FESTAV330	0x20669853
++#define PHY_ID_HISILICON_FESTAV331	0x20669863
++#define PHY_ID_HISILICON_FESTA_S28V112	0x20669900
++#define PHY_ID_HISILICON_FESTA_S28V113	0x20669903
++
++#define MII_EXPMD			0x1d	/* Expanded memory data */
++#define MII_EXPMA			0x1e	/* Expanded memory address */
++
++/* Expanded memory addresses used by the microcode download */
++#define FESTA_UCODE_START		0x33f8
++#define FESTA_UCODE_STUB		0x33f9
++#define FESTA_UCODE_ENTRY		0x3400
++/* Kept in the entry point while the rest of the image is loaded */
++#define FESTA_UCODE_HOLD		0x39
++#define FESTA_UCODE_MAGIC0		0x01
++#define FESTA_UCODE_MAGIC1		0xcc
++
++/* Written to FESTA_UCODE_STUB before the image itself */
++static const u8 festa_ucode_prologue[] = { 0xbd, 0x34, 0x00, 0x39 };
++
++/* Link change interrupts */
++#define MII_INT_SR			0x14
++#define MII_INT_CLR			0x15
++#define BIT_SPEED_CHG_INT		BIT(15)
++#define BIT_LINK_CHG_INT		BIT(14)
++#define BIT_DUPLEX_CHG_INT		BIT(13)
++#define FESTA_INT_STAT			(BIT_SPEED_CHG_INT | BIT_LINK_CHG_INT | \
++					 BIT_DUPLEX_CHG_INT)
++
++#define INT_MASK_H			0x0157
++#define BIT_SPEED_INT_EN		BIT(7)
++#define BIT_LINK_INT_EN			BIT(6)
++#define BIT_DUPLEX_INT_EN		BIT(5)
++#define FESTA_INT_EN			(BIT_SPEED_INT_EN | BIT_LINK_INT_EN | \
++					 BIT_DUPLEX_INT_EN)
++
++/* Wake-on-LAN, in the expanded address space */
++#define WOL_CTRL_STATUS			0x1f00
++#define WOL_MAGIC_PKT_ENABLE		BIT(1)
++#define WOL_WAKE_PKT_ENABLE		BIT(2)
++#define WOL_INTR_ENABLE			BIT(3)
++#define WOL_MAGIC_PKT_INTR_RAW		BIT(4)
++#define WOL_WAKE_PKT_INTR_RAW		BIT(6)
++
++#define WOL_UNICAST_CTRL		0x1f01
++#define WOL_UNICAST_ENABLE		BIT(1)
++#define WOL_FILTER0_MASK0		0x1f04
++#define WOL_FILTER0_MASK1		0x1f05
++#define WOL_FILTER0_MASK2		0x1f06
++#define WOL_FILTER0_MASK3		0x1f07
++#define WOL_FILTER0_CTRL		0x1f14
++#define WOL_FILTER_ENABLE		BIT(0)
++#define WOL_FILTER_TYPE			BIT(4)
++#define WOL_FILTER_TYPE_OFFSET		4
++#define WOL_FILTER0_OFFSET		0x1f18
++#define WOL_FILTER0_CRC0		0x1f1c
++#define WOL_FILTER0_CRC1		0x1f1d
++#define LOCAL_MACADDR_MSB		0x1f29
++
++enum filter_type {
++	MATCH_UCAST_BCAST = 0,
++	MATCH_MCAST_BCAST,
++};
++
++struct festa_filter {
++	enum filter_type type;
++	u8 offset;
++	u32 bytemask;
++	u16 crc;
++};
++
++/* The CRCs are precomputed for the fixed patterns below */
++static const struct festa_filter festa_broadcast_filter = {
++	.type = MATCH_UCAST_BCAST,
++	.offset = 0,
++	.bytemask = 0x3f,
++	.crc = 0x8029,
++};
++
++static const struct festa_filter festa_arp_filter = {
++	.type = MATCH_UCAST_BCAST,
++	.offset = 12,
++	.bytemask = 0x3,
++	.crc = 0x614e,
++};
++
++struct festa_priv {
++	int wol_irq;
++};
++
++/*
++ * The expanded memory window is addressed one byte at a time: MII_EXPMA
++ * selects the byte, MII_EXPMD carries it.
++ */
++static int festa_expanded_read(struct phy_device *phydev, u32 addr)
++{
++	int ret;
++
++	phy_lock_mdio_bus(phydev);
++
++	ret = __phy_write(phydev, MII_EXPMA, addr);
++	if (ret >= 0)
++		ret = __phy_read(phydev, MII_EXPMD);
++
++	phy_unlock_mdio_bus(phydev);
++
++	return ret;
++}
++
++static int festa_expanded_write(struct phy_device *phydev, u32 addr, u16 val)
++{
++	int ret;
++
++	phy_lock_mdio_bus(phydev);
++
++	ret = __phy_write(phydev, MII_EXPMA, addr);
++	if (ret >= 0)
++		ret = __phy_write(phydev, MII_EXPMD, val);
++
++	phy_unlock_mdio_bus(phydev);
++
++	return ret;
++}
++
++static int festa_write_byte(struct phy_device *phydev, unsigned int addr,
++			    u8 val)
++{
++	int ret;
++
++	lockdep_assert_held(&phydev->mdio.bus->mdio_lock);
++
++	ret = __phy_write(phydev, MII_EXPMA, addr);
++	if (ret < 0)
++		return ret;
++
++	return __phy_write(phydev, MII_EXPMD, val);
++}
++
++static int festa_write_bytes(struct phy_device *phydev, unsigned int addr,
++			     const u8 *data, size_t len)
++{
++	int ret;
++
++	while (len--) {
++		ret = festa_write_byte(phydev, addr++, *data++);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++}
++
++/*
++ * The PHY only takes microcode while powered down, and the entry point is
++ * released last so that the core cannot run a partially loaded image.
++ */
++static int festa_load_fw(struct phy_device *phydev,
++			 const struct firmware *fw)
++{
++	int ret;
++	int err;
++
++	phy_lock_mdio_bus(phydev);
++
++	ret = __phy_set_bits(phydev, MII_BMCR, BMCR_PDOWN);
++	if (ret < 0)
++		goto out;
++
++	ret = festa_write_bytes(phydev, FESTA_UCODE_STUB, festa_ucode_prologue,
++				ARRAY_SIZE(festa_ucode_prologue));
++	if (ret < 0)
++		goto power_up;
++
++	ret = festa_write_byte(phydev, FESTA_UCODE_ENTRY, FESTA_UCODE_HOLD);
++	if (ret < 0)
++		goto power_up;
++
++	ret = festa_write_bytes(phydev, FESTA_UCODE_ENTRY + 1,
++				fw->data + 1, fw->size - 1);
++	if (ret < 0)
++		goto power_up;
++
++	ret = festa_write_byte(phydev, FESTA_UCODE_ENTRY, fw->data[0]);
++	if (ret < 0)
++		goto power_up;
++
++	ret = festa_write_byte(phydev, FESTA_UCODE_START, 1);
++
++power_up:
++	err = __phy_clear_bits(phydev, MII_BMCR, BMCR_PDOWN);
++	if (!ret)
++		ret = err;
++out:
++	phy_unlock_mdio_bus(phydev);
++
++	return ret;
++}
++
++static int festa_patch_fw(struct phy_device *phydev)
++{
++	const struct firmware *fw;
++	char fw_name[64];
++	int ret;
++
++	snprintf(fw_name, sizeof(fw_name), "hisilicon/festa.%08x.ucode",
++		 phydev->phy_id);
++
++	ret = firmware_request_nowarn(&fw, fw_name, &phydev->mdio.dev);
++	if (ret < 0) {
++		/* No image installed, the PHY keeps whatever it runs now */
++		if (ret == -ENOENT)
++			return 0;
++		phydev_err(phydev, "failed to request firmware %s: %d\n",
++			   fw_name, ret);
++		return ret;
++	}
++
++	if (fw->size < 2 || fw->data[0] != FESTA_UCODE_MAGIC0 ||
++	    fw->data[1] != FESTA_UCODE_MAGIC1) {
++		phydev_err(phydev, "%s does not look like valid firmware, refusing to load\n",
++			   fw_name);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	ret = festa_load_fw(phydev, fw);
++	if (ret < 0) {
++		phydev_err(phydev, "failed to download firmware %s: %d\n",
++			   fw_name, ret);
++		goto out;
++	}
++
++	phydev_info(phydev, "loaded firmware %s\n", fw_name);
++
++out:
++	release_firmware(fw);
++	return ret;
++}
++
++/*
++ * The PCS does not report 100baseT EEE in its capability register although
++ * the PHY implements it: force the capability so that the EEE logic is
++ * armed.  phylib derives the advertisement from the fixed capability.
++ */
++static int festa_eee_quirk(struct phy_device *phydev)
++{
++	return phy_set_bits_mmd(phydev, MDIO_MMD_PCS, MDIO_PCS_EEE_ABLE,
++				MDIO_EEE_100TX);
++}
++
++static int festa_get_features(struct phy_device *phydev)
++{
++	int ret;
++
++	ret = genphy_read_abilities(phydev);
++	if (ret)
++		return ret;
++
++	/* See festa_eee_quirk() */
++	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
++			 phydev->supported_eee);
++
++	return 0;
++}
++
++static irqreturn_t festa_wol_irq_thread(int irq, void *dev_id)
++{
++	struct phy_device *phydev = dev_id;
++	int ret;
++
++	ret = festa_expanded_read(phydev, WOL_CTRL_STATUS);
++	if (ret < 0)
++		return IRQ_NONE;
++
++	if (!(ret & (WOL_MAGIC_PKT_INTR_RAW | WOL_WAKE_PKT_INTR_RAW)))
++		return IRQ_NONE;
++
++	/* Write 1 to clear the raw interrupts and disarm the wake sources */
++	ret |= WOL_MAGIC_PKT_INTR_RAW | WOL_WAKE_PKT_INTR_RAW;
++	ret &= ~(WOL_MAGIC_PKT_ENABLE | WOL_WAKE_PKT_ENABLE | WOL_INTR_ENABLE);
++
++	festa_expanded_write(phydev, WOL_CTRL_STATUS, ret);
++
++	return IRQ_HANDLED;
++}
++
++static int festa_probe(struct phy_device *phydev)
++{
++	struct device_node *np = phydev->mdio.dev.of_node;
++	struct festa_priv *priv;
++	int irq, ret;
++
++	priv = devm_kzalloc_obj(&phydev->mdio.dev, *priv);
++	if (!priv)
++		return -ENOMEM;
++
++	phydev->priv = priv;
++
++	/* The wake interrupt is the second interrupt of the PHY node */
++	irq = of_irq_get(np, 1);
++	if (irq == -EPROBE_DEFER)
++		return irq;
++	if (irq < 0)
++		return 0;
++
++	ret = devm_request_threaded_irq(&phydev->mdio.dev, irq, NULL,
++					festa_wol_irq_thread, IRQF_ONESHOT,
++					"festa_phy_wol", phydev);
++	if (ret)
++		return ret;
++
++	priv->wol_irq = irq;
++
++	return 0;
++}
++
++static int festa_config_intr(struct phy_device *phydev)
++{
++	int ret;
++
++	if (phydev->interrupts != PHY_INTERRUPT_ENABLED)
++		return festa_expanded_write(phydev, INT_MASK_H, 0);
++
++	/* Clear any pending status change before unmasking */
++	ret = phy_write(phydev, MII_INT_CLR, FESTA_INT_STAT);
++	if (ret)
++		return ret;
++
++	return festa_expanded_write(phydev, INT_MASK_H, FESTA_INT_EN);
++}
++
++static irqreturn_t festa_handle_interrupt(struct phy_device *phydev)
++{
++	int ret;
++
++	ret = phy_read(phydev, MII_INT_SR);
++	if (ret < 0) {
++		phydev_err(phydev, "failed to read interrupt status: %d\n",
++			   ret);
++		return IRQ_NONE;
++	}
++
++	if (!(ret & FESTA_INT_STAT))
++		return IRQ_NONE;
++
++	phy_write(phydev, MII_INT_CLR, FESTA_INT_STAT);
++
++	return IRQ_HANDLED;
++}
++
++static int festa_set_mac_address(struct phy_device *phydev, const u8 *mac)
++{
++	int i, ret;
++
++	for (i = 0; i < ETH_ALEN; i++) {
++		ret = festa_expanded_write(phydev, LOCAL_MACADDR_MSB - i,
++					   mac[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int festa_set_filter(struct phy_device *phydev, int index,
++			    const struct festa_filter *filter)
++{
++	u32 val;
++	int ret;
++
++	ret = festa_expanded_write(phydev, WOL_FILTER0_OFFSET + index,
++				   filter->offset);
++	if (ret)
++		return ret;
++
++	ret = festa_expanded_write(phydev, WOL_FILTER0_MASK0 + index * 0x4,
++				   filter->bytemask & 0xff);
++	if (ret)
++		return ret;
++
++	ret = festa_expanded_write(phydev, WOL_FILTER0_MASK1 + index * 0x4,
++				   (filter->bytemask >> 8) & 0xff);
++	if (ret)
++		return ret;
++
++	ret = festa_expanded_write(phydev, WOL_FILTER0_MASK2 + index * 0x4,
++				   (filter->bytemask >> 16) & 0xff);
++	if (ret)
++		return ret;
++
++	ret = festa_expanded_write(phydev, WOL_FILTER0_MASK3 + index * 0x4,
++				   (filter->bytemask >> 24) & 0xff);
++	if (ret)
++		return ret;
++
++	ret = festa_expanded_write(phydev, WOL_FILTER0_CRC0 + index * 0x2,
++				   filter->crc & 0xff);
++	if (ret)
++		return ret;
++
++	ret = festa_expanded_write(phydev, WOL_FILTER0_CRC1 + index * 0x2,
++				   (filter->crc >> 8) & 0xff);
++	if (ret)
++		return ret;
++
++	ret = festa_expanded_read(phydev, WOL_FILTER0_CTRL + index);
++	if (ret < 0)
++		return ret;
++
++	val = ret & ~WOL_FILTER_TYPE;
++	val |= filter->type << WOL_FILTER_TYPE_OFFSET;
++	val |= WOL_FILTER_ENABLE;
++
++	return festa_expanded_write(phydev, WOL_FILTER0_CTRL + index, val);
++}
++
++static int festa_clear_filter(struct phy_device *phydev, int index)
++{
++	int val, ret;
++
++	ret = festa_expanded_read(phydev, WOL_FILTER0_CTRL + index);
++	if (ret < 0)
++		return ret;
++
++	val = ret & ~WOL_FILTER_ENABLE;
++
++	return festa_expanded_write(phydev, WOL_FILTER0_CTRL + index, val);
++}
++
++static bool festa_filter_enabled(struct phy_device *phydev, int index)
++{
++	int val;
++
++	val = festa_expanded_read(phydev, WOL_FILTER0_CTRL + index);
++
++	return val > 0 && (val & WOL_FILTER_ENABLE);
++}
++
++static void festa_get_wol(struct phy_device *phydev,
++			  struct ethtool_wolinfo *wol)
++{
++	int val;
++
++	wol->supported = WAKE_UCAST | WAKE_BCAST | WAKE_ARP | WAKE_MAGIC;
++	wol->wolopts = 0;
++
++	val = festa_expanded_read(phydev, WOL_UNICAST_CTRL);
++	if (val > 0 && (val & WOL_UNICAST_ENABLE))
++		wol->wolopts |= WAKE_UCAST;
++
++	val = festa_expanded_read(phydev, WOL_CTRL_STATUS);
++	if (val > 0 && (val & WOL_MAGIC_PKT_ENABLE))
++		wol->wolopts |= WAKE_MAGIC;
++
++	if (festa_filter_enabled(phydev, 0))
++		wol->wolopts |= WAKE_BCAST;
++
++	if (festa_filter_enabled(phydev, 1))
++		wol->wolopts |= WAKE_ARP;
++}
++
++static int festa_set_wol(struct phy_device *phydev,
++			 struct ethtool_wolinfo *wol)
++{
++	struct net_device *ndev = phydev->attached_dev;
++	struct festa_priv *priv = phydev->priv;
++	u32 val, wol_ctrl;
++	int ret;
++
++	if (!ndev)
++		return -ENODEV;
++
++	if (wol->wolopts & (WAKE_PHY | WAKE_MCAST | WAKE_MAGICSECURE))
++		return -EOPNOTSUPP;
++
++	ret = festa_expanded_read(phydev, WOL_CTRL_STATUS);
++	if (ret < 0)
++		return ret;
++
++	wol_ctrl = ret;
++
++	if (wol->wolopts & (WAKE_MAGIC | WAKE_UCAST)) {
++		ret = festa_set_mac_address(phydev, ndev->dev_addr);
++		if (ret)
++			return ret;
++	}
++
++	if (wol->wolopts & WAKE_MAGIC) {
++		/* Write 1 to clear the raw interrupt */
++		wol_ctrl |= WOL_MAGIC_PKT_INTR_RAW;
++		/* Enable magic packet reception and interrupt */
++		wol_ctrl |= WOL_MAGIC_PKT_ENABLE | WOL_INTR_ENABLE;
++	} else {
++		wol_ctrl &= ~WOL_MAGIC_PKT_ENABLE;
++	}
++
++	if (wol->wolopts & WAKE_UCAST) {
++		ret = festa_expanded_read(phydev, WOL_UNICAST_CTRL);
++		if (ret < 0)
++			return ret;
++
++		val = ret | WOL_UNICAST_ENABLE;
++
++		ret = festa_expanded_write(phydev, WOL_UNICAST_CTRL, val);
++		if (ret)
++			return ret;
++
++		/* Write 1 to clear the raw interrupt */
++		wol_ctrl |= WOL_WAKE_PKT_INTR_RAW;
++		wol_ctrl |= WOL_WAKE_PKT_ENABLE | WOL_INTR_ENABLE;
++	} else {
++		ret = festa_expanded_read(phydev, WOL_UNICAST_CTRL);
++		if (ret < 0)
++			return ret;
++
++		val = ret & ~WOL_UNICAST_ENABLE;
++
++		ret = festa_expanded_write(phydev, WOL_UNICAST_CTRL, val);
++		if (ret)
++			return ret;
++	}
++
++	if (wol->wolopts & WAKE_BCAST) {
++		ret = festa_set_filter(phydev, 0, &festa_broadcast_filter);
++		if (ret)
++			return ret;
++
++		/* Write 1 to clear the raw interrupt */
++		wol_ctrl |= WOL_WAKE_PKT_INTR_RAW;
++		wol_ctrl |= WOL_WAKE_PKT_ENABLE | WOL_INTR_ENABLE;
++	} else {
++		ret = festa_clear_filter(phydev, 0);
++		if (ret)
++			return ret;
++	}
++
++	if (wol->wolopts & WAKE_ARP) {
++		ret = festa_set_filter(phydev, 1, &festa_arp_filter);
++		if (ret)
++			return ret;
++
++		/* Write 1 to clear the raw interrupt */
++		wol_ctrl |= WOL_WAKE_PKT_INTR_RAW;
++		wol_ctrl |= WOL_WAKE_PKT_ENABLE | WOL_INTR_ENABLE;
++	} else {
++		ret = festa_clear_filter(phydev, 1);
++		if (ret)
++			return ret;
++	}
++
++	if (!(wol->wolopts & (WAKE_UCAST | WAKE_BCAST | WAKE_ARP)))
++		wol_ctrl &= ~WOL_WAKE_PKT_ENABLE;
++
++	if (!wol->wolopts)
++		wol_ctrl &= ~WOL_INTR_ENABLE;
++
++	if (priv && priv->wol_irq > 0) {
++		if (wol->wolopts)
++			enable_irq_wake(priv->wol_irq);
++		else
++			disable_irq_wake(priv->wol_irq);
++	}
++
++	return festa_expanded_write(phydev, WOL_CTRL_STATUS, wol_ctrl);
++}
++
++static int festa_config_init(struct phy_device *phydev)
++{
++	return festa_patch_fw(phydev);
++}
++
++static int festa_config_init_eee(struct phy_device *phydev)
++{
++	int ret;
++
++	ret = festa_patch_fw(phydev);
++	if (ret)
++		return ret;
++
++	return festa_eee_quirk(phydev);
++}
++
++static struct phy_driver festa_drivers[] = {
++	{
++		PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV200),
++		.name		= "HiSilicon Festa v200/v210",
++		.config_init	= festa_config_init,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++	},
++	{
++		PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV220),
++		.name		= "HiSilicon Festa v220",
++		.get_features	= festa_get_features,
++		.config_init	= festa_config_init_eee,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++	},
++	{
++		PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV212),
++		.name		= "HiSilicon Festa v212",
++		.get_features	= festa_get_features,
++		.config_init	= festa_config_init_eee,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++	},
++	{
++		PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV300),
++		.name		= "HiSilicon Festa v300",
++		.config_init	= festa_config_init,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++	},
++	{
++		PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV330),
++		.name		= "HiSilicon Festa v330",
++		.config_init	= festa_config_init,
++		.probe		= festa_probe,
++		.config_intr	= festa_config_intr,
++		.handle_interrupt = festa_handle_interrupt,
++		.get_wol	= festa_get_wol,
++		.set_wol	= festa_set_wol,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++	},
++	{
++		PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV331),
++		.name		= "HiSilicon Festa v331",
++		.config_init	= festa_config_init,
++		.probe		= festa_probe,
++		.get_wol	= festa_get_wol,
++		.set_wol	= festa_set_wol,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++	},
++	{
++		PHY_ID_MATCH_EXACT(PHY_ID_HISILICON_FESTA_S28V112),
++		.name		= "HiSilicon Festa s28v112",
++		.probe		= festa_probe,
++		.config_intr	= festa_config_intr,
++		.handle_interrupt = festa_handle_interrupt,
++		.get_wol	= festa_get_wol,
++		.set_wol	= festa_set_wol,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++	},
++	{
++		PHY_ID_MATCH_EXACT(PHY_ID_HISILICON_FESTA_S28V113),
++		.name		= "HiSilicon Festa s28v113",
++		.probe		= festa_probe,
++		.config_intr	= festa_config_intr,
++		.handle_interrupt = festa_handle_interrupt,
++		.get_wol	= festa_get_wol,
++		.set_wol	= festa_set_wol,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++	},
++};
++
++module_phy_driver(festa_drivers);
++
++static const struct mdio_device_id __maybe_unused festa_mdio_ids[] = {
++	{ PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV200) },
++	{ PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV220) },
++	{ PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV212) },
++	{ PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV300) },
++	{ PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV330) },
++	{ PHY_ID_MATCH_MODEL(PHY_ID_HISILICON_FESTAV331) },
++	{ PHY_ID_MATCH_EXACT(PHY_ID_HISILICON_FESTA_S28V112) },
++	{ PHY_ID_MATCH_EXACT(PHY_ID_HISILICON_FESTA_S28V113) },
++	{ /* sentinel */ },
++};
++
++MODULE_DEVICE_TABLE(mdio, festa_mdio_ids);
++MODULE_DESCRIPTION("HiSilicon Festa PHY driver");
++MODULE_LICENSE("Dual MIT/GPL");

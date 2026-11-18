@@ -1,0 +1,39 @@
+From 322eefd80591834e722268b11e658673bffd460d Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Fri, 23 Oct 2026 08:22:08 +0800
+Subject: [PATCH 4/4] ARM: hisi: add the ARCH_HI3716CV200 machine symbol
+
+Hi3716CV200 has no family symbol, so there is nothing for the part to
+depend on and a driver specific to it has no gate to name.
+
+ARCH_HISI is the arm32 family gate already, and the Cortex-A9 private
+timer of this part keeps the value written and never counts, so the
+per-CPU clock events come from SP804 channels instead.
+
+Add the family bool with the selects the part needs, deliberately
+without HAVE_ARM_TWD, and its entry in multi_v7_defconfig.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ arch/arm/mach-hisi/Kconfig | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+--- a/arch/arm/mach-hisi/Kconfig
++++ b/arch/arm/mach-hisi/Kconfig
+@@ -55,6 +55,16 @@ config ARCH_HIX5HD2
+ 	help
+ 	  Support for Hisilicon HIX5HD2 SoC family
+ 
++config ARCH_HI3716CV200
++	bool "Hisilicon Hi3716CV200 family"
++	depends on ARCH_MULTI_V7
++	select HAVE_ARM_SCU if SMP
++	help
++	  Support for the HiSilicon Hi3716CV200 SoC family. The Cortex-A9 private
++	  timer is deliberately not selected here: on this part it keeps the value
++	  written and never counts, and the per-CPU clock events come from the
++	  SP804 channels instead.
++
+ config ARCH_SD5203
+ 	bool "Hisilicon SD5203 family"
+ 	depends on ARCH_MULTI_V5

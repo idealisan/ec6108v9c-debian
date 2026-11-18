@@ -1,0 +1,2873 @@
+From efed5e3816c4f4c50f20d58f08da20e82594b907 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 3 Nov 2026 14:38:01 +0800
+Subject: [PATCH 2/3] media: platform: add the HiSTB H.264 encoder driver
+
+The VEDU encoder family of the HiSTB set-top-box SoCs has no mainline
+driver.
+
+The v2 block of hi3716cv200 and hi3798mv100 is programmed through
+register writes and a 64-byte packet ring, codes IDR and P pictures, and
+its device-tree match belongs to one platform driver so a later
+generation can attach as a second backend. Add the shared core and the
+v2 backend.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/media/platform/hisilicon/Kconfig      |    2 +
+ drivers/media/platform/hisilicon/Makefile     |    1 +
+ .../platform/hisilicon/histb-venc/Kconfig     |   22 +
+ .../platform/hisilicon/histb-venc/Makefile    |    4 +
+ .../hisilicon/histb-venc/histb-venc.h         |   36 +
+ .../hisilicon/histb-venc/histb_venc_core.c    |  108 +
+ .../hisilicon/histb-venc/histb_venc_v2.c      | 2643 +++++++++++++++++
+ 7 files changed, 2816 insertions(+)
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/Kconfig
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/Makefile
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/histb-venc.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/histb_venc_core.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-venc/histb_venc_v2.c
+
+--- a/drivers/media/platform/hisilicon/Kconfig
++++ b/drivers/media/platform/hisilicon/Kconfig
+@@ -2,6 +2,8 @@
+ 
+ comment "HiSilicon media platform drivers"
+ 
++source "drivers/media/platform/hisilicon/histb-venc/Kconfig"
++
+ config VIDEO_HISTB_JPGD
+ 	tristate "HiSilicon HiSTB JPEG decoder driver"
+ 	depends on ARCH_HISI || COMPILE_TEST
+--- a/drivers/media/platform/hisilicon/Makefile
++++ b/drivers/media/platform/hisilicon/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++obj-y += histb-venc/
+ obj-$(CONFIG_VIDEO_HISTB_JPGD) += histb-jpgd.o
+ obj-$(CONFIG_VIDEO_HISTB_JPGE) += histb-jpge.o
+ obj-$(CONFIG_VIDEO_HISTB_VPSS) += histb-vpss.o
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/Kconfig
+@@ -0,0 +1,22 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_HISTB_VENC
++	tristate "HiSilicon HiSTB H.264 encoder driver"
++	depends on ARCH_HISI || COMPILE_TEST
++	depends on V4L_MEM2MEM_DRIVERS
++	depends on VIDEO_DEV
++	select VIDEOBUF2_DMA_CONTIG
++	select VIDEOBUF2_VMALLOC
++	select V4L2_MEM2MEM_DEV
++	help
++	  Support for the VEDU video encoder family on HiSilicon HiSTB
++	  set-top-box SoCs. The encoder is stateful: a raw picture goes in and
++	  H.264 network abstraction layer data comes out, with the parameter
++	  sets and the slice headers written by the driver.
++
++	  This backend serves the v2 VEDU of Hi3716CV200 and Hi3798MV100 -- the
++	  part the vendor calls V2R8, built through its venc_v1.0 layer. It is
++	  programmed with register writes and a 64-byte packet ring, and codes
++	  IDR pictures only.
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called histb-venc.
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++histb-venc-y += histb_venc_core.o
++histb-venc-y += histb_venc_v2.o
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/histb-venc.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Shared contract between the HiSTB video encoder driver core and its
++ * per-generation backends.
++ *
++ * The v2 block (VEDU V2R8, the vendor's venc_v1.0 layer) takes register writes
++ * and a packet ring and only codes IDR pictures; the v5 block (V500, its
++ * venc_v2.0 layer) takes a command image and has its own memory-management unit
++ * and picture types.  Their V4L2 M2M nodes stay with the backends; the core
++ * owns the platform driver identity, the device-tree match and the runtime-PM
++ * dispatch both generations need.
++ */
++#ifndef __HISTB_VENC_H__
++#define __HISTB_VENC_H__
++
++#include <linux/device.h>
++#include <linux/platform_device.h>
++
++/* The node name is the merged driver's, whichever backend a chip binds. */
++#define HISTB_VENC_NAME		"histb-venc"
++
++struct histb_venc_variant {
++	int (*probe)(struct platform_device *pdev);
++	void (*remove)(struct platform_device *pdev);
++	int (*runtime_suspend)(struct device *dev);
++	int (*runtime_resume)(struct device *dev);
++	int (*system_suspend)(struct device *dev);
++	int (*system_resume)(struct device *dev);
++};
++
++extern const struct histb_venc_variant histb_venc_v2_variant;
++
++int histb_venc_v2_probe(struct platform_device *pdev);
++void histb_venc_v2_remove(struct platform_device *pdev);
++
++#endif /* __HISTB_VENC_H__ */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/histb_venc_core.c
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * HiSilicon HiSTB video encoder driver.
++ *
++ * The family has two blocks with genuinely different programming models: the
++ * v2 VEDU of hi3716cv200 and hi3798mv100 (the vendor's V2R8 part) is driven by
++ * register writes and a packet ring, the v5 V500 of hi3798mv200h by a command
++ * image in DMA memory. Each generation keeps its own V4L2 M2M node in its
++ * backend; this file owns the platform driver so that the device-tree match,
++ * the module and the runtime-PM entry points exist once.
++ */
++
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#include "histb-venc.h"
++
++static int histb_venc_probe(struct platform_device *pdev)
++{
++	const struct histb_venc_variant *variant;
++
++	variant = of_device_get_match_data(&pdev->dev);
++	if (!variant || !variant->probe)
++		return -ENODEV;
++
++	return variant->probe(pdev);
++}
++
++static void histb_venc_remove(struct platform_device *pdev)
++{
++	const struct histb_venc_variant *variant;
++
++	variant = of_device_get_match_data(&pdev->dev);
++	if (variant && variant->remove)
++		variant->remove(pdev);
++}
++
++static int histb_venc_runtime_suspend(struct device *dev)
++{
++	const struct histb_venc_variant *variant;
++
++	variant = of_device_get_match_data(dev);
++	if (variant && variant->runtime_suspend)
++		return variant->runtime_suspend(dev);
++	return 0;
++}
++
++static int histb_venc_runtime_resume(struct device *dev)
++{
++	const struct histb_venc_variant *variant;
++
++	variant = of_device_get_match_data(dev);
++	if (variant && variant->runtime_resume)
++		return variant->runtime_resume(dev);
++	return 0;
++}
++
++static int histb_venc_suspend(struct device *dev)
++{
++	const struct histb_venc_variant *variant;
++
++	variant = of_device_get_match_data(dev);
++	if (variant && variant->system_suspend)
++		return variant->system_suspend(dev);
++	return 0;
++}
++
++static int histb_venc_resume(struct device *dev)
++{
++	const struct histb_venc_variant *variant;
++
++	variant = of_device_get_match_data(dev);
++	if (variant && variant->system_resume)
++		return variant->system_resume(dev);
++	return 0;
++}
++
++static const struct dev_pm_ops histb_venc_pm_ops = {
++	RUNTIME_PM_OPS(histb_venc_runtime_suspend, histb_venc_runtime_resume,
++		       NULL)
++	SYSTEM_SLEEP_PM_OPS(histb_venc_suspend, histb_venc_resume)
++};
++
++static const struct of_device_id histb_venc_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-venc",
++	  .data = &histb_venc_v2_variant },
++	{ .compatible = "hisilicon,hi3716cv200-venc",
++	  .data = &histb_venc_v2_variant },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, histb_venc_of_match);
++
++static struct platform_driver histb_venc_driver = {
++	.probe		= histb_venc_probe,
++	.remove		= histb_venc_remove,
++	.driver		= {
++		.name			= "histb-venc",
++		.of_match_table		= histb_venc_of_match,
++		.pm			= pm_ptr(&histb_venc_pm_ops),
++	},
++};
++module_platform_driver(histb_venc_driver);
++
++MODULE_AUTHOR("David Yang <mmyangfl@gmail.com>");
++MODULE_DESCRIPTION("HiSilicon HiSTB H.264 encoder driver");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-venc/histb_venc_v2.c
+@@ -0,0 +1,2639 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Video encoder (VEDU V2R8, the vendor's venc_v1.0 layer) for HiSilicon
++ * Hi3798MV100 and Hi3716CV200.
++ *
++ * One raw picture per mem2mem job, coded as an IDR picture: the block is
++ * programmed with a whole frame and answers with an end-of-picture interrupt
++ * once it has appended its packets to the ring the driver gave it. Every output
++ * carries its own parameter sets, so every frame is independently decodable and
++ * the channel needs no picture state of its own.
++ *
++ * The block does not build the parameter sets or the slice header. Both are the
++ * driver's job, and the block's convention for receiving them is unusual: the
++ * SPS and PPS go into the stream ring ahead of the picture as two 128-byte
++ * packets the driver wrote itself, and the slice header goes into registers as
++ * three separate right-justified bit groups - the picture header, the reference
++ * list reordering, and dec_ref_pic_marking - each with its own width field.
++ *
++ * The ring is a circular buffer of 64-byte packets. Each packet begins with a
++ * 64-byte header whose first word is the length of the whole packet, whose
++ * second word says how many bytes at the end of the payload are padding, whose
++ * ninth byte names the NAL unit and whose twelfth marks the picture's last
++ * packet. The read and write pointers are not registers either: they are two
++ * words at the addresses given by SRPTRADDR and SWPTRADDR, each one an offset
++ * into the ring rather than an address, and the block and the driver both see
++ * them.
++ *
++ * The picture is copied into the driver's scratch rather than coded in place: a
++ * client's buffer is cached memory and this block is not cache-coherent, so a
++ * job against it can code bytes the CPU has not written out yet. The block also
++ * writes two reconstruction frames next to the ring, which is why the scratch
++ * is picture-sized twice over even though an all-intra channel never reads them
++ * back.
++ *
++ * Rate control has no off switch: the register file has no enable bit for it. A
++ * fixed quantiser is programmed by putting the same QP in the minimum, the
++ * maximum and the start field, because the reference clamps its picture QP into
++ * that window before it uses it; the target-bits register still wants a number
++ * a picture can plausibly spend.
++ *
++ * The register layout comes from accumulating the vendor's register header by
++ * member - 0xff14 bytes, with the version pair at 0xf8 and 0xfc as the
++ * self-check that no reserved hole was miscounted - and the values from the
++ * live path of VENC_HAL_CfgReg() and the vendor encoder driver for the
++ * s5v100/98M build this chip uses. Two blocks are deliberately not
++ * mirrored: the colour-space coefficient file and the temporal-filter
++ * thresholds, both consumed only by paths this driver leaves disabled, where
++ * the reset value is what the reference's own zeroed descriptor would have left
++ * there.
++ *
++ * What the board measured, on an EC6108V9C with this block at 0xf8c80000 and
++ * version 0x56325238: a 352x288 and a 1920x1080 NV12 picture, each coded at a
++ * fixed QP of 32, come back as one SPS, one PPS and one IDR slice that ffmpeg
++ * decodes. The 1920x1080 case reports 1920x1080 out of a 120x68 macroblock grid,
++ * so the crop in the parameter set is being read. Every macroblock of a
++ * per-block-coded picture decodes at its own code (0 of 4480 off by more than
++ * five levels), luma shows no level shift at all (mean error 0.002), and a
++ * chroma pair sent as U 60 / V 190 comes back as 59 / 189 - quantisation, not
++ * the black-level offset the JPEG encoder of this family has. Feeding the same
++ * picture as NV21 instead of NV12 decodes to the same 59 / 189, so both
++ * packageSel values point at the chroma order they name. Four pictures coded
++ * through one file handle all decode, with the identifier in the slice header
++ * stepping 0, 1, 2, 3.
++ *
++ * One thing the block does not do is re-time the slice header it is handed. The
++ * reference writes frame_num in four bits while its own parameter set declares
++ * eight (log2_max_frame_num_minus4 = 0), and the coded slice reproduces the four
++ * bits verbatim instead of widening them; decoders put up with it, and mirroring
++ * the reference is the only option that is known to match shipped behaviour.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/jiffies.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#include "histb-venc.h"
++#include <linux/reset.h>
++#include <linux/slab.h>
++#include <linux/sizes.h>
++#include <linux/unaligned.h>
++#include <linux/videodev2.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-dev.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-vmalloc.h>
++
++/*
++ * Semi-planar input: the block's input-format register names the two chroma
++ * orders of a frame, and in that layout the reference reads one stride for both
++ * planes of a 4:2:0 frame and twice the luma stride for the full-height chroma
++ * plane of a 4:2:2 one, which it then codes as 4:2:0. The M forms are the same
++ * storage with the chroma plane in its own buffer, which the block's separate
++ * chroma address register is written for.
++ */
++static const u32 histb_venc_out_fmts[] = {
++	V4L2_PIX_FMT_NV12,
++	V4L2_PIX_FMT_NV21,
++	V4L2_PIX_FMT_NV12M,
++	V4L2_PIX_FMT_NV21M,
++	V4L2_PIX_FMT_NV16,
++	V4L2_PIX_FMT_NV61,
++	V4L2_PIX_FMT_YUYV,
++	V4L2_PIX_FMT_UYVY,
++};
++
++/* ------------------------------------------------------------------ */
++/* Registers, per the vendor's register header, accumulated by member */
++/* ------------------------------------------------------------------ */
++
++#define VENC_INTSTAT		0x000
++#define  VENC_INT_EOP		BIT(0)
++#define  VENC_INT_BUF_FULL	BIT(1)
++#define  VENC_INT_PBIT		BIT(3)
++#define  VENC_INT_TIMEOUT	BIT(27)
++#define  VENC_INT_CFG_ERR	BIT(30)
++#define  VENC_INT_JOB		(VENC_INT_EOP | VENC_INT_BUF_FULL | \
++				 VENC_INT_PBIT | VENC_INT_TIMEOUT | \
++				 VENC_INT_CFG_ERR)
++
++#define VENC_INTMASK		0x004	/* a set bit enables that source */
++#define VENC_RAWINT		0x008
++#define VENC_INTCLR		0x00c	/* write 1 to clear */
++
++#define VENC_START		0x010
++#define  VENC_START_RUN		BIT(0)
++
++#define VENC_MODE		0x020
++#define  VENC_MODE_VENC_EN	BIT(1)
++#define  VENC_MODE_STD_MOD	GENMASK(4, 3)	/* 0 is H.264 on this generation */
++#define  VENC_MODE_CSC_EN	BIT(9)
++#define  VENC_MODE_TIME_EN	GENMASK(11, 10)
++#define  VENC_MODE_CLK_GATE	GENMASK(14, 13)
++#define  VENC_MODE_MEM_GATE	BIT(15)
++#define  VENC_MODE_PKG_SEL	GENMASK(24, 17)
++#define  VENC_MODE_STR_FMT	GENMASK(27, 26)	/* 0 semi, 1 package, 2 planar */
++#define  VENC_MODE_VAL		(VENC_MODE_VENC_EN | \
++				 FIELD_PREP(VENC_MODE_TIME_EN, 3) | \
++				 FIELD_PREP(VENC_MODE_CLK_GATE, 2) | \
++				 VENC_MODE_MEM_GATE)
++
++/*
++ * packageSel is the chroma order of a semi-planar frame: the reference's own
++ * conversion table maps NV12 to 1 (U before V) and NV21 to 0 (V before U).
++ * A packed pair carries its own code, which also names the byte order inside
++ * the pair (v1.0): 0b11011000 is Y0 U Y1 V and 0b10001101 is U Y0 V Y1.
++ */
++#define  VENC_PKG_V_U		0
++#define  VENC_PKG_U_V		1
++#define  VENC_PKG_YUYV		0xd8
++#define  VENC_PKG_UYVY		0x8d
++
++#define VENC_PICFG0		0x024
++#define  VENC_PICFG0_PTBITS_EN	BIT(8)
++#define  VENC_PICFG0_CONST_I	BIT(12)
++#define  VENC_PICFG0_I_PIC	BIT(13)
++#define  VENC_PICFG0_TRANS	GENMASK(15, 14)	/* 0 is documented as unsupported */
++#define  VENC_PICFG0_NAL_REF	GENMASK(17, 16)
++#define  VENC_PICFG0_ENTROPY	BIT(19)	/* 0 is CAVLC, 1 is CABAC */
++#define  VENC_PICFG0_I_VAL	(VENC_PICFG0_PTBITS_EN | VENC_PICFG0_I_PIC | \
++				  FIELD_PREP(VENC_PICFG0_TRANS, 1) | \
++				  FIELD_PREP(VENC_PICFG0_NAL_REF, 3))
++/* A reference P picture: no I flag, and nal_ref_idc 2 rather than 3. */
++#define  VENC_PICFG0_P_VAL	(VENC_PICFG0_PTBITS_EN | \
++				 FIELD_PREP(VENC_PICFG0_TRANS, 1) | \
++				 FIELD_PREP(VENC_PICFG0_NAL_REF, 2))
++
++#define VENC_PICFG1		0x028	/* slice split, off: one slice per picture */
++#define  VENC_PICFG1_SLICE_SIZE		GENMASK(15, 0)	/* bytes per slice */
++#define  VENC_PICFG1_SLICE_BY_LINE	BIT(16)	/* clear: the size is bytes */
++#define  VENC_PICFG1_SLICE_SPLIT	BIT(17)
++
++#define VENC_PICFG2		0x02c
++#define  VENC_PICFG2_IPCM	BIT(0)
++#define  VENC_PICFG2_I4		BIT(1)
++#define  VENC_PICFG2_I16	BIT(3)
++#define  VENC_PICFG2_ILOWPOW	BIT(31)
++#define  VENC_PICFG2_VAL	(VENC_PICFG2_IPCM | VENC_PICFG2_I4 | \
++				 VENC_PICFG2_I16 | VENC_PICFG2_ILOWPOW)
++
++/*
++ * The inter-prediction enables stay set exactly as the reference leaves them for
++ * an H.264 channel (the vendor's live path takes them from the same descriptor
++ * the intra path fills). They cost nothing here, because no macroblock is coded
++ * inter in an I picture.
++ */
++#define VENC_PICFG3		0x030
++#define  VENC_PICFG3_VAL	0xe000001f
++
++#define VENC_PICFG4		0x034	/* input clipping, off */
++
++/* The window the block would clip to if PICFG4 enabled it: video range. */
++#define VENC_PICFG5		0x038
++#define  VENC_PICFG5_LUMA_MIN	GENMASK(7, 0)
++#define  VENC_PICFG5_LUMA_MAX	GENMASK(15, 8)
++#define  VENC_PICFG5_CHR_MIN	GENMASK(23, 16)
++#define  VENC_PICFG5_CHR_MAX	GENMASK(31, 24)
++#define  VENC_PICFG5_VAL	(FIELD_PREP(VENC_PICFG5_LUMA_MIN, 16) | \
++				 FIELD_PREP(VENC_PICFG5_LUMA_MAX, 235) | \
++				 FIELD_PREP(VENC_PICFG5_CHR_MIN, 16) | \
++				 FIELD_PREP(VENC_PICFG5_CHR_MAX, 240))
++
++#define VENC_ENCUPDATE		0x040	/* MPEG-4 intra refresh only */
++
++#define VENC_VEDIMGSIZE		0x050
++#define  VENC_IMG_WIDTH		GENMASK(12, 0)	/* pixels, minus one */
++#define  VENC_IMG_HEIGHT	GENMASK(28, 16)
++
++/* Per-picture bit budget; going over it raises the overflow source. */
++#define VENC_PTBITS		0x058
++#define  VENC_PTBITS_MAX	500000	/* bytes; the reference's 4 Mbit ceiling */
++
++/*
++ * The three slice-header groups, right justified so that a group's last bit is
++ * bit 0 of its word and its first bit sits at the width the parameter register
++ * names. The reference passes all three even for a slice type that, read from
++ * the standard alone, has no reordering field, so this driver mirrors the
++ * reference and lets the block decide what to emit. The widths are bits minus
++ * one: an IDR's marking group is the no-output and long-term pair, a P
++ * picture's is the single adaptive-mode flag.
++ */
++#define VENC_SLCHDRSTRM		0x060	/* 4 header, 2 reorder, 2 marking words */
++#define  VENC_SLCHDR_WORDS	8
++#define VENC_SLCHDRPARA		0x080
++#define  VENC_SLCHPARA_IDR	BIT(1)
++#define  VENC_SLCHPARA_PARA_WD	GENMASK(14, 8)
++#define  VENC_SLCHPARA_REORD_WD	GENMASK(21, 16)
++#define  VENC_SLCHPARA_MARK_WD	GENMASK(27, 22)
++/* The reorder group is the single '0' bit, the marking group the two '00' bits. */
++#define  VENC_SLCHPARA_REORD	0
++#define  VENC_SLCHPARA_MARK_I	1
++#define  VENC_SLCHPARA_MARK_P	0
++
++#define VENC_PTS0		0x090
++#define VENC_TIMEOUT		0x0a0
++#define  VENC_TIMEOUT_VAL	10000000
++#define VENC_OUTSTD		0x0a4
++#define  VENC_OUTSTD_NUM	GENMASK(3, 0)
++#define  VENC_OUTSTD_VAL	FIELD_PREP(VENC_OUTSTD_NUM, 1)
++
++#define VENC_VERSION		0x0fc	/* "V2R8" here; the pair at 0xf8 reads 0 */
++
++#define VENC_SRCYADDR		0x100
++#define VENC_SRCCADDR		0x104
++#define VENC_SRCVADDR		0x108	/* unused by a semi-planar picture */
++#define VENC_RCNYADDR		0x110
++#define VENC_RCNCADDR		0x114
++#define VENC_REFYADDR		0x120
++#define VENC_REFCADDR		0x124
++
++#define VENC_SSTRIDE		0x130
++#define  VENC_SSTRIDE_Y		GENMASK(15, 0)
++#define  VENC_SSTRIDE_C		GENMASK(31, 16)
++
++#define VENC_RSTRIDE		0x134
++#define  VENC_RSTRIDE_Y		GENMASK(15, 0)
++#define  VENC_RSTRIDE_C		GENMASK(31, 16)
++
++#define VENC_STRMADDR		0x140
++#define VENC_SRPTRADDR		0x144	/* address of the word holding the offset */
++#define VENC_SWPTRADDR		0x148
++#define VENC_STRMBUFLEN		0x14c
++#define  VENC_STRMBUFLEN_UNIT	GENMASK(31, 6)	/* whole bytes, low 6 unused:
++						 * the reference writes its byte
++						 * size into the word raw, and
++						 * the JPGE half of this block
++						 * reported "stream full" when
++						 * the size was divided by 64
++						 */
++
++/* Motion search: idle for an I picture, and programmed every frame anyway. */
++#define VENC_MECFG0		0x200
++#define  VENC_MECFG0_HSW	GENMASK(3, 0)
++#define  VENC_MECFG0_VSW	GENMASK(6, 4)
++#define  VENC_MECFG0_REAL_MV	GENMASK(19, 16)
++#define VENC_MECFG1		0x204	/* four search ranges, all enabled */
++#define  VENC_MECFG1_VAL	0xf
++#define VENC_MERECTCFG		0x208	/* four words, 16 bytes apart */
++#define VENC_METHR0		0x220
++#define  VENC_METHR0_TH1	GENMASK(15, 0)
++#define  VENC_METHR0_TH2	GENMASK(31, 16)
++#define VENC_METHR1		0x224
++#define  VENC_METHR1_INTRA	GENMASK(15, 0)
++#define VENC_MERDOCFG		0x228	/* the lambda offsets, all zero */
++#define VENC_CREFLDMODE		0x22c
++#define  VENC_CREFLDBUR8	BIT(0)
++#define VENC_MDCFG		0x230
++#define  VENC_MDCFG_RDO		BIT(16)
++
++/* The reference's search settings for the widest class, range 0 to range 3. */
++static const u32 venc_me_rect[4] = { 0x00000202, 0x00008208, 0x010d0d0d,
++				      0x00000404 };
++
++#define VENC_DEFAULT_GOP		1	/* every picture is an IDR */
++
++#define VENC_ROICFG		0x300
++#define  VENC_ROICFG_VAL	0x0000ff00	/* no region enabled, all absolute QP */
++
++#define VENC_QPTHR		0x350
++#define  VENC_QPTHR_MIN		GENMASK(5, 0)
++#define  VENC_QPTHR_MAX		GENMASK(13, 8)
++#define  VENC_QPTHR_START	GENMASK(21, 16)
++
++#define VENC_RC1		0x354
++#define  VENC_RC1_QP_DELTA	GENMASK(5, 0)
++#define  VENC_RC1_MADP_DELTA	GENMASK(15, 8)
++#define  VENC_RC1_VAL		(FIELD_PREP(VENC_RC1_QP_DELTA, 2) | \
++				 FIELD_PREP(VENC_RC1_MADP_DELTA, 0xf8))
++
++/* The three QP-delta thresholds are constants in the reference, not derived. */
++#define VENC_QPDELTATHR		0x358
++static const u32 venc_qp_delta_thr[3] = { 0x09070707, 0x19120e0c, 0xffffffff };
++
++#define VENC_TARGETBITS		0x364
++#define VENC_PICBITS		0x374	/* bits the last picture spent */
++#define VENC_MEANQP		0x388	/* mean QP it actually used */
++#define VENC_MODLAMBDA		0x3a0	/* 20 words of two 16-bit lambdas */
++#define VENC_VPP_OSD_CFG	0x500	/* eight overlay planes, all off */
++#define VENC_SCALE		0x5e00	/* 32 words: intra list, then inter list */
++
++#define VENC_REG_WINDOW		0x10000
++
++/* ------------------------------------------------------------------ */
++/* Stream ring                                                         */
++/* ------------------------------------------------------------------ */
++
++#define VENC_PKG_HDR_BYTES	64	/* the header block at a packet's start */
++#define VENC_PKG_BLOCK		64	/* the payload block that follows it */
++#define VENC_PKG_LEN		0	/* whole packet, 64-byte aligned */
++#define VENC_PKG_INVLD		4	/* padding at the end of the payload */
++#define VENC_PKG_TYPE		8	/* nal_unit_type of the payload */
++#define VENC_PKG_LAST		11	/* set on the picture's last packet */
++#define VENC_PKG_BYTES		(VENC_PKG_HDR_BYTES + VENC_PKG_BLOCK)
++#define VENC_PTR_BYTES		32	/* the two pointer words, at 0 and 16 */
++#define VENC_STRM_OFF		64	/* STRMADDR, above the pointer block */
++#define VENC_ALIGN_STREAM	64	/* STRMADDR granularity */
++#define VENC_ALIGN_FRAME	16	/* plane addresses and strides */
++#define VENC_ALIGN_BUFLEN	256	/* sizes kept whole, so the 64-byte
++					 * quanta the length register counts
++					 * never round off
++					 */
++
++/* ------------------------------------------------------------------ */
++/* H.264 parameter sets, written by the driver                         */
++/* ------------------------------------------------------------------ */
++
++#define VENC_NAL_IDR		5
++#define VENC_NAL_SPS		7
++#define VENC_NAL_PPS		8
++#define VENC_PROFILE_IDC	66	/* baseline: the PPS carries no scaling lists */
++#define VENC_PROFILE_MAIN	77
++#define VENC_PROFILE_HIGH	100
++#define VENC_START_CODE_BYTES	4
++#define VENC_VBR_I_BUDGET	4	/* average pictures an I picture may spend */
++#define VENC_VBR_I_QP_BONUS	6	/* quantiser steps a VBR I picture starts below */
++
++struct venc_level {
++	unsigned int max_fs;
++	unsigned int max_mbps;
++	unsigned int max_br_kbps;
++	u8 level_idc;
++};
++
++/*
++ * ITU-T H.264 Table A-1, levels 1 to 5.1: frame-size, macroblock-rate and
++ * bit-rate caps. MaxBR is the Baseline/Main/Extended column, which the High
++ * column equals at every level this encoder reaches.
++ */
++static const struct venc_level venc_levels[] = {
++	{    99,    1485,     64, 10 }, {   396,    3000,    192, 11 },
++	{   396,    6000,    384, 12 }, {   396,   11880,    768, 13 },
++	{   396,   11880,   2000, 20 }, {   792,   19800,   4000, 21 },
++	{  1620,   40500,   4000, 22 }, {  1620,   40500,  10000, 30 },
++	{  3600,  108000,  14000, 31 }, {  5120,  216000,  20000, 32 },
++	{  8192,  245760,  20000, 40 }, {  8192,  245760,  50000, 41 },
++	{  8704,  522240,  50000, 42 }, { 22080,  589824, 135000, 50 },
++	{ 36864,  983040, 240000, 51 },
++};
++
++/* The two 8x8 quantiser lists, intra first, in the raster order the block wants. */
++static const u8 venc_scale[128] = {
++	6, 10, 13, 16, 18, 23, 25, 27, 10, 11, 16, 18, 23, 25, 27, 29,
++	13, 16, 18, 23, 25, 27, 29, 31, 16, 18, 23, 25, 27, 29, 31, 33,
++	18, 23, 25, 27, 29, 31, 33, 36, 23, 25, 27, 29, 31, 33, 36, 38,
++	25, 27, 29, 31, 33, 36, 38, 40, 27, 29, 31, 33, 36, 38, 40, 42,
++	9, 13, 15, 17, 19, 21, 22, 24, 13, 13, 17, 19, 21, 22, 24, 25,
++	15, 17, 19, 21, 22, 24, 25, 27, 17, 19, 21, 22, 24, 25, 27, 28,
++	19, 21, 22, 24, 25, 27, 28, 30, 21, 22, 24, 25, 27, 28, 30, 32,
++	22, 24, 25, 27, 28, 30, 32, 33, 24, 25, 27, 28, 30, 32, 33, 35,
++};
++
++static const u16 venc_mod_lambda[40] = {
++	1, 1, 1, 2, 2, 3, 3, 4, 5, 7, 9, 11, 14, 17, 22, 27, 34, 43, 54, 69,
++	86, 109, 137, 173, 218, 274, 345, 435, 548, 691, 870, 1097, 1382,
++	1741, 2193, 2763, 3482, 4095, 4095, 4095,
++};
++
++/* ------------------------------------------------------------------ */
++/* Block limits                                                        */
++/* ------------------------------------------------------------------ */
++
++#define VENC_MIN_WIDTH		176
++#define VENC_MIN_HEIGHT		144
++#define VENC_MAX_WIDTH		1920
++#define VENC_MAX_HEIGHT		1088
++#define VENC_MB_ALIGN		16	/* the block codes whole macroblocks */
++#define VENC_DIM_ALIGN		4	/* the reference's own size gate */
++#define VENC_QP_DEFAULT		32
++#define VENC_QP_MIN		0
++#define VENC_QP_MAX		51
++#define VENC_BITRATE_DEFAULT	2000000
++#define VENC_MIN_STREAM_SIZE	SZ_256K	/* the reference's lower bound */
++#define VENC_MAX_STREAM_SIZE	SZ_16M
++/*
++ * A picture is one synchronous pass through the block, and the wait holds
++ * hw_lock, so a wedged engine blocks every context for this long. The largest
++ * frame the encoder accepts (1920x1088) codes in tens of milliseconds on the
++ * board, so a second is already more than an order of magnitude of margin.
++ */
++#define VENC_JOB_TIMEOUT	msecs_to_jiffies(1000)
++#define VENC_SETTLE_US		10
++
++/*
++ * struct histb_venc - one VEDU instance
++ * @hw_lock: the block keeps one global descriptor rather than per-channel
++ *	     state, so a job owns it from its first write to its completion;
++ *	     that also leaves @int_state and @int_done to one writer
++ */
++struct histb_venc {
++	struct device		*dev;
++	struct device		*memdev;
++	void __iomem		*regs;
++	struct clk		*clk;
++	struct reset_control	*rst;
++	struct v4l2_device	v4l2_dev;
++	struct video_device	*vdev;
++	struct v4l2_m2m_dev	*m2m_dev;
++	int			irq;	/* kept so remove can mask it */
++	bool			removing;	/* device_run() refuses work */
++	struct mutex		hw_lock;
++	struct mutex		vdev_lock;
++	wait_queue_head_t	done;
++	u32			int_state;
++	bool			int_done;
++};
++
++/*
++ * struct histb_venc_q - one queue's layout as client and block see it
++ *
++ * For the OUTPUT queue it is the raw picture; for CAPTURE @size is the largest
++ * bitstream the client will accept, which is also the ring the block writes.
++ * @planes counts the buffers one picture occupies and @plane_size says how many
++ * bytes each of them holds, so a plane never has to be re-derived.
++ */
++struct histb_venc_q {
++	u32	fourcc;
++	unsigned int width;
++	unsigned int height;
++	unsigned int bytesperline;
++	unsigned int size;
++	u8	planes;
++	unsigned int plane_size[2];
++};
++
++/* The M forms are the same storage as their twins, split in two. */
++static bool histb_venc_is_m_fmt(u32 fourcc)
++{
++	return fourcc == V4L2_PIX_FMT_NV12M || fourcc == V4L2_PIX_FMT_NV21M;
++}
++
++/* A packed pair is one plane of two bytes per pixel and is 4:2:2. */
++static bool histb_venc_is_packed(u32 fourcc)
++{
++	return fourcc == V4L2_PIX_FMT_YUYV || fourcc == V4L2_PIX_FMT_UYVY;
++}
++
++/* Semi-planar 4:2:2 keeps a full-height chroma plane beside the luma. */
++static bool histb_venc_is_semi422(u32 fourcc)
++{
++	return fourcc == V4L2_PIX_FMT_NV16 || fourcc == V4L2_PIX_FMT_NV61;
++}
++
++/* Write a negotiated layout into the plane description a client asked for. */
++static void histb_venc_fill_pix(struct v4l2_pix_format_mplane *pix,
++				const struct histb_venc_q *q)
++{
++	unsigned int p;
++
++	pix->pixelformat = q->fourcc;
++	pix->width = q->width;
++	pix->height = q->height;
++	pix->field = V4L2_FIELD_NONE;
++	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
++	pix->num_planes = q->planes;
++	for (p = 0; p < q->planes; p++) {
++		pix->plane_fmt[p].bytesperline = q->bytesperline;
++		pix->plane_fmt[p].sizeimage = q->plane_size[p];
++	}
++}
++
++/* True when a plane does not hold the number of bytes its layout asks for. */
++static bool histb_venc_payload_bad(struct vb2_buffer *vb,
++				   const struct histb_venc_q *q)
++{
++	unsigned int p;
++
++	for (p = 0; p < q->planes; p++)
++		if (vb2_get_plane_payload(vb, p) < q->plane_size[p] ||
++		    vb2_get_plane_payload(vb, p) > vb->planes[p].length)
++			return true;
++
++	return false;
++}
++
++struct histb_venc_ctx {
++	struct histb_venc	*venc;
++	struct v4l2_fh		fh;
++	struct v4l2_ctrl_handler ctrl_hdl;
++	struct histb_venc_q	out_q;
++	struct histb_venc_q	cap_q;
++	struct v4l2_ctrl	*min_qp;
++	struct v4l2_ctrl	*max_qp;
++	struct v4l2_ctrl	*bitrate;
++	struct v4l2_ctrl	*gop;
++	struct v4l2_ctrl	*force_idr;
++	struct v4l2_ctrl	*profile;
++	struct v4l2_ctrl	*rc_mode;
++	struct v4l2_ctrl	*cabac;
++	struct v4l2_ctrl	*slice_mode;
++	struct v4l2_ctrl	*slice_bytes;
++	unsigned int		idr_pic_id;
++	unsigned int		frm_num;	/* the four-bit frame_num of the reference */
++	unsigned int		frm_in_gop;
++	unsigned int		rcn_sel;
++	unsigned int		sequence;
++	struct v4l2_fract	fps;
++	/* The source rectangle to code, in OUTPUT coordinates; empty = whole. */
++	struct v4l2_rect	crop;
++	/*
++	 * Host-side rate control: the block only honours the per-picture start
++	 * QP inside the [min, max] window, so the target bit rate is met by
++	 * moving that start QP against a one-second bit credit.
++	 */
++	unsigned int		rc_qp;
++	s64			rc_credit;
++	bool			rc_ready;
++	bool			last_intra;
++	/* the first picture of a context opens with an IDR */
++	bool			coded;
++	const char		*why;
++	void			*stream;
++	dma_addr_t		stream_dma;
++	size_t			stream_alloc;
++};
++
++/* A job's addresses and the slice header that goes with them. */
++struct histb_venc_job {
++	dma_addr_t		src_y;
++	dma_addr_t		src_c;		/* chroma plane of the whole source */
++	dma_addr_t		rcn;
++	size_t			strm_off;
++	size_t			ring_len;
++	size_t			rcn_frame;	/* one reconstruction picture */
++	unsigned int		rcn_luma;
++	unsigned int		rcn_sel;	/* half of the pair being written */
++	unsigned int		coded_w;	/* the picture actually coded */
++	unsigned int		coded_h;
++	bool			intra;
++	u32			slc_hdr;
++	unsigned int		para_wd;
++};
++
++/* v4l2-ioctl passes no file handle to the format ops, only to the file. */
++static struct histb_venc_ctx *file_to_ctx(struct file *file)
++{
++	return container_of(file_to_v4l2_fh(file), struct histb_venc_ctx, fh);
++}
++
++/* ------------------------------------------------------------------ */
++/* Bit and slice-header writers                                        */
++/* ------------------------------------------------------------------ */
++
++struct venc_bs {
++	u8	*buf;
++	unsigned int bits;
++};
++
++/* Most significant bit first, into the buffer the client will be given. */
++static void venc_bs_put(struct venc_bs *bs, u32 code, unsigned int n)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i++) {
++		unsigned int sh = 7 - (bs->bits & 7);
++		u8 bit = (code >> (n - 1 - i)) & 1;
++
++		bs->buf[bs->bits >> 3] &= ~BIT(sh);
++		bs->buf[bs->bits >> 3] |= bit << sh;
++		bs->bits++;
++	}
++}
++
++/* Exp-Golomb: the value plus one, in twice its bit length minus one bits. */
++static void venc_bs_ue(struct venc_bs *bs, u32 v)
++{
++	u32 code = v + 1;
++
++	venc_bs_put(bs, code, 2 * fls(code) - 1);
++}
++
++static void venc_bs_se(struct venc_bs *bs, int v)
++{
++	venc_bs_ue(bs, v <= 0 ? 2 * -v : 2 * v - 1);
++}
++
++/* The reference's trailing bits: one '1', then zeros up to the next byte. */
++static void venc_bs_trailing(struct venc_bs *bs)
++{
++	venc_bs_put(bs, 1, 1);
++	if (bs->bits & 7)
++		venc_bs_put(bs, 0, 8 - (bs->bits & 7));
++}
++
++/*
++ * Emulation prevention (H.264 7.3.1.1): inside a NAL a pair of zero bytes
++ * followed by 00..03 gains a 0x03, so a decoder cannot mistake the payload for
++ * a start code. The start code itself is not part of the NAL and stays as it
++ * is. One SPS bit pattern that reaches this (see the timing_info pair) was
++ * read by the reference decoder as eight bits past the end of the VUI before
++ * the escape was added.
++ */
++static size_t histb_venc_escape(u8 *buf, size_t len)
++{
++	u8 out[VENC_PKG_BLOCK];
++	unsigned int zeros = 0;
++	size_t i, n;
++
++	if (len < VENC_START_CODE_BYTES || len > sizeof(out))
++		return 0;
++
++	memcpy(out, buf, VENC_START_CODE_BYTES);
++	n = VENC_START_CODE_BYTES;
++	for (i = VENC_START_CODE_BYTES; i < len; i++) {
++		u8 b = buf[i];
++
++		if (zeros >= 2 && b <= 3) {
++			out[n++] = 3;
++			zeros = 0;
++		}
++		out[n++] = b;
++		zeros = b ? 0 : zeros + 1;
++	}
++	memcpy(buf, out, n);
++
++	return n;
++}
++
++/*
++ * The slice header of an IDR picture: ue(2) for the type, '1' for parameter set
++ * 0, frame_num in the four bits the reference writes - always zero, because an
++ * IDR picture's frame number is zero by the standard - and ue of the picture
++ * identifier. Joined at the low end, so the finished group is right justified
++ * the way the register wants it and its width is the total minus one.
++ *
++ * The reference increments its identifier per IDR picture rather than
++ * alternating it between two values, and keeps only its low four bits; this
++ * does the same, because what the block does with a group it is handed is only
++ * knowable from the board.
++ */
++static void venc_slc_hdr(u32 *hdr, unsigned int *para_wd, bool intra,
++			 unsigned int id, unsigned int fn)
++{
++	u32 code;
++	unsigned int bits;
++
++	if (!intra) {
++		/*
++		 * ue(0) for the P slice type, '1' for parameter set 0, the running
++		 * frame_num, and the '0' override flag the reference emits because its
++		 * NumRefIndex is 0, per the vendor encoder driver.
++		 */
++		*hdr = (1u << 6) | (1u << 5) | ((fn & 0xf) << 1);
++		*para_wd = 6;
++		return;
++	}
++
++	code = (id & 0xf) + 1;
++	bits = 2 * fls(code) - 1;
++	*hdr = (0x3u << (5 + bits)) | (1u << (4 + bits)) | code;
++	*para_wd = 3 + 1 + 4 + bits - 1;
++}
++
++/* ------------------------------------------------------------------ */
++/* Parameter sets                                                      */
++/* ------------------------------------------------------------------ */
++
++static u8 venc_level_idc(unsigned int total_mb, unsigned int mbps,
++			 unsigned int br_kbps, bool *direct8x8)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(venc_levels); i++) {
++		if (total_mb <= venc_levels[i].max_fs &&
++		    mbps <= venc_levels[i].max_mbps &&
++		    br_kbps <= venc_levels[i].max_br_kbps) {
++			*direct8x8 = total_mb >= 1620;
++			return venc_levels[i].level_idc;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * The SPS the block's coder needs: no constraint flags, a timing-only VUI, one
++ * reference frame, and picture-order-count type 2, which is what lets
++ * the slice header carry no picture order at all. The picture is cropped back
++ * from whole macroblocks in half-sample units, the way the reference computes
++ * it.
++ */
++static size_t histb_venc_write_sps(u8 *buf, unsigned int width,
++				   unsigned int height, unsigned int profile,
++				   const struct v4l2_fract *fps,
++				   unsigned int bitrate)
++{
++	unsigned int mb_w = DIV_ROUND_UP(width, VENC_MB_ALIGN);
++	unsigned int mb_h = DIV_ROUND_UP(height, VENC_MB_ALIGN);
++	unsigned int crop_r = (mb_w * VENC_MB_ALIGN - width) / 2;
++	unsigned int crop_b = (mb_h * VENC_MB_ALIGN - height) / 2;
++	bool crop = crop_r || crop_b;
++	struct venc_bs bs = { .buf = buf };
++	bool direct8x8;
++	u8 level;
++
++	level = venc_level_idc(mb_w * mb_h,
++			       mb_w * mb_h * fps->numerator /
++				       max_t(unsigned int, fps->denominator, 1),
++			       bitrate / 1000, &direct8x8);
++	if (!level)
++		return 0;
++
++	memset(buf, 0, VENC_PKG_BLOCK);
++	venc_bs_put(&bs, 1, VENC_START_CODE_BYTES * 8);	/* the start code */
++	venc_bs_put(&bs, 0, 1);		/* forbidden_zero_bit */
++	venc_bs_put(&bs, 3, 2);		/* nal_ref_idc */
++	venc_bs_put(&bs, VENC_NAL_SPS, 5);
++	venc_bs_put(&bs, profile, 8);
++	venc_bs_put(&bs, 0x00, 8);	/* the six constraint flags, none set */
++	venc_bs_put(&bs, level, 8);
++	venc_bs_ue(&bs, 0);		/* seq_parameter_set_id */
++	/*
++	 * High carries its sampling and depth explicitly after the set id; the
++	 * reference writes the six bits that say 4:2:0, 8 bits per sample and no
++	 * scaling matrix. The coder is 4:2:0 whatever
++	 * the input layout: a packed pair is subsampled on the way in, so the
++	 * stream keeps this sampling.
++	 */
++	if (profile >= VENC_PROFILE_HIGH) {
++		venc_bs_ue(&bs, 1);	/* chroma_format_idc: 4:2:0 */
++		venc_bs_ue(&bs, 0);	/* bit_depth_luma_minus8 */
++		venc_bs_ue(&bs, 0);	/* bit_depth_chroma_minus8 */
++		venc_bs_put(&bs, 0, 1);	/* qpprime_y_zero_transform_bypass_flag */
++		venc_bs_put(&bs, 0, 1);	/* seq_scaling_matrix_present_flag */
++	}
++	venc_bs_ue(&bs, 0);		/* log2_max_frame_num_minus4 */
++	venc_bs_ue(&bs, 2);		/* pic_order_cnt_type */
++	venc_bs_ue(&bs, 1);		/* num_ref_frames */
++	venc_bs_put(&bs, 0, 1);		/* gaps_in_frame_num_value_allowed_flag */
++	venc_bs_ue(&bs, mb_w - 1);	/* pic_width_in_mbs_minus1 */
++	venc_bs_ue(&bs, mb_h - 1);	/* pic_height_in_mbs_minus1 */
++	venc_bs_put(&bs, 1, 1);		/* frame_mbs_only_flag */
++	venc_bs_put(&bs, direct8x8, 1);	/* direct_8x8_inference_flag */
++	/* The offsets may not all be zero once the flag is set. */
++	venc_bs_put(&bs, crop, 1);	/* frame_cropping_flag */
++	if (crop) {
++		venc_bs_ue(&bs, 0);		/* frame_crop_left_offset */
++		venc_bs_ue(&bs, crop_r);	/* frame_crop_right_offset */
++		venc_bs_ue(&bs, 0);		/* frame_crop_top_offset */
++		venc_bs_ue(&bs, crop_b);	/* frame_crop_bottom_offset */
++	}
++	venc_bs_put(&bs, 1, 1);		/* vui_parameters_present_flag */
++	/* timing_info: one tick per field, fixed frame rate. */
++	venc_bs_put(&bs, 0, 1);		/* aspect_ratio_info_present_flag */
++	venc_bs_put(&bs, 0, 1);		/* overscan_info_present_flag */
++	venc_bs_put(&bs, 0, 1);		/* video_signal_type_present_flag */
++	venc_bs_put(&bs, 0, 1);		/* chroma_loc_info_present_flag */
++	venc_bs_put(&bs, 1, 1);		/* timing_info_present_flag */
++	venc_bs_put(&bs, 1, 32);	/* num_units_in_tick */
++	venc_bs_put(&bs, 2 * fps->numerator /
++			 max_t(unsigned int, fps->denominator, 1), 32);
++	venc_bs_put(&bs, 1, 1);		/* fixed_frame_rate_flag */
++	venc_bs_put(&bs, 0, 1);		/* nal_hrd_parameters_present */
++	venc_bs_put(&bs, 0, 1);		/* vcl_hrd_parameters_present */
++	venc_bs_put(&bs, 0, 1);		/* pic_struct_present_flag */
++	venc_bs_put(&bs, 0, 1);		/* bitstream_restriction_flag */
++	venc_bs_trailing(&bs);
++
++	return bs.bits / 8;
++}
++
++/*
++ * CAVLC, one slice group, no weighting, no second chroma QP offset and no
++ * scaling lists: baseline has no transform_8x8_mode_flag to hang them on, which
++ * is why the reference skips the whole block for this profile even though it
++ * uploads the lists to the scale registers anyway.
++ */
++static size_t histb_venc_write_pps(u8 *buf, bool cabac)
++{
++	struct venc_bs bs = { .buf = buf };
++
++	memset(buf, 0, VENC_PKG_BLOCK);
++	venc_bs_put(&bs, 1, VENC_START_CODE_BYTES * 8);
++	venc_bs_put(&bs, 0, 1);
++	venc_bs_put(&bs, 3, 2);
++	venc_bs_put(&bs, VENC_NAL_PPS, 5);
++	venc_bs_ue(&bs, 0);		/* pic_parameter_set_id */
++	venc_bs_ue(&bs, 0);		/* seq_parameter_set_id */
++	venc_bs_put(&bs, cabac ? 1 : 0, 1); /* entropy_coding_mode_flag */
++	venc_bs_put(&bs, 0, 1);		/* bottom_field_pic_order_in_frame_present */
++	venc_bs_ue(&bs, 0);		/* num_slice_groups_minus1 */
++	venc_bs_ue(&bs, 0);		/* num_ref_idx_l0_active_minus1 */
++	venc_bs_ue(&bs, 0);		/* num_ref_idx_l1_active_minus1 */
++	venc_bs_put(&bs, 0, 1);		/* weighted_pred_flag */
++	venc_bs_put(&bs, 0, 2);		/* weighted_bipred_idc */
++	venc_bs_se(&bs, 0);		/* pic_init_qp_minus26 */
++	venc_bs_se(&bs, 0);		/* pic_init_qs_minus26 */
++	venc_bs_se(&bs, 0);		/* chroma_qp_index_offset */
++	venc_bs_put(&bs, 1, 1);		/* deblocking_filter_control_present_flag */
++	venc_bs_put(&bs, 0, 1);		/* constrained_intra_pred_flag */
++	venc_bs_put(&bs, 0, 1);		/* redundant_pic_cnt_present_flag */
++	venc_bs_trailing(&bs);
++
++	return bs.bits / 8;
++}
++
++/* ------------------------------------------------------------------ */
++/* Ring                                                                */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Every offset into the ring is taken modulo its length, because the block's
++ * write pointer wraps with it.
++ */
++static void venc_ring_put(struct histb_venc_ctx *ctx, size_t off,
++			  const void *src, size_t n)
++{
++	size_t len = ctx->cap_q.size;
++	u8 *base = ctx->stream;
++	size_t first;
++
++	off %= len;
++	first = min(n, len - off);
++	memcpy(base + VENC_STRM_OFF + off, src, first);
++	if (n > first)
++		memcpy(base + VENC_STRM_OFF, (const u8 *)src + first,
++		       n - first);
++}
++
++static void venc_ring_get(struct histb_venc_ctx *ctx, size_t off, void *dst,
++			  size_t n)
++{
++	size_t len = ctx->cap_q.size;
++	u8 *base = ctx->stream;
++	size_t first;
++
++	off %= len;
++	first = min(n, len - off);
++	memcpy(dst, base + VENC_STRM_OFF + off, first);
++	if (n > first)
++		memcpy((u8 *)dst + first, base + VENC_STRM_OFF, n - first);
++}
++
++/*
++ * A parameter set is one header block and one payload block: the length covers
++ * both, the padding word says how much of the payload block went unused, and the
++ * picture is not finished, so the last-packet byte stays clear.
++ */
++static void histb_venc_pkg_param(struct histb_venc_ctx *ctx, size_t off,
++				 const u8 *payload, size_t bytes, u32 type)
++{
++	u8 blk[VENC_PKG_BYTES] = { 0 };
++
++	put_unaligned_le32(VENC_PKG_BYTES, blk + VENC_PKG_LEN);
++	put_unaligned_le32(VENC_PKG_BLOCK - bytes, blk + VENC_PKG_INVLD);
++	blk[VENC_PKG_TYPE] = type;
++	memcpy(blk + VENC_PKG_HDR_BYTES, payload, bytes);
++
++	venc_ring_put(ctx, off, blk, sizeof(blk));
++}
++
++/* ------------------------------------------------------------------ */
++/* Hardware control                                                    */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The block is taken through a reset once, before anything is configured, from
++ * the probe path. The reference does the same pair per frame around its own
++ * register writes (BoardDeinit asserts the reset, BoardInit releases it inside
++ * CfgRegVenc); a driver that owns the whole block and
++ * never leaves it configured between jobs needs it only once, and again after a
++ * job that ended without the block having finished.
++ *
++ * The version register is polled afterwards as a "does the window answer" check:
++ * it reads "V2R8" with the gate on and zero with the clock off.
++ */
++static int histb_venc_reset(struct histb_venc *venc)
++{
++	u32 val;
++	int ret;
++
++	writel(0, venc->regs + VENC_INTMASK);
++
++	ret = reset_control_assert(venc->rst);
++	if (ret)
++		return ret;
++
++	udelay(VENC_SETTLE_US);
++	writel(VENC_INT_JOB, venc->regs + VENC_INTCLR);
++
++	ret = reset_control_deassert(venc->rst);
++	if (ret)
++		return ret;
++
++	udelay(VENC_SETTLE_US);
++	writel(VENC_INT_JOB, venc->regs + VENC_INTMASK);
++
++	if (readl_relaxed_poll_timeout(venc->regs + VENC_VERSION, val, val, 10,
++				       1000))
++		dev_warn(venc->dev, "version register reads 0\n");
++
++	return 0;
++}
++
++static u32 histb_venc_pkg_sel(u32 fourcc)
++{
++	if (fourcc == V4L2_PIX_FMT_YUYV)
++		return VENC_PKG_YUYV;
++	if (fourcc == V4L2_PIX_FMT_UYVY)
++		return VENC_PKG_UYVY;
++
++	return fourcc == V4L2_PIX_FMT_NV21 || fourcc == V4L2_PIX_FMT_NV21M ||
++	       fourcc == V4L2_PIX_FMT_NV61 ? VENC_PKG_V_U : VENC_PKG_U_V;
++}
++
++static unsigned int histb_venc_base_target(const struct histb_venc_ctx *ctx);
++static unsigned int histb_venc_pic_target(const struct histb_venc_ctx *ctx,
++					  bool intra);
++
++/*
++ * Everything the block needs to code one picture, in the order the reference's
++ * own configuration routine writes it.
++ *
++ * The reconstruction slots are the second and the first 1.5-luma blocks of the
++ * scratch, which is the pairing the reference programs for the first frame of a
++ * channel: its frame index flips before the write, so the picture reads slot 0
++ * as its reference and writes slot 1. An all-intra channel never reads either
++ * back, but the block writes the reference it is given addresses for.
++ */
++static void histb_venc_program(struct histb_venc *venc,
++			       struct histb_venc_ctx *ctx,
++			       const struct histb_venc_job *job)
++{
++	const struct histb_venc_q *pic = &ctx->out_q;
++	unsigned int min_qp = ctx->min_qp->val;
++	unsigned int max_qp = ctx->max_qp->val;
++	unsigned int stride = ALIGN(job->coded_w, VENC_MB_ALIGN);
++	unsigned int target = histb_venc_pic_target(ctx, job->intra);
++	unsigned int start_qp = min_qp == max_qp ? min_qp :
++		clamp_t(unsigned int, ctx->rc_qp, min_qp, max_qp);
++
++	/* A VBR I picture starts at a finer quantiser; the credit loop pays the
++	 * difference back on the pictures that follow it.
++	 */
++	if (job->intra && min_qp < max_qp && ctx->rc_mode &&
++	    ctx->rc_mode->val == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR)
++		start_qp = max_t(unsigned int, min_qp,
++				 start_qp - VENC_VBR_I_QP_BONUS);
++	dma_addr_t base = ctx->stream_dma;
++	dma_addr_t strm = base + job->strm_off;
++	dma_addr_t rcn_base, ref_base;
++	unsigned int i;
++	u32 picfg1 = 0;
++
++	if (ctx->slice_mode->val == V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_MAX_BYTES)
++		picfg1 = FIELD_PREP(VENC_PICFG1_SLICE_SIZE,
++				    (u32)ctx->slice_bytes->val) |
++			 VENC_PICFG1_SLICE_SPLIT;
++
++	writel(VENC_INT_JOB, venc->regs + VENC_INTMASK);
++	writel(VENC_MODE_VAL |
++	       FIELD_PREP(VENC_MODE_STR_FMT,
++			  histb_venc_is_packed(pic->fourcc) ? 1 : 0) |
++	       FIELD_PREP(VENC_MODE_PKG_SEL, histb_venc_pkg_sel(pic->fourcc)),
++	       venc->regs + VENC_MODE);
++
++	writel((job->intra ? VENC_PICFG0_I_VAL : VENC_PICFG0_P_VAL) |
++	       (ctx->cabac->val ? VENC_PICFG0_ENTROPY : 0),
++	       venc->regs + VENC_PICFG0);
++	writel(picfg1, venc->regs + VENC_PICFG1);
++	writel(VENC_PICFG2_VAL, venc->regs + VENC_PICFG2);
++	writel(VENC_PICFG3_VAL, venc->regs + VENC_PICFG3);
++	writel(0, venc->regs + VENC_PICFG4);
++	writel(VENC_PICFG5_VAL, venc->regs + VENC_PICFG5);
++	writel(0, venc->regs + VENC_ENCUPDATE);
++
++	writel(FIELD_PREP(VENC_IMG_WIDTH, job->coded_w - 1) |
++	       FIELD_PREP(VENC_IMG_HEIGHT, job->coded_h - 1),
++	       venc->regs + VENC_VEDIMGSIZE);
++	writel(min_t(u32, job->ring_len, VENC_PTBITS_MAX) * 8,
++	       venc->regs + VENC_PTBITS);
++
++	writel(job->slc_hdr, venc->regs + VENC_SLCHDRSTRM);
++	for (i = 1; i < VENC_SLCHDR_WORDS; i++)
++		writel(0, venc->regs + VENC_SLCHDRSTRM + 4 * i);
++	writel((job->intra ? VENC_SLCHPARA_IDR : 0) |
++	       FIELD_PREP(VENC_SLCHPARA_PARA_WD, job->para_wd) |
++	       FIELD_PREP(VENC_SLCHPARA_REORD_WD, VENC_SLCHPARA_REORD) |
++	       FIELD_PREP(VENC_SLCHPARA_MARK_WD,
++			  job->intra ? VENC_SLCHPARA_MARK_I : VENC_SLCHPARA_MARK_P),
++	       venc->regs + VENC_SLCHDRPARA);
++
++	writel(0, venc->regs + VENC_PTS0);
++	writel(VENC_TIMEOUT_VAL, venc->regs + VENC_TIMEOUT);
++	writel(VENC_OUTSTD_VAL, venc->regs + VENC_OUTSTD);
++
++	writel(job->src_y, venc->regs + VENC_SRCYADDR);
++	writel(job->src_c, venc->regs + VENC_SRCCADDR);
++	writel(0, venc->regs + VENC_SRCVADDR);
++	/*
++	 * Two pictures' worth of reconstruction, half the pair read as the reference
++	 * and the other half written: the reference's RcnIdx flip per submitted
++	 * frame.
++	 */
++	rcn_base = job->rcn +
++		(dma_addr_t)job->rcn_sel * job->rcn_frame;
++	ref_base = job->rcn +
++		(dma_addr_t)(job->rcn_sel ^ 1) * job->rcn_frame;
++	writel(rcn_base, venc->regs + VENC_RCNYADDR);
++	writel(rcn_base + (dma_addr_t)job->rcn_luma,
++	       venc->regs + VENC_RCNCADDR);
++	writel(ref_base, venc->regs + VENC_REFYADDR);
++	writel(ref_base + (dma_addr_t)job->rcn_luma,
++	       venc->regs + VENC_REFCADDR);
++
++	/*
++	 * A 4:2:2 chroma plane is full height, so its rows sit at twice the luma
++	 * stride the way the reference feeds it; the
++	 * coder still produces 4:2:0 and samples every other row.
++	 */
++	writel(FIELD_PREP(VENC_SSTRIDE_Y, pic->bytesperline) |
++	       FIELD_PREP(VENC_SSTRIDE_C,
++			  histb_venc_is_semi422(pic->fourcc) ?
++				  2 * pic->bytesperline : pic->bytesperline),
++	       venc->regs + VENC_SSTRIDE);
++	writel(FIELD_PREP(VENC_RSTRIDE_Y, stride) |
++	       FIELD_PREP(VENC_RSTRIDE_C, stride),
++	       venc->regs + VENC_RSTRIDE);
++
++	writel(strm, venc->regs + VENC_STRMADDR);
++	writel(strm - VENC_STRM_OFF, venc->regs + VENC_SRPTRADDR);
++	writel(strm - VENC_STRM_OFF + 16, venc->regs + VENC_SWPTRADDR);
++	writel(job->ring_len & VENC_STRMBUFLEN_UNIT,
++	       venc->regs + VENC_STRMBUFLEN);
++
++	writel(FIELD_PREP(VENC_MECFG0_HSW, 5) |
++	       FIELD_PREP(VENC_MECFG0_REAL_MV, 15), venc->regs + VENC_MECFG0);
++	writel(VENC_MECFG1_VAL, venc->regs + VENC_MECFG1);
++	for (i = 0; i < ARRAY_SIZE(venc_me_rect); i++)
++		writel(venc_me_rect[i], venc->regs + VENC_MERECTCFG + 4 * i);
++	writel(FIELD_PREP(VENC_METHR0_TH2, 1500), venc->regs + VENC_METHR0);
++	writel(FIELD_PREP(VENC_METHR1_INTRA, 4096), venc->regs + VENC_METHR1);
++	writel(0, venc->regs + VENC_MERDOCFG);
++	writel(VENC_CREFLDBUR8, venc->regs + VENC_CREFLDMODE);
++	writel(0x3c00 | VENC_MDCFG_RDO, venc->regs + VENC_MDCFG);	/* -1024, 1 */
++
++	writel(FIELD_PREP(VENC_QPTHR_MIN, min_qp) |
++	       FIELD_PREP(VENC_QPTHR_MAX, max_qp) |
++	       FIELD_PREP(VENC_QPTHR_START, start_qp),
++	       venc->regs + VENC_QPTHR);
++	writel(VENC_RC1_VAL, venc->regs + VENC_RC1);
++	for (i = 0; i < ARRAY_SIZE(venc_qp_delta_thr); i++)
++		writel(venc_qp_delta_thr[i],
++		       venc->regs + VENC_QPDELTATHR + 4 * i);
++	writel(target, venc->regs + VENC_TARGETBITS);
++
++	for (i = 0; i < 20; i++)
++		writel(venc_mod_lambda[2 * i] |
++		       (venc_mod_lambda[2 * i + 1] << 16),
++		       venc->regs + VENC_MODLAMBDA + 4 * i);
++
++	for (i = 0; i < VENC_PKG_BLOCK / 2; i++)
++		writel(get_unaligned_le32(&venc_scale[4 * i]),
++		       venc->regs + VENC_SCALE + 4 * i);
++
++	writel(VENC_ROICFG_VAL, venc->regs + VENC_ROICFG);
++	writel(0, venc->regs + VENC_VPP_OSD_CFG);
++
++	writel(0, venc->regs + VENC_START);
++	writel(VENC_START_RUN, venc->regs + VENC_START);
++}
++
++static void histb_venc_dump(struct histb_venc *venc, const char *when)
++{
++	dev_dbg(venc->dev, "%s: MODE %#x PICFG0 %#x SIZE %#x PTBITS %#x\n", when,
++		readl(venc->regs + VENC_MODE),
++		readl(venc->regs + VENC_PICFG0),
++		readl(venc->regs + VENC_VEDIMGSIZE),
++		readl(venc->regs + VENC_PTBITS));
++	dev_dbg(venc->dev, "%s: STRM %#x RP %#x WP %#x LEN %#x QP %#x TGT %#x\n",
++		when, readl(venc->regs + VENC_STRMADDR),
++		readl(venc->regs + VENC_SRPTRADDR),
++		readl(venc->regs + VENC_SWPTRADDR),
++		readl(venc->regs + VENC_STRMBUFLEN),
++		readl(venc->regs + VENC_QPTHR),
++		readl(venc->regs + VENC_TARGETBITS));
++	dev_dbg(venc->dev, "%s: SRCY %#x SRCC %#x RCNY %#x REFY %#x SST %#x RST %#x\n",
++		when, readl(venc->regs + VENC_SRCYADDR),
++		readl(venc->regs + VENC_SRCCADDR),
++		readl(venc->regs + VENC_RCNYADDR),
++		readl(venc->regs + VENC_REFYADDR),
++		readl(venc->regs + VENC_SSTRIDE),
++		readl(venc->regs + VENC_RSTRIDE));
++	dev_dbg(venc->dev, "%s: SLCHDR %#x PARA %#x SLCHDR7 %#x\n", when,
++		readl(venc->regs + VENC_SLCHDRSTRM),
++		readl(venc->regs + VENC_SLCHDRPARA),
++		readl(venc->regs + VENC_SLCHDRSTRM + 28));
++}
++
++static irqreturn_t histb_venc_irq(int irq, void *dev_id)
++{
++	struct histb_venc *venc = dev_id;
++	u32 state = readl(venc->regs + VENC_INTSTAT);
++
++	if (!(state & VENC_INT_JOB))
++		return IRQ_NONE;
++
++	writel(state, venc->regs + VENC_INTCLR);
++	venc->int_state = state;
++	WRITE_ONCE(venc->int_done, true);
++	wake_up(&venc->done);
++
++	return IRQ_HANDLED;
++}
++
++/* ------------------------------------------------------------------ */
++/* Encode job                                                          */
++/* ------------------------------------------------------------------ */
++
++/* A refusal travels with the job, so it is tellable by name from the log. */
++static int histb_venc_no(struct histb_venc_ctx *ctx, const char *why)
++{
++	ctx->why = why;
++	return -EINVAL;
++}
++
++static int histb_venc_stream_get(struct histb_venc_ctx *ctx, size_t want)
++{
++	size_t need = round_up(want, PAGE_SIZE);
++	void *mem;
++	dma_addr_t dma;
++
++	if (ctx->stream_alloc >= need)
++		return 0;
++
++	if (ctx->stream)
++		dma_free_coherent(ctx->venc->memdev, ctx->stream_alloc,
++				  ctx->stream, ctx->stream_dma);
++	ctx->stream = NULL;
++	ctx->stream_alloc = 0;
++
++	mem = dma_alloc_coherent(ctx->venc->memdev, need, &dma, GFP_KERNEL);
++	if (!mem)
++		return -ENOMEM;
++
++	ctx->stream = mem;
++	ctx->stream_dma = dma;
++	ctx->stream_alloc = need;
++
++	return 0;
++}
++
++/*
++ * Pull the picture out of the ring: walk the packets from the start of the data
++ * the driver queued to the offset the block reported, and copy each payload
++ * without its header block or its tail padding. The parameter sets the driver
++ * wrote itself are picked up by the same walk, so what the client is handed is
++ * one Annex-B access unit in the order the block emitted it.
++ */
++static int histb_venc_collect(struct histb_venc_ctx *ctx, size_t wp, void *dst,
++			      size_t avail, size_t *out)
++{
++	size_t off = 0, total = 0;
++	bool last = false;
++
++	while (off < wp) {
++		u8 hdr[VENC_PKG_HDR_BYTES];
++		size_t pkt, bytes;
++		u32 invld, type;
++
++		venc_ring_get(ctx, off, hdr, sizeof(hdr));
++		pkt = get_unaligned_le32(hdr + VENC_PKG_LEN);
++		invld = get_unaligned_le32(hdr + VENC_PKG_INVLD);
++		type = hdr[VENC_PKG_TYPE];
++		last = hdr[VENC_PKG_LAST];
++
++		if (pkt < VENC_PKG_HDR_BYTES || pkt % VENC_PKG_HDR_BYTES ||
++		    off + pkt > wp) {
++			ctx->why = "packet length";
++			dev_warn(ctx->venc->dev,
++				 "packet at %zu says %zu of %zu used\n", off,
++				 pkt, wp);
++			return -EIO;
++		}
++
++		bytes = pkt - VENC_PKG_HDR_BYTES;
++		if (bytes < invld) {
++			ctx->why = "packet padding";
++			return -EIO;
++		}
++		bytes -= invld;
++
++		dev_dbg(ctx->venc->dev, "packet %zu: type %u len %zu take %zu%s\n",
++			off, type, pkt, bytes, last ? " (last)" : "");
++
++		if (total + bytes > avail) {
++			ctx->why = "capture buffer";
++			return -ENOSPC;
++		}
++		venc_ring_get(ctx, off + VENC_PKG_HDR_BYTES, (u8 *)dst + total,
++			      bytes);
++		total += bytes;
++		off += pkt;
++	}
++
++	if (!total) {
++		ctx->why = "empty picture";
++		return -EIO;
++	}
++	if (!last) {
++		ctx->why = "no last packet";
++		dev_warn(ctx->venc->dev, "picture ended at %zu with no last flag\n",
++			 wp);
++		return -EIO;
++	}
++
++	*out = total;
++
++	return 0;
++}
++
++/*
++ * An imported plane is the exporter's DMA memory: whoever reads the access unit
++ * out of it is not this device, and videobuf2 does not bracket a driver's CPU
++ * use of it. So bracket it here. The vmalloc pages this driver allocates itself
++ * have no device mapping to sync, which is why the window only exists for a
++ * plane that carries a dma_buf.
++ */
++static int histb_venc_cpu_begin(struct vb2_buffer *vb,
++				enum dma_data_direction dir)
++{
++	struct dma_buf *dbuf = vb->planes[0].dbuf;
++
++	if (dbuf)
++		return dma_buf_begin_cpu_access(dbuf, dir);
++
++	return 0;
++}
++
++static void histb_venc_cpu_end(struct vb2_buffer *vb,
++			       enum dma_data_direction dir)
++{
++	struct dma_buf *dbuf = vb->planes[0].dbuf;
++
++	if (dbuf)
++		dma_buf_end_cpu_access(dbuf, dir);
++}
++
++/*
++ * Steer the next picture's start QP from what the last one actually spent.
++ * The credit bank is one second deep, which lets an I picture borrow from the
++ * surrounding pictures without letting a burst of them hold the average away
++ * from the target.
++ */
++static void histb_venc_rc_update(struct histb_venc_ctx *ctx)
++{
++	unsigned int target = histb_venc_base_target(ctx);
++	unsigned int min_qp = ctx->min_qp->val;
++	unsigned int max_qp = ctx->max_qp->val;
++	unsigned int fps = ctx->fps.numerator /
++		max_t(unsigned int, ctx->fps.denominator, 1);
++	unsigned int depth = max_t(unsigned int, fps, 1);
++	unsigned int act = readl(ctx->venc->regs + VENC_PICBITS);
++	s64 limit = (s64)target * depth;
++
++	/* A fixed window is the reference's fixed-QP mode. */
++	if (min_qp >= max_qp)
++		return;
++	if (!ctx->rc_ready) {
++		ctx->rc_qp = clamp_t(unsigned int, (min_qp + max_qp) / 2,
++				     min_qp, max_qp);
++		ctx->rc_credit = 0;
++		ctx->rc_ready = true;
++	}
++
++	ctx->rc_credit += (s64)target - act;
++	ctx->rc_credit = clamp_t(s64, ctx->rc_credit, -limit, limit);
++	/* One QP step per picture keeps the loop stable at 30 fps. */
++	if (ctx->rc_credit > (s64)target) {
++		if (ctx->rc_qp > min_qp)
++			ctx->rc_qp--;
++		ctx->rc_credit -= (s64)target;
++	} else if (ctx->rc_credit < -(s64)target) {
++		if (ctx->rc_qp < max_qp)
++			ctx->rc_qp++;
++		ctx->rc_credit += (s64)target;
++	}
++	dev_dbg(ctx->venc->dev, "rc: act %u target %u credit %lld qp %u\n",
++		act, target, ctx->rc_credit, ctx->rc_qp);
++}
++
++/*
++ * The picture the block codes is the selected rectangle, or the whole OUTPUT
++ * frame when nothing is selected. Selection is stored already macroblock
++ * aligned, so this is exact and the parameter set only trims the padding.
++ */
++static void histb_venc_coded_dims(const struct histb_venc_ctx *ctx,
++				  unsigned int *w, unsigned int *h)
++{
++	if (ctx->crop.width && ctx->crop.height) {
++		*w = ctx->crop.width;
++		*h = ctx->crop.height;
++	} else {
++		*w = ctx->out_q.width;
++		*h = ctx->out_q.height;
++	}
++}
++
++static unsigned int histb_venc_profile_idc(unsigned int profile)
++{
++	switch (profile) {
++	case V4L2_MPEG_VIDEO_H264_PROFILE_HIGH:
++		return VENC_PROFILE_HIGH;
++	case V4L2_MPEG_VIDEO_H264_PROFILE_MAIN:
++		return VENC_PROFILE_MAIN;
++	}
++	return VENC_PROFILE_IDC;
++}
++
++/*
++ * What one picture may spend. CBR spreads one second's budget evenly; VBR
++ * gives an I picture a quarter of a GOP's budget and the P pictures the rest,
++ * so the run still averages the requested rate. The steering below always
++ * compares a picture against the even share, so an I picture that spends more
++ * is paid back by the pictures after it.
++ */
++static unsigned int histb_venc_base_target(const struct histb_venc_ctx *ctx)
++{
++	u64 base;
++
++	base = div_u64((u64)ctx->bitrate->val * ctx->fps.denominator,
++		       ctx->fps.numerator ? : 1);
++
++	return max_t(u64, base, 1);
++}
++
++static unsigned int histb_venc_pic_target(const struct histb_venc_ctx *ctx,
++					  bool intra)
++{
++	unsigned int base = histb_venc_base_target(ctx);
++
++	if (!ctx->rc_mode ||
++	    ctx->rc_mode->val != V4L2_MPEG_VIDEO_BITRATE_MODE_VBR ||
++	    ctx->gop->val <= VENC_VBR_I_BUDGET)
++		return base;
++
++	if (intra)
++		return base * VENC_VBR_I_BUDGET;
++
++	return div_u64((u64)base * (ctx->gop->val - VENC_VBR_I_BUDGET),
++		       ctx->gop->val - 1);
++}
++
++static int histb_venc_run(struct histb_venc_ctx *ctx, struct vb2_buffer *src,
++			  struct vb2_buffer *dst)
++{
++	struct histb_venc *venc = ctx->venc;
++	unsigned int full_h = ctx->out_q.height;
++	unsigned int width, height;
++	size_t rcn_luma, rcn_frame, ring_len, rcn_off, total = 0;
++	u8 sps[VENC_PKG_BLOCK], pps[VENC_PKG_BLOCK];
++	struct histb_venc_job job = { 0 };
++	size_t sps_bytes, pps_bytes;
++	dma_addr_t base;
++	u32 wp;
++	bool packed, timed_out;
++	int ret;
++
++	histb_venc_coded_dims(ctx, &width, &height);
++	packed = histb_venc_is_packed(ctx->out_q.fourcc);
++	rcn_luma = (size_t)ALIGN(width, VENC_MB_ALIGN) *
++		   ALIGN(height, VENC_MB_ALIGN);
++	/* A packed picture reconstructs a full-height chroma plane. */
++	rcn_frame = packed ? 2 * rcn_luma : 3 * rcn_luma / 2;
++
++	if (histb_venc_payload_bad(src, &ctx->out_q))
++		return histb_venc_no(ctx, "picture size");
++
++	sps_bytes = histb_venc_write_sps(sps, width, height,
++					 histb_venc_profile_idc(ctx->profile->val),
++					 &ctx->fps, ctx->bitrate->val);
++	pps_bytes = histb_venc_write_pps(pps, ctx->cabac->val);
++	if (!sps_bytes || !pps_bytes)
++		return histb_venc_no(ctx, "parameter sets");
++	sps_bytes = histb_venc_escape(sps, sps_bytes);
++	pps_bytes = histb_venc_escape(pps, pps_bytes);
++	if (!sps_bytes || !pps_bytes)
++		return histb_venc_no(ctx, "parameter set escape");
++
++	/*
++	 * The ring has to hold the two parameter-set packets the driver queues
++	 * before the block is started, and it is the client's CAPTURE size: the
++	 * block wraps inside it and reports its own write offset, so a picture
++	 * larger than the room left after the parameter sets overruns them.
++	 */
++	ring_len = round_down(ctx->cap_q.size, VENC_ALIGN_BUFLEN);
++	if (ring_len <= 2 * VENC_PKG_BYTES)
++		return histb_venc_no(ctx, "capture size");
++
++	/*
++	 * STRMADDR is 64-byte aligned and sits above the two pointer words the
++	 * block and the driver share; the two reconstruction frames follow the
++	 * ring. The picture is not staged here: the block reads the client's
++	 * plane through its own dma address.
++	 */
++	rcn_off = ALIGN(VENC_STRM_OFF + ring_len, VENC_ALIGN_STREAM);
++	ret = histb_venc_stream_get(ctx, rcn_off + 2 * rcn_frame);
++	if (ret) {
++		ctx->why = "stream buffer";
++		return ret;
++	}
++
++	base = ctx->stream_dma;
++	if (base & (VENC_ALIGN_FRAME - 1))
++		return histb_venc_no(ctx, "stream alignment");
++
++	if (vb2_dma_contig_plane_dma_addr(src, 0) & (VENC_ALIGN_FRAME - 1))
++		return histb_venc_no(ctx, "picture alignment");
++
++	histb_venc_pkg_param(ctx, 0, sps, sps_bytes, VENC_NAL_SPS);
++	histb_venc_pkg_param(ctx, VENC_PKG_BYTES, pps, pps_bytes, VENC_NAL_PPS);
++
++	/* Both pointers are offsets into the ring, and the data starts at 0. */
++	put_unaligned_le32(0, ctx->stream);
++	put_unaligned_le32(2 * VENC_PKG_BYTES, (u8 *)ctx->stream + 16);
++
++	if (!ctx->profile->val && ctx->cabac->val)
++		return histb_venc_no(ctx, "baseline with CABAC");
++
++	if (ctx->force_idr && ctx->force_idr->val) {
++		ctx->force_idr->val = 0;
++		job.intra = true;
++	} else {
++		job.intra = ctx->gop->val <= 1 || !ctx->coded ||
++			    ctx->frm_in_gop >= ctx->gop->val - 1;
++	}
++	if (job.intra) {
++		ctx->frm_num = 0;
++		ctx->idr_pic_id++;
++	} else {
++		ctx->frm_num = (ctx->frm_num + 1) & 0xf;
++	}
++	venc_slc_hdr(&job.slc_hdr, &job.para_wd, job.intra, ctx->idr_pic_id,
++		     ctx->frm_num);
++	/*
++	 * The crop moves the read origin. A chroma pair covers two luma columns,
++	 * so the horizontal offset is the byte offset itself. A packed picture is
++	 * one plane of two bytes per pixel: its horizontal offset doubles and
++	 * there is no chroma plane to point at. A one-plane semi-planar picture
++	 * keeps its chroma where the layout puts it -- a full luma plane below the
++	 * luma -- with the rows of a 4:2:2 chroma plane at the luma stride, while
++	 * an M form names that origin in its own plane.
++	 */
++	job.src_y = vb2_dma_contig_plane_dma_addr(src, 0) +
++		    (dma_addr_t)ctx->crop.left * (packed ? 2 : 1) +
++		    (dma_addr_t)ctx->out_q.bytesperline * ctx->crop.top;
++	if (packed) {
++		job.src_c = 0;
++	} else {
++		dma_addr_t chroma =
++			vb2_dma_contig_plane_dma_addr(src,
++						      ctx->out_q.planes - 1);
++		bool semi422 = histb_venc_is_semi422(ctx->out_q.fourcc);
++
++		job.src_c = chroma + ctx->crop.left +
++			    (dma_addr_t)ctx->out_q.bytesperline *
++				    (semi422 ? ctx->crop.top : ctx->crop.top / 2);
++		if (ctx->out_q.planes == 1)
++			job.src_c += (dma_addr_t)ctx->out_q.bytesperline *
++				     full_h;
++	}
++	job.coded_w = width;
++	job.coded_h = height;
++	job.rcn = base + rcn_off;
++	job.rcn_sel = ctx->rcn_sel;
++	ctx->last_intra = job.intra;
++	job.strm_off = VENC_STRM_OFF;
++	job.ring_len = ring_len;
++	job.rcn_luma = rcn_luma;
++	job.rcn_frame = rcn_frame;
++
++	venc->int_state = 0;
++	WRITE_ONCE(venc->int_done, false);
++	histb_venc_program(venc, ctx, &job);
++	histb_venc_dump(venc, "want");
++
++	timed_out = !wait_event_timeout(venc->done, READ_ONCE(venc->int_done),
++					VENC_JOB_TIMEOUT);
++	/*
++	 * A block that never reported is still coding, so it is stopped here rather than
++	 * left writing into a ring the next job is about to re programme. The
++	 * reference's timeout interrupt (Venc_ISR_TimeOut) does the same pulse.
++	 */
++	if (timed_out) {
++		dev_warn(venc->dev, "encode timed out (RAWINT %#x START %#x)\n",
++			 readl(venc->regs + VENC_RAWINT),
++			 readl(venc->regs + VENC_START));
++		histb_venc_reset(venc);
++		return -ETIMEDOUT;
++	}
++
++	if (venc->int_state & VENC_INT_CFG_ERR) {
++		dev_warn(venc->dev, "configuration error (INT %#x)\n",
++			 venc->int_state);
++		histb_venc_reset(venc);
++		return -EIO;
++	}
++
++	if (venc->int_state & (VENC_INT_BUF_FULL | VENC_INT_PBIT)) {
++		dev_info(venc->dev, "stream full or over budget: capture %u is too small (INT "
++			 "%#x)\n",
++			 ctx->cap_q.size, venc->int_state);
++		/* The block may still be draining into the ring: stop it before
++		 * the next job repurposes that memory.
++		 */
++		histb_venc_reset(venc);
++		return -ENOSPC;
++	}
++
++	/* Any other report but the end of the picture is an unfinished block. */
++	if (!(venc->int_state & VENC_INT_EOP)) {
++		dev_warn(venc->dev, "no end of picture (INT %#x)\n",
++			 venc->int_state);
++		histb_venc_reset(venc);
++		return -EIO;
++	}
++
++	/*
++	 * The block's own report is the write word below STRMADDR: the offset in
++	 * the ring it stopped at. Anything below what the driver queued there
++	 * means the picture wrapped, and the parameter sets at the front of the
++	 * ring are gone.
++	 */
++	wp = get_unaligned_le32((u8 *)ctx->stream + 16);
++	if (!wp || wp > ring_len || wp < 2 * VENC_PKG_BYTES) {
++		ctx->why = "write pointer";
++		dev_warn(venc->dev, "write pointer %#x of ring %zu\n", wp,
++			 ring_len);
++		return -ENOSPC;
++	}
++
++	ret = histb_venc_cpu_begin(dst, DMA_TO_DEVICE);
++	if (ret) {
++		ctx->why = "capture cpu access";
++		return ret;
++	}
++	ret = histb_venc_collect(ctx, wp, vb2_plane_vaddr(dst, 0),
++				 dst->planes[0].length, &total);
++	histb_venc_cpu_end(dst, DMA_TO_DEVICE);
++	if (ret)
++		return ret;
++
++	/*
++	 * The group's position and the reference pair only advance once the picture is
++	 * handed over; a job that failed is retried against the same reference, as the
++	 * reference driver rolls its counters back when it drops a frame.
++	 */
++	ctx->frm_in_gop = job.intra ? 0 : ctx->frm_in_gop + 1;
++	ctx->rcn_sel ^= 1;
++	ctx->coded = true;
++
++	vb2_set_plane_payload(dst, 0, total);
++	histb_venc_rc_update(ctx);
++	dev_dbg(venc->dev, "encoded %ux%u q %u-%u -> %zu bytes\n", width, height,
++		ctx->min_qp->val, ctx->max_qp->val, total);
++	dev_dbg(venc->dev, "act:  PICBITS %#x MEANQP %#x INT %#x\n",
++		readl(venc->regs + VENC_PICBITS),
++		readl(venc->regs + VENC_MEANQP), venc->int_state);
++	histb_venc_dump(venc, "act");
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* mem2mem                                                             */
++/* ------------------------------------------------------------------ */
++
++/* The end of a drained stream is said twice: in a buffer and as an event. */
++static const struct v4l2_event histb_venc_eos_event = {
++	.type = V4L2_EVENT_EOS,
++};
++
++static void histb_venc_device_run(void *priv)
++{
++	struct histb_venc_ctx *ctx = priv;
++	struct histb_venc *venc = ctx->venc;
++	struct vb2_v4l2_buffer *src, *dst;
++	enum vb2_buffer_state state;
++	int ret;
++
++	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
++	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	if (!src || !dst) {
++		v4l2_m2m_job_finish(venc->m2m_dev, ctx->fh.m2m_ctx);
++		return;
++	}
++
++	if (READ_ONCE(venc->removing)) {
++		/*
++		 * v4l2_m2m_suspend() waits for the current context only, so a job
++		 * can still be scheduled while remove() runs. Hand the buffers back
++		 * as errors: a client that gets no completion waits forever.
++		 */
++		v4l2_m2m_buf_done_and_job_finish(venc->m2m_dev, ctx->fh.m2m_ctx,
++						 VB2_BUF_STATE_ERROR);
++		return;
++	}
++
++	v4l2_m2m_buf_copy_metadata(src, dst);
++	/* This driver never holds a CAPTURE buffer across jobs. */
++	src->flags &= ~V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF;
++
++	ret = pm_runtime_resume_and_get(venc->dev);
++	if (ret) {
++		v4l2_m2m_buf_done_and_job_finish(venc->m2m_dev,
++						 ctx->fh.m2m_ctx,
++						 VB2_BUF_STATE_ERROR);
++		return;
++	}
++	mutex_lock(&venc->hw_lock);
++	ret = histb_venc_run(ctx, &src->vb2_buf, &dst->vb2_buf);
++	mutex_unlock(&venc->hw_lock);
++	pm_runtime_put_autosuspend(venc->dev);
++
++	if (ret)
++		dev_dbg(venc->dev, "job refused: %d (%s)\n", ret,
++			ctx->why ? : "unspecified");
++	ctx->why = NULL;
++
++	state = ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
++	/* The client needs the picture type without parsing the bitstream. */
++	if (!ret) {
++		dst->flags |= ctx->last_intra ? V4L2_BUF_FLAG_KEYFRAME :
++					       V4L2_BUF_FLAG_PFRAME;
++		dst->sequence = ctx->sequence++;
++		/* The picture that completes the drain carries the end marker. */
++		if (v4l2_m2m_is_last_draining_src_buf(ctx->fh.m2m_ctx, src)) {
++			dst->flags |= V4L2_BUF_FLAG_LAST;
++			v4l2_event_queue_fh(&ctx->fh, &histb_venc_eos_event);
++			v4l2_m2m_mark_stopped(ctx->fh.m2m_ctx);
++		}
++	}
++	v4l2_m2m_buf_done_and_job_finish(venc->m2m_dev, ctx->fh.m2m_ctx, state);
++}
++
++/*
++ * No job_abort(): device_run() is synchronous and leaves both buffers on the
++ * ready lists until it completes, so an abort request from VIDIOC_STREAMOFF or
++ * close only has to wait for the job already in flight to finish itself.
++ */
++static const struct v4l2_m2m_ops histb_venc_m2m_ops = {
++	.device_run = histb_venc_device_run,
++};
++
++/* ------------------------------------------------------------------ */
++/* vb2                                                                 */
++/* ------------------------------------------------------------------ */
++
++static int histb_venc_queue_setup(struct vb2_queue *vq, unsigned int *num_buffers,
++				  unsigned int *num_planes, unsigned int sizes[],
++				  struct device *alloc_devs[])
++{
++	struct histb_venc_ctx *ctx = vq->drv_priv;
++	const struct histb_venc_q *q = V4L2_TYPE_IS_OUTPUT(vq->type) ?
++				       &ctx->out_q : &ctx->cap_q;
++	unsigned int p;
++
++	/* Both queues describe themselves, so a buffer cannot be sized before
++	 * the format is set.
++	 */
++	if (!q->size)
++		return -EINVAL;
++
++	if (*num_planes) {
++		if (*num_planes != q->planes)
++			return -EINVAL;
++		for (p = 0; p < q->planes; p++)
++			if (sizes[p] < q->plane_size[p])
++				return -EINVAL;
++		return 0;
++	}
++
++	*num_planes = q->planes;
++	for (p = 0; p < q->planes; p++)
++		sizes[p] = q->plane_size[p];
++
++	return 0;
++}
++
++static int histb_venc_buf_prepare(struct vb2_buffer *vb)
++{
++	struct histb_venc_ctx *ctx = vb->vb2_queue->drv_priv;
++	unsigned int i;
++
++	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type)) {
++		if (histb_venc_payload_bad(vb, &ctx->out_q))
++			return -EINVAL;
++
++		/*
++		 * The block is handed the frame origin in one 32-bit register
++		 * (VENC_SRCYADDR and friends), so every plane it reads has to end
++		 * below 4 GiB. This device's DMA mask keeps its own allocations
++		 * inside that window; an imported plane is checked here rather
++		 * than trusted.
++		 */
++		for (i = 0; i < vb->num_planes; i++) {
++			dma_addr_t dma = vb2_dma_contig_plane_dma_addr(vb, i);
++
++			if ((u64)dma + vb2_plane_size(vb, i) - 1 >
++			    DMA_BIT_MASK(32))
++				return -ERANGE;
++		}
++
++		return 0;
++	}
++
++	if (vb->planes[0].length < ctx->cap_q.size)
++		return -EINVAL;
++	/* The payload says how short the bitstream really was, once it is out. */
++	vb2_set_plane_payload(vb, 0, 0);
++
++	return 0;
++}
++
++static int histb_venc_subscribe_event(struct v4l2_fh *fh,
++				      const struct v4l2_event_subscription *sub)
++{
++	if (sub->type == V4L2_EVENT_EOS)
++		return v4l2_event_subscribe(fh, sub, 0, NULL);
++
++	return v4l2_ctrl_subscribe_event(fh, sub);
++}
++
++static void histb_venc_buf_queue(struct vb2_buffer *vb)
++{
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	struct histb_venc_ctx *ctx = vb->vb2_queue->drv_priv;
++	unsigned int i;
++
++	/*
++	 * A drain asked for while no capture buffer was queued has no picture to
++	 * put the end marker on, so the first one the client offers after it is
++	 * the marker itself: no bytes, the LAST flag, and the session stopped.
++	 * Without this the empty drain would have no end.
++	 */
++	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
++	    vb2_is_streaming(vb->vb2_queue) &&
++	    v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx)) {
++		for (i = 0; i < vb->num_planes; i++)
++			vb2_set_plane_payload(vb, i, 0);
++		vbuf->field = V4L2_FIELD_NONE;
++		v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, vbuf);
++		v4l2_event_queue_fh(&ctx->fh, &histb_venc_eos_event);
++		return;
++	}
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
++}
++
++static int histb_venc_start_streaming(struct vb2_queue *vq, unsigned int count)
++{
++	struct histb_venc_ctx *ctx = vq->drv_priv;
++
++	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
++		/* The opening IDR is the most expensive picture of the stream;
++		 * start it in the middle of the window, not at its best end. */
++		ctx->rc_qp = clamp_t(unsigned int,
++				     (ctx->min_qp->val + ctx->max_qp->val) / 2,
++				     ctx->min_qp->val, ctx->max_qp->val);
++		ctx->rc_ready = true;
++		ctx->rc_credit = 0;
++		/*
++		 * Streaming OUTPUT again is a new stream, not the tail of the
++		 * drained one: the group position, the frame numbering and the
++		 * opening IDR all start over.
++		 */
++		ctx->coded = false;
++		ctx->last_intra = false;
++		ctx->frm_in_gop = 0;
++		ctx->frm_num = 0;
++		ctx->idr_pic_id = 0;
++		ctx->sequence = 0;
++	}
++	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, vq);
++
++	return 0;
++}
++
++static void histb_venc_stop_streaming(struct vb2_queue *vq)
++{
++	struct histb_venc_ctx *ctx = vq->drv_priv;
++	struct vb2_v4l2_buffer *buf;
++
++	do {
++		buf = V4L2_TYPE_IS_OUTPUT(vq->type) ?
++		      v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx) :
++		      v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++		if (buf)
++			v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
++	} while (buf);
++
++	/*
++	 * A drain that had not finished still owes its caller the end marker,
++	 * and the capture queue's own teardown clears the whole session state.
++	 */
++	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, vq);
++}
++
++static const struct vb2_ops histb_venc_vb2_ops = {
++	.queue_setup = histb_venc_queue_setup,
++	.buf_prepare = histb_venc_buf_prepare,
++	.buf_queue = histb_venc_buf_queue,
++	.start_streaming = histb_venc_start_streaming,
++	.stop_streaming = histb_venc_stop_streaming,
++};
++
++/* ------------------------------------------------------------------ */
++/* Format ioctls                                                       */
++/* ------------------------------------------------------------------ */
++
++static int histb_venc_querycap(struct file *file, void *priv,
++			       struct v4l2_capability *cap)
++{
++	struct histb_venc *venc = video_get_drvdata(video_devdata(file));
++
++	strscpy(cap->driver, HISTB_VENC_NAME, sizeof(cap->driver));
++	strscpy(cap->card, HISTB_VENC_NAME, sizeof(cap->card));
++	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
++		 dev_name(venc->dev));
++
++	return 0;
++}
++
++static int histb_venc_enum_fmt_cap(struct file *file, void *priv,
++				  struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++
++	f->pixelformat = V4L2_PIX_FMT_H264;
++
++	return 0;
++}
++
++static int histb_venc_enum_fmt_out(struct file *file, void *priv,
++				   struct v4l2_fmtdesc *f)
++{
++	if (f->index >= ARRAY_SIZE(histb_venc_out_fmts))
++		return -EINVAL;
++
++	f->pixelformat = histb_venc_out_fmts[f->index];
++
++	return 0;
++}
++
++static bool histb_venc_is_out_fmt(u32 fourcc)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(histb_venc_out_fmts); i++)
++		if (histb_venc_out_fmts[i] == fourcc)
++			return true;
++
++	return false;
++}
++
++/*
++ * The reference gates sizes to a multiple of four within 176x144..1920x1088, so
++ * a picture that is not a whole number of macroblocks is coded with the padding
++ * columns and rows and cropped back by the parameter set. Both stride fields are
++ * 16 bits wide, and the chroma pair plane follows the luma at one stride per
++ * half-height row -- the same stride for both planes, which is why an M form
++ * only moves the chroma origin and needs no other layout change.
++ */
++static int histb_venc_out_geom(struct v4l2_pix_format_mplane *pix,
++			       struct histb_venc_q *q)
++{
++	unsigned int width = round_down(pix->width, VENC_DIM_ALIGN);
++	unsigned int height = round_down(pix->height, VENC_DIM_ALIGN);
++	unsigned int bpl, luma;
++
++	if (!histb_venc_is_out_fmt(pix->pixelformat))
++		return -EINVAL;
++	if (width < VENC_MIN_WIDTH || width > VENC_MAX_WIDTH ||
++	    height < VENC_MIN_HEIGHT || height > VENC_MAX_HEIGHT)
++		return -EINVAL;
++
++	/* The block reads at its macroblock stride, so that is what G_FMT says.
++	 * A packed pair doubles it: one row of two bytes per pixel.
++	 */
++	bpl = ALIGN(width, VENC_MB_ALIGN) *
++	      (histb_venc_is_packed(pix->pixelformat) ? 2 : 1);
++	if (bpl > U16_MAX)
++		return -EINVAL;
++
++	luma = bpl * height;
++	q->fourcc = pix->pixelformat;
++	q->width = width;
++	q->height = height;
++	q->bytesperline = bpl;
++	q->planes = histb_venc_is_m_fmt(pix->pixelformat) ? 2 : 1;
++	q->size = histb_venc_is_packed(pix->pixelformat) ? luma :
++		  histb_venc_is_semi422(pix->pixelformat) ? luma * 2 :
++							    luma * 3 / 2;
++	q->plane_size[0] = q->planes == 2 ? luma : q->size;
++	q->plane_size[1] = q->planes == 2 ? luma / 2 : 0;
++	histb_venc_fill_pix(pix, q);
++
++	return 0;
++}
++
++/*
++ * The ring the block writes is what the client is willing to accept, and the
++ * picture it belongs to is the one the OUTPUT queue describes. The default is
++ * the raw picture size, which is far above what an intra frame spends.
++ */
++static int histb_venc_cap_geom(const struct histb_venc_ctx *ctx,
++			       struct v4l2_pix_format_mplane *pix,
++			       struct histb_venc_q *q)
++{
++	const struct histb_venc_q *out = &ctx->out_q;
++	unsigned int cw, ch, size;
++
++	if (pix->pixelformat != V4L2_PIX_FMT_H264)
++		return -EINVAL;
++	if (!out->size)
++		return -EINVAL;
++
++	histb_venc_coded_dims(ctx, &cw, &ch);
++	size = clamp(pix->plane_fmt[0].sizeimage ? :
++		     max_t(unsigned int, out->size, VENC_MIN_STREAM_SIZE),
++		     (unsigned int)VENC_MIN_STREAM_SIZE,
++		     (unsigned int)VENC_MAX_STREAM_SIZE);
++
++	q->fourcc = pix->pixelformat;
++	q->width = cw;
++	q->height = ch;
++	q->bytesperline = 0;
++	q->size = round_up(size, VENC_ALIGN_BUFLEN);
++	q->planes = 1;
++	q->plane_size[0] = q->size;
++	q->plane_size[1] = 0;
++	histb_venc_fill_pix(pix, q);
++
++	return 0;
++}
++
++static int histb_venc_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct histb_venc_ctx *ctx = file_to_ctx(file);
++	const struct histb_venc_q *q = V4L2_TYPE_IS_OUTPUT(f->type) ?
++				       &ctx->out_q : &ctx->cap_q;
++
++	if (f->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
++	    f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
++		return -EINVAL;
++
++	histb_venc_fill_pix(&f->fmt.pix_mp, q);
++
++	return 0;
++}
++
++static int histb_venc_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct histb_venc_ctx *ctx = file_to_ctx(file);
++	struct histb_venc_q q;
++	struct vb2_queue *vq;
++	int ret;
++
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
++	if (!vq)
++		return -EINVAL;
++	if (vb2_is_busy(vq))
++		return -EBUSY;
++
++	/*
++	 * The two queues are set independently, as on the decoder side: the
++	 * picture geometry comes from OUTPUT and the ring bound from CAPTURE, and
++	 * a CAPTURE format before an OUTPUT one is refused rather than guessed at.
++	 */
++	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++		struct v4l2_pix_format_mplane cap = { 0 };
++
++		ret = histb_venc_out_geom(&f->fmt.pix_mp, &q);
++		if (ret)
++			return ret;
++		ctx->out_q = q;
++		/* A new geometry invalidates a selection made against the old one. */
++		ctx->crop = (struct v4l2_rect){ 0 };
++		/*
++		 * The bitstream queue describes the same picture, so a new
++		 * geometry re-derives it; what the client asked for as the bound
++		 * carries over, being the one thing the picture does not dictate.
++		 */
++		cap.pixelformat = V4L2_PIX_FMT_H264;
++		cap.plane_fmt[0].sizeimage = ctx->cap_q.size;
++
++		return histb_venc_cap_geom(ctx, &cap, &ctx->cap_q);
++	}
++
++	ret = histb_venc_cap_geom(ctx, &f->fmt.pix_mp, &q);
++	if (!ret)
++		ctx->cap_q = q;
++
++	return ret;
++}
++
++static int histb_venc_try_fmt(struct file *file, void *priv,
++			      struct v4l2_format *f)
++{
++	struct histb_venc_ctx *ctx = file_to_ctx(file);
++	struct histb_venc_q q;
++
++	if (V4L2_TYPE_IS_OUTPUT(f->type))
++		return histb_venc_out_geom(&f->fmt.pix_mp, &q);
++	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
++		return -EINVAL;
++
++	return histb_venc_cap_geom(ctx, &f->fmt.pix_mp, &q);
++}
++
++static int histb_venc_g_parm(struct file *file, void *priv,
++			      struct v4l2_streamparm *p)
++{
++	struct histb_venc_ctx *ctx = file_to_ctx(file);
++
++	p->parm.capture.timeperframe.numerator = ctx->fps.denominator;
++	p->parm.capture.timeperframe.denominator = ctx->fps.numerator;
++	return 0;
++}
++
++static int histb_venc_s_parm(struct file *file, void *priv,
++			      struct v4l2_streamparm *p)
++{
++	struct histb_venc_ctx *ctx = file_to_ctx(file);
++	struct v4l2_fract f = p->parm.capture.timeperframe;
++	struct v4l2_fract fps;
++
++	if (!f.numerator || !f.denominator)
++		return -EINVAL;
++
++	/*
++	 * The capture interface speaks seconds per frame while the bit budget
++	 * and the SPS timing both divide by a frame rate, so the accepted
++	 * interval is stored inverted.
++	 */
++	fps.numerator = f.denominator;
++	fps.denominator = f.numerator;
++	if (fps.numerator / fps.denominator < 1 ||
++	    fps.numerator / fps.denominator > 240)
++		return -EINVAL;
++	ctx->fps = fps;
++	return 0;
++}
++
++static int histb_venc_g_selection(struct file *file, void *priv,
++				  struct v4l2_selection *s)
++{
++	struct histb_venc_ctx *ctx = file_to_ctx(file);
++	struct v4l2_rect full = { 0, 0, ctx->out_q.width, ctx->out_q.height };
++
++	/* The core hands selection ioctls the plain buffer type, whatever the
++	 * client asked for (v4l_s_selection), so this queue is named that way.
++	 */
++	if (s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
++		return -EINVAL;
++
++	switch (s->target) {
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++		s->r = (ctx->crop.width && ctx->crop.height) ? ctx->crop : full;
++		break;
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		s->r = full;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int histb_venc_s_selection(struct file *file, void *priv,
++				  struct v4l2_selection *s)
++{
++	struct histb_venc_ctx *ctx = file_to_ctx(file);
++	struct vb2_queue *vq;
++	struct v4l2_rect r = s->r;
++
++	/* The core hands selection ioctls the plain buffer type, whatever the
++	 * client asked for (v4l_s_selection), so this queue is named that way.
++	 */
++	if (s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT ||
++	    s->target != V4L2_SEL_TGT_CROP)
++		return -EINVAL;
++	if (!ctx->out_q.width || !ctx->out_q.height)
++		return -EINVAL;
++
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, s->type);
++	if (!vq)
++		return -EINVAL;
++	if (vb2_is_busy(vq))
++		return -EBUSY;
++
++	/*
++	 * The block walks the source in whole macroblocks, so the origin is
++	 * macroblock-aligned and the extent rounded down to one. The coded size is
++	 * this rectangle, which the parameter set still trims when it is not a
++	 * whole number of macroblocks.
++	 */
++	if (r.left < 0 || r.top < 0)
++		return -EINVAL;
++	r.left = round_down(r.left, VENC_MB_ALIGN);
++	r.top = round_down(r.top, VENC_MB_ALIGN);
++	r.width = round_down(r.width, VENC_MB_ALIGN);
++	r.height = round_down(r.height, VENC_MB_ALIGN);
++	if (r.width < VENC_MIN_WIDTH || r.height < VENC_MIN_HEIGHT ||
++	    r.left + r.width > ctx->out_q.width ||
++	    r.top + r.height > ctx->out_q.height)
++		return -EINVAL;
++
++	if (!r.left && !r.top && r.width == ctx->out_q.width &&
++	    r.height == ctx->out_q.height)
++		ctx->crop = (struct v4l2_rect){ 0 };
++	else
++		ctx->crop = r;
++	s->r = r;
++
++	return 0;
++}
++
++/*
++ * The mem2m core owns the drain state: STOP records the last output buffer,
++ * or - when none is queued - asks for the next capture buffer to be the end
++ * marker, and START clears the stopped state so the same stream runs on. The
++ * picture that carries the marker is tagged where it completes, and the queue
++ * left empty afterwards is answered in the capture buffer's own queue
++ * callback.
++ */
++static int histb_venc_encoder_cmd(struct file *file, void *priv,
++				  struct v4l2_encoder_cmd *cmd)
++{
++	struct histb_venc_ctx *ctx = file_to_ctx(file);
++	int ret;
++
++	ret = v4l2_m2m_encoder_cmd(file, ctx->fh.m2m_ctx, cmd);
++	/*
++	 * A drain with nothing left to code is finished by the core inside this
++	 * call, marker buffer and all, so the end of stream has to be said here:
++	 * a session that codes no further picture never reaches the completion
++	 * path that announces it.
++	 */
++	if (!ret && cmd->cmd == V4L2_ENC_CMD_STOP &&
++	    v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
++		v4l2_event_queue_fh(&ctx->fh, &histb_venc_eos_event);
++
++	return ret;
++}
++
++static const struct v4l2_ioctl_ops histb_venc_ioctl_ops = {
++	.vidioc_querycap = histb_venc_querycap,
++	.vidioc_enum_fmt_vid_cap = histb_venc_enum_fmt_cap,
++	.vidioc_enum_fmt_vid_out = histb_venc_enum_fmt_out,
++	.vidioc_g_fmt_vid_cap_mplane = histb_venc_g_fmt,
++	.vidioc_g_fmt_vid_out_mplane = histb_venc_g_fmt,
++	.vidioc_s_fmt_vid_cap_mplane = histb_venc_s_fmt,
++	.vidioc_s_fmt_vid_out_mplane = histb_venc_s_fmt,
++	.vidioc_try_fmt_vid_cap_mplane = histb_venc_try_fmt,
++	.vidioc_try_fmt_vid_out_mplane = histb_venc_try_fmt,
++	.vidioc_g_selection = histb_venc_g_selection,
++	.vidioc_s_selection = histb_venc_s_selection,
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++	.vidioc_encoder_cmd = histb_venc_encoder_cmd,
++	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
++	.vidioc_g_parm = histb_venc_g_parm,
++	.vidioc_s_parm = histb_venc_s_parm,
++	.vidioc_log_status = v4l2_ctrl_log_status,
++	.vidioc_subscribe_event = histb_venc_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++/* ------------------------------------------------------------------ */
++/* File handles and device                                             */
++/* ------------------------------------------------------------------ */
++
++static int histb_venc_queue_init(void *priv, struct vb2_queue *src_vq,
++				 struct vb2_queue *dst_vq);
++
++static int histb_venc_open(struct file *file)
++{
++	struct histb_venc *venc = video_drvdata(file);
++	struct histb_venc_ctx *ctx;
++	struct v4l2_ctrl *min_qp, *max_qp, *bitrate, *gop_ctrl, *force_idr;
++	struct v4l2_ctrl *profile, *rc_mode, *cabac, *slice_mode, *slice_bytes;
++	int ret;
++
++	ctx = kzalloc_obj(*ctx);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->venc = venc;
++	ctx->fps.numerator = 30;
++	ctx->fps.denominator = 1;
++	/* Both queues have one format each; the geometry is filled in by S_FMT. */
++	ctx->out_q.fourcc = histb_venc_out_fmts[0];
++	ctx->cap_q.fourcc = V4L2_PIX_FMT_H264;
++
++	v4l2_fh_init(&ctx->fh, video_devdata(file));
++	v4l2_ctrl_handler_init(&ctx->ctrl_hdl, 10);
++	/*
++	 * The quantiser window is the one control this block has no equivalent of:
++	 * the pair is clamped into the QP range the register file gives, and the
++	 * target-bits register is derived from the bit rate the client names.
++	 */
++	min_qp = v4l2_ctrl_new_std(&ctx->ctrl_hdl, NULL,
++				   V4L2_CID_MPEG_VIDEO_H264_MIN_QP, VENC_QP_MIN,
++				   VENC_QP_MAX, 1, VENC_QP_DEFAULT);
++	max_qp = v4l2_ctrl_new_std(&ctx->ctrl_hdl, NULL,
++				   V4L2_CID_MPEG_VIDEO_H264_MAX_QP, VENC_QP_MIN,
++				   VENC_QP_MAX, 1, VENC_QP_DEFAULT);
++	bitrate = v4l2_ctrl_new_std(&ctx->ctrl_hdl, NULL,
++				    V4L2_CID_MPEG_VIDEO_BITRATE, 0,
++				    100000000, 1000, VENC_BITRATE_DEFAULT);
++	/*
++	 * Both modes keep the same average; the difference is the per-picture
++	 * budget, which VBR tilts towards the I picture. Constant quality needs
++	 * per-picture-type quantisers the block cannot carry, so that mode is
++	 * masked out rather than offered as a no-op.
++	 */
++	rc_mode = v4l2_ctrl_new_std_menu(&ctx->ctrl_hdl, NULL,
++					 V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
++					 V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
++					 BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ),
++					 V4L2_MPEG_VIDEO_BITRATE_MODE_CBR);
++	gop_ctrl = v4l2_ctrl_new_std(&ctx->ctrl_hdl, NULL,
++				     V4L2_CID_MPEG_VIDEO_GOP_SIZE, 1, 300, 1,
++				     VENC_DEFAULT_GOP);
++	force_idr = v4l2_ctrl_new_std(&ctx->ctrl_hdl, NULL,
++				      V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
++				      0, 0, 0, 0);
++	profile = v4l2_ctrl_new_std_menu(&ctx->ctrl_hdl, NULL,
++					 V4L2_CID_MPEG_VIDEO_H264_PROFILE,
++					 V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
++					 BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE) |
++					 BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED),
++					 V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE);
++	cabac = v4l2_ctrl_new_std_menu(&ctx->ctrl_hdl, NULL,
++				       V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE,
++				       V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC,
++				       0,
++				       V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CAVLC);
++	/*
++	 * The block splits by byte count, so only the byte-sized form of the
++	 * standard multi-slice control is offered; the MB form is masked out.
++	 */
++	slice_mode = v4l2_ctrl_new_std_menu(&ctx->ctrl_hdl, NULL,
++					    V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MODE,
++					    V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_MAX_BYTES,
++					    BIT(V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_MAX_MB),
++					    V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_SINGLE);
++	slice_bytes = v4l2_ctrl_new_std(&ctx->ctrl_hdl, NULL,
++					V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MAX_BYTES,
++					512, 65535, 1, 1024);
++	if (ctx->ctrl_hdl.error) {
++		ret = ctx->ctrl_hdl.error;
++		v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++		v4l2_fh_exit(&ctx->fh);
++		kfree(ctx);
++		return ret;
++	}
++	ctx->min_qp = min_qp;
++	ctx->gop = gop_ctrl;
++	ctx->force_idr = force_idr;
++	ctx->profile = profile;
++	ctx->rc_mode = rc_mode;
++	ctx->cabac = cabac;
++	ctx->slice_mode = slice_mode;
++	ctx->slice_bytes = slice_bytes;
++	ctx->max_qp = max_qp;
++	ctx->bitrate = bitrate;
++	ctx->fh.ctrl_handler = &ctx->ctrl_hdl;
++
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(venc->m2m_dev, ctx,
++					    histb_venc_queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++		v4l2_fh_exit(&ctx->fh);
++		kfree(ctx);
++		return ret;
++	}
++
++	v4l2_fh_add(&ctx->fh, file);
++
++	return 0;
++}
++
++static int histb_venc_release(struct file *file)
++{
++	struct histb_venc *venc = video_drvdata(file);
++	struct v4l2_fh *fh = file->private_data;
++	struct histb_venc_ctx *ctx = container_of(fh, struct histb_venc_ctx, fh);
++
++	mutex_lock(&venc->vdev_lock);
++	v4l2_fh_del(fh, file);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	v4l2_fh_exit(fh);
++	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++	if (ctx->stream)
++		dma_free_coherent(venc->memdev, ctx->stream_alloc, ctx->stream,
++				  ctx->stream_dma);
++	mutex_unlock(&venc->vdev_lock);
++	kfree(ctx);
++
++	return 0;
++}
++
++static const struct v4l2_file_operations histb_venc_fops = {
++	.owner = THIS_MODULE,
++	.open = histb_venc_open,
++	.release = histb_venc_release,
++	.poll = v4l2_m2m_fop_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = v4l2_m2m_fop_mmap,
++};
++
++static int histb_venc_queue_init(void *priv, struct vb2_queue *src_vq,
++				 struct vb2_queue *dst_vq)
++{
++	struct histb_venc_ctx *ctx = priv;
++	unsigned int i;
++	struct vb2_queue *vq[2];
++	int ret;
++
++	/* Both queues hold a full picture per buffer, so nothing is shared. */
++	vq[0] = src_vq;
++	vq[1] = dst_vq;
++	for (i = 0; i < ARRAY_SIZE(vq); i++) {
++		vq[i]->io_modes = VB2_MMAP | VB2_DMABUF;
++		vq[i]->drv_priv = ctx;
++		vq[i]->ops = &histb_venc_vb2_ops;
++		vq[i]->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++		vq[i]->min_queued_buffers = 1;
++		vq[i]->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++		vq[i]->lock = &ctx->venc->vdev_lock;
++		vq[i]->dev = ctx->venc->memdev;
++	}
++	/*
++	 * The block reads the picture through its own dma address, so the OUTPUT
++	 * queue holds DMA memory; the bitstream is copied out of the ring by the
++	 * driver, so CAPTURE is a plain vmalloc queue. Neither run path asks for
++	 * a kernel mapping of a plane it does not own.
++	 */
++	src_vq->mem_ops = &vb2_dma_contig_memops;
++	dst_vq->mem_ops = &vb2_vmalloc_memops;
++	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++
++	ret = vb2_queue_init(src_vq);
++	if (ret)
++		return ret;
++
++	return vb2_queue_init(dst_vq);
++}
++
++/* ------------------------------------------------------------------ */
++/* Platform device                                                     */
++/* ------------------------------------------------------------------ */
++
++static void histb_venc_v4l2_release(struct v4l2_device *v4l2_dev)
++{
++	struct histb_venc *venc = container_of(v4l2_dev, struct histb_venc, v4l2_dev);
++
++	v4l2_device_unregister(v4l2_dev);
++	if (venc->m2m_dev)
++		v4l2_m2m_release(venc->m2m_dev);
++	put_device(venc->memdev);
++	kfree(venc);
++}
++
++static void histb_venc_v4l2_put(void *data)
++{
++	struct histb_venc *venc = data;
++
++	v4l2_device_put(&venc->v4l2_dev);
++}
++
++int histb_venc_v2_probe(struct platform_device *pdev)
++{
++	struct platform_device *mem;
++	struct histb_venc *venc;
++	struct video_device *vdev;
++	int ret, irq;
++
++	venc = kzalloc_obj(*venc);
++	if (!venc)
++		return -ENOMEM;
++
++	ret = v4l2_device_register(&pdev->dev, &venc->v4l2_dev);
++	if (ret) {
++		kfree(venc);
++		return ret;
++	}
++	venc->v4l2_dev.release = histb_venc_v4l2_release;
++	ret = devm_add_action_or_reset(&pdev->dev, histb_venc_v4l2_put, venc);
++	if (ret)
++		return ret;
++
++	venc->dev = &pdev->dev;
++	platform_set_drvdata(pdev, venc);
++	mutex_init(&venc->hw_lock);
++	mutex_init(&venc->vdev_lock);
++	init_waitqueue_head(&venc->done);
++
++	venc->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(venc->regs))
++		return PTR_ERR(venc->regs);
++
++	venc->clk = devm_clk_get(&pdev->dev, "venc");
++	if (IS_ERR(venc->clk))
++		return dev_err_probe(&pdev->dev, PTR_ERR(venc->clk),
++				     "no clock\n");
++
++	ret = clk_prepare_enable(venc->clk);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret, "cannot enable clock\n");
++
++	venc->rst = devm_reset_control_get_exclusive(&pdev->dev, "venc");
++	if (IS_ERR(venc->rst)) {
++		ret = PTR_ERR(venc->rst);
++		goto err_clk;
++	}
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		ret = irq;
++		goto err_clk;
++	}
++
++	/* Exported buffers retain the allocator across unbind and rebind. */
++	mem = platform_device_alloc("histb-venc-dma", PLATFORM_DEVID_NONE);
++	if (!mem) {
++		ret = -ENOMEM;
++		goto err_clk;
++	}
++	venc->memdev = &mem->dev;
++	platform_device_set_of_node(mem, pdev->dev.of_node);
++	mem->dev.coherent_dma_mask = DMA_BIT_MASK(32);
++	ret = of_dma_configure(&mem->dev, mem->dev.of_node, true);
++	if (ret) {
++		dev_err_probe(&pdev->dev, ret, "failed to configure DMA\n");
++		goto err_clk;
++	}
++
++	/* A DT without "memory-region" keeps using the default CMA area. */
++	ret = devm_of_reserved_mem_device_init(&mem->dev);
++	if (ret && ret != -ENODEV) {
++		dev_err(&pdev->dev, "failed to bind reserved memory\n");
++		goto err_clk;
++	}
++
++	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
++	if (ret) {
++		dev_err(&pdev->dev, "failed to set DMA mask\n");
++		goto err_clk;
++	}
++
++	vb2_dma_contig_set_max_seg_size(venc->memdev, DMA_BIT_MASK(32));
++
++	venc->m2m_dev = v4l2_m2m_init(&histb_venc_m2m_ops);
++	if (IS_ERR(venc->m2m_dev)) {
++		ret = PTR_ERR(venc->m2m_dev);
++		venc->m2m_dev = NULL;
++		v4l2_err(&venc->v4l2_dev, "failed to init mem2mem device\n");
++		goto err_clk;
++	}
++
++	vdev = video_device_alloc();
++	if (!vdev) {
++		ret = -ENOMEM;
++		goto err_clk;
++	}
++	venc->vdev = vdev;
++	vdev->v4l2_dev = &venc->v4l2_dev;
++	vdev->fops = &histb_venc_fops;
++	vdev->ioctl_ops = &histb_venc_ioctl_ops;
++	vdev->lock = &venc->vdev_lock;
++	vdev->release = video_device_release;
++	vdev->vfl_dir = VFL_DIR_M2M;
++	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
++	strscpy(vdev->name, HISTB_VENC_NAME, sizeof(vdev->name));
++	video_set_drvdata(vdev, venc);
++
++	ret = histb_venc_reset(venc);
++	if (ret)
++		goto err_vdev;
++
++	ret = devm_request_irq(&pdev->dev, irq, histb_venc_irq, 0,
++			       HISTB_VENC_NAME, venc);
++	if (ret) {
++		dev_err(&pdev->dev, "failed to request irq\n");
++		goto err_assert;
++	}
++	venc->irq = irq;
++
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++	if (ret) {
++		v4l2_err(&venc->v4l2_dev, "failed to register video device\n");
++		goto err_irq;
++	}
++
++	dev_info(&pdev->dev, "video encoder, version %#x\n",
++		 readl(venc->regs + VENC_VERSION));
++
++	/* The block is only clocked while a job is in flight. */
++	clk_disable_unprepare(venc->clk);
++	pm_runtime_set_suspended(&pdev->dev);
++	pm_runtime_set_autosuspend_delay(&pdev->dev, 100);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	pm_runtime_enable(&pdev->dev);
++
++	return 0;
++
++err_irq:
++	disable_irq(venc->irq);
++err_assert:
++	reset_control_assert(venc->rst);
++err_vdev:
++	video_device_release(vdev);
++err_clk:
++	clk_disable_unprepare(venc->clk);
++	return ret;
++}
++
++void histb_venc_v2_remove(struct platform_device *pdev)
++{
++	struct histb_venc *venc = platform_get_drvdata(pdev);
++
++	/*
++	 * v4l2_m2m_release() is only a kfree() in this tree, so it cannot be what
++	 * waits for a job: a client parked in device_run would keep using the
++	 * m2m device after remove returned. Pause the queue and let the running
++	 * job finish while its interrupt is still live, then mask the line
++	 * before the clock and reset go away -- a late report against an
++	 * unclocked block is an abort inside the handler, not a lost wakeup.
++	 */
++	mutex_lock(&venc->vdev_lock);
++	WRITE_ONCE(venc->removing, true);
++	v4l2_m2m_suspend(venc->m2m_dev);
++	disable_irq(venc->irq);
++	video_unregister_device(venc->vdev);
++	mutex_unlock(&venc->vdev_lock);
++	reset_control_assert(venc->rst);
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		pm_runtime_suspend(&pdev->dev);
++}
++
++static int histb_venc_runtime_suspend(struct device *dev)
++{
++	struct histb_venc *venc = dev_get_drvdata(dev);
++
++	clk_disable_unprepare(venc->clk);
++	return 0;
++}
++
++static int histb_venc_runtime_resume(struct device *dev)
++{
++	struct histb_venc *venc = dev_get_drvdata(dev);
++
++	return clk_prepare_enable(venc->clk);
++}
++
++const struct histb_venc_variant histb_venc_v2_variant = {
++	.probe			= histb_venc_v2_probe,
++	.remove			= histb_venc_v2_remove,
++	.runtime_suspend	= histb_venc_runtime_suspend,
++	.runtime_resume		= histb_venc_runtime_resume,
++	.system_suspend		= pm_runtime_force_suspend,
++	.system_resume		= pm_runtime_force_resume,
++};

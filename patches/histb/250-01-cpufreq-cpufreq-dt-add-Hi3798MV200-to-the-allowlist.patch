@@ -1,0 +1,24 @@
+From ae54e4ef112b82403ec89d353f573a67e30cbfa9 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Thu, 22 Oct 2026 04:13:26 +0800
+Subject: [PATCH] cpufreq: cpufreq-dt: add Hi3798MV200 to the allowlist
+
+The CPU clock on Hi3798MV200 is a CRG mux whose parents are fixed-rate
+clocks, so clock-only operating points are enough. Add the SoC to the
+cpufreq-dt allowlist.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/cpufreq/cpufreq-dt-platdev.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/drivers/cpufreq/cpufreq-dt-platdev.c
++++ b/drivers/cpufreq/cpufreq-dt-platdev.c
+@@ -33,6 +33,7 @@ static const struct of_device_id allowli
+ 	{ .compatible = "arm,integrator-cp", },
+ 
+ 	{ .compatible = "hisilicon,hi3660", },
++	{ .compatible = "hisilicon,hi3798mv200", },
+ 
+ 	{ .compatible = "fsl,imx27", },
+ 	{ .compatible = "fsl,imx51", },

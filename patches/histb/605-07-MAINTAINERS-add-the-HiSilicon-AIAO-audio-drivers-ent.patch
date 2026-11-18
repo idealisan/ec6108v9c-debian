@@ -1,0 +1,36 @@
+From 9c1251bbf8f180d54650f4b3603a2cfa28fda885 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 16:52:24 +0800
+Subject: [PATCH 7/7] MAINTAINERS: add the HiSilicon AIAO audio drivers entry
+
+The AIAO audio block has three drivers and no maintainer entry. The I2S
+port driver, the sound card and the internal DAC codec are all
+DT-binding drivers under linux-sound.
+
+Register the three drivers with their bindings in one entry.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ MAINTAINERS | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -12032,6 +12032,17 @@ F:	drivers/net/dsa/hirschmann/*
+ F:	include/linux/platform_data/hirschmann-hellcreek.h
+ F:	net/dsa/tag_hellcreek.c
+ 
++HISILICON AIAO AUDIO DRIVERS
++M:	David Yang <mmyangfl@gmail.com>
++L:	linux-sound@vger.kernel.org
++S:	Supported
++F:	Documentation/devicetree/bindings/sound/hisilicon,hi3716cv200-adac.yaml
++F:	Documentation/devicetree/bindings/sound/hisilicon,hi3798mv100-aiao-card.yaml
++F:	Documentation/devicetree/bindings/sound/hisilicon,hi3798mv100-aiao-i2s.yaml
++F:	sound/soc/hisilicon/histb-adac.c
++F:	sound/soc/hisilicon/histb-aiao-card.c
++F:	sound/soc/hisilicon/histb-aiao-i2s.c
++
+ HISILICON DMA DRIVER
+ M:	Zhou Wang <wangzhou1@hisilicon.com>
+ M:	Longfang Liu <liulongfang@huawei.com>

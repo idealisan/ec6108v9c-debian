@@ -1,0 +1,24 @@
+From 110412e44d95b7d3cb4f8febe97996c901f59d98 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Thu, 22 Oct 2026 04:09:00 +0800
+Subject: [PATCH 1/4] dt-bindings: phy: hisilicon,inno-usb2-phy: add
+ Hi3798MV200
+
+The USB2 ports on Hi3798MV200 have no test port, so they need a
+compatible of their own rather than the generic one.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../devicetree/bindings/phy/hisilicon,inno-usb2-phy.yaml         | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/Documentation/devicetree/bindings/phy/hisilicon,inno-usb2-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/hisilicon,inno-usb2-phy.yaml
+@@ -19,6 +19,7 @@ properties:
+     enum:
+       - hisilicon,hi3798cv200-usb2-phy
+       - hisilicon,hi3798mv100-usb2-phy
++      - hisilicon,hi3798mv200-usb2-phy
+       - hisilicon,inno-usb2-phy
+ 
+   reg:

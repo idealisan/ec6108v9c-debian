@@ -1,0 +1,50 @@
+From 458b1958c84bf08635d1a035f5049173be4b72f8 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 19:41:04 +0800
+Subject: [PATCH] hwrng: histb - fix read timeout
+
+The old figures were per-word averages, but the device produces 4
+words in one go, with each unit of post-process depth taking ~200us.
+
+The old 30ms timeout was chosen on that per-word basis. At a depth
+of 144, a 4-word batch may take as long as ~30ms, causing random
+read timeouts.
+
+Also, a restart after rewriting the control word may take ~300ms, so
+use a 500ms timeout instead to cover all of the above.
+
+Fixes: a2216e187471 ("crypto: hisilicon/trng - add support for HiSTB TRNG")
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+---
+ drivers/char/hw_random/histb-rng.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+--- a/drivers/char/hw_random/histb-rng.c
++++ b/drivers/char/hw_random/histb-rng.c
+@@ -26,16 +26,21 @@ struct histb_rng_priv {
+ };
+ 
+ /*
+- * Observed:
+- * depth = 1 -> ~1ms
+- * depth = 255 -> ~16ms
++ * Observed: the FIFO fills with 4 words at a time, roughly every 200us per
++ * unit of post-process depth, i.e. one batch per:
++ * depth = 144 -> ~30ms
++ * depth = 255 -> ~52ms
++ * Rewriting the control word delays the first batch by up to 300ms.
+  */
++#define BATCH_TIMEOUT_US	(500 * USEC_PER_MSEC)
++
+ static int histb_rng_wait(void __iomem *base)
+ {
+ 	u32 val;
+ 
+ 	return readl_relaxed_poll_timeout(base + RNG_STAT, val,
+-					  val & DATA_COUNT, 1000, 30 * 1000);
++					  val & DATA_COUNT, 1000,
++					  BATCH_TIMEOUT_US);
+ }
+ 
+ static void histb_rng_init(void __iomem *base, unsigned int depth)

@@ -1,0 +1,37 @@
+From 4d108a47d86e1ffac923d43b241fca993a2412de Mon Sep 17 00:00:00 2001
+From: Yang Xiwen <forbidden405@outlook.com>
+Date: Wed, 5 Apr 2023 13:59:16 +0800
+Subject: [PATCH 2/2] clk: hisilicon: use the split clock headers
+
+The CRG driver of each SoC provides different clocks and resets, so one
+generic header across all HiSTB SoCs is wrong.
+
+Split histb-clock.h into hisilicon,hi3798cv200-crg.h and
+
+hisilicon,hi3798cv200-sysctrl.h and keep histb-clock.h as a deprecated
+wrapper that includes both for backward compatibility only.
+
+Include the individual headers from the in-tree consumers,
+
+crg-hi3798cv200.c and the poplar dtsi, so neither prints the deprecation
+warning.
+
+Acked-by: Krzysztof Kozlowski <krzysztof.kozlowski@linaro.org>
+Signed-off-by: Yang Xiwen <forbidden405@outlook.com>
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/clk/hisilicon/crg-hi3798cv200.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/drivers/clk/hisilicon/crg-hi3798cv200.c
++++ b/drivers/clk/hisilicon/crg-hi3798cv200.c
+@@ -5,7 +5,8 @@
+  * Copyright (c) 2016 HiSilicon Technologies Co., Ltd.
+  */
+ 
+-#include <dt-bindings/clock/histb-clock.h>
++#include <dt-bindings/clock/hisilicon,hi3798cv200-crg.h>
++#include <dt-bindings/clock/hisilicon,hi3798cv200-sysctrl.h>
+ #include <linux/clk-provider.h>
+ #include <linux/module.h>
+ #include <linux/of.h>

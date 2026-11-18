@@ -1,0 +1,230 @@
+From 54faea030d3567b4ed3996aa74cf4b57078b575a Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sat, 10 Oct 2026 21:06:49 +0800
+Subject: [PATCH 1/3] ARM: dts: hisilicon: add the Hi3798 family includes
+
+The Hi3798 STB family shares a register map but has no shared include.
+The family file carries what every member has -- the AMBA windows, the
+CPU cluster shell and the PMOC cells -- and the Hi3798-S5 file the OPP
+table shared by the A7 parts, with the voltage of each step the vendor
+PMOC driver names.
+
+Add both, so a SoC file only names what differs on that part.
+
+Signed-off-by: Hongfu Yang <yanghf_0@126.com>
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ arch/arm/boot/dts/hisilicon/hi3798-s5.dtsi | 104 +++++++++++++++++++++
+ arch/arm/boot/dts/hisilicon/hi3798.dtsi    |  98 +++++++++++++++++++
+ 2 files changed, 202 insertions(+)
+ create mode 100644 arch/arm/boot/dts/hisilicon/hi3798-s5.dtsi
+ create mode 100644 arch/arm/boot/dts/hisilicon/hi3798.dtsi
+
+--- /dev/null
++++ b/arch/arm/boot/dts/hisilicon/hi3798-s5.dtsi
+@@ -0,0 +1,104 @@
++// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++/*
++ * Copyright (c) 2023 David Yang
++ */
++
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++#include "hi3798.dtsi"
++
++/*
++ * The CPU side of the 32-bit members of the family: four Cortex-A7 behind one
++ * GIC-400, which is what the SDK's mach-hi3798mx platform covers. The PMU lines
++ * are that controller's private peripheral interrupts, one per core, and they
++ * are numbered 8 to 11 in the Hi3798MV100 interrupt map.
++ */
++/ {
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++		enable-method = "hisilicon,hi3798-smp";
++
++		cpu0: cpu@0 {
++			compatible = "arm,cortex-a7";
++			device_type = "cpu";
++			reg = <0>;
++			clocks = <&crg HI3798MV100_CPU_CLK>;
++			operating-points-v2 = <&cpu_opp_table>;
++			cpu-supply = <&vddcpu>;
++			#cooling-cells = <2>;
++		};
++
++		cpu1: cpu@1 {
++			compatible = "arm,cortex-a7";
++			device_type = "cpu";
++			reg = <1>;
++			operating-points-v2 = <&cpu_opp_table>;
++			#cooling-cells = <2>;
++		};
++
++		cpu2: cpu@2 {
++			compatible = "arm,cortex-a7";
++			device_type = "cpu";
++			reg = <2>;
++			operating-points-v2 = <&cpu_opp_table>;
++			#cooling-cells = <2>;
++		};
++
++		cpu3: cpu@3 {
++			compatible = "arm,cortex-a7";
++			device_type = "cpu";
++			reg = <3>;
++			operating-points-v2 = <&cpu_opp_table>;
++			#cooling-cells = <2>;
++		};
++	};
++
++	/*
++	 * The cluster shares one clock and one rail, so all CPUs use a single
++	 * shared table.  The voltages are the vendor's per-OPP upper bounds --
++	 * the HI_VDD_MPU_OPP2_UV and HI_VDD_MPU_OPP4_UV macros -- rather than
++	 * the AVS minimum, which is the conservative choice here since this
++	 * port does not implement the HPM/AVS hardware.
++	 *
++	 * The vendor's 1200 and 1500MHz points need 1420 and 1495mV and are left
++	 * out for now: this board has no heatsink and has no use for them.
++	 */
++	cpu_opp_table: opp-table {
++		compatible = "operating-points-v2";
++		opp-shared;
++
++		opp-600000000 {
++			opp-hz = /bits/ 64 <600000000>;
++			opp-microvolt = <1150000>;
++		};
++
++		opp-1000000000 {
++			opp-hz = /bits/ 64 <1000000000>;
++			opp-microvolt = <1300000>;
++		};
++	};
++
++	gic: interrupt-controller@f8a01000 {
++		compatible = "arm,cortex-a7-gic";
++		#interrupt-cells = <3>;
++		#address-cells = <0>;
++		interrupt-controller;
++		/* gic dist base, gic cpu base */
++		reg = <0xf8a01000 0x1000>, <0xf8a02000 0x100>;
++	};
++
++	pmu: pmu {
++		compatible = "arm,cortex-a7-pmu";
++		interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>,
++			<GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH>,
++			<GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH>,
++			<GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-affinity = <&cpu0>, <&cpu1>, <&cpu2>, <&cpu3>;
++		interrupt-parent = <&gic>;
++	};
++};
++
++/* Devices below the bus containers inherit their interrupt parent here. */
++&soc {
++	interrupt-parent = <&gic>;
++};
+--- /dev/null
++++ b/arch/arm/boot/dts/hisilicon/hi3798.dtsi
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2016-2017 HiSilicon Technologies Co., Ltd. Copyright (c) 2023
++ * David Yang
++ */
++
++/*
++ * The Hi3798 address map, shared by every member of the family, and nothing
++ * else.
++ *
++ * The four controller windows are the SDK's HI_SYS_BASE_ADDR,
++ * HI_PERI_BASE_ADDR, HI_IO_BASE_ADDR and HI_CRG_BASE_ADDR, in the vendor's
++ * common register header. They sit outside the #ifdef that selects a chip's
++ * register headers, and that #ifdef gives Hi3798MV100, Hi3796MV100 and
++ * Hi3716DV100 one shared set, so another 32-bit member can include this file
++ * unchanged.
++ *
++ * Peripheral nodes belong to the per-SoC file instead. Each of them is bound
++ * through a clock or reset cell, and those name a field of one SoC's clock
++ * controller in that SoC's own binding header -- and they do move inside the
++ * family: the DMAC gate is PERI_CRG41 (0xa4) on MV100 but PERI_CRG227 (0x38c)
++ * on MV200, and the HDMI controller reset pair is bits 9/8 on MV100 but 7/6 on
++ * MV200. Hi3798CV200 shows the same split from the other side: its dtsi uses
++ * the HISTB_* ids of dt-bindings/clock/histb-clock.h, a different id space from
++ * HI3798MV100_*.
++ *
++ * The one clock this file does carry is the crystal reference: every vendor
++ * description of these parts names the same 24 MHz "clk24M" source. The bus
++ * containers take their interrupt parent from the CPU layer, which is where
++ * that controller's own window is described.
++ */
++
++/ {
++	compatible = "hisilicon,hi3798";
++	#address-cells = <1>;
++	#size-cells = <1>;
++
++	xtal24mhz: xtal24mhz {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <24000000>;
++	};
++
++	soc: soc@f0000000 {
++		compatible = "simple-bus";
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges = <0 0xf0000000 0x10000000>;
++
++		crg: clock-reset-controller@8a22000 {
++			compatible = "syscon", "simple-mfd";
++			reg = <0x8a22000 0x1000>;
++			#clock-cells = <1>;
++			#reset-cells = <2>;
++		};
++
++		sysctrl: system-controller@8000000 {
++			compatible = "syscon";
++			reg = <0x8000000 0x1000>;
++			#clock-cells = <1>;
++			#reset-cells = <2>;
++		};
++
++		perictrl: peripheral-controller@8a20000 {
++			compatible = "syscon", "simple-mfd";
++			reg = <0x8a20000 0x1000>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges = <0x0 0x8a20000 0x1000>;
++		};
++
++		pmx0: pinconf@8a21000 {
++			compatible = "pinconf-single";
++			reg = <0x8a21000 0x180>;
++			#pinctrl-cells = <1>;
++			pinctrl-single,register-width = <32>;
++			pinctrl-single,function-mask = <7>;
++
++			range: gpio-range {
++				#pinctrl-single,gpio-range-cells = <3>;
++			};
++		};
++
++		apb: apb {
++			#address-cells = <1>;
++			#size-cells = <1>;
++			compatible = "simple-bus";
++			ranges;
++		};
++
++		ahb: ahb {
++			#address-cells = <1>;
++			#size-cells = <1>;
++			compatible = "simple-bus";
++			ranges;
++		};
++	};
++};

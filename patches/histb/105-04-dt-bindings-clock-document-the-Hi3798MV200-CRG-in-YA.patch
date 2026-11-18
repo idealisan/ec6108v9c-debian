@@ -1,0 +1,49 @@
+From ebfeca888a99683afa26c674b495119a29abf770 Mon Sep 17 00:00:00 2001
+From: Yang Xiwen <forbidden405@outlook.com>
+Date: Sat, 24 Feb 2024 01:09:19 +0800
+Subject: [PATCH 4/4] dt-bindings: clock: document the Hi3798MV200 CRG in YAML
+
+The Hi3798MV200 is similar to the Hi3798CV200 and needs its own
+compatibles in the schema. Add them to hisilicon,hisi-crg.yaml; the
+clock id headers come with the driver block.
+
+The in-tree sysctrl nodes are written as "<soc>-sysctrl", "syscon" while
+the CRG nodes add "simple-mfd", so the oneOf carries both forms and the
+poplar board keeps validating.
+
+Acked-by: Rob Herring <robh@kernel.org>
+Signed-off-by: Yang Xiwen <forbidden405@outlook.com>
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../devicetree/bindings/clock/hisilicon,hisi-crg.yaml | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/Documentation/devicetree/bindings/clock/hisilicon,hisi-crg.yaml
++++ b/Documentation/devicetree/bindings/clock/hisilicon,hisi-crg.yaml
+@@ -22,6 +22,7 @@ properties:
+               - hisilicon,hi3516cv300-sysctrl
+               - hisilicon,hi3798cv200-sysctrl
+               - hisilicon,hi3798mv100-sysctrl
++              - hisilicon,hi3798mv200-sysctrl
+           - const: syscon
+       - items:
+           - enum:
+@@ -29,8 +30,18 @@ properties:
+               - hisilicon,hi3716cv200-crg
+               - hisilicon,hi3798cv200-crg
+               - hisilicon,hi3798mv100-crg
++              - hisilicon,hi3798mv200-crg
+           - const: syscon
+           - const: simple-mfd
++      - items:
++          - enum:
++              - hisilicon,hi3516cv300-crg
++              - hisilicon,hi3516cv300-sysctrl
++              - hisilicon,hi3798cv200-crg
++              - hisilicon,hi3798cv200-sysctrl
++              - hisilicon,hi3798mv200-crg
++              - hisilicon,hi3798mv200-sysctrl
++          - const: syscon
+ 
+   reg:
+     maxItems: 1

@@ -1,0 +1,28 @@
+From 2b1fbdd9c154225a804ef864c1d0895c49129a44 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Fri, 23 Oct 2026 08:22:08 +0800
+Subject: [PATCH 3/3] ARM: configs: multi_v7: enable the Hi3716CV200 machine
+
+The Hi3716CV200 has no family symbol, so a driver specific to the part
+has no gate to name and its DTB sits behind ARCH_MULTIPLATFORM.
+ARCH_HISI is already that gate, and the part's Cortex-A9 private timer
+keeps the value written, so the family bool selects everything but
+HAVE_ARM_TWD.
+
+Add the symbol to multi_v7_defconfig so make dtbs builds the board DTBs.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ arch/arm/configs/multi_v7_defconfig | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/arch/arm/configs/multi_v7_defconfig
++++ b/arch/arm/configs/multi_v7_defconfig
+@@ -48,6 +48,7 @@ CONFIG_ARCH_EXYNOS=y
+ CONFIG_ARCH_HIGHBANK=y
+ CONFIG_ARCH_HISI=y
+ CONFIG_ARCH_HI3xxx=y
++CONFIG_ARCH_HI3716CV200=y
+ CONFIG_ARCH_HIP01=y
+ CONFIG_ARCH_HIP04=y
+ CONFIG_ARCH_HIX5HD2=y

@@ -1,0 +1,668 @@
+From 56b6f1a61d96a76e2a91039a031c2cf6b0f8a61e Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 3 Nov 2026 14:41:30 +0800
+Subject: [PATCH 8/10] media: histb-vdec: add V5R6 MPEG-2 support
+
+The stateless controls carry the sequence, picture and quantisation
+headers but not the slices, so the driver walks the submitted access
+unit for slice_start_code and decodes the 13818-2 6.2.2.4 slice header
+itself into the 8-word descriptors the picture message links. The
+reference pictures are named by the two timestamps the picture control
+carries, so no picture buffer list is needed here: each timestamp
+resolves to the capture buffer it was queued on.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../platform/hisilicon/histb-vdec/Makefile    |   1 +
+ .../hisilicon/histb-vdec/histb_vdec_v5_core.c |   1 +
+ .../histb-vdec/histb_vdec_v5_mpeg2.c          | 627 ++++++++++++++++++
+ 3 files changed, 629 insertions(+)
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_mpeg2.c
+
+--- a/drivers/media/platform/hisilicon/histb-vdec/Makefile
++++ b/drivers/media/platform/hisilicon/histb-vdec/Makefile
+@@ -13,3 +13,4 @@ histb-vdec-y += histb_vdec_v5_hw.o
+ histb-vdec-y += histb_vdec_v5_core.o
+ histb-vdec-y += histb_vdec_v5_h264.o
+ histb-vdec-y += histb_vdec_v5_hevc.o
++histb-vdec-y += histb_vdec_v5_mpeg2.o
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_core.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_core.c
+@@ -67,6 +67,7 @@ struct histb_vdec_v5 *histb_vdec_v5_of_c
+ static const histb_vdec_v5_fmt_desc *const histb_vdec_v5_fmt_list[] = {
+ 	&histb_vdec_v5_h264_fmt,
+ 	&histb_vdec_v5_hevc_fmt,
++	&histb_vdec_v5_mpeg2_fmt,
+ };
+ 
+ static const struct histb_vdec_chip histb_vdec_v5_chip_mv200h = {
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_mpeg2.c
+@@ -0,0 +1,627 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * HiSilicon HiSTB V5R6 stateless MPEG-2 decoder.
++ *
++ * The MPEG-2 stateless controls carry the sequence, picture and quantisation
++ * headers, but not the slices: a slice's macroblock range and its span of the
++ * macroblock layer are found by walking the submitted access unit for
++ * slice_start_code and decoding the header of 13818-2 6.2.2.4. Each slice gets
++ * a descriptor of eight words and the picture message links them into the chain
++ * the core walks.
++ *
++ * The reference pictures are named by the two timestamps the picture control
++ * carries, so the driver needs no DPB of its own: each timestamp resolves to
++ * the capture buffer it was queued on, and that buffer's address is what the
++ * message points at.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/dma-mapping.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++
++#include <media/videobuf2-dma-contig.h>
++
++#include "histb_vdec_v5.h"
++
++#define V5R6_MPEG2_UP_BYTES		(1024 * 4 * 4)
++#define V5R6_MPEG2_PIC_OFF		ALIGN(V5R6_MPEG2_UP_BYTES, SZ_4K)
++#define V5R6_MPEG2_SLICE_OFF		(V5R6_MPEG2_PIC_OFF + 256)
++#define V5R6_MPEG2_SLICE_BYTES		32
++#define V5R6_MPEG2_MAX_SLICES		1024
++#define V5R6_MPEG2_MSG_END \
++	(V5R6_MPEG2_SLICE_OFF + V5R6_MPEG2_MAX_SLICES * V5R6_MPEG2_SLICE_BYTES)
++static_assert(V5R6_MPEG2_MSG_END <= V5R6_POOL_SED_LEFT_PHY,
++	      "the MPEG-2 message area does not fit ahead of the pool");
++
++#define V5R6_MPEG2_CFG0			0x41400000u
++#define V5R6_MPEG2_CFG1			0x00034003u
++
++/* The vendor packer adds 24 dummy bits to the whole-picture segment length. */
++#define V5R6_MPEG2_DUMMY_BITS		24
++
++#define V5R6_MPEG2_PIC_I		1
++#define V5R6_MPEG2_PIC_P		2
++#define V5R6_MPEG2_PIC_B		3
++
++/* 13818-2 6.2.23.1: 1 top field, 2 bottom field, 3 frame. */
++#define V5R6_MPEG2_STRUCT_FRAME		3
++
++static u32 *histb_vdec_v5_mpeg2_pic_slot(struct histb_vdec_v5 *dec)
++{
++	return dec->pool.va + V5R6_MPEG2_PIC_OFF;
++}
++
++static u32 *histb_vdec_v5_mpeg2_slice_slot(struct histb_vdec_v5 *dec,
++					 unsigned int index)
++{
++	return dec->pool.va + V5R6_MPEG2_SLICE_OFF +
++	       index * V5R6_MPEG2_SLICE_BYTES;
++}
++
++static unsigned int histb_vdec_v5_mpeg2_bits(const u8 *p, unsigned int pos,
++					   unsigned int n)
++{
++	unsigned int val = 0;
++	unsigned int i;
++
++	for (i = 0; i < n; i++)
++		val = val << 1 |
++		      ((p[(pos + i) / 8] >> (7 - (pos + i) % 8)) & 1U);
++
++	return val;
++}
++
++/*
++ * One slice header of 6.2.2.4. @p follows the 32-bit start code and @code is
++ * its low byte. Returns the macroblock row, the quantiser scale code, the
++ * intra_slice flag and how many header bits follow the start code.
++ *
++ * The full form (vertical position, horizontal position, quantiser, the intra
++ * slice flag and its seven reserved bits, extra_bit_slice) and the short form
++ * ffmpeg's encoder writes for both standards are accepted. A slice that starts
++ * mid-row, or whose header opens a trailing field this walk does not consume,
++ * is refused: its data start is then unknown, and one wrong bit misaligns every
++ * macroblock that follows.
++ */
++static int histb_vdec_v5_mpeg2_slice_hdr(const u8 *p, unsigned int code,
++				       bool progressive,
++				       unsigned int mb_height,
++				       unsigned int idx, unsigned int *row,
++				       unsigned int *qsc, unsigned int *intra,
++				       unsigned int *hdr_bits)
++{
++	unsigned int bits = progressive ? 8 : 10;
++	unsigned int vpos, flag;
++
++	if (progressive) {
++		vpos = histb_vdec_v5_mpeg2_bits(p, 0, 8);
++	} else {
++		if (histb_vdec_v5_mpeg2_bits(p, 0, 3))
++			return -EINVAL;
++		vpos = histb_vdec_v5_mpeg2_bits(p, 3, 7);
++	}
++
++	if (vpos == idx + 1 && vpos >= 1 && vpos <= mb_height &&
++	    histb_vdec_v5_mpeg2_bits(p, bits, 8) == 0) {
++		bits += 8;
++		*qsc = histb_vdec_v5_mpeg2_bits(p, bits, 5);
++		if (!*qsc || *qsc > 31)
++			return -EINVAL;
++		bits += 5;
++		flag = histb_vdec_v5_mpeg2_bits(p, bits, 1);
++		bits += 1;
++		if (flag) {
++			*intra = histb_vdec_v5_mpeg2_bits(p, bits, 1);
++			bits += 8;
++		} else {
++			*intra = 0;
++		}
++		if (histb_vdec_v5_mpeg2_bits(p, bits, 1))
++			return -EINVAL;
++		*row = vpos - 1;
++		*hdr_bits = bits + 1;
++		return 0;
++	}
++
++	if (progressive && !vpos) {
++		*qsc = histb_vdec_v5_mpeg2_bits(p, 8, 5);
++		if (!*qsc || *qsc > 31 ||
++		    histb_vdec_v5_mpeg2_bits(p, 13, 2))
++			return -EINVAL;
++		*intra = 0;
++		*row = idx;
++		*hdr_bits = 15;
++		return 0;
++	}
++
++	if (code >= 1 && code <= 0x8f && code - 1 == idx &&
++	    p[0] >= 0x08 && !(p[0] & 0x04)) {
++		*qsc = p[0] >> 3;
++		*intra = 0;
++		*row = code - 1;
++		*hdr_bits = 5 + 1;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++/*
++ * The width of the first macroblock_address_increment codeword, from Table B-1.
++ * The slice segment starts at the first bit after it, and the start cannot be
++ * guessed: one bit off misaligns every macroblock that follows. Stuffing is
++ * skipped; the escape form has no width in the table and is refused, as is any
++ * window belonging to no length group.
++ */
++static int histb_vdec_v5_mpeg2_first_incr(const u8 *p, unsigned int pos,
++					unsigned int avail, unsigned int *len)
++{
++	static const struct {
++		unsigned char bits;
++		u16 first;
++		u16 last;
++	} grp[] = {
++		{ 1, 0x001, 0x001 },
++		{ 3, 0x002, 0x003 },
++		{ 4, 0x004, 0x005 },
++		{ 5, 0x008, 0x009 },
++		{ 7, 0x006, 0x007 },
++		{ 8, 0x006, 0x00b },
++		{ 10, 0x012, 0x017 },
++		{ 11, 0x018, 0x023 },
++	};
++	unsigned int i, w11;
++
++	for (;;) {
++		if (avail < 11)
++			return -EINVAL;
++
++		w11 = (histb_vdec_v5_mpeg2_bits(p, pos, 8) << 3) |
++		      histb_vdec_v5_mpeg2_bits(p, pos + 8, 3);
++
++		if ((w11 >> 3) == 0x01) {
++			pos += 8;
++			avail -= 8;
++			continue;
++		}
++		if ((w11 >> 3) == 0x02)
++			return -EINVAL;
++
++		for (i = 0; i < ARRAY_SIZE(grp); i++) {
++			unsigned int code = w11 >> (11 - grp[i].bits);
++
++			if (code >= grp[i].first && code <= grp[i].last) {
++				*len = grp[i].bits;
++				return 0;
++			}
++		}
++		return -EINVAL;
++	}
++}
++
++/*
++ * One slice descriptor, words 0 to 7. Word 0 holds the valid bit count and the
++ * offset inside the addressed 16-byte granule, word 1 the granule as a distance
++ * from the programmed stream base, word 4 the quantiser and intra flag, words 5
++ * and 6 the macroblock range and word 7 the next descriptor.
++ *
++ * The span runs from the slice's first macroblock to the end of the access
++ * unit, not to the next start code: the next descriptor is what limits the
++ * decoded range, and a window cut at the following start code makes the core
++ * stop with a wait-stream report instead of following the chain.
++ */
++static void histb_vdec_v5_mpeg2_pack_slice(u32 *w, u32 data_bit, u32 end_bit,
++					 u32 qsc, u32 intra, u32 start_mbn,
++					 u32 end_mbn, dma_addr_t next_dma)
++{
++	w[0] = ((end_bit - data_bit) & 0xffffff) |
++	       ((data_bit & 127) << 24);
++	w[1] = ((data_bit / 8) & ~15u) >> V5R6_ADDR_SHIFT;
++	w[2] = 0;
++	w[3] = 0;
++	w[4] = (qsc & 0x3f) | (intra ? BIT(6) : 0);
++	w[5] = start_mbn & 0xfffff;
++	w[6] = end_mbn & 0xfffff;
++	w[7] = histb_vdec_v5_addr_at(next_dma, V5R6_ADDR_SHIFT);
++}
++
++static int histb_vdec_v5_mpeg2_pack_slices(struct histb_vdec_v5 *dec,
++					 const u8 *buf, unsigned int size,
++					 bool progressive,
++					 unsigned int mb_width,
++					 unsigned int mb_total)
++{
++	unsigned int mb_height = mb_total / mb_width;
++	unsigned int i = 0, slot = 0, end_bit = size * 8;
++	unsigned int prev_data_bit = 0, prev_qsc = 0, prev_start_mbn = 0;
++	unsigned int prev_intra = 0;
++	bool have_prev = false;
++
++	while (i + 7 < size) {
++		unsigned int hdr_bit = i * 8, data_bit, mbn, qsc, code, row;
++		unsigned int intra, hdr_bits, inc_bits;
++
++		if (buf[i] || buf[i + 1] || buf[i + 2] != 1) {
++			i++;
++			continue;
++		}
++		code = buf[i + 3];
++		if (code < 0x01 || code > 0x8f) {
++			i += 4;
++			continue;
++		}
++		if (histb_vdec_v5_mpeg2_slice_hdr(buf + i + 4, code, progressive,
++						mb_height, slot, &row, &qsc,
++						&intra, &hdr_bits))
++			return -EINVAL;
++
++		mbn = row * mb_width;
++		if ((!have_prev && mbn) || (have_prev && mbn <= prev_start_mbn) ||
++		    mbn >= mb_total || slot + 1 >= V5R6_MPEG2_MAX_SLICES)
++			return -EINVAL;
++
++		data_bit = hdr_bit + 32 + hdr_bits;
++		if (histb_vdec_v5_mpeg2_first_incr(buf, data_bit,
++						 size * 8 - data_bit, &inc_bits))
++			return -EINVAL;
++		data_bit += inc_bits;
++
++		if (have_prev)
++			histb_vdec_v5_mpeg2_pack_slice(
++				histb_vdec_v5_mpeg2_slice_slot(dec, slot - 1),
++				prev_data_bit, end_bit, prev_qsc, prev_intra,
++				prev_start_mbn, mbn - 1,
++				dec->pool.dma + V5R6_MPEG2_SLICE_OFF +
++				(dma_addr_t)slot * V5R6_MPEG2_SLICE_BYTES);
++		dev_dbg(dec->dev,
++			"mpeg2 sl%u bit=%u qsc=%u intra=%u mb=%u hdr=%u\n",
++			slot, data_bit, qsc, intra, mbn, hdr_bits + 32 + inc_bits);
++		prev_data_bit = data_bit;
++		prev_qsc = qsc;
++		prev_intra = intra;
++		prev_start_mbn = mbn;
++		have_prev = true;
++		slot++;
++		i += 4;
++	}
++
++	if (!have_prev)
++		return -EINVAL;
++
++	histb_vdec_v5_mpeg2_pack_slice(
++		histb_vdec_v5_mpeg2_slice_slot(dec, slot - 1), prev_data_bit,
++		end_bit, prev_qsc, prev_intra, prev_start_mbn, mb_total - 1, 0);
++	memset(histb_vdec_v5_mpeg2_slice_slot(dec, slot), 0,
++	       V5R6_MPEG2_SLICE_BYTES);
++
++	return slot;
++}
++
++/*
++ * The uAPI hands the matrices in scan order and the message words are raster
++ * addressed; a flat table hides the difference, a real one is off by up to 23
++ * levels read the other way.
++ */
++static const u8 histb_vdec_v5_mpeg2_scan2raster[64] = {
++	 0,  1,  8, 16,  9,  2,  3, 10, 17, 24, 32, 25, 18, 11,  4,  5,
++	12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13,  6,  7, 14, 21, 28,
++	35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
++	58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63
++};
++
++static void histb_vdec_v5_mpeg2_permute(const u8 *scan, u8 *raster)
++{
++	unsigned int s;
++
++	for (s = 0; s < 64; s++)
++		raster[histb_vdec_v5_mpeg2_scan2raster[s]] = scan[s];
++}
++
++/* Two matrices in picture words 16..47, one column of eight rows per pair. */
++static void histb_vdec_v5_mpeg2_pack_qmatrix(u32 *w, const u8 *intra,
++					   const u8 *nonintra)
++{
++	unsigned int c, r, i;
++
++	for (i = 0; i < 16; i++) {
++		w[16 + i] = 0;
++		w[32 + i] = 0;
++	}
++
++	for (c = 0; c < 8; c++) {
++		for (r = 0; r < 4; r++) {
++			w[16 + 2 * c] |= (u32)intra[2 * r * 8 + c] << (8 * r);
++			w[17 + 2 * c] |=
++				(u32)intra[(2 * r + 1) * 8 + c] << (8 * r);
++			w[32 + 2 * c] |=
++				(u32)nonintra[2 * r * 8 + c] << (8 * r);
++			w[33 + 2 * c] |=
++				(u32)nonintra[(2 * r + 1) * 8 + c] << (8 * r);
++		}
++	}
++}
++
++/*
++ * Whether the access unit carries MPEG-1 syntax. There is no control field for
++ * it, sequences differ by the presence of the sequence extension, and this
++ * generation's message has no bit that selects the older syntax.
++ */
++static bool histb_vdec_v5_mpeg2_is_mpeg1(const u8 *p, size_t n)
++{
++	bool seq = false, ext = false;
++	size_t i;
++
++	for (i = 0; i + 3 < n; i++) {
++		if (p[i] || p[i + 1] || p[i + 2] != 1)
++			continue;
++		if (p[i + 3] == 0xb3)
++			seq = true;
++		else if (p[i + 3] == 0xb5 && i + 4 < n &&
++			 (p[i + 4] >> 4) == 1)
++			ext = true;
++	}
++
++	return seq && !ext;
++}
++
++/* Resolve one reference timestamp to the surface it was queued on. */
++static int histb_vdec_v5_mpeg2_ref(struct histb_vdec_v5_ctx *ctx, u64 ts,
++				 dma_addr_t *out)
++{
++	struct vb2_queue *cap_q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++	struct histb_vdec_v5_frame *frame;
++	struct vb2_buffer *vb;
++
++	if (!ts)
++		return -ENOENT;
++	vb = vb2_find_buffer(cap_q, ts);
++	if (vb == NULL || vb->index >= V5R6_MAX_FRAMES)
++		return -ENOENT;
++
++	frame = histb_vdec_v5_frame_of(ctx, vb->index);
++	if (frame == NULL)
++		return -ENOENT;
++	*out = frame->dma;
++
++	return 0;
++}
++
++/* The motion-history slot of one capture buffer; the queue holds at most one
++ * buffer per slot, so the buffer index is the slot number.
++ */
++static dma_addr_t histb_vdec_v5_mpeg2_pmv(const struct histb_vdec_v5_ctx *ctx,
++					unsigned int index)
++{
++	unsigned int slot = ctx->pmv.slots ? index % ctx->pmv.slots : 0;
++
++	return ctx->pmv.dma + (dma_addr_t)slot * ctx->pmv.slot_bytes;
++}
++
++static int histb_vdec_v5_mpeg2_run(struct histb_vdec_v5_ctx *ctx,
++				 struct vb2_v4l2_buffer *src,
++				 struct vb2_v4l2_buffer *dst)
++{
++	struct histb_vdec_v5 *dec = histb_vdec_v5_of_ctx(ctx);
++	struct histb_vdec_v5_job job = {
++		.to_val		= V5R6_TIMEOUT_DEFAULT,
++		.reg_shift	= V5R6_ADDR_SHIFT,
++		.cfg0		= V5R6_MPEG2_CFG0,
++		.cfg1		= V5R6_MPEG2_CFG1,
++	};
++	const struct v4l2_ctrl_mpeg2_sequence *seq;
++	const struct v4l2_ctrl_mpeg2_picture *pic;
++	const struct v4l2_ctrl_mpeg2_quantisation *quant;
++	struct histb_vdec_v5_frame *dst_frame;
++	struct v4l2_ctrl *ctrl;
++	unsigned int mb_width, mb_height, mb_total, pitch, lines, uv;
++	unsigned int bytesused, n_slices;
++	dma_addr_t fwd, bwd, src_dma;
++	const u8 *src_va;
++	u32 *w;
++
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_MPEG2_SEQUENCE);
++	seq = ctrl != NULL ? ctrl->p_cur.p : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_MPEG2_PICTURE);
++	pic = ctrl != NULL ? ctrl->p_cur.p : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_MPEG2_QUANTISATION);
++	quant = ctrl != NULL ? ctrl->p_cur.p : NULL;
++
++	if (seq == NULL || pic == NULL || quant == NULL) {
++		dev_dbg(dec->dev, "no controls for this picture\n");
++		return -EINVAL;
++	}
++
++	if (seq->chroma_format != 1) {
++		dev_dbg(dec->dev, "only 4:2:0 reaches this core\n");
++		return -EINVAL;
++	}
++	if (pic->picture_structure != V5R6_MPEG2_STRUCT_FRAME) {
++		dev_dbg(dec->dev, "field pictures are not expressible\n");
++		return -EINVAL;
++	}
++	if (seq->horizontal_size < 16 || seq->vertical_size < 16 ||
++	    seq->horizontal_size > V5R6_MAX_WIDTH ||
++	    seq->vertical_size > V5R6_MAX_HEIGHT) {
++		dev_dbg(dec->dev, "picture size %ux%u out of range\n",
++			seq->horizontal_size, seq->vertical_size);
++		return -EINVAL;
++	}
++
++	mb_width = DIV_ROUND_UP(seq->horizontal_size, 16);
++	mb_height = DIV_ROUND_UP(seq->vertical_size, 16);
++	mb_total = mb_width * mb_height;
++
++	bytesused = vb2_get_plane_payload(&src->vb2_buf, 0);
++	if (bytesused <= src->vb2_buf.planes[0].data_offset) {
++		dev_dbg(dec->dev, "OUTPUT queue has no bitstream\n");
++		return -EINVAL;
++	}
++	/*
++	 * The submission may start inside the plane: what the core is told to
++	 * read, and what the sniffers walk, is the payload behind that start.
++	 */
++	bytesused -= src->vb2_buf.planes[0].data_offset;
++	src_va = histb_vdec_src_va(&src->vb2_buf);
++	if (src_va == NULL) {
++		dev_dbg(dec->dev, "OUTPUT queue has no mapping\n");
++		return -EINVAL;
++	}
++	if (histb_vdec_v5_mpeg2_is_mpeg1(src_va, bytesused)) {
++		dev_dbg(dec->dev, "MPEG-1 syntax has no field in this message\n");
++		return -EINVAL;
++	}
++
++	dst_frame = histb_vdec_v5_frame_of(ctx, dst->vb2_buf.index);
++	if (dst_frame == NULL)
++		return -EINVAL;
++
++	histb_vdec_v5_buf_geom(ctx, &pitch, &lines, &uv);
++	if (V5R6_BAND_PITCH(seq->horizontal_size) > pitch ||
++	    ALIGN(seq->vertical_size, ctx->desc->grid_align) > lines ||
++	    vb2_get_plane_payload(&dst->vb2_buf, 0) <
++	    histb_vdec_v5_linear_size(seq->horizontal_size,
++				    seq->vertical_size)) {
++		dev_dbg(dec->dev, "capture grid too small for %ux%u coded\n",
++			seq->horizontal_size, seq->vertical_size);
++		return -EINVAL;
++	}
++
++	fwd = bwd = dst_frame->dma;
++	if (pic->picture_coding_type != V5R6_MPEG2_PIC_I) {
++		int ferr = histb_vdec_v5_mpeg2_ref(ctx, pic->forward_ref_ts, &fwd);
++		int berr = histb_vdec_v5_mpeg2_ref(ctx, pic->backward_ref_ts, &bwd);
++
++		if (pic->picture_coding_type == V5R6_MPEG2_PIC_P && ferr)
++			return -EINVAL;
++		if (pic->picture_coding_type == V5R6_MPEG2_PIC_B &&
++		    (ferr || berr))
++			return -EINVAL;
++	}
++
++	if (bytesused * 8ULL + V5R6_MPEG2_DUMMY_BITS > GENMASK(23, 0)) {
++		dev_dbg(dec->dev, "access unit exceeds the segment field\n");
++		return -E2BIG;
++	}
++
++	src_dma = histb_vdec_src_dma(&src->vb2_buf);
++
++	/* The report area and both message blocks belong to this job only. */
++	memset(dec->pool.va, 0, V5R6_MPEG2_UP_BYTES);
++	w = histb_vdec_v5_mpeg2_pic_slot(dec);
++	memset(w, 0, 256);
++
++	w[0] = (mb_width - 1) | ((mb_height - 1) << 16);
++	w[1] = ((pic->flags & V4L2_MPEG2_PIC_FLAG_FRAME_PRED_DCT) ? BIT(0) : 0) |
++	       (pic->picture_structure << 8) |
++	       ((pic->flags & V4L2_MPEG2_PIC_FLAG_CONCEALMENT_MV) ? BIT(16) : 0) |
++	       (pic->picture_coding_type << 24);
++	w[2] = (pic->f_code[1][1] & 0xf) |
++	       ((pic->f_code[1][0] & 0xf) << 8) |
++	       ((pic->f_code[0][1] & 0xf) << 16) |
++	       ((pic->f_code[0][0] & 0xf) << 24) |
++	       ((pic->flags & V4L2_MPEG2_PIC_FLAG_TOP_FIELD_FIRST) ? BIT(31) : 0);
++	w[3] = (pic->intra_dc_precision & 3) |
++	       ((pic->flags & V4L2_MPEG2_PIC_FLAG_Q_SCALE_TYPE) ? BIT(8) : 0) |
++	       ((pic->flags & V4L2_MPEG2_PIC_FLAG_INTRA_VLC) ? BIT(16) : 0) |
++	       ((pic->flags & V4L2_MPEG2_PIC_FLAG_ALT_SCAN) ? BIT(24) : 0);
++
++	w[4] = histb_vdec_v5_addr_at(bwd, V5R6_ADDR_SHIFT);
++	w[5] = histb_vdec_v5_addr_at(fwd, V5R6_ADDR_SHIFT);
++	w[6] = histb_vdec_v5_addr_at(dst_frame->dma, V5R6_ADDR_SHIFT);
++	w[7] = histb_vdec_v5_addr_at(
++		histb_vdec_v5_mpeg2_pmv(ctx, dst->vb2_buf.index),
++		V5R6_ADDR_SHIFT);
++	w[8] = 0;
++	w[9] = bytesused * 8 + V5R6_MPEG2_DUMMY_BITS;
++	w[48] = histb_vdec_v5_addr_at(dec->pool.dma + V5R6_TBL_PMV_TOP,
++				    V5R6_ADDR_SHIFT);
++	w[63] = histb_vdec_v5_addr_at(dec->pool.dma + V5R6_MPEG2_SLICE_OFF,
++				    V5R6_ADDR_SHIFT);
++
++	{
++		u8 intra[64], nonintra[64];
++
++		histb_vdec_v5_mpeg2_permute(quant->intra_quantiser_matrix, intra);
++		histb_vdec_v5_mpeg2_permute(quant->non_intra_quantiser_matrix,
++					  nonintra);
++		histb_vdec_v5_mpeg2_pack_qmatrix(w, intra, nonintra);
++	}
++
++	n_slices = histb_vdec_v5_mpeg2_pack_slices(dec, src_va, bytesused,
++						 seq->flags &
++						 V4L2_MPEG2_SEQ_FLAG_PROGRESSIVE,
++						 mb_width, mb_total);
++	if ((int)n_slices < 0) {
++		dev_dbg(dec->dev, "slice chain does not tile the picture\n");
++		return n_slices;
++	}
++
++	job.pic_dma = dec->pool.dma + V5R6_MPEG2_PIC_OFF;
++	job.up_dma = dec->pool.dma;
++	job.pitch = pitch;
++	job.stream = src_dma;
++	job.recon = dst_frame->dma;
++	job.uv_offset = uv;
++	job.pic = w;
++	job.slice = histb_vdec_v5_mpeg2_slice_slot(dec, 0);
++	job.cfg0 |= (mb_total - 1) & V5R6_CFG0_MBAMT;
++	ctx->mbs = 0;
++	ctx->slices = n_slices;
++
++	dev_dbg(dec->dev, "mpeg2 %ux%u mbs=%u slices=%u type=%u\n",
++		mb_width, mb_height, mb_total, n_slices,
++		pic->picture_coding_type);
++
++	return histb_vdec_v5_launch(dec, &job);
++}
++
++static int histb_vdec_v5_mpeg2_try_ctrl(struct v4l2_ctrl *ctrl)
++{
++	const struct v4l2_ctrl_mpeg2_sequence *seq;
++
++	if (ctrl->id != V4L2_CID_STATELESS_MPEG2_SEQUENCE)
++		return 0;
++
++	seq = ctrl->p_new.p;
++	if (seq->chroma_format && seq->chroma_format != 1)
++		return -EINVAL;
++
++	return 0;
++}
++
++static const struct histb_vdec_v5_codec_ops histb_vdec_v5_mpeg2_ops = {
++	.run		= histb_vdec_v5_mpeg2_run,
++	.try_ctrl	= histb_vdec_v5_mpeg2_try_ctrl,
++};
++
++static unsigned int histb_vdec_v5_mpeg2_stride(unsigned int width)
++{
++	return V5R6_BAND_PITCH(width);
++}
++
++static const struct v4l2_ctrl_config histb_vdec_v5_mpeg2_ctrls[] = {
++	{ .id = V4L2_CID_STATELESS_MPEG2_SEQUENCE },
++	{ .id = V4L2_CID_STATELESS_MPEG2_PICTURE },
++	{ .id = V4L2_CID_STATELESS_MPEG2_QUANTISATION },
++};
++
++static const u32 histb_vdec_v5_mpeg2_req_ctrls[] = {
++	V4L2_CID_STATELESS_MPEG2_SEQUENCE,
++	V4L2_CID_STATELESS_MPEG2_PICTURE,
++	V4L2_CID_STATELESS_MPEG2_QUANTISATION,
++};
++
++const histb_vdec_v5_fmt_desc histb_vdec_v5_mpeg2_fmt = {
++	.fourcc		= V4L2_PIX_FMT_MPEG2_SLICE,
++	.vidstd		= 3,
++	.num_ctrls	= ARRAY_SIZE(histb_vdec_v5_mpeg2_ctrls),
++	.ctrls		= histb_vdec_v5_mpeg2_ctrls,
++	.ops		= &histb_vdec_v5_mpeg2_ops,
++	.stride		= histb_vdec_v5_mpeg2_stride,
++	.grid_align	= 32,
++	.req_ctrls	= histb_vdec_v5_mpeg2_req_ctrls,
++	.num_req	= ARRAY_SIZE(histb_vdec_v5_mpeg2_req_ctrls),
++};

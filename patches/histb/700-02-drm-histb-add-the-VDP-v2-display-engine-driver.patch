@@ -1,0 +1,3670 @@
+From 2685203f06f1059952a021c062014e487eff46c5 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 20:06:06 +0800
+Subject: [PATCH 2/5] drm/histb: add the VDP v2 display engine driver
+
+Introduce the v2 display engine driver for the cv200 and mv100 lines. It
+drives one CRTC with a primary plane over the channel the DT port
+selects and exposes the mv100 write-back taps as DRM writeback
+connectors. The DRM device, the plane/crtc/encoder scaffolding and the
+component lifetime live in a shared VDP core that the backend embeds. A
+cv200 boot leaves the graphics mixers in an undefined slot order and the
+GP0 CSC stage bypassed; the slots are reset to the order the fetch unit
+assumes and the CSC carries the cv200 matrix before the first commit.
+The CSC and the mixer background follow the colour format the bridge
+negotiation settled on, the plane is scaled with the GP0 coefficient set
+and placed where the core clipped it, and the plane alpha comes from the
+surface when the format carries one.
+
+On the mv100 the generic programming misses points where the channel
+answers differently: the update register's bit 0 is a self-clearing
+strobe that has to be polled to prove the block took the write,
+VDPVERSION1 reads zero while the block is held in reset, the alpha field
+is seven bits wide, and the vertical porch and sync fields are eight
+against sixteen for the horizontal ones, so out-of-range timings are
+rejected instead of truncated into a different picture.
+
+Both write-back taps arm per commit: each carries its own pending flag,
+completion is counted against the channel's vblank, and a job whose
+block is still busy stays queued for the next commit instead of stopping
+the scan.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/gpu/drm/Kconfig                 |    1 +
+ drivers/gpu/drm/Makefile                |    1 +
+ drivers/gpu/drm/histb/Kconfig           |   18 +
+ drivers/gpu/drm/histb/Makefile          |    3 +
+ drivers/gpu/drm/histb/histb-vdp-core.c  |  402 ++++
+ drivers/gpu/drm/histb/histb-vdp.h       |  106 +
+ drivers/gpu/drm/histb/histb-vdp2-regs.h |  497 +++++
+ drivers/gpu/drm/histb/histb-vdp2.c      | 2557 +++++++++++++++++++++++
+ 8 files changed, 3585 insertions(+)
+ create mode 100644 drivers/gpu/drm/histb/Kconfig
+ create mode 100644 drivers/gpu/drm/histb/Makefile
+ create mode 100644 drivers/gpu/drm/histb/histb-vdp-core.c
+ create mode 100644 drivers/gpu/drm/histb/histb-vdp.h
+ create mode 100644 drivers/gpu/drm/histb/histb-vdp2-regs.h
+ create mode 100644 drivers/gpu/drm/histb/histb-vdp2.c
+
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -317,6 +317,7 @@ source "drivers/gpu/drm/fsl-dcu/Kconfig"
+ source "drivers/gpu/drm/gma500/Kconfig"
+ source "drivers/gpu/drm/gud/Kconfig"
+ source "drivers/gpu/drm/hisilicon/Kconfig"
++source "drivers/gpu/drm/histb/Kconfig"
+ source "drivers/gpu/drm/hyperv/Kconfig"
+ source "drivers/gpu/drm/i915/Kconfig"
+ source "drivers/gpu/drm/imagination/Kconfig"
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -214,6 +214,7 @@ obj-y			+= bridge/
+ obj-$(CONFIG_DRM_FSL_DCU) += fsl-dcu/
+ obj-$(CONFIG_DRM_ETNAVIV) += etnaviv/
+ obj-y			+= hisilicon/
++obj-y			+= histb/
+ obj-y			+= mxsfb/
+ obj-y			+= sysfb/
+ obj-y			+= tiny/
+--- /dev/null
++++ b/drivers/gpu/drm/histb/Kconfig
+@@ -0,0 +1,18 @@
++# SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++config DRM_HISTB_VDP
++	tristate "DRM Support for HiSTB VDP display engines"
++	depends on DRM && OF
++	depends on ARCH_HISI || COMPILE_TEST
++	select DRM_GEM_DMA_HELPER
++	select DRM_KMS_HELPER
++	select DRM_DISPLAY_HELPER
++	select DRM_BRIDGE_CONNECTOR
++	select DRM_CLIENT_SELECTION
++	help
++	  Choose this option for DRM support for the VDP v2 display engine found
++	  on HiSilicon HiSTB SoCs such as the hi3716cv200 and hi3798mv100. It
++	  exposes one CRTC with a primary plane and sends its output to the
++	  transmitter selected through the device tree of_graph port@0 endpoint;
++	  the engine also exposes its write-back taps.
++
++	  If in doubt, say N.
+--- /dev/null
++++ b/drivers/gpu/drm/histb/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++obj-$(CONFIG_DRM_HISTB_VDP) += histb-vdp.o
++histb-vdp-y := histb-vdp-core.o histb-vdp2.o
+--- /dev/null
++++ b/drivers/gpu/drm/histb/histb-vdp-core.c
+@@ -0,0 +1,402 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * DRM driver for the HiSTB VDP display engine family.
++ *
++ * The VDP block provides two display channels; the driver exposes DHD0 (the
++ * HD channel) as one CRTC with a primary plane fed by the G0 graphics layer
++ * and sends its output to the transmitter selected through the device tree
++ * of_graph port@0 endpoint, which is a drm_bridge component of the same
++ * aggregate.
++ *
++ * The generations differ in how that pipeline is built: the v2 engine routes
++ * G0 -> GP0 -> MIXG0 -> CBM(MIX0) -> DHD0 and has write-back taps, the v4
++ * engine admits G0 to the mixer directly (G0 -> CBM MIX0 -> DHD0) and has
++ * none.  Their clocks, resets, enable orders and write-back blocks all live
++ * in the backend; this file owns everything the aggregate has to do the same
++ * way on both, so that the platform driver, the DRM device and the component
++ * lifetime exist once.
++ */
++
++#include <linux/component.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#include <drm/clients/drm_client_setup.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_blend.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_bridge_connector.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_fbdev_dma.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_managed.h>
++#include <drm/drm_mode_config.h>
++#include <drm/drm_of.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_vblank.h>
++
++#include "histb-vdp.h"
++
++static const struct component_master_ops histb_vdp_master_ops;
++
++static const struct drm_encoder_funcs histb_vdp_encoder_funcs = {
++	.destroy	= drm_encoder_cleanup,
++};
++
++DEFINE_DRM_GEM_DMA_FOPS(histb_vdp_fops);
++
++static const struct drm_driver histb_vdp_driver = {
++	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.fops			= &histb_vdp_fops,
++	DRM_GEM_DMA_DRIVER_OPS,
++	DRM_FBDEV_DMA_DRIVER_OPS,
++	.name			= "histb-vdp",
++	.desc			= "HiSTB VDP display engine",
++	.major			= 1,
++	.minor			= 0,
++};
++
++static int histb_vdp_bind(struct device *dev)
++{
++	struct histb_vdp *vdp = dev_get_drvdata(dev);
++	const struct histb_vdp_variant *variant = vdp->variant;
++	struct histb_vdp_display *disp;
++	struct drm_device *drm;
++	struct drm_bridge *bridge;
++	struct drm_connector *connector;
++	int ret;
++
++	ret = component_bind_all(dev, NULL);
++	if (ret)
++		return dev_err_probe(dev, ret, "component_bind_all failed\n");
++
++	/*
++	 * Only the devm variant of this lookup exists, so each rebind adds a
++	 * bridge reference tied to this device rather than to the aggregate.
++	 * They are all dropped when the device goes away; the transmitter
++	 * outlives the aggregate by construction (it is a component of it).
++	 */
++	bridge = devm_drm_of_get_bridge(dev, dev->of_node, 0, 0);
++	if (IS_ERR(bridge)) {
++		ret = PTR_ERR(bridge);
++		dev_err_probe(dev, ret, "failed to find downstream HDMI bridge\n");
++		goto err_unbind;
++	}
++
++	drm = drm_dev_alloc(&histb_vdp_driver, dev);
++	if (IS_ERR(drm)) {
++		ret = PTR_ERR(drm);
++		dev_err_probe(dev, ret, "drm_dev_alloc failed\n");
++		goto err_unbind;
++	}
++
++	disp = drmm_kzalloc(drm, variant->display_size, GFP_KERNEL);
++	if (!disp) {
++		ret = -ENOMEM;
++		goto err_put;
++	}
++	disp->vdp = vdp;
++	disp->drm = drm;
++	drm->dev_private = disp;
++	WRITE_ONCE(vdp->disp, disp);
++
++	ret = drmm_mode_config_init(drm);
++	if (ret) {
++		dev_err_probe(dev, ret, "mode_config_init failed\n");
++		goto err_put;
++	}
++
++	drm->mode_config.min_width	= variant->min_width;
++	drm->mode_config.max_width	= variant->max_width;
++	drm->mode_config.min_height	= variant->min_height;
++	drm->mode_config.max_height	= variant->max_height;
++	drm->mode_config.funcs		= variant->mode_config_funcs;
++
++	/* one CRTC, so the vblank core must exist before the IRQ can be served
++	 * and before any atomic commit waits on it
++	 */
++	ret = drm_vblank_init(drm, 1);
++	if (ret) {
++		dev_err_probe(dev, ret, "vblank_init failed\n");
++		goto err_put;
++	}
++
++	ret = drm_universal_plane_init(drm, &disp->primary,
++				       variant->plane_possible_crtcs,
++				       variant->plane_funcs,
++				       variant->formats,
++				       variant->num_formats,
++				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
++	if (ret) {
++		dev_err_probe(dev, ret, "plane_init failed\n");
++		goto err_put;
++	}
++	drm_plane_helper_add(&disp->primary, variant->plane_helper);
++
++	/*
++	 * The v2 mixer can take the alpha byte as a coverage weight and can
++	 * treat the surface as premultiplied, so it offers both upstream modes
++	 * next to "None".  The v4 pipeline has no such stage and only offers
++	 * the layer's global opacity.
++	 */
++	if (variant->blend_mode_property) {
++		ret = drm_plane_create_blend_mode_property(&disp->primary,
++						BIT(DRM_MODE_BLEND_PIXEL_NONE) |
++						BIT(DRM_MODE_BLEND_PREMULTI) |
++						BIT(DRM_MODE_BLEND_COVERAGE));
++		if (ret) {
++			dev_err_probe(dev, ret, "blend_mode failed\n");
++			goto err_put;
++		}
++	}
++
++	ret = drm_plane_create_alpha_property(&disp->primary);
++	if (ret) {
++		dev_err_probe(dev, ret, "alpha failed\n");
++		goto err_put;
++	}
++
++	ret = drm_crtc_init_with_planes(drm, &disp->crtc, &disp->primary, NULL,
++					variant->crtc_funcs, variant->crtc_name);
++	if (ret) {
++		dev_err_probe(dev, ret, "crtc_init failed\n");
++		goto err_put;
++	}
++	drm_crtc_helper_add(&disp->crtc, variant->crtc_helper);
++	drm_crtc_vblank_reset(&disp->crtc);
++
++	disp->encoder.possible_crtcs = drm_crtc_mask(&disp->crtc);
++	ret = drm_encoder_init(drm, &disp->encoder, &histb_vdp_encoder_funcs,
++			       DRM_MODE_ENCODER_TMDS, variant->encoder_name);
++	if (ret) {
++		dev_err_probe(dev, ret, "encoder_init failed\n");
++		goto err_put;
++	}
++
++	ret = drm_bridge_attach(&disp->encoder, bridge, NULL,
++				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
++	if (ret) {
++		dev_err_probe(dev, ret, "bridge_attach failed\n");
++		goto err_put;
++	}
++
++	connector = drm_bridge_connector_init(drm, &disp->encoder);
++	if (IS_ERR(connector)) {
++		dev_err_probe(dev, PTR_ERR(connector),
++			      "failed to init bridge connector\n");
++		goto err_put;
++	}
++	drm_connector_attach_encoder(connector, &disp->encoder);
++
++	if (variant->ops->display_init) {
++		ret = variant->ops->display_init(disp);
++		if (ret) {
++			dev_err_probe(dev, ret, "display init failed\n");
++			goto err_put;
++		}
++	}
++
++	/*
++	 * The transmitter has no usable HPD output (it is a level signal that
++	 * storms while a sink is attached), so the connector the bridge helper
++	 * created asks for DRM_CONNECTOR_POLL_CONNECT|DISCONNECT.  Without
++	 * starting the poll work here nothing would ever re-detect a plug
++	 * event.  The drmm variant stops with the DRM device.
++	 */
++	drmm_kms_helper_poll_init(drm);
++
++	drm_mode_config_reset(drm);
++
++	ret = drm_dev_register(drm, 0);
++	if (ret) {
++		dev_err_probe(dev, ret, "drm_dev_register failed\n");
++		goto err_put;
++	}
++
++	drm_client_setup(drm, NULL);
++
++	return 0;
++
++err_put:
++	WRITE_ONCE(vdp->disp, NULL);
++	drm_dev_put(drm);
++err_unbind:
++	component_unbind_all(dev, NULL);
++	return ret;
++}
++
++static void histb_vdp_unbind(struct device *dev)
++{
++	struct histb_vdp *vdp = dev_get_drvdata(dev);
++	struct histb_vdp_display *disp = vdp->disp;
++	struct drm_device *drm = disp->drm;
++
++	/* drm_dev_unplug() also unregisters; tear down while clocks are on */
++	drm_dev_unplug(drm);
++	drm_atomic_helper_shutdown(drm);
++
++	WRITE_ONCE(vdp->disp, NULL);
++	component_unbind_all(dev, NULL);
++	drm_dev_put(drm);
++}
++
++static const struct component_master_ops histb_vdp_master_ops = {
++	.bind		= histb_vdp_bind,
++	.unbind		= histb_vdp_unbind,
++};
++
++/*
++ * Who belongs to this pipeline is read out of the device tree, not out of the
++ * order someone happens to echo into unbind: the transmitter on the far side
++ * of our own graph endpoint is added as a component of this aggregate, so
++ * removing its driver takes the DRM device down before that driver's bridge,
++ * regmaps and MMIO are released.  Without it, unbinding the transmitter under
++ * a live card lets the atomic paths dereference the freed bridge.
++ */
++static int histb_vdp_add_master(struct device *dev)
++{
++	struct component_match *match = NULL;
++	struct device_node *endpoint;
++
++	for_each_endpoint_of_node(dev->of_node, endpoint) {
++		struct device_node *remote =
++			of_graph_get_remote_port_parent(endpoint);
++
++		if (remote && of_device_is_available(remote))
++			drm_of_component_match_add(dev, &match,
++						   component_compare_of, remote);
++		of_node_put(remote);
++	}
++
++	/*
++	 * component_master_add_with_match() reads match->num before anything
++	 * else, so an aggregate with no available component must fail instead
++	 * of handing it NULL.  Disabling only the transmitter node is a valid
++	 * DT configuration.
++	 */
++	if (!match)
++		return -ENODEV;
++
++	return component_master_add_with_match(dev, &histb_vdp_master_ops,
++					       match);
++}
++
++static int histb_vdp_probe(struct platform_device *pdev)
++{
++	const struct histb_vdp_variant *variant;
++	int ret;
++
++	variant = of_device_get_match_data(&pdev->dev);
++	if (!variant || !variant->probe)
++		return -ENODEV;
++
++	ret = variant->probe(pdev, variant);
++	if (ret)
++		return ret;
++
++	ret = histb_vdp_add_master(&pdev->dev);
++	if (ret) {
++		variant->remove(pdev);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void histb_vdp_remove(struct platform_device *pdev)
++{
++	const struct histb_vdp_variant *variant =
++		((struct histb_vdp *)platform_get_drvdata(pdev))->variant;
++
++	component_master_del(&pdev->dev, &histb_vdp_master_ops);
++	variant->remove(pdev);
++}
++
++/*
++ * drm_dev_register() documents that a KMS driver stops the pipeline at
++ * shutdown and reboot: the channel would otherwise keep scanning a
++ * framebuffer whose pages are about to be torn down underneath it.
++ */
++static void histb_vdp_shutdown(struct platform_device *pdev)
++{
++	struct histb_vdp *vdp = platform_get_drvdata(pdev);
++	struct histb_vdp_display *disp = READ_ONCE(vdp->disp);
++
++	if (disp)
++		drm_atomic_helper_shutdown(disp->drm);
++}
++
++static int histb_vdp_runtime_suspend(struct device *dev)
++{
++	struct histb_vdp *vdp = dev_get_drvdata(dev);
++
++	if (vdp->variant->ops->runtime_suspend)
++		return vdp->variant->ops->runtime_suspend(dev);
++	return 0;
++}
++
++static int histb_vdp_runtime_resume(struct device *dev)
++{
++	struct histb_vdp *vdp = dev_get_drvdata(dev);
++
++	if (vdp->variant->ops->runtime_resume)
++		return vdp->variant->ops->runtime_resume(dev);
++	return 0;
++}
++
++static int histb_vdp_suspend(struct device *dev)
++{
++	struct histb_vdp *vdp = dev_get_drvdata(dev);
++
++	if (vdp->variant->ops->system_suspend)
++		return vdp->variant->ops->system_suspend(dev);
++	return 0;
++}
++
++static int histb_vdp_resume(struct device *dev)
++{
++	struct histb_vdp *vdp = dev_get_drvdata(dev);
++
++	if (vdp->variant->ops->system_resume)
++		return vdp->variant->ops->system_resume(dev);
++	return 0;
++}
++
++static const struct dev_pm_ops histb_vdp_pm_ops = {
++	RUNTIME_PM_OPS(histb_vdp_runtime_suspend, histb_vdp_runtime_resume, NULL)
++	SYSTEM_SLEEP_PM_OPS(histb_vdp_suspend, histb_vdp_resume)
++};
++
++static const struct of_device_id histb_vdp_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-vdp",
++	  .data = &histb_vdp2_mv100_variant },
++	/*
++	 * Hi3716CV200 drives its output channel through the same register file:
++	 * every offset this driver touches is identical on this part except the
++	 * GP0 zoom block, whose cv200 offsets and 4.12 precisions are recorded in
++	 * histb-vdp2-regs.h beside the board reading that fixed them.
++	 */
++	{ .compatible = "hisilicon,hi3716cv200-vdp",
++	  .data = &histb_vdp2_cv200_variant },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, histb_vdp_of_match);
++
++static struct platform_driver histb_vdp_platform_driver = {
++	.probe		= histb_vdp_probe,
++	.remove		= histb_vdp_remove,
++	.shutdown	= histb_vdp_shutdown,
++	.driver		= {
++		.name			= "histb-vdp",
++		.of_match_table		= histb_vdp_of_match,
++		.pm			= pm_ptr(&histb_vdp_pm_ops),
++	},
++};
++module_platform_driver(histb_vdp_platform_driver);
++
++MODULE_AUTHOR("David Yang <mmyangfl@gmail.com>");
++MODULE_DESCRIPTION("DRM driver for the HiSTB VDP display engine");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/gpu/drm/histb/histb-vdp.h
+@@ -0,0 +1,106 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Shared contract between the HiSTB VDP display driver core and its
++ * per-generation backends.
++ *
++ * The two generations keep their own register programming: the v2 pipeline
++ * has a GP0 stage the v4 one does not, their clocks and resets are requested
++ * differently and only v2 has write-back taps.  What they share is the DRM
++ * device, the plane/crtc/encoder scaffolding and the component lifetime, and
++ * that is what the core in histb-vdp-core.c owns.
++ */
++#ifndef __HISTB_VDP_H__
++#define __HISTB_VDP_H__
++
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/types.h>
++
++#include <drm/drm_crtc.h>
++#include <drm/drm_device.h>
++#include <drm/drm_encoder.h>
++#include <drm/drm_mode_config.h>
++#include <drm/drm_plane.h>
++#include <drm/drm_plane_helper.h>
++
++struct histb_vdp;
++struct histb_vdp_display;
++struct histb_vdp_variant;
++
++/*
++ * The DRM objects every generation has.  A backend's own display structure
++ * embeds this as its first member and keeps whatever else it needs (the
++ * write-back connectors on v2) behind it.
++ */
++struct histb_vdp_display {
++	struct histb_vdp	*vdp;
++	struct drm_device	*drm;
++	struct drm_plane	primary;
++	struct drm_crtc		crtc;
++	struct drm_encoder	encoder;
++};
++
++/*
++ * Generation hooks the core calls.  Every one is optional: an absent
++ * system-sleep hook means the generation has nothing to do there.
++ */
++struct histb_vdp_ops {
++	int (*runtime_suspend)(struct device *dev);
++	int (*runtime_resume)(struct device *dev);
++	int (*system_suspend)(struct device *dev);
++	int (*system_resume)(struct device *dev);
++	/*
++	 * Called after the core has created the plane, CRTC, encoder and
++	 * connector, and with the DRM device fully initialised but not yet
++	 * registered.  A backend uses it to publish itself to its interrupt
++	 * path and to create the objects the other generation lacks.
++	 */
++	int (*display_init)(struct histb_vdp_display *disp);
++};
++
++struct histb_vdp_variant {
++	const struct histb_vdp_ops	*ops;
++	/* Generation data handed to @probe, NULL for a single-generation part. */
++	const void			*data;
++	int (*probe)(struct platform_device *pdev,
++		     const struct histb_vdp_variant *variant);
++	void (*remove)(struct platform_device *pdev);
++
++	size_t				display_size;
++	unsigned int			min_width;
++	unsigned int			min_height;
++	unsigned int			max_width;
++	unsigned int			max_height;
++
++	const u32			*formats;
++	unsigned int			num_formats;
++	const struct drm_plane_funcs	*plane_funcs;
++	const struct drm_plane_helper_funcs *plane_helper;
++	const struct drm_crtc_funcs	*crtc_funcs;
++	const struct drm_crtc_helper_funcs *crtc_helper;
++	const struct drm_mode_config_funcs *mode_config_funcs;
++
++	/* What the plane advertises to generic atomic clients. */
++	unsigned int			plane_possible_crtcs;
++	bool				blend_mode_property;
++
++	const char			*crtc_name;
++	const char			*encoder_name;
++};
++
++/*
++ * Per-device state the core owns.  A backend's structure has to put this
++ * first so that platform_get_drvdata() and the core's bind/unbind agree on
++ * the address.
++ */
++struct histb_vdp {
++	struct device			*dev;
++	const struct histb_vdp_variant	*variant;
++	struct histb_vdp_display	*disp;
++};
++
++/* Provided by the generation backends; referenced by the core's match table. */
++extern const struct histb_vdp_variant histb_vdp2_mv100_variant;
++extern const struct histb_vdp_variant histb_vdp2_cv200_variant;
++
++#endif /* __HISTB_VDP_H__ */
+--- /dev/null
++++ b/drivers/gpu/drm/histb/histb-vdp2-regs.h
+@@ -0,0 +1,497 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Register definitions for the HiSTB VDP v2 display engine (hi3798mv100 and
++ * friends).
++ *
++ * The VDP block sits at 0xf8cc0000 on hi3798mv100. Two display channels
++ * (DHD0/DHD1) exist, spaced 0x400 apart; this driver drives DHD0 and reaches
++ * the HDMI TX through it, which VO_MUX.hdmi_sel has to name (channel 0) for
++ * the interface to read the channel that was actually programmed.
++ *
++ * Offsets are counted from the VDP base. HDATE_VERSION reads 0xf000 here and
++ * anchors the layout. Ranges that the SoC leaves unnamed are still
++ * implemented -- holes in the documented struct are real registers -- and are
++ * named below after the function the block performs.
++ */
++
++#ifndef _HISTB_VDP2_REGS_H_
++#define _HISTB_VDP2_REGS_H_
++
++#include <linux/bitops.h>
++
++/* ------------------------------------------------------------------ */
++/* Global (offsets from VO base)                                       */
++/* ------------------------------------------------------------------ */
++#define VO_CTRL			0x0000
++#define   VO_CTRL_CK_GT_EN	BIT(31)		/* vo_ck_gt_en */
++#define VO_MUX			0x0100	/*
++					 * output routing: sddate[0] hddate[1]
++					 * vga[2] hdmi[3] digital[5:4];
++					 * hdmi_sel selects which DHD channel
++					 * feeds the HDMI interface
++					 */
++#define   VO_MUX_SDDATE_SEL	BIT(0)
++#define   VO_MUX_HDDATE_SEL	BIT(1)
++#define   VO_MUX_VGA_SEL	BIT(2)
++#define   VO_MUX_HDMI_SEL	BIT(3)
++#define   VO_MUX_DIGITAL	GENMASK(5, 4)
++#define VO_MUX_TESTSYNC		0x0108	/* vo_test_en[31] + test sync polarity bits */
++#define VO_MUX_TESTDATA		0x010c	/* test_data[29:0] */
++/*
++ * Reserved on mv100 and mv200: never written, reads back 0. Listed only so the
++ * register dump lines up with the rest of the block.
++ */
++#define VO_DAC_MUX		0x0140
++#define VO_INTSTA		0x0004
++#define VO_MSKINTSTA		0x0008	/* write 1 to clear int status */
++#define VO_INTMSK		0x000c	/* 1 = that source delivers */
++#define VO_VDPVERSION1		0x0010	/* read-only IP date stamp */
++#define VO_VDPVERSION2		0x0014	/* read-only IP date stamp */
++
++#define VO_INT_DHD0_VTTHD1	BIT(0)	/* DHD0 vblank-ish threshold int */
++#define VO_INT_DHD0_VTTHD2	BIT(1)
++#define VO_INT_DHD0_VTTHD3	BIT(2)
++#define VO_INT_GWBC0_VTTHD	BIT(8)	/* graphics write-back frame done */
++#define VO_INT_DWBC0_VTTHD	BIT(9)	/* HD channel write-back frame done */
++#define VO_INT_WBCDHD_PARTFNS	BIT(28)	/* low-delay partial line done */
++
++#define VOAXICTRL		0x0034
++#define   VO_AXI_M0_RD0_OSTD GENMASK(3, 0)	/* read outstanding, bus 0 */
++#define   VO_AXI_M0_RD1_OSTD GENMASK(7, 4)	/* read outstanding, bus 1 */
++#define   VO_AXI_M0_WR_OSTD GENMASK(11, 8)	/* write outstanding */
++
++/*
++ * Second display channel ("SD"), addressed as the DHD0 registers plus
++ * CHN_OFFSET. Nothing in this range is named by the SoC's register layout, so
++ * the names below mirror the DHD0 layout.
++ */
++#define SD_CTRL			0xc400
++#define SD_VSYNC		0xc404
++#define SD_HSYNC1		0xc408
++#define SD_HSYNC2		0xc40c
++#define SD_VPLUS		0xc410
++#define SD_PWR			0xc414
++#define SD_VTTHD3		0xc418
++#define SD_VTTHD		0xc41c
++#define SD_SYNC_INV		0xc420
++#define SD_DATA_SEL		0xc42c
++
++/* ------------------------------------------------------------------ */
++/* G0 graphics (RGB fetch) layer                                       */
++/* ------------------------------------------------------------------ */
++/* graphics layers are one 0x800-wide block each: G0..G4 (GFX_MAX=5) */
++#define GFX_LAYER_STRIDE		0x800
++#define G0_CTRL			0x6000
++#define   G0_CTRL_IFMT GENMASK(7, 0)
++#define   G0_CTRL_BITEXT GENMASK(9, 8)	/* bit extension */
++#define     G0_BITEXT_3RD	3
++#define   G0_CTRL_FLIP_EN BIT(24)	/* vertical flip */
++#define   G0_CTRL_READ_MODE BIT(26)	/* read_mode; 1 = progressive fetch */
++#define   G0_CTRL_UPD_MODE BIT(27)	/* upd_mode; 1 = progressive update */
++#define   G0_CTRL_SURFACE_EN BIT(31)
++#define G0_UPD			0x6004
++#define   G0_UPD_REGUP BIT(0)
++#define G0_ADDR			0x6010
++#define G0_STRIDE		0x601c
++#define   G0_STRIDE_MASK GENMASK(15, 0)	/* unit: 16 bytes */
++#define G0_IRESO		0x6020
++#define   G0_IRESO_IW GENMASK(11, 0)
++#define   G0_IRESO_IH GENMASK(23, 12)
++#define G0_SFPOS		0x6024
++#define   G0_SFPOS_X GENMASK(6, 0)	/* pixels inside the unit G0_ADDR names */
++#define G0_CBMPARA		0x6030
++#define   G0_CBMPARA_GALPHA GENMASK(7, 0)
++#define   G0_CBMPARA_PALPHA_RANGE BIT(8)	/* 1: alpha over 255, else 7 bits only */
++#define   G0_CBMPARA_PALPHA_EN BIT(12)	/* take alpha from the pixel, not from galpha */
++#define   G0_CBMPARA_PREMULT_EN BIT(13)	/* the surface is premultiplied by its own alpha */
++#define   G0_CBMPARA_KEY_EN	BIT(14)	/* colour-key the surface */
++#define   G0_CBMPARA_KEY_MODE	BIT(15)
++#define G0_PARAUP		0x6044
++#define G0_DFPOS		0x6080
++#define   G0_DFPOS_X GENMASK(11, 0)
++#define   G0_DFPOS_Y GENMASK(23, 12)
++#define G0_DLPOS		0x6084
++#define   G0_DLPOS_X GENMASK(11, 0)
++#define   G0_DLPOS_Y GENMASK(23, 12)
++#define G0_VFPOS		0x6088
++#define G0_VLPOS		0x608c
++
++/*
++ * Input pixel format. The alpha byte is *consumed* by the A-prefixed codes: a
++ * DRM_FORMAT_XRGB8888 framebuffer (which carries 0x00 there) fed in as ARGB8888
++ * composites as fully transparent, so XRGB has to use the keyed code that
++ * ignores byte 3.
++ */
++#define G0_IFMT_RGB444		0x40	/* 16bpp, R in bits 11:8, no alpha */
++#define G0_IFMT_RGB555		0x41	/* 16bpp, R in bits 14:10, no alpha */
++#define G0_IFMT_RGB565		0x42	/* 16bpp, no alpha */
++#define G0_IFMT_ARGB4444	0x48	/* 16bpp, A:R:G:B nibbles */
++/*
++ * 0x49 is the 16bpp code with a single alpha bit. It is not used: with
++ * palpha_en set the layer disappeared for both bit states, under every
++ * combination of palpha_range and premult_en that was tried, while the same
++ * pixels with the bit cleared came back at full level (board, luma 0 for
++ * 0x10ff/0x11ff/0x30ff/0x31ff and 255 for 0x00ff).
++ */
++#define G0_IFMT_RGB888		0x50	/* 24bpp, one byte per channel, no alpha */
++#define G0_IFMT_KRGB888		0x60	/* 32bpp, alpha ignored */
++#define G0_IFMT_ARGB8888	0x68	/* 32bpp, alpha taken from the pixel */
++#define G0_IFMT_RGBA8888	0xe8	/* 32bpp, R:G:B:A, alpha in the low byte */
++#define G0_IFMT_ABGR8888	0xef	/* 32bpp, A:B:G:R, alpha in the top byte */
++
++/* ------------------------------------------------------------------ */
++/* GP0 graphics post block (G0 -> GP0 -> CBM mixer -> DHD0)            */
++/* ------------------------------------------------------------------ */
++#define GP0_CTRL		0x9000
++#define   GP0_CTRL_READ_MODE	BIT(31)	/* read_mode; a running pipeline has it set */
++/*
++ * Whole-register values of the IP orders GP0 can select: no post-processing
++ * 0x1032, CSC only 0x1230, ZME+CSC 0x1203.
++ */
++#define GP0_ORDER_NULL		0x00001032
++#define GP0_ORDER_CSC		0x00001230
++#define GP0_ORDER_ZME_CSC	0x00001203
++#define   GP0_CTRL_MUX1_SEL GENMASK(1, 0)
++#define   GP0_CTRL_MUX2_SEL GENMASK(5, 4)
++#define   GP0_CTRL_AOUT_SEL GENMASK(9, 8)
++#define   GP0_CTRL_BOUT_SEL GENMASK(13, 12)
++#define GP0_UPD			0x9004
++#define GP0_GALPHA		0x9020
++#define GP0_HCOEFAD		0x9010	/* ZME horizontal coefficient window */
++#define GP0_VCOEFAD		0x9014	/* ZME vertical coefficient window */
++#define GP0_PARAUP		0x9018	/* shadow-register update latch */
++#define   GP0_PARAUP_HCOEF	BIT(0)	/* latch the horizontal step and table */
++#define   GP0_PARAUP_VCOEF	BIT(1)	/* latch the vertical step and table */
++#define GP0_DFPOS		0x9100
++#define GP0_DLPOS		0x9104
++#define GP0_BK			0x9110
++#define GP0_ALPHA		0x9114
++#define   GP0_UPD_REGUP BIT(0)
++#define GP0_ORESO		0x9008
++#define   GP0_ORESO_OW GENMASK(11, 0)
++#define   GP0_ORESO_OH GENMASK(23, 12)
++#define GP0_IRESO		0x900c
++#define   GP0_IRESO_IW GENMASK(11, 0)
++#define   GP0_IRESO_IH GENMASK(23, 12)
++#define GP0_DFPOS		0x9100
++#define GP0_DLPOS		0x9104
++#define GP0_VFPOS		0x9108
++#define GP0_VLPOS		0x910c
++/*
++ * GP0 CSC stage: a 3x3 matrix over the three component lines, two signed 15-bit
++ * coefficients per register with unity = 1<<10 (the vendor's register header,
++ * written by VDP_GP_SetCscCoef() in the vendor driver), plus 11-bit input and
++ * output DC offsets scaled by 4 for 8-bit values.
++ *
++ * cv200 needs a matrix here even though the interface runs in RGB: the G0 fetch
++ * hands its three components to the mixer one position rotated, and neither an
++ * ifmt code nor any 32-bit DRM pixel format reaches the honest assignment
++ * (board-measured on the AR513W). GP0_CSC_CYC below is that compensation;
++ * the same stage also
++ * carries the 219/255 gain and the +16 code offset that make the luma the
++ * limited range the AVI InfoFrame declares (see the comment on the writes in
++ * histb-vdp2.c).
++ */
++#define GP0_CSC_IDC		0x9120	/* cscidc0/1[10:0][21:11] csc_en[22] */
++#define   GP0_CSC_EN		BIT(22)
++#define GP0_CSC_ODC		0x9124	/* cscodc0/1[10:0][21:11] csc_sign_mode[22] */
++#define GP0_CSC_IODC		0x9128	/* cscidc2[10:0] cscodc2[21:11] */
++#define GP0_CSC_P0		0x912c	/* row 0: coef00[14:0] coef01[30:16] */
++#define GP0_CSC_P1		0x9130	/* row 0 col 2, row 1 col 0 */
++#define GP0_CSC_P2		0x9134	/* row 1: coef11[14:0] coef12[30:16] */
++#define GP0_CSC_P3		0x9138	/* row 2: coef20[14:0] coef21[30:16] */
++#define GP0_CSC_P4		0x913c	/* row 2 col 2: coef22[14:0] */
++#define   GP0_CSC_LIM		(219 * (1 << 10) / 255)	/* = 881: 219/255 in the same Q10 */
++#define   GP0_CSC_DC16		(16 * 4)	/* +16 codes: DC fields are 10-bit */
++#define   GP0_CSC_PAIR(lo, hi)	(FIELD_PREP(GENMASK(14, 0), (lo)) | \
++				 FIELD_PREP(GENMASK(30, 16), (hi)))
++/* 15-bit signed coefficient, two's complement (vendor assigns HI_S32 to the field) */
++#define   GP0_CSC_COEF(v)	((u32)(v) & 0x7fff)
++/* out0 = in1, out1 = in2, out2 = in0: the inverse of the fetch's rotation */
++#define GP0_CSC_CYC_P0		GP0_CSC_PAIR(0, GP0_CSC_LIM)
++#define GP0_CSC_CYC_P2		GP0_CSC_PAIR(0, GP0_CSC_LIM)
++#define GP0_CSC_CYC_P3		GP0_CSC_PAIR(GP0_CSC_LIM, 0)
++#define GP0_CSC_DC_ODC		(FIELD_PREP(GENMASK(10, 0), GP0_CSC_DC16) | \
++				 FIELD_PREP(GENMASK(21, 11), GP0_CSC_DC16))
++#define GP0_CSC_DC_IODC		FIELD_PREP(GENMASK(21, 11), GP0_CSC_DC16)
++
++/*
++ * GP0 zoom engine step registers: hratio/vratio are the source pixels consumed
++ * per destination pixel, in fixed point with the precision named below. They
++ * are shadowed like the rest of the block, so a driver that sets GP0_IRESO /
++ * GP0_ORESO without them keeps the scaling that was already programmed.
++ *
++ * The two SoCs of this family differ here, and nowhere else in this file:
++ * hi3798mv100 splits the horizontal phase across two registers and takes
++ * hratio in 4.20, while hi3716cv200 packs both horizontal offsets into one
++ * register (GP0_ZME_HOFFSET) and its hratio field is 16 bits. Which set applies
++ * is carried by the matching of_device_id entry (histb_vdp2_chipdata), because
++ * the same driver serves both. The cv200 numbers are not read off a table: the
++ * 1:1 step was measured on the board, where a channel left running by the
++ * vendor fastboot holds 0xf8cc9140 = 0x00001000 and 0xf8cc914c = 0x00001000,
++ * so the horizontal precision is 4.12 like the vertical one.
++ */
++#define GP0_ZME_HSP		0x9140
++#define   GP0_ZME_HSP_RATIO	GENMASK(23, 0)
++#define   GP0_ZME_HSP_HFIR_ORDER BIT(24)
++#define   GP0_ZME_HSP_HAFIR_EN	BIT(25)
++#define   GP0_ZME_HSP_HFIR_EN	BIT(26)
++#define   GP0_ZME_HSP_HCHMID_EN	BIT(28)
++#define   GP0_ZME_HSP_HLMID_EN	BIT(29)
++#define   GP0_ZME_HSP_HAMID_EN	BIT(30)
++#define   GP0_ZME_HSP_HSC_EN	BIT(31)
++#define   GP0_ZME_HPREC		BIT(20)
++#define   GP0_ZME_HFIR_ENABLES	GENMASK(31, 24)	/* filter, median and order bits */
++#define GP0_ZME_HLOFFSET	0x9144
++#define GP0_ZME_HCOFFSET	0x9148
++#define GP0_ZME_VSP		0x914c	/* filter/tap enables only; ratio is in VSR */
++#define GP0_ZME_VSR		0x9150
++#define   GP0_ZME_VSR_RATIO	GENMASK(15, 0)
++#define   GP0_ZME_VPREC		BIT(12)
++#define GP0_ZME_VOFFSET		0x9154
++
++/* hi3716cv200: one horizontal offset register holding both phases, 4.12 hratio */
++#define CV200_GP0_ZME_HSP		0x9140
++#define   CV200_GP0_ZME_HSP_RATIO		GENMASK(15, 0)
++#define   CV200_GP0_ZME_HSP_HFIR_ORDER	BIT(19)
++#define   CV200_GP0_ZME_HSP_HAFIR_EN	BIT(23)
++#define   CV200_GP0_ZME_HSP_HFIR_EN	BIT(24)
++#define   CV200_GP0_ZME_HSP_HCHMID_EN	BIT(28)
++#define   CV200_GP0_ZME_HSP_HLMID_EN	BIT(29)
++#define   CV200_GP0_ZME_HSP_HAMID_EN	BIT(30)
++#define   CV200_GP0_ZME_HSP_HSC_EN	BIT(31)
++#define   CV200_GP0_ZME_HPREC			BIT(12)
++#define CV200_GP0_ZME_HOFFSET		0x9144
++#define   CV200_GP0_ZME_HOFFSET_CO	GENMASK(15, 0)
++#define   CV200_GP0_ZME_HOFFSET_LO	GENMASK(31, 16)
++#define CV200_GP0_ZME_VSP		0x9148
++#define CV200_GP0_ZME_VSR		0x914c
++#define   CV200_GP0_ZME_VSR_RATIO		GENMASK(15, 0)
++#define   CV200_GP0_ZME_VPREC			BIT(12)
++#define CV200_GP0_ZME_VOFFSET		0x9150
++#define   CV200_GP0_ZME_VOFFSET_BTM	GENMASK(15, 0)
++#define   CV200_GP0_ZME_VOFFSET_TOP	GENMASK(31, 16)
++
++/*
++ * GP1: the second graphics-post block, GP0 + GP_OFFSET (0x800; two GP blocks
++ * exist). This range is unnamed, so the field layout below is GP0_CTRL's
++ * applied at the mirror offsets.
++ */
++#define GP1_CTRL		0x9800
++#define GP1_UPD			0x9804
++#define GP1_HCOEFAD		0x9810
++#define GP1_VCOEFAD		0x9814
++#define GP1_PARAUP		0x9818
++#define GP1_ORESO		0x9808
++#define GP1_IRESO		0x980c
++#define GP1_GALPHA		0x9820
++#define GP1_DFPOS		0x9900
++#define GP1_DLPOS		0x9904
++#define GP1_VFPOS		0x9908
++#define GP1_VLPOS		0x990c
++
++/* ------------------------------------------------------------------ */
++/* Mixers / CBM                                                        */
++/* ------------------------------------------------------------------ */
++/*
++ * The SoC's register layout leaves 0x60a8-0x8fff and 0x918c-0x9fff as holes,
++ * but the silicon has the full set addressed by stride: five graphics blocks
++ * (G0..G4) at 0x6000..0x8000 and two graphics-post blocks (GP0/GP1) at
++ * 0x9000/0x9800. MIXG0, the mixer behind the graphics blocks, is therefore a
++ * real mixer even though no header names it and has to be programmed like any
++ * other.
++ */
++#define MIXG0_BKG		0xb200
++#define MIXG0_BKALPHA		0xb204
++#define MIXG0_MIX		0xb208
++#define   MIX_PRIO0 GENMASK(3, 0)
++#define   MIX_PRIO1 GENMASK(7, 4)
++#define CBM_BKG1		0xb400	/* DHD0 mixer background:
++					 * Cr[9:0] Cb[19:10] Y[29:20]
++					 */
++#define   CBM_BKG_BLACK		0x04080200	/* Y=64, Cb=Cr=512 */
++#define CBM_MIX1		0xb408		/* DHD0 mixer priority */
++#define CBM_BKG2		0xb420		/* DHD1 mixer background */
++#define CBM_MIX2		0xb428		/* DHD1 mixer priority */
++#define CBM_ATTR		0xb440
++#define   CBM_ATTR_SUR0 BIT(0)
++#define   CBM_ATTR_SUR1 BIT(1)
++#define   CBM_ATTR_SUR2 BIT(2)
++#define   CBM_ATTR_SUR3 BIT(3)
++#define   CBM_ATTR_SUR4 BIT(4)
++
++/* CBM_MIX1 layer ids (values programmed are layer_id + 1, 0 = no layer) */
++#define CBM_LAYER_VP0		1
++#define CBM_LAYER_GP0		2
++
++/*
++ * MIXG0 is the graphics-side mixer and numbers its slots by graphics layer: 1 =
++ * G0, 2 = G1. Same bit positions as above, different namespace.
++ */
++#define MIXG0_LAYER_G0		1
++#define MIXG0_LAYER_G1		2
++
++/* ------------------------------------------------------------------ */
++/* WBC_HD0: write-back of the composited HD channel                    */
++/* ------------------------------------------------------------------ */
++/*
++ * Taps DHD0 after the mixer, so a capture only produces pixels while the
++ * channel is running, and one enable plus regup yields one frame. The
++ * address and stride fields are byte values; the size fields are the last
++ * pixel, minus one style, like the rest of the block.
++ */
++#define WBC_DHD0_CTRL		0xac00
++#define   WBC_CTRL_REQ_INTERVAL	GENMASK(9, 0)	/* lines between write requests */
++#define   WBC_CTRL_AUTO_STOP	BIT(10)	/* wired up for WBC_GP0 only */
++#define   WBC_CTRL_HISTOGRAM	BIT(11)	/* histogam_en in the SoC layout */
++#define   WBC_CTRL_3D_MODE		GENMASK(19, 18)	/* 0 = mono */
++#define   WBC_CTRL_FORMAT		GENMASK(27, 24)	/* see the WBC_FORMAT_* values */
++#define   WBC_FORMAT_PKG_UYVY	0
++#define   WBC_FORMAT_PKG_YUYV	1
++#define   WBC_FORMAT_PKG_YVYU	2
++#define   WBC_FORMAT_SP420		4
++#define   WBC_FORMAT_SP422		5
++#define   WBC_FORMAT_ARGB8888		3	/* only the graphics tap takes this */
++#define   WBC_CTRL_MODE		GENMASK(29, 28)	/* what the block reads from the channel */
++#define   WBC_MODE_PROGRESSIVE	1
++#define   WBC_CTRL_UV_ORDER		BIT(30)	/* 1 = U first; planar formats only */
++#define   WBC_CTRL_EN			BIT(31)
++#define WBC_DHD0_UPD		0xac04
++#define   WBC_UPD_REGUP			BIT(0)
++#define WBC_DHD0_YADDR		0xac10	/* luma plane, or the whole picture when packed */
++#define WBC_DHD0_CADDR		0xac14	/* chroma plane of the semi-planar formats */
++#define WBC_DHD0_STRIDE		0xac18	/* both halves are written as one word */
++#define   WBC_STRIDE_L			GENMASK(15, 0)
++#define   WBC_STRIDE_C			GENMASK(31, 16)
++#define WBC_DHD0_ORESO		0xac20	/* written picture size, minus one */
++#define WBC_DHD0_FCROP		0xac24	/* first pixel kept: h[23:12] w[11:0] */
++#define   WBC_FCROP_W			GENMASK(11, 0)
++#define   WBC_FCROP_H			GENMASK(23, 12)
++#define WBC_DHD0_LCROP		0xac28	/* last pixel kept, minus one style */
++#define   WBC_LCROP_W			GENMASK(11, 0)
++#define   WBC_LCROP_H			GENMASK(23, 12)
++#define   WBC_ORESO_W			GENMASK(11, 0)
++#define   WBC_ORESO_H			GENMASK(23, 12)
++/*
++ * Relative offsets inside a write-back block. WBC_DHD0_* and WBC_GP0_* below
++ * share this layout; only DHD0 goes on to have a ZME and a histogram, and only
++ * GP0 has a dither mode.
++ */
++#define WBC_OFS_CTRL			0x000
++#define WBC_OFS_UPD			0x004
++#define WBC_OFS_YADDR			0x010
++#define WBC_OFS_CADDR			0x014
++#define WBC_OFS_STRIDE			0x018
++#define WBC_OFS_ORESO			0x020
++#define WBC_OFS_FCROP			0x024
++#define WBC_OFS_LCROP			0x028
++#define WBC_BASE_DHD0			0xac00
++#define WBC_BASE_GP0			0xa800
++
++/*
++ * The graphics tap: the vendor's own framebuffer code writes ARGB8888 out of
++ * this block to copy the on-screen layer, with the
++ * 8-bit SPA dither mode in dither_md[31:29].
++ */
++#define WBC_GP0_DITHER_CTRL		0xa900
++#define   WBC_GP0_DITHER_MD		GENMASK(31, 29)
++#define   WBC_GP0_DITHER_SPA_8		3
++
++/*
++ * The write-back scales through a ZME of its own, laid out like the graphics
++ * layer's: same ratio fields, same offset registers.
++ */
++#define WBC_DHD0_ZME_HSP		0xaec0
++#define   WBC_ZME_HSP_RATIO		GENMASK(23, 0)
++#define   WBC_ZME_HPREC			BIT(20)	/* 1:1 horizontal ratio */
++#define WBC_DHD0_ZME_HLOFFSET	0xaec4
++#define WBC_DHD0_ZME_HCOFFSET	0xaec8
++#define WBC_DHD0_ZME_VSP		0xaed8	/* format of what the block fetches, plus taps */
++#define   WBC_ZME_IN_FMT		GENMASK(20, 19)	/* VDP_PROC_FMT_*: 0 SP422, 1 SP420 */
++#define   WBC_ZME_OUT_FMT		GENMASK(22, 21)
++#define WBC_DHD0_ZME_VSR		0xaedc
++#define   WBC_ZME_VSR_RATIO		GENMASK(15, 0)
++#define   WBC_ZME_VPREC			BIT(12)	/* 1:1 vertical ratio */
++#define WBC_DHD0_ZME_VOFFSET	0xaee0
++
++/* ------------------------------------------------------------------ */
++/* DHD0 display channel (DHD1 = base + 0x400)                          */
++/* ------------------------------------------------------------------ */
++#define DHD0_CTRL		0xc000
++#define   DHD_CTRL_REGUP BIT(0)
++#define   DHD_CTRL_IOP BIT(4)		/* 1 = progressive */
++#define   DHD_CTRL_HDMI_MODE BIT(14)
++#define   DHD_CTRL_CBAR_SEL BIT(29)	/* color-bar pattern select */
++#define   DHD_CTRL_CBAR_EN BIT(30)	/* hardware color-bar generator */
++#define   DHD_CTRL_INTF_EN BIT(31)
++#define   DHD_CTRL_INTFB BIT(15)	/*
++					 * reserved in the mv100 layout, yet a channel
++					 * that drives a panel has it set, so this
++					 * driver sets it too.
++					 */
++#define DHD0_VSYNC		0xc004
++#define   DHD_VSYNC_VACT GENMASK(11, 0)
++#define   DHD_VSYNC_VBB GENMASK(19, 12)
++#define   DHD_VSYNC_VFB GENMASK(27, 20)
++#define DHD0_HSYNC1		0xc008
++#define   DHD_HSYNC1_HACT GENMASK(15, 0)
++#define   DHD_HSYNC1_HBB GENMASK(31, 16)
++#define DHD0_HSYNC2		0xc00c
++#define   DHD_HSYNC2_HFB GENMASK(15, 0)
++#define   DHD_HSYNC2_HMID GENMASK(31, 16)
++#define DHD0_VPLUS		0xc010
++#define   DHD_VPLUS_BVACT GENMASK(11, 0)
++#define   DHD_VPLUS_BVBB GENMASK(19, 12)
++#define   DHD_VPLUS_BVFB GENMASK(27, 20)
++#define DHD0_PWR		0xc014
++#define   DHD_PWR_HPW GENMASK(15, 0)
++#define   DHD_PWR_VPW GENMASK(23, 16)
++#define DHD0_VTTHD3		0xc018
++#define DHD0_VTTHD		0xc01c
++#define   DHD_VTTHD1 GENMASK(12, 0)
++#define   DHD_VTTHD1_MODE BIT(15)	/* 1 = frame based */
++#define DHD0_SYNC_INV		0xc020
++#define   DHD_SYNC_HDMI_DV_INV BIT(8)
++#define   DHD_SYNC_HDMI_HS_INV BIT(9)
++#define   DHD_SYNC_HDMI_VS_INV BIT(10)
++#define   DHD_SYNC_HDMI_F_INV BIT(11)
++#define   DHD_SYNC_DATE_HS_INV BIT(13)
++#define DHD0_DATA_SEL		0xc02c
++#define DHD0_STATE		0xc0f0	/* live: vblank[1] vcnt[15:3] */
++#define DHD0_DEBUG		0xc0f8	/* live: pix_h[15:0] pix_v[27:16] pix_src[30:28] */
++#define DHD0_DEBUG_STATE	0xc0fc	/* live: pixel_value[29:0] at the sample point */
++#define HDATE_VERSION		0xf000	/* IP version word; anchor of the register layout */
++#define HDATE_STATE		0xf010	/* hd digital port: line_len[12:0] frame_len[26:16] */
++#define HDATE_EN		0xf004	/* hd_en[0]: hd digital output port enable */
++#define HDATE_POLA_CTRL		0xf008	/* hs/vs/fid input polarity */
++#define HDATE_VIDEO_FORMAT	0xf00c	/* video_ft[3:0] sync_add[6:4] out_ctrl[8:7] csc[11:9] */
++#define HDATE_OUT_CTRL		0xf014	/* vsync_sel[1:0] hsync_sel[3:2] video3_sel[5:4]
++					 * video2_sel[7:6] video1_sel[9:8] src_ctrl[11:10]
++					 * sync_lpf_en[12] sd_sel[13]
++					 */
++#define   HDATE_EN_HD		BIT(0)
++/* video_ft[3:0]: 2 = 720p, 4 = 1080p/1080i as the vendor's default path codes it */
++#define   HDATE_VIDEO_FT	GENMASK(3, 0)
++#define   HDATE_OUT_VIDEO3_SEL	GENMASK(5, 4)
++#define   HDATE_OUT_VIDEO2_SEL	GENMASK(7, 6)
++#define   HDATE_OUT_VIDEO1_SEL	GENMASK(9, 8)
++#define   HDATE_POLA_IN		(BIT(0) | BIT(1))	/* hs/vs input polarity */
++/*
++ * The HD port resamples the composed frame with an 18-tap filter whose taps
++ * live in two runs: taps 1..13 follow OUT_CTRL, taps 14..18 sit past the
++ * CGMSA/DAC-detector registers.
++ */
++#define HDATE_SRC_13_COEF1	0xf018
++#define HDATE_SRC_13_COEF_HEAD	13
++#define HDATE_SRC_13_COEF14	0xf0c8
++#define HDATE_SRC_13_COEF_TAIL	5
++/*
++ * hdmi_data_sel picks the data type the DHD channel serialises on the
++ * HDMI pins: 1 = RGB, 0 = YCbCr. It is bit 3 here and the only one the
++ * VDP owns: bit 1 is vga_data_sel and bit 2 is reserved on mv100, so this
++ * register has to be read, patched and written back.
++ */
++#define   DHD_DATA_SEL_HDMI BIT(3)
++#define DHD0_ABUFTHD		0xc034
++
++#endif /* _HISTB_VDP2_REGS_H_ */
+--- /dev/null
++++ b/drivers/gpu/drm/histb/histb-vdp2.c
+@@ -0,0 +1,2557 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * DRM driver for the HiSTB VDP v2 display engine, found on hi3798mv100 /
++ * hi3796mv100 / hi3716dv100 SoCs.
++ *
++ * The VDP block at 0xf8cc0000 provides two display channels. This driver
++ * exposes DHD0 (the HD channel) as a single CRTC with a primary plane fed by
++ * the G0 graphics (RGB) layer, routed G0 -> GP0 -> MIXG0 -> CBM(MIX0) -> DHD0
++ * -> HDMI. Scanout data leaves the VDP towards the HDMI transmitter selected
++ * through of_graph port@0; the downstream node is a drm_bridge
++ * (hisilicon,hi3798mv100-hdmi).
++ *
++ * Clocking: the HD channel is fed by the CRG's HD PLL through a post divider
++ * and CRG54's vo_hd_clk_div (offset 0xd8), i.e. the channel clock is half the
++ * PLL output. drivers/clk/hisilicon models that as "clk_vo_hd", which is also
++ * what the HDMI transmitter receives 1:1, so the two blocks cannot disagree
++ * about the pixel clock. The driver enables the CRG54 gates by hand and pulses
++ * CRG54 bit 30 before it configures anything, so the display controller comes
++ * up from its reset defaults rather than from the state it was handed over in.
++ *
++ * WBC_HD0 taps that mixed output and can write one frame back to memory;
++ * it is exposed as a DRM writeback connector, and only produces data while
++ * the channel is running.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/clk.h>
++#include <linux/component.h>
++#include <linux/io.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_bridge_connector.h>
++#include <drm/drm_edid.h>
++#include <drm/drm_blend.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_damage_helper.h>
++#include <drm/drm_drv.h>
++#include <drm/clients/drm_client_setup.h>
++#include <drm/drm_fbdev_dma.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_plane.h>
++#include <drm/drm_util.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_managed.h>
++#include <drm/drm_mode_config.h>
++#include <drm/drm_modeset_helper.h>
++#include <drm/drm_of.h>
++#include <drm/drm_print.h>
++#include <drm/drm_plane_helper.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_vblank.h>
++#include <drm/drm_writeback.h>
++
++#include "histb-vdp.h"
++#include "histb-vdp2-regs.h"
++
++/*
++ * Where the GP0 zoom engine keeps its step registers, and what a 1:1 step is.
++ * The two SoCs this driver serves agree on every other offset the driver
++ * touches; this block is the one place they differ (see the note in
++ * histb-vdp2-regs.h), so it is selected by the of_device_id rather than by a
++ * compile-time choice.
++ */
++struct histb_vdp2_zme {
++	u32	hsp;		/* horizontal step register */
++	u32	vsr;		/* vertical step register */
++	u32	hoffset;	/* horizontal phase; the second one, if any, is at +4 */
++	u32	voffset;	/* vertical phase */
++	u32	hratio;		/* field mask inside hsp */
++	u32	vratio;		/* field mask inside vsr */
++	u32	hratio_max;	/* widest value the two fields hold */
++	u32	vratio_max;
++	bool	hoffset_pair;
++	unsigned long	hprec;	/* the ratio that means 1:1 */
++	unsigned long	vprec;
++};
++
++static const struct histb_vdp2_zme histb_vdp2_zme_mv100 = {
++	.hsp = GP0_ZME_HSP,
++	.vsr = GP0_ZME_VSR,
++	.hoffset = GP0_ZME_HLOFFSET,
++	.voffset = GP0_ZME_VOFFSET,
++	.hratio = GP0_ZME_HSP_RATIO,
++	.vratio = GP0_ZME_VSR_RATIO,
++	.hratio_max = 0xffffff,
++	.vratio_max = 0xffff,
++	.hoffset_pair = true,
++	.hprec = GP0_ZME_HPREC,
++	.vprec = GP0_ZME_VPREC,
++};
++
++/*
++ * The precisions here are board readings, not table arithmetic: a channel the
++ * vendor fastboot left scanning holds 0x00001000 in both step registers, so
++ * this part counts in 4.12 both ways.
++ */
++static const struct histb_vdp2_zme histb_vdp2_zme_cv200 = {
++	.hsp = CV200_GP0_ZME_HSP,
++	.vsr = CV200_GP0_ZME_VSR,
++	.hoffset = CV200_GP0_ZME_HOFFSET,
++	.voffset = CV200_GP0_ZME_VOFFSET,
++	.hratio = CV200_GP0_ZME_HSP_RATIO,
++	.vratio = CV200_GP0_ZME_VSR_RATIO,
++	.hratio_max = 0xffff,
++	.vratio_max = 0xffff,
++	.hoffset_pair = false,
++	.hprec = CV200_GP0_ZME_HPREC,
++	.vprec = CV200_GP0_ZME_VPREC,
++};
++
++/*
++ * Per-chip differences in the *output shaping* path, established by reading the
++ * same registers on a part that is displaying: the vendor's live values on
++ * Hi3716CV200 are VO_MUX 0x9 (sddate_sel and hdmi_sel set, ie its primary
++ * display is channel 1), GP0_CTRL 0x80001230 (CSC order, no zoom stage) and
++ * DHD0_CTRL 0x80008010 (the HDMI_MODE bit is absent, interface B is set),
++ * while the Hi3798MV100 pipeline this driver first ran on had 0x8000C010
++ * with both bits and its mux already routed by the boot.
++ */
++struct histb_vdp2_chip {
++	const struct histb_vdp2_zme	*zme;
++	u32				gp0_order;
++	bool				dhd_intf_b;
++	bool				dhd_hdmi_mode;
++	bool				mux_hdmi_dhd0;
++	bool				hdate_hdmi_out;
++	/*
++	 * What the zoom engine wants in its step registers alongside a non-1:1
++	 * ratio: the filter, median and order bits. Zero for a part whose recipe
++	 * has not been established on hardware, which is also what refuses scaling
++	 * there. The vertical ones live in a separate register on this part, but
++	 * the same address is cv200's vertical step register, so which block to
++	 * touch is per part as well.
++	 */
++	u32				zme_hfir_en;
++	u32				zme_vfir_reg;
++	u32				zme_vfir_en;
++	/*
++	 * Expose the write-back taps: WBC_HD0 (the composited HD channel, block
++	 * at 0xac00) and WBC_GP0 (graphics layer, 0xa800). Hi3798MV100 has both
++	 * board-verified. Hi3716CV200's own register file has the same two blocks
++	 * at the same offsets with the same bit positions, accumulated from
++	 * S_VOU_CV200_REGS_TYPE in the vendor's cv200 register header, and its
++	 * cast path drives WBC_HD0 the way this driver does, so the map is shared.
++	 */
++	bool				has_wbc;
++	/*
++	 * Run the GP0 CSC stage as the component-line unrotation plus the
++	 * limited-range shaping. That contract was established on Hi3716CV200
++	 * (the G0 fetch hands its lines over rotated, see the comment in
++	 * histb_vdp2_pipeline_init()); Hi3798MV100 was verified displaying with
++	 * the stage bypassed, so on it the stage must stay off.
++	 */
++	bool				gp0_csc_cycle;
++};
++
++static const struct histb_vdp2_chip histb_vdp2_mv100 = {
++	.zme = &histb_vdp2_zme_mv100,
++	.gp0_order = GP0_ORDER_ZME_CSC,
++	/*
++	 * Board readings: the part's own live gfx path carried these while
++	 * magnifying (0x9140 = 0xf7055555, 0x914c = 0xf1800000), and the same
++	 * words put a clean scaled picture on the panel here. Both are the value
++	 * of their field, not pre-shifted: the register step is applied against
++	 * the mask.
++	 */
++	.zme_hfir_en = 0xf7,
++	.zme_vfir_reg = GP0_ZME_VSP,
++	.zme_vfir_en = 0xf1800000,
++	.dhd_intf_b = true,
++	.dhd_hdmi_mode = true,
++	.mux_hdmi_dhd0 = false,
++	.has_wbc = true,
++	.gp0_csc_cycle = false,
++};
++
++static const struct histb_vdp2_chip histb_vdp2_cv200 = {
++	.zme = &histb_vdp2_zme_cv200,
++	.gp0_order = GP0_ORDER_CSC,
++	.dhd_intf_b = true,
++	/*
++	 * hdmi_mode (bit14) is the interface's data-type decision and this part
++	 * leaves it clear while carrying RGB -- measured on a channel that was
++	 * displaying: 0x80008010, where this driver's 0x8000C010 had it set.
++	 */
++	.dhd_hdmi_mode = false,
++	.mux_hdmi_dhd0 = true,
++	.hdate_hdmi_out = true,
++	.has_wbc = true,
++};
++
++struct histb_vdp2 {
++	struct histb_vdp	base;
++	struct device		*dev;
++	void __iomem		*regs;
++
++	struct clk		*clk_pix;	/* HD channel clock, shared with HDMI */
++	struct clk		*clk_vo;	/* CRG54 gate group of the channel */
++
++	struct reset_control	*rst;
++	const struct histb_vdp2_zme	*zme;
++	const struct histb_vdp2_chip	*chip;
++	void				*zme_coef;	/* filter tables in memory */
++	dma_addr_t			zme_coef_dma;
++
++	int			irq;
++
++	struct histb_vdp2_display	*disp;	/* NULL unless the pipeline is bound */
++};
++
++/*
++ * The DRM objects belong to the aggregate driver, not to the platform device:
++ * they come into existence when the pipeline the device tree describes is up
++ * and go away when it comes down, which can happen while this device stays
++ * probed (the transmitter is a component of the aggregate). devm cannot cover
++ * that lifetime, so this block is allocated by the aggregate's bind and
++ * released by its unbind.
++ */
++struct histb_vdp2_display {
++	struct histb_vdp_display	base;
++	struct histb_vdp2		*vdp;
++
++	struct drm_encoder	wb_enc;
++	struct drm_writeback_connector	wb;
++	struct drm_encoder	wb_gp0_enc;
++	struct drm_writeback_connector	wb_gp0;
++	/*
++	 * One slot per write-back block: wb_pending[t] says a job is armed on
++	 * block t and wb_running[t] names the connector to signal. Only the
++	 * commit tail sets wb_pending; the interrupt handler, or a channel that
++	 * goes down with a job still armed, clears it.
++	 */
++	bool			wb_pending[2];
++	struct drm_writeback_connector *wb_running[2];
++};
++
++static inline struct histb_vdp2_display *
++plane_to_display(struct drm_plane *plane)
++{
++	struct histb_vdp_display *base =
++		container_of(plane, struct histb_vdp_display, primary);
++
++	return container_of(base, struct histb_vdp2_display, base);
++}
++
++static inline struct histb_vdp2_display *
++crtc_to_display(struct drm_crtc *crtc)
++{
++	struct histb_vdp_display *base =
++		container_of(crtc, struct histb_vdp_display, crtc);
++
++	return container_of(base, struct histb_vdp2_display, base);
++}
++
++static inline struct histb_vdp2 *plane_to_vdp(struct drm_plane *plane)
++{
++	return plane_to_display(plane)->vdp;
++}
++
++static inline struct histb_vdp2 *crtc_to_vdp(struct drm_crtc *crtc)
++{
++	return crtc_to_display(crtc)->vdp;
++}
++
++/*
++ * The mode's pixel clock is the HD channel clock, which the CRG driver builds
++ * from the HD PLL's post divider and CRG54's vo_hd_clk_div. With vo_hd_clk_div
++ * at /2 the PLL runs at twice the pixel clock: 297MHz for 1080p60, 148.5MHz for
++ * 720p and the 1080p24-30 family. Requesting the channel rate is therefore
++ * enough for the transmitter to see the same clock, since it takes vo_hd 1:1.
++ */
++static int histb_vdp2_set_pixclk(struct histb_vdp2 *vdp, unsigned int mode_khz)
++{
++	unsigned long rate = (unsigned long)mode_khz * 1000;
++	int ret;
++
++	ret = clk_set_rate(vdp->clk_pix, rate);
++	if (ret) {
++		dev_err(vdp->dev, "failed to set pixel clock to %lu Hz: %d\n",
++			rate, ret);
++		return ret;
++	}
++
++	dev_dbg(vdp->dev, "pixel clock %lu Hz for mode clock %u kHz\n",
++		clk_get_rate(vdp->clk_pix), mode_khz);
++	return 0;
++}
++
++static inline u32 vo_read(struct histb_vdp2 *vdp, u32 off)
++{
++	return readl_relaxed(vdp->regs + off);
++}
++
++static inline void vo_write(struct histb_vdp2 *vdp, u32 off, u32 val)
++{
++	writel_relaxed(val, vdp->regs + off);
++}
++
++/*
++ * FIELD_PREP() cannot be used here: the ratio masks come from chip data, and
++ * that macro requires a build-time constant mask.
++ */
++static u32 vo_rmw_field(struct histb_vdp2 *vdp, u32 off, u32 mask, u32 val)
++{
++	u32 ctrl = vo_read(vdp, off);
++
++	val = (val << __ffs(mask)) & mask;
++	ctrl = (ctrl & ~mask) | val;
++	vo_write(vdp, off, ctrl);
++
++	return ctrl;
++}
++
++/*
++ * Wait for a layer's shadow-latch request to be consumed. The update
++ * register's bit 0 is a self-clearing strobe on this part: writing DHD0_CTRL
++ * with bit 0 set read back with it clear immediately afterwards, and G0_UPD does
++ * the same, so the poll proves the write was taken rather than that the block
++ * re-sampled at a vsync boundary. The layer paths need that because the
++ * framebuffer can be freed right after the commit returns, and a surface_en
++ * clear still sitting unconsumed would then be lost.
++ */
++static void histb_vdp2_wait_upd(struct histb_vdp2 *vdp, u32 off)
++{
++	int i;
++
++	for (i = 0; i < 100; i++) {
++		if (!(vo_read(vdp, off) & G0_UPD_REGUP))
++			return;
++		udelay(10);
++	}
++
++	dev_warn(vdp->dev, "register update at 0x%04x did not finish\n", off);
++}
++
++/* ------------------------------------------------------------------ */
++/* Plane (G0 graphics layer)                                           */
++/* ------------------------------------------------------------------ */
++
++/*
++ * ARGB8888 is accepted as storage for a 32bpp surface but its alpha byte is
++ * ignored (see the format switch in histb_vdp2_g0_set()), which is what the
++ * plane's "pixel blend mode" = None declares.
++ */
++static const u32 histb_vdp2_formats[] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_ABGR8888,
++	DRM_FORMAT_RGBA8888,
++	DRM_FORMAT_RGB565,
++	DRM_FORMAT_XRGB4444,
++	DRM_FORMAT_ARGB4444,
++	DRM_FORMAT_XRGB1555,
++	/* one byte per channel; the fetch stride is in 16-byte units, so the
++	 * width has to be a multiple of 16 pixels for the pitch to divide.
++	 */
++	DRM_FORMAT_BGR888,
++};
++
++/* `value - 1`, clamped so that a zero porch/sync width never underflows */
++static u32 histb_vdp2_m1(u32 v)
++{
++	return max(v, 1u) - 1;
++}
++
++/*
++ * The zoom engine reads its filter coefficients from memory, so a step that is
++ * not 1:1 needs the band table as well. These are the polyphase tables for the
++ * eight-tap horizontal and four-tap vertical stages, one set per supported step
++ * (magnifying, 1.11, 0.75, 0.5, 0.33, 0.25 and beyond that), each set holding
++ * luma then chroma then the two-tap stage. At 1:1 the engine copies and needs no
++ * table, which is why this block could run without one until now.
++ */
++static const u32 histb_vdp2_zme_coef[] = {
++	0xffea0004, 0x01d40028, 0xffea0028, 0x00000004, 0xfff90001,
++	0x01c9fff7, 0xffda0064, 0x00000008, 0x00040000, 0x01a9ffd6,
++	0xffca00a8, 0x0000000b, 0x000b0000, 0x0176ffc2, 0xffbf00f0,
++	0x0000000e, 0x000e0000, 0x0136ffbc, 0xffbc0136, 0x0000000e,
++	0x000e0000, 0x00f0ffbf, 0xffc20176, 0x0000000b, 0x000b0000,
++	0x00a8ffca, 0xffd601a9, 0x00000004, 0x00080000, 0x0064ffda,
++	0xfff701c9, 0x0001fff9, 0xffea0004, 0x01d40028, 0xffea0028,
++	0x00000004, 0xfff90001, 0x01c9fff7, 0xffda0064, 0x00000008,
++	0x00040000, 0x01a9ffd6, 0xffca00a8, 0x0000000b, 0x000b0000,
++	0x0176ffc2, 0xffbf00f0, 0x0000000e, 0x000e0000, 0x0136ffbc,
++	0xffbc0136, 0x0000000e, 0x000e0000, 0x00f0ffbf, 0xffc20176,
++	0x0000000b, 0x000b0000, 0x00a8ffca, 0xffd601a9, 0x00000004,
++	0x00080000, 0x0064ffda, 0xfff701c9, 0x0001fff9, 0x96e001ff,
++	0x10edc524, 0xe9862bd5, 0x0032d351, 0x91a2f144, 0x04010039,
++	0x10bc4010, 0x00544af5, 0x4cb6187a, 0x67143b4d, 0x0000468e,
++	0x00000000, 0x00000000, 0x01ff0000, 0x00000000, 0x00000000,
++	0x000bfffd, 0x01f0ffd7, 0xfff0003d, 0x00000004, 0x0011fffc,
++	0x01c3ffc1, 0xffdd008a, 0xffff0009, 0x0012fffc, 0x0182ffba,
++	0xffcc00de, 0xfffe000e, 0x0011fffd, 0x0133ffbf, 0xffbf0133,
++	0xfffd0011, 0x000efffe, 0x00deffcc, 0xffba0182, 0xfffc0012,
++	0x0009ffff, 0x008affdd, 0xffc101c3, 0xfffc0011, 0x00040000,
++	0x003dfff0, 0xffd701f0, 0xfffd000b, 0x00000000, 0x01ff0000,
++	0x00000000, 0x00000000, 0x000bfffd, 0x01f0ffd7, 0xfff0003d,
++	0x00000004, 0x0011fffc, 0x01c3ffc1, 0xffdd008a, 0xffff0009,
++	0x0012fffc, 0x0182ffba, 0xffcc00de, 0xfffe000e, 0x0011fffd,
++	0x0133ffbf, 0xffbf0133, 0xfffd0011, 0x000efffe, 0x00deffcc,
++	0xffba0182, 0xfffc0012, 0x0009ffff, 0x008affdd, 0xffc101c3,
++	0xfffc0011, 0x00040000, 0x003dfff0, 0xffd701f0, 0xfffd000b,
++	0x96e001ff, 0x10edc524, 0xe9862bd5, 0x0032d351, 0x91a2f144,
++	0x04010039, 0x10bc4010, 0x00544af5, 0x4cb6187a, 0x67143b4d,
++	0x0000468e, 0x00000000, 0xffea0004, 0x01d40028, 0xffea0028,
++	0x00000004, 0xfff90001, 0x01c9fff7, 0xffda0064, 0x00000008,
++	0x00040000, 0x01a9ffd6, 0xffca00a8, 0x0000000b, 0x000b0000,
++	0x0176ffc2, 0xffbf00f0, 0x0000000e, 0x000e0000, 0x0136ffbc,
++	0xffbc0136, 0x0000000e, 0x000e0000, 0x00f0ffbf, 0xffc20176,
++	0x0000000b, 0x000b0000, 0x00a8ffca, 0xffd601a9, 0x00000004,
++	0x00080000, 0x0064ffda, 0xfff701c9, 0x0001fff9, 0xffea0004,
++	0x01d40028, 0xffea0028, 0x00000004, 0xfff90001, 0x01c9fff7,
++	0xffda0064, 0x00000008, 0x00040000, 0x01a9ffd6, 0xffca00a8,
++	0x0000000b, 0x000b0000, 0x0176ffc2, 0xffbf00f0, 0x0000000e,
++	0x000e0000, 0x0136ffbc, 0xffbc0136, 0x0000000e, 0x000e0000,
++	0x00f0ffbf, 0xffc20176, 0x0000000b, 0x000b0000, 0x00a8ffca,
++	0xffd601a9, 0x00000004, 0x00080000, 0x0064ffda, 0xfff701c9,
++	0x0001fff9, 0x96e001ff, 0x10edc524, 0xe9862bd5, 0x0032d351,
++	0x91a2f144, 0x04010039, 0x10bc4010, 0x00544af5, 0x4cb6187a,
++	0x67143b4d, 0x0000468e, 0x00000000, 0x0000fff0, 0x00fe0091,
++	0x00000091, 0x0000fff0, 0xfff7fff3, 0x00fc007b, 0x000b00a7,
++	0x0000ffed, 0xfff1fff6, 0x00f50065, 0x001900bc, 0xffffffeb,
++	0xffedfff9, 0x00ec0050, 0x002900ce, 0xfffdffea, 0xffebfffb,
++	0x00de003c, 0x003c00de, 0xfffbffeb, 0xffeafffd, 0x00ce0029,
++	0x005000ec, 0xfff9ffed, 0xffebffff, 0x00bc0019, 0x006500f5,
++	0xfff6fff1, 0xffed0000, 0x00a7000b, 0x007b00fc, 0xfff3fff7,
++	0x0000fff0, 0x00fe0091, 0x00000091, 0x0000fff0, 0xfff7fff3,
++	0x00fc007b, 0x000b00a7, 0x0000ffed, 0xfff1fff6, 0x00f50065,
++	0x001900bc, 0xffffffeb, 0xffedfff9, 0x00ec0050, 0x002900ce,
++	0xfffdffea, 0xffebfffb, 0x00de003c, 0x003c00de, 0xfffbffeb,
++	0xffeafffd, 0x00ce0029, 0x005000ec, 0xfff9ffed, 0xffebffff,
++	0x00bc0019, 0x006500f5, 0xfff6fff1, 0xffed0000, 0x00a7000b,
++	0x007b00fc, 0xfff3fff7, 0x96e001ff, 0x10edc524, 0xe9862bd5,
++	0x0032d351, 0x91a2f144, 0x04010039, 0x10bc4010, 0x00544af5,
++	0x4cb6187a, 0x67143b4d, 0x0000468e, 0x00000000, 0x0013ffee,
++	0x00e20090, 0x00130090, 0xfffcffee, 0x0009ffef, 0x00e1007e,
++	0x001e00a1, 0xfffbffef, 0x0000fff1, 0x00de006d, 0x002b00b1,
++	0xfff9ffef, 0xfffafff2, 0x00d6005b, 0x003a00c0, 0xfff7fff2,
++	0xfff5fff4, 0x00cd004a, 0x004a00cd, 0xfff4fff5, 0xfff2fff7,
++	0x00c0003a, 0x005b00d6, 0xfff2fffa, 0xffeffff9, 0x00b1002b,
++	0x006d00de, 0xfff10000, 0xffeffffb, 0x00a1001e, 0x007e00e1,
++	0xffef0009, 0x0013ffee, 0x00e20090, 0x00130090, 0xfffcffee,
++	0x0009ffef, 0x00e1007e, 0x001e00a1, 0xfffbffef, 0x0000fff1,
++	0x00de006d, 0x002b00b1, 0xfff9ffef, 0xfffafff2, 0x00d6005b,
++	0x003a00c0, 0xfff7fff2, 0xfff5fff4, 0x00cd004a, 0x004a00cd,
++	0xfff4fff5, 0xfff2fff7, 0x00c0003a, 0x005b00d6, 0xfff2fffa,
++	0xffeffff9, 0x00b1002b, 0x006d00de, 0xfff10000, 0xffeffffb,
++	0x00a1001e, 0x007e00e1, 0xffef0009, 0x96e001ff, 0x10edc524,
++	0xe9862bd5, 0x0032d351, 0x91a2f144, 0x04010039, 0x10bc4010,
++	0x00544af5, 0x4cb6187a, 0x67143b4d, 0x0000468e, 0x00000000,
++	0x0013ffee, 0x00e20090, 0x00130090, 0xfffcffee, 0x0009ffef,
++	0x00e1007e, 0x001e00a1, 0xfffbffef, 0x0000fff1, 0x00de006d,
++	0x002b00b1, 0xfff9ffef, 0xfffafff2, 0x00d6005b, 0x003a00c0,
++	0xfff7fff2, 0xfff5fff4, 0x00cd004a, 0x004a00cd, 0xfff4fff5,
++	0xfff2fff7, 0x00c0003a, 0x005b00d6, 0xfff2fffa, 0xffeffff9,
++	0x00b1002b, 0x006d00de, 0xfff10000, 0xffeffffb, 0x00a1001e,
++	0x007e00e1, 0xffef0009, 0x0013ffee, 0x00e20090, 0x00130090,
++	0xfffcffee, 0x0009ffef, 0x00e1007e, 0x001e00a1, 0xfffbffef,
++	0x0000fff1, 0x00de006d, 0x002b00b1, 0xfff9ffef, 0xfffafff2,
++	0x00d6005b, 0x003a00c0, 0xfff7fff2, 0xfff5fff4, 0x00cd004a,
++	0x004a00cd, 0xfff4fff5, 0xfff2fff7, 0x00c0003a, 0x005b00d6,
++	0xfff2fffa, 0xffeffff9, 0x00b1002b, 0x006d00de, 0xfff10000,
++	0xffeffffb, 0x00a1001e, 0x007e00e1, 0xffef0009, 0x96e001ff,
++	0x10edc524, 0xe9862bd5, 0x0032d351, 0x91a2f144, 0x04010039,
++	0x10bc4010, 0x00544af5, 0x4cb6187a, 0x67143b4d, 0x0000468e,
++	0x00000000, 0x0013ffee, 0x00e20090, 0x00130090, 0xfffcffee,
++	0x0009ffef, 0x00e1007e, 0x001e00a1, 0xfffbffef, 0x0000fff1,
++	0x00de006d, 0x002b00b1, 0xfff9ffef, 0xfffafff2, 0x00d6005b,
++	0x003a00c0, 0xfff7fff2, 0xfff5fff4, 0x00cd004a, 0x004a00cd,
++	0xfff4fff5, 0xfff2fff7, 0x00c0003a, 0x005b00d6, 0xfff2fffa,
++	0xffeffff9, 0x00b1002b, 0x006d00de, 0xfff10000, 0xffeffffb,
++	0x00a1001e, 0x007e00e1, 0xffef0009, 0x0013ffee, 0x00e20090,
++	0x00130090, 0xfffcffee, 0x0009ffef, 0x00e1007e, 0x001e00a1,
++	0xfffbffef, 0x0000fff1, 0x00de006d, 0x002b00b1, 0xfff9ffef,
++	0xfffafff2, 0x00d6005b, 0x003a00c0, 0xfff7fff2, 0xfff5fff4,
++	0x00cd004a, 0x004a00cd, 0xfff4fff5, 0xfff2fff7, 0x00c0003a,
++	0x005b00d6, 0xfff2fffa, 0xffeffff9, 0x00b1002b, 0x006d00de,
++	0xfff10000, 0xffeffffb, 0x00a1001e, 0x007e00e1, 0xffef0009,
++	0x96e001ff, 0x10edc524, 0xe9862bd5, 0x0032d351, 0x91a2f144,
++	0x04010039, 0x10bc4010, 0x00544af5, 0x4cb6187a, 0x67143b4d,
++	0x0000468e, 0x00000000, 0x0188004e, 0xffdc004e, 0x0188004e,
++	0xffdc004e, 0x01890038, 0xffd90066, 0x01890038, 0xffd90066,
++	0x01870024, 0xffd50080, 0x01870024, 0xffd50080, 0x01800012,
++	0xffd3009b, 0x01800012, 0xffd3009b, 0x01750002, 0xffd100b8,
++	0x01750002, 0xffd100b8, 0x0166fff4, 0xffd100d5, 0x0166fff4,
++	0xffd100d5, 0x0154ffe9, 0xffd200f1, 0x0154ffe9, 0xffd200f1,
++	0x013fffe0, 0xffd4010d, 0x013fffe0, 0xffd4010d, 0x0127ffd9,
++	0xffd90127, 0x0127ffd9, 0xffd90127, 0x010dffd4, 0xffe0013f,
++	0x010dffd4, 0xffe0013f, 0x00f1ffd2, 0xffe90154, 0x00f1ffd2,
++	0xffe90154, 0x00d5ffd1, 0xfff40166, 0x00d5ffd1, 0xfff40166,
++	0x00b8ffd1, 0x00020175, 0x00b8ffd1, 0x00020175, 0x009bffd3,
++	0x00120180, 0x009bffd3, 0x00120180, 0x0080ffd5, 0x00240187,
++	0x0080ffd5, 0x00240187, 0x0066ffd9, 0x00380189, 0x0066ffd9,
++	0x00380189, 0x96e001ff, 0xf075e324, 0xedc52855, 0x002bd510,
++	0x543169a6, 0x51e9862f, 0x6d6532d3, 0x00361282, 0x91a2f144,
++	0xd3792239, 0x01003cd0, 0x00401004, 0xca1488de, 0xf510bc57,
++	0x949b544a, 0x0050cbd5, 0x4cb6187a, 0x86985a4d, 0x143b4a0d,
++	0x00468e67, 0x4f378c1d, 0x00000043, 0x00000000, 0x00000000,
++	0x01ff0000, 0x00000000, 0x01ff0000, 0x00000000, 0x01fdffdb,
++	0xfffe002a, 0x01fdffdb, 0xfffe002a, 0x01f3ffc0, 0xfff70056,
++	0x01f3ffc0, 0xfff70056, 0x01e4ffae, 0xffed0081, 0x01e4ffae,
++	0xffed0081, 0x01cfffa2, 0xffe100ae, 0x01cfffa2, 0xffe100ae,
++	0x01b6ff9e, 0xffd300d9, 0x01b6ff9e, 0xffd300d9, 0x0199ff9e,
++	0xffc50104, 0x0199ff9e, 0xffc50104, 0x0178ffa4, 0xffb8012c,
++	0x0178ffa4, 0xffb8012c, 0x0153ffad, 0xffad0153, 0x0153ffad,
++	0xffad0153, 0x012cffb8, 0xffa40178, 0x012cffb8, 0xffa40178,
++	0x0104ffc5, 0xff9e0199, 0x0104ffc5, 0xff9e0199, 0x00d9ffd3,
++	0xff9e01b6, 0x00d9ffd3, 0xff9e01b6, 0x00aeffe1, 0xffa201cf,
++	0x00aeffe1, 0xffa201cf, 0x0081ffed, 0xffae01e4, 0x0081ffed,
++	0xffae01e4, 0x0056fff7, 0xffc001f3, 0x0056fff7, 0xffc001f3,
++	0x002afffe, 0xffdb01fd, 0x002afffe, 0xffdb01fd, 0x96e0c9ce,
++	0xf12db524, 0x959b2855, 0x002bd511, 0x5431f982, 0x5261682f,
++	0xc94e32d3, 0x00361282, 0x91a33134, 0xd3991a39, 0x01003cd0,
++	0x00401004, 0xca1468e6, 0xf4d0cc57, 0x38b2544a, 0x0050cbd5,
++	0x4cb5a098, 0x86087e4d, 0x6c654a0d, 0x00468e66, 0x4f36d44b,
++	0x00000043, 0x00000000, 0x00000000, 0x017f004f, 0xffe3004f,
++	0x017f004f, 0xffe3004f, 0x0180003a, 0xffe00066, 0x0180003a,
++	0xffe00066, 0x017c0028, 0xffdd007f, 0x017c0028, 0xffdd007f,
++	0x01760017, 0xffda0099, 0x01760017, 0xffda0099, 0x016b0008,
++	0xffd900b4, 0x016b0008, 0xffd900b4, 0x015dfffa, 0xffd900d0,
++	0x015dfffa, 0xffd900d0, 0x014bfff0, 0xffda00eb, 0x014bfff0,
++	0xffda00eb, 0x0137ffe7, 0xffdc0106, 0x0137ffe7, 0xffdc0106,
++	0x011fffe1, 0xffe1011f, 0x011fffe1, 0xffe1011f, 0x0106ffdc,
++	0xffe70137, 0x0106ffdc, 0xffe70137, 0x00ebffda, 0xfff0014b,
++	0x00ebffda, 0xfff0014b, 0x00d0ffd9, 0xfffa015d, 0x00d0ffd9,
++	0xfffa015d, 0x00b4ffd9, 0x0008016b, 0x00b4ffd9, 0x0008016b,
++	0x0099ffda, 0x00170176, 0x0099ffda, 0x00170176, 0x007fffdd,
++	0x0028017c, 0x007fffdd, 0x0028017c, 0x0066ffe0, 0x003a0180,
++	0x0066ffe0, 0x003a0180, 0x96e0c9ce, 0xf12db524, 0x959b2855,
++	0x002bd511, 0x5431f982, 0x5261682f, 0xc94e32d3, 0x00361282,
++	0x91a33134, 0xd3991a39, 0x01003cd0, 0x00401004, 0xca1468e6,
++	0xf4d0cc57, 0x38b2544a, 0x0050cbd5, 0x4cb5a098, 0x86087e4d,
++	0x6c654a0d, 0x00468e66, 0x4f36d44b, 0x00000043, 0x00000000,
++	0x00000000, 0x01480067, 0xffea0067, 0x01480067, 0xffea0067,
++	0x01480055, 0xffea0079, 0x01480055, 0xffea0079, 0x01440045,
++	0xffea008d, 0x01440045, 0xffea008d, 0x013f0035, 0xffeb00a1,
++	0x013f0035, 0xffeb00a1, 0x01370028, 0xffec00b5, 0x01370028,
++	0xffec00b5, 0x012d001b, 0xffef00c9, 0x012d001b, 0xffef00c9,
++	0x01200010, 0xfff300dd, 0x01200010, 0xfff300dd, 0x01110007,
++	0xfff800f0, 0x01110007, 0xfff800f0, 0x0102fffe, 0xfffe0102,
++	0x0102fffe, 0xfffe0102, 0x00f0fff8, 0x00070111, 0x00f0fff8,
++	0x00070111, 0x00ddfff3, 0x00100120, 0x00ddfff3, 0x00100120,
++	0x00c9ffef, 0x001b012d, 0x00c9ffef, 0x001b012d, 0x00b5ffec,
++	0x00280137, 0x00b5ffec, 0x00280137, 0x00a1ffeb, 0x0035013f,
++	0x00a1ffeb, 0x0035013f, 0x008dffea, 0x00450144, 0x008dffea,
++	0x00450144, 0x0079ffea, 0x00550148, 0x0079ffea, 0x00550148,
++	0x96e0c9ce, 0xf12db524, 0x959b2855, 0x002bd511, 0x5431f982,
++	0x5261682f, 0xc94e32d3, 0x00361282, 0x91a33134, 0xd3991a39,
++	0x01003cd0, 0x00401004, 0xca1468e6, 0xf4d0cc57, 0x38b2544a,
++	0x0050cbd5, 0x4cb5a098, 0x86087e4d, 0x6c654a0d, 0x00468e66,
++	0x4f36d44b, 0x00000043, 0x00000000, 0x00000000, 0x012d0071,
++	0xfff10071, 0x012d0071, 0xfff10071, 0x012c0061, 0xfff20081,
++	0x012c0061, 0xfff20081, 0x01290052, 0xfff40091, 0x01290052,
++	0xfff40091, 0x01240044, 0xfff600a2, 0x01240044, 0xfff600a2,
++	0x011d0037, 0xfff900b3, 0x011d0037, 0xfff900b3, 0x0115002b,
++	0xfffc00c4, 0x0115002b, 0xfffc00c4, 0x010b0020, 0x000100d4,
++	0x010b0020, 0x000100d4, 0x00ff0017, 0x000700e3, 0x00ff0017,
++	0x000700e3, 0x00f2000e, 0x000e00f2, 0x00f2000e, 0x000e00f2,
++	0x00e30007, 0x001700ff, 0x00e30007, 0x001700ff, 0x00d40001,
++	0x0020010b, 0x00d40001, 0x0020010b, 0x00c4fffc, 0x002b0115,
++	0x00c4fffc, 0x002b0115, 0x00b3fff9, 0x0037011d, 0x00b3fff9,
++	0x0037011d, 0x00a2fff6, 0x00440124, 0x00a2fff6, 0x00440124,
++	0x0091fff4, 0x00520129, 0x0091fff4, 0x00520129, 0x0081fff2,
++	0x0061012c, 0x0081fff2, 0x0061012c, 0x96e0c9ce, 0xf12db524,
++	0x959b2855, 0x002bd511, 0x5431f982, 0x5261682f, 0xc94e32d3,
++	0x00361282, 0x91a33134, 0xd3991a39, 0x01003cd0, 0x00401004,
++	0xca1468e6, 0xf4d0cc57, 0x38b2544a, 0x0050cbd5, 0x4cb5a098,
++	0x86087e4d, 0x6c654a0d, 0x00468e66, 0x4f36d44b, 0x00000043,
++	0x00000000, 0x00000000, 0x01140079, 0xfffa0079, 0x01140079,
++	0xfffa0079, 0x0113006b, 0xfffc0086, 0x0113006b, 0xfffc0086,
++	0x0110005d, 0xffff0094, 0x0110005d, 0xffff0094, 0x010b0051,
++	0x000200a2, 0x010b0051, 0x000200a2, 0x01060044, 0x000600b0,
++	0x01060044, 0x000600b0, 0x00ff003a, 0x000a00bd, 0x00ff003a,
++	0x000a00bd, 0x00f60030, 0x001000ca, 0x00f60030, 0x001000ca,
++	0x00ed0026, 0x001700d6, 0x00ed0026, 0x001700d6, 0x00e2001e,
++	0x001e00e2, 0x00e2001e, 0x001e00e2, 0x00d60017, 0x002600ed,
++	0x00d60017, 0x002600ed, 0x00ca0010, 0x003000f6, 0x00ca0010,
++	0x003000f6, 0x00bd000a, 0x003a00ff, 0x00bd000a, 0x003a00ff,
++	0x00b00006, 0x00440106, 0x00b00006, 0x00440106, 0x00a20002,
++	0x0051010b, 0x00a20002, 0x0051010b, 0x0094ffff, 0x005d0110,
++	0x0094ffff, 0x005d0110, 0x0086fffc, 0x006b0113, 0x0086fffc,
++	0x006b0113, 0x96e0c9ce, 0xf12db524, 0x959b2855, 0x002bd511,
++	0x5431f982, 0x5261682f, 0xc94e32d3, 0x00361282, 0x91a33134,
++	0xd3991a39, 0x01003cd0, 0x00401004, 0xca1468e6, 0xf4d0cc57,
++	0x38b2544a, 0x0050cbd5, 0x4cb5a098, 0x86087e4d, 0x6c654a0d,
++	0x00468e66, 0x4f36d44b, 0x00000043, 0x00000000, 0x00000000,
++	0x00e30087, 0x000f0087, 0x00e30087, 0x000f0087, 0x00e2007c,
++	0x0013008f, 0x00e2007c, 0x0013008f, 0x00de0073, 0x00180097,
++	0x00de0073, 0x00180097, 0x00db0069, 0x001d009f, 0x00db0069,
++	0x001d009f, 0x00d7005f, 0x002300a7, 0x00d7005f, 0x002300a7,
++	0x00d30056, 0x002900ae, 0x00d30056, 0x002900ae, 0x00ce004e,
++	0x002f00b5, 0x00ce004e, 0x002f00b5, 0x00c90045, 0x003600bc,
++	0x00c90045, 0x003600bc, 0x00c2003e, 0x003e00c2, 0x00c2003e,
++	0x003e00c2, 0x00bc0036, 0x004500c9, 0x00bc0036, 0x004500c9,
++	0x00b5002f, 0x004e00ce, 0x00b5002f, 0x004e00ce, 0x00ae0029,
++	0x005600d3, 0x00ae0029, 0x005600d3, 0x00a70023, 0x005f00d7,
++	0x00a70023, 0x005f00d7, 0x009f001d, 0x006900db, 0x009f001d,
++	0x006900db, 0x00970018, 0x007300de, 0x00970018, 0x007300de,
++	0x008f0013, 0x007c00e2, 0x008f0013, 0x007c00e2, 0x96e0c9ce,
++	0xf12db524, 0x959b2855, 0x002bd511, 0x5431f982, 0x5261682f,
++	0xc94e32d3, 0x00361282, 0x91a33134, 0xd3991a39, 0x01003cd0,
++	0x00401004, 0xca1468e6, 0xf4d0cc57, 0x38b2544a, 0x0050cbd5,
++	0x4cb5a098, 0x86087e4d, 0x6c654a0d, 0x00468e66, 0x4f36d44b,
++	0x00000043, 0x00000000, 0x00000000,
++};
++
++/*
++ * Strides inside that image: the horizontal bands are 304 bytes each, the
++ * vertical ones 352 and start after the seven horizontal bands.
++ */
++#define ZME_H_BAND_BYTES	304
++#define ZME_V_BANDS_OFFSET	0x850
++#define ZME_V_BAND_BYTES	352
++
++/*
++ * Which band's table a step uses. The vendor generator indexes its seven
++ * coefficient blocks by 4096*4096 divided by the step expressed in 4.12, and its
++ * second threshold differs per axis (3686 horizontal, 3264 vertical), so the
++ * caller hands over the step in that form and the boundary for its axis.
++ */
++static unsigned int histb_vdp2_zme_band(u32 ratio, u32 e1)
++{
++	u32 tmp = 4096u * 4096u / ratio;
++
++	if (tmp > 4096)
++		return 0;
++	if (tmp >= e1)
++		return 1;
++	if (tmp >= 3072)
++		return 2;
++	if (tmp >= 2048)
++		return 3;
++	if (tmp >= 1365)
++		return 4;
++	if (tmp >= 1024)
++		return 5;
++	return 6;
++}
++
++/*
++ * Program the step, its band's table and the filter enables together, then latch
++ * them: the steps are shadowed per axis through GP0_PARAUP and the rest of the
++ * block through GP0_UPD. The filter stays off at 1:1, as it has always been.
++ */
++static void histb_vdp2_zme_setup(struct histb_vdp2 *vdp, u32 src_w, u32 src_h,
++				 u32 dst_w, u32 dst_h)
++{
++	unsigned long hprec = vdp->zme->hprec;
++	unsigned long vprec = vdp->zme->vprec;
++	u32 hratio = DIV_ROUND_CLOSEST_ULL((u64)src_w * hprec, dst_w);
++	u32 vratio = DIV_ROUND_CLOSEST_ULL((u64)src_h * vprec, dst_h);
++	unsigned int hband, vband;
++	bool scale;
++
++	scale = vdp->chip->zme_hfir_en && (hratio != hprec || vratio != vprec);
++	if (!scale) {
++		hratio = hprec;
++		vratio = vprec;
++	}
++	hratio = min_t(u32, hratio, vdp->zme->hratio_max);
++	vratio = min_t(u32, vratio, vdp->zme->vratio_max);
++	/* The generator's table index wants both steps in 4.12. */
++	hband = histb_vdp2_zme_band(hratio >> (__fls(hprec) - 12), 3686);
++	vband = histb_vdp2_zme_band(vratio, 3264);
++
++	if (scale) {
++		vo_write(vdp, GP0_HCOEFAD,
++			 vdp->zme_coef_dma + hband * ZME_H_BAND_BYTES);
++		vo_write(vdp, GP0_VCOEFAD, vdp->zme_coef_dma + ZME_V_BANDS_OFFSET +
++			 vband * ZME_V_BAND_BYTES);
++	} else {
++		vo_write(vdp, GP0_HCOEFAD, 0);
++		vo_write(vdp, GP0_VCOEFAD, 0);
++	}
++
++	vo_rmw_field(vdp, vdp->zme->hsp, vdp->zme->hratio, hratio);
++	vo_rmw_field(vdp, vdp->zme->vsr, vdp->zme->vratio, vratio);
++	vo_rmw_field(vdp, vdp->zme->hsp, GP0_ZME_HFIR_ENABLES,
++		     scale ? vdp->chip->zme_hfir_en : 0);
++	if (vdp->chip->zme_vfir_reg)
++		vo_write(vdp, vdp->chip->zme_vfir_reg,
++			 scale ? vdp->chip->zme_vfir_en : 0);
++	vo_write(vdp, vdp->zme->hoffset, 0);
++	if (vdp->zme->hoffset_pair)
++		vo_write(vdp, vdp->zme->hoffset + 4, 0);
++	vo_write(vdp, vdp->zme->voffset, 0);
++	if (scale)
++		vo_write(vdp, GP0_PARAUP, GP0_PARAUP_HCOEF | GP0_PARAUP_VCOEF);
++}
++
++/*
++ * G0_ADDR carries 16-byte units: the block drops the low nibble of whatever
++ * address it is handed and adds (src_xfpos * bytes per pixel) modulo 16 back
++ * on, which is how the source corner of a crop gets expressed at all (board:
++ * every src_xfpos from 0 to 15 was read back as that many pixels of offset,
++ * wrapping inside the unit). A corner the two fields cannot name is refused
++ * instead of rounded: rounding started the fetch up to 15 bytes early.
++ */
++static int histb_vdp2_fetch_pos(struct drm_framebuffer *fb, dma_addr_t base,
++				unsigned int src_x, unsigned int src_y,
++				dma_addr_t *addr, u32 *sfpos)
++{
++	unsigned int bpp = drm_format_info_min_pitch(fb->format, 0, 1);
++	dma_addr_t want = base + fb->offsets[0] +
++		(dma_addr_t)src_y * fb->pitches[0] + (dma_addr_t)src_x * bpp;
++	u32 sf;
++
++	for (sf = 0; sf < 16; sf++)
++		if (((sf * bpp) & 15) == ((u32)want & 15))
++			break;
++	if (sf == 16)
++		return -ERANGE;
++
++	*addr = want;
++	*sfpos = sf;
++	return 0;
++}
++
++static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb,
++			    struct drm_gem_dma_object *gem,
++			    const struct drm_plane_state *pstate, bool enable)
++{
++	u32 ctrl, ifmt;
++	bool palpha, blend;
++	u32 src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h;
++	u32 win_w, win_h, sfpos;
++	dma_addr_t addr;
++
++	if (!enable) {
++		ctrl = vo_read(vdp, G0_CTRL);
++		ctrl &= ~G0_CTRL_SURFACE_EN;
++		vo_write(vdp, G0_CTRL, ctrl);
++		vo_write(vdp, G0_UPD, G0_UPD_REGUP);
++		return;
++	}
++
++	/*
++	 * The core has already clipped the destination to the screen and moved the
++	 * source corner along with it, into these two rectangles. The crtc_x and
++	 * src_x fields keep what the caller asked for, so a plane that starts off
++	 * the left edge would be placed by their negative value: masking one into
++	 * the 12-bit position field put its first corner at 4032 while its last
++	 * stayed at 575, and the layer vanished instead of losing its left column.
++	 */
++	src_x = pstate->src.x1 >> 16;
++	src_y = pstate->src.y1 >> 16;
++	src_w = (pstate->src.x2 - pstate->src.x1) >> 16;
++	src_h = (pstate->src.y2 - pstate->src.y1) >> 16;
++	dst_x = pstate->dst.x1;
++	dst_y = pstate->dst.y1;
++	dst_w = drm_rect_width(&pstate->dst);
++	dst_h = drm_rect_height(&pstate->dst);
++	if (!src_w || !src_h || !dst_w || !dst_h)
++		return;
++
++	/*
++	 * Pixel format. The A-prefixed codes consume the buffer's alpha byte, so
++	 * an XRGB framebuffer must not be described as ARGB8888: every pixel would
++	 * carry alpha 0x00 and the layer would composite as fully transparent.
++	 * Which memory byte holds which channel was read off the panel with a
++	 * primary-coloured field (the codes here are the SDK's VDP_GFX_IFMT_E):
++	 * 0x60/0x68 put B,G,R in the low three bytes, 0xe8 is R:G:B:A and 0xef is
++	 * A:B:G:R, so they take the matching DRM formats.
++	 */
++	blend = pstate->pixel_blend_mode != DRM_MODE_BLEND_PIXEL_NONE;
++	switch (fb->format->format) {
++	case DRM_FORMAT_XRGB4444:
++		ifmt = G0_IFMT_RGB444;
++		break;
++	case DRM_FORMAT_XRGB1555:
++		ifmt = G0_IFMT_RGB555;
++		break;
++	case DRM_FORMAT_ARGB4444:
++		/*
++		 * The alpha nibble is replicated into a byte before the blend
++		 * (board: a white surface with the nibble 0/1/4/8/15 came back as
++		 * 0/17/67/135/255, which is the nibble times 0x11 over 255), so the
++		 * range bit stays set here as it does for the byte-alpha codes.
++		 */
++		ifmt = blend ? G0_IFMT_ARGB4444 : G0_IFMT_RGB444;
++		break;
++	case DRM_FORMAT_RGB565:
++		ifmt = G0_IFMT_RGB565;
++		break;
++	case DRM_FORMAT_BGR888:
++		ifmt = G0_IFMT_RGB888;
++		break;
++	case DRM_FORMAT_ARGB8888:
++		ifmt = blend ? G0_IFMT_ARGB8888 : G0_IFMT_KRGB888;
++		break;
++	case DRM_FORMAT_RGBA8888:
++		ifmt = G0_IFMT_RGBA8888;
++		break;
++	case DRM_FORMAT_ABGR8888:
++		ifmt = G0_IFMT_ABGR8888;
++		break;
++	default:
++		ifmt = G0_IFMT_KRGB888;
++		break;
++	}
++	palpha = blend && fb->format->has_alpha;
++
++	/*
++	 * bitext, read_mode and upd_mode all have to be set for a layer that
++	 * drives a panel. Left at 0, read_mode means that the fetch follows the
++	 * interface's field coding instead of running progressive.
++	 */
++	ctrl = vo_read(vdp, G0_CTRL);
++	ctrl &= ~(G0_CTRL_IFMT | G0_CTRL_BITEXT | G0_CTRL_READ_MODE |
++		  G0_CTRL_UPD_MODE);
++	ctrl |= FIELD_PREP(G0_CTRL_IFMT, ifmt) |
++		FIELD_PREP(G0_CTRL_BITEXT, G0_BITEXT_3RD) |
++		G0_CTRL_READ_MODE | G0_CTRL_UPD_MODE;
++	vo_write(vdp, G0_CTRL, ctrl);
++
++	/*
++	 * The plane's "alpha" is 16-bit (0xffff opaque), this field is 8-bit, so
++	 * the top byte is what reaches the mixer; latched by G0_UPD below.
++	 *
++	 * palpha_range picks the divisor for the pixel's alpha byte: with it set the
++	 * blend is out = a*c + (1-a)*bg over the full byte (measured against a
++	 * non-black mixer background: 0x00/0x40/0x80/0xc0/0xff came back within one
++	 * luma step of that line), cleared it only uses the top seven bits and
++	 * saturates at 0x80. premult_en is the other half of the DRM choice: the
++	 * buffer's colour is then added as it stands and only the background is
++	 * scaled by (1-a), which is what a premultiplied surface expects.
++	 */
++	ctrl = vo_read(vdp, G0_CBMPARA);
++	ctrl &= ~(G0_CBMPARA_GALPHA | G0_CBMPARA_PALPHA_EN | G0_CBMPARA_PALPHA_RANGE |
++		  G0_CBMPARA_PREMULT_EN | G0_CBMPARA_KEY_EN | G0_CBMPARA_KEY_MODE);
++	ctrl |= FIELD_PREP(G0_CBMPARA_GALPHA, pstate->alpha >> 8);
++	if (palpha) {
++		ctrl |= G0_CBMPARA_PALPHA_EN | G0_CBMPARA_PALPHA_RANGE;
++		if (pstate->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
++			ctrl |= G0_CBMPARA_PREMULT_EN;
++	}
++	vo_write(vdp, G0_CBMPARA, ctrl);
++
++	/*
++	 * There is no src_y register, so the source corner is taken by advancing
++	 * the base address and the extent by G0_IRESO. The stride keeps describing
++	 * the surface, so a cropped region still reads whole rows of it.
++	 */
++	if (histb_vdp2_fetch_pos(fb, gem->dma_addr, src_x, src_y, &addr, &sfpos))
++		return;
++	vo_write(vdp, G0_SFPOS, sfpos);
++	vo_write(vdp, G0_ADDR, (u32)addr);
++	/* G0_STRIDE is programmed in units of 16 bytes */
++	vo_write(vdp, G0_STRIDE,
++		 FIELD_PREP(G0_STRIDE_MASK, fb->pitches[0] / 16));
++	vo_write(vdp, G0_IRESO,
++		 FIELD_PREP(G0_IRESO_IW, src_w - 1) |
++		 FIELD_PREP(G0_IRESO_IH, src_h - 1));
++
++	/*
++	 * Two rectangles describe the layer: D* is the window its fetched picture
++	 * is laid into, V* is the picture itself counted from the layer's origin.
++	 * The panel position the block ends up using is the display start scaled by
++	 * the zoom ratio plus the GP0 video start, so the display start belongs at
++	 * 0 and the position is carried by the GP0 corner below; left at the
++	 * destination, every layer landed a second destination-width to the right
++	 * (128 instead of 64 at x=64, 192 instead of 64 at 2x magnify).
++	 *
++	 * The picture has to be the wider of the two rectangles, not the
++	 * destination: GP0 re-shapes the window G0 laid down, so a destination
++	 * smaller than the source would clip the region the zoom stage is told to
++	 * read, and the minified commit came back as a flat field on the panel.
++	 */
++	win_w = max(src_w, dst_w);
++	win_h = max(src_h, dst_h);
++	vo_write(vdp, G0_VFPOS, 0);
++	vo_write(vdp, G0_VLPOS,
++		 FIELD_PREP(G0_DLPOS_X, win_w - 1) |
++		 FIELD_PREP(G0_DLPOS_Y, win_h - 1));
++	vo_write(vdp, G0_DFPOS, 0);
++	vo_write(vdp, G0_DLPOS,
++		 FIELD_PREP(G0_DLPOS_X, dst_x + win_w - 1) |
++		 FIELD_PREP(G0_DLPOS_Y, dst_y + win_h - 1));
++
++	/*
++	 * GP0 post-processes the window G0 produced, not the whole surface, and its
++	 * video pair is the rectangle the picture occupies on the panel: it has to
++	 * span exactly the output size. Written wider, the block covers the rest of
++	 * the screen with out-of-range pixels and the write-back tap stops
++	 * completing frames; written 0-based, every layer is clipped at a panel
++	 * column equal to its own width.
++	 */
++	vo_write(vdp, GP0_IRESO,
++		 FIELD_PREP(G0_IRESO_IW, src_w - 1) |
++		 FIELD_PREP(G0_IRESO_IH, src_h - 1));
++	vo_write(vdp, GP0_ORESO,
++		 FIELD_PREP(GP0_ORESO_OW, dst_w - 1) |
++		 FIELD_PREP(GP0_ORESO_OH, dst_h - 1));
++	vo_write(vdp, GP0_DFPOS,
++		 FIELD_PREP(G0_DFPOS_X, dst_x) |
++		 FIELD_PREP(G0_DFPOS_Y, dst_y));
++	vo_write(vdp, GP0_DLPOS,
++		 FIELD_PREP(G0_DLPOS_X, dst_x + dst_w - 1) |
++		 FIELD_PREP(G0_DLPOS_Y, dst_y + dst_h - 1));
++	vo_write(vdp, GP0_VFPOS,
++		 FIELD_PREP(G0_DFPOS_X, dst_x) |
++		 FIELD_PREP(G0_DFPOS_Y, dst_y));
++	vo_write(vdp, GP0_VLPOS,
++		 FIELD_PREP(G0_DLPOS_X, dst_x + dst_w - 1) |
++		 FIELD_PREP(G0_DLPOS_Y, dst_y + dst_h - 1));
++
++	/*
++	 * The zoom engine walks the source with its own step registers, so
++	 * GP0_IRESO == GP0_ORESO does not mean 1:1: left alone, the engine
++	 * keeps scaling by whatever was programmed for the previous user of the
++	 * block, which can make the output cover the screen more than once. The
++	 * formula is ratio = in * precision / out, and the register layout the
++	 * ratios live in is what differs between the two SoCs of this family --
++	 * hence the chip data rather than the macros.
++	 */
++	histb_vdp2_zme_setup(vdp, src_w, src_h, dst_w, dst_h);
++	vo_write(vdp, GP0_UPD, GP0_UPD_REGUP);
++
++	/* layer enable + shadow-register update */
++	ctrl = vo_read(vdp, G0_CTRL);
++	ctrl |= G0_CTRL_SURFACE_EN;
++	vo_write(vdp, G0_CTRL, ctrl);
++	vo_write(vdp, G0_UPD, G0_UPD_REGUP);
++}
++
++static void histb_vdp2_plane_atomic_update(struct drm_plane *plane,
++					 struct drm_atomic_commit *state)
++{
++	struct histb_vdp2 *vdp = plane_to_vdp(plane);
++	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_gem_dma_object *gem;
++	struct drm_framebuffer *fb = new_state->fb;
++
++	if (!fb)
++		return;
++
++	gem = drm_fb_dma_get_gem_obj(fb, 0);
++	if (!gem)
++		return;
++
++	histb_vdp2_g0_set(vdp, fb, gem, new_state, new_state->visible);
++}
++
++static void histb_vdp2_plane_atomic_disable(struct drm_plane *plane,
++					  struct drm_atomic_commit *state)
++{
++	struct histb_vdp2 *vdp = plane_to_vdp(plane);
++
++	histb_vdp2_g0_set(vdp, NULL, NULL, NULL, false);
++	histb_vdp2_wait_upd(vdp, GP0_UPD);
++	histb_vdp2_wait_upd(vdp, G0_UPD);
++}
++
++static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
++				       struct drm_atomic_commit *state)
++{
++	struct drm_plane_state *new_state =
++		drm_atomic_get_new_plane_state(state, plane);
++	struct histb_vdp2 *vdp = plane_to_vdp(plane);
++	struct drm_crtc_state *crtc_state;
++	struct drm_gem_dma_object *gem;
++	unsigned int min_scale, max_scale;
++	dma_addr_t addr;
++	int ret;
++	u32 sfpos;
++
++	if (!new_state->fb)
++		return 0;
++
++	/* G0_STRIDE is programmed in units of 16 bytes */
++	if (new_state->fb->pitches[0] % 16)
++		return -EINVAL;
++
++	/* the G0_IRESO / GP0_ORESO width fields are 12 bits wide */
++	if (new_state->fb->width > 4095)
++		return -EINVAL;
++
++	if (!new_state->crtc)
++		return 0;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
++	/* The new-state getter is a slot read, so it yields NULL. */
++	if (!crtc_state)
++		return PTR_ERR(crtc_state);
++
++	/*
++	 * This is what fills in new_state->visible, and atomic_update acts on
++	 * it: without the helper visible stays false, so every plane commit
++	 * switches the surface off again. can_position is true because the
++	 * destination window is programmed through DFPOS/DLPOS; fixing it to
++	 * the CRTC size made the helper reject every cropped source rectangle
++	 * ("Plane must cover entire CRTC") even though the hardware can show it.
++	 */
++	/*
++	 * The bounds are the factors the panel confirmed: 2x, 4x and 8x
++	 * magnification and 2x and 4x minification each returned the stripe period
++	 * at the predicted factor. Past them the reading left the prediction behind
++	 * (a 16x step came back as roughly 14x, an 8x minification lost the window
++	 * entirely), so the checker does not promise those. A part whose filter
++	 * recipe is unverified stays pinned to 1:1.
++	 */
++	if (vdp->chip->zme_hfir_en) {
++		min_scale = (1 << 16) / 8;
++		max_scale = 4 << 16;
++	} else {
++		min_scale = DRM_PLANE_NO_SCALING;
++		max_scale = DRM_PLANE_NO_SCALING;
++	}
++
++	ret = drm_atomic_helper_check_plane_state(new_state, crtc_state,
++						  min_scale, max_scale,
++						  true, true);
++	if (ret)
++		return ret;
++
++	/*
++	 * With the rectangles clipped to the panel, the source corner the fetch will
++	 * be pointed at is known: the address field carries 16-byte units and
++	 * src_xfpos the pixels inside one of them, and a corner neither can name is
++	 * refused here rather than rounded down in the update path.
++	 */
++	if (!new_state->visible)
++		return 0;
++
++	gem = drm_fb_dma_get_gem_obj(new_state->fb, 0);
++	if (!gem)
++		return -EINVAL;
++	if (histb_vdp2_fetch_pos(new_state->fb, gem->dma_addr,
++				 new_state->src.x1 >> 16,
++				 new_state->src.y1 >> 16, &addr, &sfpos))
++		return -ERANGE;
++
++	return 0;
++}
++
++static const struct drm_plane_helper_funcs histb_vdp2_plane_helper_funcs = {
++	/*
++	 * No DRM_GEM_SHADOW_PLANE_HELPER_FUNCS here: they upcast the state with
++	 * container_of() to struct drm_shadow_plane_state, which only the
++	 * matching DRM_GEM_SHADOW_PLANE_FUNCS duplicate() allocates.
++	 */
++	.atomic_check		= histb_vdp2_plane_atomic_check,
++	.atomic_update		= histb_vdp2_plane_atomic_update,
++	.atomic_disable		= histb_vdp2_plane_atomic_disable,
++};
++
++static const struct drm_plane_funcs histb_vdp2_plane_funcs = {
++	.update_plane		= drm_atomic_helper_update_plane,
++	.disable_plane		= drm_atomic_helper_disable_plane,
++	.destroy		= drm_plane_cleanup,
++	.atomic_create_state	= drm_atomic_helper_plane_create_state,
++	.atomic_duplicate_state	= drm_atomic_helper_plane_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
++};
++
++/* ------------------------------------------------------------------ */
++/* Write-back (WBC_DHD0, WBC_GP0)                                      */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The block copies whatever it taps and never colour-converts it: over eight
++ * colour bars a planar target carries the red sample in the luma byte and
++ * green and blue in the Cb and Cr ones, so those entries are byte packings of
++ * an RGB image rather than YCbCr. A consumer that wants the frame as it is
++ * displayed takes the graphics tap instead, which writes 32-bit pixels with
++ * the lanes in B, G, R, X order and X filled with 0xff - XBGR8888.
++ */
++struct histb_wb_fmt {
++	u32	format;
++	u8	wbc_format;
++	u8	planes;
++	bool	uv_order;	/* chroma order of the planar formats */
++	u16	base;		/* which write-back block produces it */
++};
++
++static const struct histb_wb_fmt histb_wb_fmts[] = {
++	{ DRM_FORMAT_NV12, WBC_FORMAT_SP420, 2, true, WBC_BASE_DHD0 },
++	{ DRM_FORMAT_NV21, WBC_FORMAT_SP420, 2, false, WBC_BASE_DHD0 },
++	{ DRM_FORMAT_NV16, WBC_FORMAT_SP422, 2, true, WBC_BASE_DHD0 },
++	{ DRM_FORMAT_NV61, WBC_FORMAT_SP422, 2, false, WBC_BASE_DHD0 },
++	{ DRM_FORMAT_UYVY, WBC_FORMAT_PKG_UYVY, 1, false, WBC_BASE_DHD0 },
++	{ DRM_FORMAT_YUYV, WBC_FORMAT_PKG_YUYV, 1, false, WBC_BASE_DHD0 },
++	{ DRM_FORMAT_YVYU, WBC_FORMAT_PKG_YVYU, 1, false, WBC_BASE_DHD0 },
++	{ DRM_FORMAT_XBGR8888, WBC_FORMAT_ARGB8888, 1, false, WBC_BASE_GP0 },
++};
++
++static const u32 histb_wb_format_list[] = {
++	DRM_FORMAT_NV12,
++	DRM_FORMAT_NV21,
++	DRM_FORMAT_NV16,
++	DRM_FORMAT_NV61,
++	DRM_FORMAT_UYVY,
++	DRM_FORMAT_YUYV,
++	DRM_FORMAT_YVYU,
++};
++
++static const u32 histb_wb_gp0_format_list[] = {
++	DRM_FORMAT_XBGR8888,
++};
++
++static const struct histb_wb_fmt *histb_wb_fmt_find(u32 format)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(histb_wb_fmts); i++)
++		if (histb_wb_fmts[i].format == format)
++			return &histb_wb_fmts[i];
++
++	return NULL;
++}
++
++
++/* the capture is one frame of what the channel mixes, at 1:1 */
++static void histb_wb_setup(struct histb_vdp2 *vdp, const struct histb_wb_fmt *fmt,
++			   struct drm_framebuffer *fb)
++{
++	struct drm_gem_dma_object *gem;
++	dma_addr_t addr;
++	u32 ctrl, stride, reso;
++	int plane;
++
++	u32 base = fmt->base;
++
++	ctrl = vo_read(vdp, base + WBC_OFS_CTRL);
++	ctrl &= ~(WBC_CTRL_FORMAT | WBC_CTRL_MODE | WBC_CTRL_3D_MODE);
++	ctrl |= FIELD_PREP(WBC_CTRL_FORMAT, fmt->wbc_format) |
++		FIELD_PREP(WBC_CTRL_MODE, 1);	/* progressive */
++	if (fmt->planes == 2) {
++		ctrl &= ~WBC_CTRL_UV_ORDER;
++		if (fmt->uv_order)
++			ctrl |= WBC_CTRL_UV_ORDER;
++	}
++	/* the caller enables, once the target is fully described */
++	vo_write(vdp, base + WBC_OFS_CTRL, ctrl);
++
++
++	if (base == WBC_BASE_GP0) {
++		/* 10-bit surfaces dither down to the 8-bit target the block writes */
++		vo_write(vdp, WBC_GP0_DITHER_CTRL,
++			 FIELD_PREP(WBC_GP0_DITHER_MD, WBC_GP0_DITHER_SPA_8));
++	}
++
++	stride = FIELD_PREP(WBC_STRIDE_L, fb->pitches[0]) |
++		 FIELD_PREP(WBC_STRIDE_C, fb->pitches[fmt->planes - 1]);
++	vo_write(vdp, base + WBC_OFS_STRIDE, stride);
++
++	reso = FIELD_PREP(WBC_ORESO_W, fb->width - 1) |
++	       FIELD_PREP(WBC_ORESO_H, fb->height - 1);
++	vo_write(vdp, base + WBC_OFS_ORESO, reso);
++
++	/*
++	 * The crop window has to be stated as well: both edges default to zero,
++	 * and a window that ends at the first pixel has nothing to write.
++	 */
++	vo_write(vdp, base + WBC_OFS_FCROP, 0);
++	vo_write(vdp, base + WBC_OFS_LCROP,
++		 FIELD_PREP(WBC_LCROP_W, fb->width - 1) |
++		 FIELD_PREP(WBC_LCROP_H, fb->height - 1));
++
++	/*
++	 * The channel tap scales through its own ZME before writing, so a 1:1
++	 * capture still has to state the ratio: both directions carry the value
++	 * that means "one output line per input line" with the filters off.
++	 * The graphics tap has no ZME of its own.
++	 */
++	if (base == WBC_BASE_DHD0) {
++		vo_write(vdp, WBC_DHD0_ZME_HSP, WBC_ZME_HPREC);
++		vo_write(vdp, WBC_DHD0_ZME_HLOFFSET, 0);
++		vo_write(vdp, WBC_DHD0_ZME_HCOFFSET, 0);
++		vo_write(vdp, WBC_DHD0_ZME_VSR, WBC_ZME_VPREC);
++		vo_write(vdp, WBC_DHD0_ZME_VOFFSET, 0);
++	}
++
++	for (plane = 0; plane < fmt->planes; plane++) {
++		gem = drm_fb_dma_get_gem_obj(fb, plane);
++		if (!gem)
++			return;
++		addr = gem->dma_addr + fb->offsets[plane];
++		/* a packed capture ignores the chroma address */
++		vo_write(vdp, base + (plane ? WBC_OFS_CADDR : WBC_OFS_YADDR),
++			 addr);
++	}
++}
++
++/* The two write-back blocks, in the order their connectors are listed. */
++static u32 histb_wb_base_of(unsigned int tap)
++{
++	return tap ? WBC_BASE_GP0 : WBC_BASE_DHD0;
++}
++
++static u32 histb_wb_vte_bit(u32 base)
++{
++	return base == WBC_BASE_DHD0 ? VO_INT_DWBC0_VTTHD : VO_INT_GWBC0_VTTHD;
++}
++
++static void histb_wb_start(struct histb_vdp2_display *disp,
++			   unsigned int tap,
++			   const struct histb_wb_fmt *fmt,
++			   struct drm_framebuffer *fb,
++			   struct drm_writeback_connector *wb)
++{
++	struct histb_vdp2 *vdp = disp->vdp;
++	u32 base = fmt->base;
++
++	histb_wb_setup(vdp, fmt, fb);
++	/*
++	 * The block's own frame-done source is what retires the job, so it
++	 * delivers only while a capture runs: clear a latch left over from
++	 * the previous one, then ask for it.
++	 */
++	vo_write(vdp, VO_MSKINTSTA, histb_wb_vte_bit(base));
++	vo_write(vdp, VO_INTMSK,
++		 vo_read(vdp, VO_INTMSK) | histb_wb_vte_bit(base));
++	vo_write(vdp, base + WBC_OFS_CTRL,
++		 vo_read(vdp, base + WBC_OFS_CTRL) | WBC_CTRL_EN);
++
++	/* the block latches everything it was pointed at with one update bit */
++	vo_write(vdp, base + WBC_OFS_UPD, WBC_UPD_REGUP);
++	disp->wb_running[tap] = wb;
++	WRITE_ONCE(disp->wb_pending[tap], true);
++}
++
++static void histb_wb_stop(struct histb_vdp2 *vdp, u16 base)
++{
++	u32 ctrl = vo_read(vdp, base + WBC_OFS_CTRL);
++
++	ctrl &= ~WBC_CTRL_EN;
++	vo_write(vdp, base + WBC_OFS_CTRL, ctrl);
++	vo_write(vdp, base + WBC_OFS_UPD, WBC_UPD_REGUP);
++	vo_write(vdp, VO_INTMSK,
++		 vo_read(vdp, VO_INTMSK) & ~histb_wb_vte_bit(base));
++}
++
++/*
++ * The block raises its frame-done bit once per arm, so the first delivery
++ * retires the job (board: after that one bit no second arrived for five
++ * seconds while the block kept its enable bit set). The channel's vblank is
++ * not the completion: the tap's own bit is the direct evidence that the
++ * picture reached memory, and it does not depend on the core holding a
++ * reference for the committing file.
++ */
++static void histb_wb_update(struct histb_vdp2_display *disp, u32 sta)
++{
++	struct histb_vdp2 *vdp = disp->vdp;
++	unsigned int tap;
++
++	for (tap = 0; tap < ARRAY_SIZE(disp->wb_pending); tap++) {
++		u32 base = histb_wb_base_of(tap);
++
++		if (!READ_ONCE(disp->wb_pending[tap]))
++			continue;
++		if (!(sta & histb_wb_vte_bit(base)))
++			continue;
++
++		histb_wb_stop(vdp, base);
++		WRITE_ONCE(disp->wb_pending[tap], false);
++		drm_writeback_signal_completion(disp->wb_running[tap], 0);
++		disp->wb_running[tap] = NULL;
++	}
++}
++
++static int histb_wb_enc_atomic_check(struct drm_encoder *encoder,
++				     struct drm_crtc_state *crtc_state,
++				     struct drm_connector_state *conn_state)
++{
++	struct drm_device *drm = encoder->dev;
++	struct drm_framebuffer *fb;
++	const struct histb_wb_fmt *fmt;
++	const struct drm_display_mode *mode = &crtc_state->mode;
++	struct histb_vdp2_display *disp;
++	struct histb_vdp_display *base;
++
++	base = container_of(crtc_state->crtc, struct histb_vdp_display, crtc);
++	disp = container_of(base, struct histb_vdp2_display, base);
++
++	fb = conn_state->writeback_job ? conn_state->writeback_job->fb : NULL;
++	if (!conn_state->writeback_job || !conn_state->writeback_job->fb)
++		return 0;
++
++	fmt = histb_wb_fmt_find(fb->format->format);
++	if (!fmt) {
++		drm_dbg_kms(drm, "wbc: format %p4cc is not written by this block\n",
++			    &fb->format->format);
++		return -EINVAL;
++	}
++
++	/*
++	 * The format picks the block, so an encoder must not be handed a target
++	 * that the other tap produces: the check below would otherwise arm the
++	 * wrong block and report the other tap's pixels as this one's.
++	 */
++	if (fmt->base != (encoder == &disp->wb_enc ? WBC_BASE_DHD0 : WBC_BASE_GP0)) {
++		drm_dbg_kms(drm, "wbc: %p4cc belongs to the other tap\n",
++			    &fb->format->format);
++		return -EINVAL;
++	}
++
++	/*
++	 * The write-back takes the mixed picture at 1:1, so the target has to be
++	 * the frame the channel is scanning out.
++	 */
++	if (fb->width != mode->hdisplay || fb->height != mode->vdisplay) {
++		drm_dbg_kms(drm, "wbc: %ux%u target does not match %ux%u mode\n",
++			    fb->width, fb->height, mode->hdisplay,
++			    mode->vdisplay);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int histb_wb_conn_get_modes(struct drm_connector *connector)
++{
++	return drm_add_modes_noedid(connector, connector->dev->mode_config.max_width,
++				    connector->dev->mode_config.max_height);
++}
++
++static const struct drm_encoder_helper_funcs histb_wb_enc_helper_funcs = {
++	.atomic_check		= histb_wb_enc_atomic_check,
++};
++
++static const struct drm_connector_helper_funcs histb_wb_conn_helper_funcs = {
++	.get_modes		= histb_wb_conn_get_modes,
++};
++
++static const struct drm_connector_funcs histb_wb_conn_funcs = {
++	.reset			= drm_atomic_helper_connector_reset,
++	.fill_modes		= drm_helper_probe_single_connector_modes,
++	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
++};
++
++static int histb_wb_one(struct histb_vdp2_display *disp,
++			struct drm_encoder *enc, struct drm_writeback_connector *wb,
++			const u32 *fmts, unsigned int n_fmts, const char *name)
++{
++	struct drm_device *drm = disp->base.drm;
++	int ret;
++
++	enc->possible_crtcs = drm_crtc_mask(&disp->base.crtc);
++	ret = drmm_encoder_init(drm, enc, NULL, DRM_MODE_ENCODER_VIRTUAL, name);
++	if (ret)
++		return ret;
++	drm_encoder_helper_add(enc, &histb_wb_enc_helper_funcs);
++
++	drm_connector_helper_add(&wb->base, &histb_wb_conn_helper_funcs);
++
++	return drmm_writeback_connector_init(drm, wb, &histb_wb_conn_funcs, enc,
++					     fmts, n_fmts);
++}
++
++static int histb_wb_init(struct histb_vdp2_display *disp)
++{
++	unsigned int both;
++	int ret;
++
++	if (!disp->vdp->chip->has_wbc)
++		return 0;
++
++	/*
++	 * The write-back has no enable sequence of its own: the block is armed
++	 * from the CRTC's flush, so a job that arrives while the channel is off
++	 * simply never sees a vblank.
++	 */
++	ret = histb_wb_one(disp, &disp->wb_enc, &disp->wb, histb_wb_format_list,
++			   ARRAY_SIZE(histb_wb_format_list), "histb-vdp2-wb-enc");
++	if (ret)
++		return ret;
++
++	ret = histb_wb_one(disp, &disp->wb_gp0_enc, &disp->wb_gp0,
++			   histb_wb_gp0_format_list,
++			   ARRAY_SIZE(histb_wb_gp0_format_list),
++			   "histb-vdp2-wb-gp0-enc");
++	if (ret)
++		return ret;
++
++	/*
++	 * Capturing while displaying attaches both encoders to the one CRTC, and
++	 * the core requires every encoder of a CRTC to list the others as
++	 * cloneable before it accepts such a commit.
++	 */
++	/* every encoder of the CRTC has to list the others as cloneable */
++	both = drm_encoder_mask(&disp->base.encoder) | drm_encoder_mask(&disp->wb_enc) |
++	       drm_encoder_mask(&disp->wb_gp0_enc);
++	disp->base.encoder.possible_clones = both;
++	disp->wb_enc.possible_clones = both;
++	disp->wb_gp0_enc.possible_clones = both;
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Framebuffer creation                                                */
++/* ------------------------------------------------------------------ */
++
++static const struct drm_framebuffer_funcs histb_wb_fb_funcs = {
++	.destroy		= drm_gem_fb_destroy,
++	.create_handle		= drm_gem_fb_create_handle,
++};
++
++/*
++ * The generic helper refuses a format that no plane can scan out. A write-back
++ * target is written by WBC_HD0 and read by no plane at all, so the plane list
++ * cannot describe it and those framebuffers are assembled here.
++ */
++static struct drm_framebuffer *
++histb_vdp2_fb_create(struct drm_device *drm, struct drm_file *file,
++		     const struct drm_format_info *info,
++		     const struct drm_mode_fb_cmd2 *mode_cmd)
++{
++	struct drm_gem_object *objs[DRM_FORMAT_MAX_PLANES] = { NULL };
++	struct drm_framebuffer *fb;
++	unsigned int i;
++	int ret;
++
++	if (drm_any_plane_has_format(drm, mode_cmd->pixel_format,
++				     mode_cmd->modifier[0]))
++		return drm_gem_fb_create(drm, file, info, mode_cmd);
++
++	if (!histb_wb_fmt_find(mode_cmd->pixel_format)) {
++		drm_dbg_kms(drm, "%p4cc is neither scanned out nor written back\n",
++			    &mode_cmd->pixel_format);
++		return ERR_PTR(-EINVAL);
++	}
++
++	for (i = 0; i < info->num_planes; i++) {
++		unsigned int width = drm_format_info_plane_width(info,
++							mode_cmd->width, i);
++		unsigned int height = drm_format_info_plane_height(info,
++							mode_cmd->height, i);
++		unsigned int min_size;
++
++		objs[i] = drm_gem_object_lookup(file, mode_cmd->handles[i]);
++		if (!objs[i]) {
++			drm_dbg_kms(drm, "no GEM object behind handle %u\n",
++				    mode_cmd->handles[i]);
++			ret = -ENOENT;
++			goto err_put;
++		}
++
++		min_size = (height - 1) * mode_cmd->pitches[i] +
++			   drm_format_info_min_pitch(info, i, width) +
++			   mode_cmd->offsets[i];
++		if (objs[i]->size < min_size) {
++			drm_dbg_kms(drm, "buffer of %zu bytes is short of the %u needed for plane "
++				    "%u\n",
++				    objs[i]->size, min_size, i);
++			ret = -EINVAL;
++			goto err_put;
++		}
++	}
++
++	/*
++	 * Plain slab allocation, not a drmm action: the destroy callback this
++	 * framebuffer uses is drm_gem_fb_destroy(), which frees with kfree().
++	 */
++	fb = kzalloc_obj(*fb);
++	if (!fb) {
++		ret = -ENOMEM;
++		goto err_put;
++	}
++
++	drm_helper_mode_fill_fb_struct(drm, fb, info, mode_cmd);
++	for (i = 0; i < info->num_planes; i++)
++		fb->obj[i] = objs[i];
++
++	ret = drm_framebuffer_init(drm, fb, &histb_wb_fb_funcs);
++	if (ret) {
++		kfree(fb);
++		goto err_put;
++	}
++
++	return fb;
++
++err_put:
++	while (i > 0) {
++		--i;
++		drm_gem_object_put(objs[i]);
++	}
++	return ERR_PTR(ret);
++}
++
++/* ------------------------------------------------------------------ */
++/* CRTC (DHD0 channel)                                                 */
++/* ------------------------------------------------------------------ */
++
++/*
++ * One-time display pipeline setup: route GP0 into the DHD0 mixer, set the AXI
++ * outstanding limits and enable the block's clock gate.  @yuv444 carries the
++ * link format the connector negotiated (RGB vs YCbCr 4:4:4): in the YCbCr
++ * case the GP0 CSC stage carries the RGB -> limited-range YCbCr matrix the
++ * vendor's own displaying pipeline leaves in that block (read at the fastboot
++ * prompt: BT.709 row scaled by 219/255 in this stage's Q10, DC offsets +16
++ * luma / +128 chroma), and the channel data type below follows the same
++ * decision.
++ */
++static void histb_vdp2_pipeline_init(struct histb_vdp2 *vdp,
++				     const struct drm_display_mode *mode,
++				     bool yuv444)
++{
++	unsigned int i;
++	u32 ctrl;
++
++	/*
++	 * Open the clock gate FIRST: every write issued while vo_ck_gt_en is
++	 * clear can be dropped by the gated clock domain, which leaves the AXI
++	 * side without its outstanding limits and the composition sampling
++	 * black.
++	 */
++	ctrl = vo_read(vdp, VO_CTRL);
++	ctrl |= VO_CTRL_CK_GT_EN;
++	vo_write(vdp, VO_CTRL, ctrl);
++
++	/* AXI outstanding limits: read bus 0/1 = 7, write = 4. */
++	ctrl = vo_read(vdp, VOAXICTRL);
++	ctrl &= ~(VO_AXI_M0_RD0_OSTD | VO_AXI_M0_RD1_OSTD | VO_AXI_M0_WR_OSTD);
++	ctrl |= FIELD_PREP(VO_AXI_M0_RD0_OSTD, 7) |
++		FIELD_PREP(VO_AXI_M0_RD1_OSTD, 7) |
++		FIELD_PREP(VO_AXI_M0_WR_OSTD, 4);
++	vo_write(vdp, VOAXICTRL, ctrl);
++
++	/*
++	 * CBM_ATTR routes each surface to one of the two mixers; the surfaces
++	 * of the display channel use sur_attr2|sur_attr3, so 0xc.
++	 */
++	vo_write(vdp, CBM_ATTR, CBM_ATTR_SUR2 | CBM_ATTR_SUR3);
++
++	/*
++	 * Firmware can leave its own logo layers enabled, and they sit at a
++	 * higher mixer priority than ours, so turn off every graphics layer
++	 * except the one the plane drives.
++	 */
++	for (i = 0; i < 5; i++) {
++		u32 off = G0_CTRL + i * GFX_LAYER_STRIDE;
++
++		if (off == G0_CTRL)
++			continue;
++		ctrl = vo_read(vdp, off);
++		if (!(ctrl & G0_CTRL_SURFACE_EN))
++			continue;
++		vo_write(vdp, off, ctrl & ~G0_CTRL_SURFACE_EN);
++		vo_write(vdp, off + (G0_UPD - G0_CTRL), G0_UPD_REGUP);
++	}
++
++	/*
++	 * Two mixers sit between the surfaces and the channel: MIXG0 takes the
++	 * graphics layers, CBM_MIX1 is DHD0's. Both hold layer_id + 1 per
++	 * priority slot and 0 for no slot, so G0 goes to MIXG0 slot 0 and GP0
++	 * to DHD0's slot 1 (0x21 in each).
++	 */
++	vo_write(vdp, MIXG0_MIX,
++		 FIELD_PREP(MIX_PRIO0, MIXG0_LAYER_G0) |
++		 FIELD_PREP(MIX_PRIO1, MIXG0_LAYER_G1));
++	vo_write(vdp, CBM_MIX1,
++		 FIELD_PREP(MIX_PRIO0, CBM_LAYER_VP0) |
++		 FIELD_PREP(MIX_PRIO1, CBM_LAYER_GP0));
++
++	/*
++	 * GP0 sits between the G0 fetch and the mixer (DHD0's table admits
++	 * prio0 = VP0, prio1 = GP0), so the surface has to transit a post block
++	 * before the mixer sees it. Which stages that output taps is one of the
++	 * three whole-register values of GP0_CTRL; the working combination is
++	 * GP0_ORDER_ZME_CSC with read_mode set, and the scaling step registers
++	 * are programmed for 1:1 by histb_vdp2_g0_set().
++	 */
++	vo_write(vdp, GP0_CTRL, vdp->chip->gp0_order | GP0_CTRL_READ_MODE);
++	vo_write(vdp, GP0_GALPHA, 0xff);
++	/*
++	 * The G0 fetch delivers its three components to this stage one position
++	 * rotated, and nothing upstream can be changed to fix it: every 32bpp ifmt
++	 * code this chip names only rotates the byte index of the pixel, and no
++	 * 32-bit DRM format composes with that map into the honest assignment (both
++	 * measured on the AR513W). This stage is the one place in the path that
++	 * reorders the
++	 * component lines, so it carries the inverse cycle, and it still performs no
++	 * colour-space conversion -- the interface carries RGB (see
++	 * histb_vdp2_crtc_setup_timing()) and the transmitter converts on its own.
++	 *
++	 * The gain and the output offsets are the range, not a colour tweak. The
++	 * transmitter's own RGB->YCbCr converter emits full-range luma (board-measured:
++	 * painted red arrives in the stream at Y = 54.0, the BT.709 full-range figure),
++	 * while the AVI InfoFrame the bridge sends declares limited range -- so a receiver
++	 * that obeys the declaration expands a signal that does not need it, and painted
++	 * red reached the capture card at Y = 44.2 instead of 54.2. A common scale and a
++	 * common offset on the three RGB lines fix that without disturbing the lane order:
++	 * the luma weights sum to 1, so Y becomes 219/255*Y + 16 -- limited range exactly --
++	 * and the Cb/Cr weights sum to 0, so the shared offset leaves chroma where it was.
++	 * Those are also the vendor's own two numbers: their live GP0 carries the
++	 * documented BT.709 row multiplied by 0.861 = 219/255, and IODC's output field
++	 * holds 64, which is +16 codes at the SDK's s32DcPre = 4 (measured on the AR513W:
++	 * this gain with odc 0 reads 35.81, with odc 64 it reads 54.72, odc 100 reads
++	 * 64.77, and the unaltered block reads 44.20).
++	 *
++	 * Both halves are chip data, not family constants: every measurement behind
++	 * them was taken on Hi3716CV200, and Hi3798MV100 was verified displaying with
++	 * this stage bypassed, so there it stays bypassed.
++	 */
++	if (vdp->chip->gp0_csc_cycle) {
++		vo_write(vdp, GP0_CSC_ODC, GP0_CSC_DC_ODC);
++		vo_write(vdp, GP0_CSC_IODC, GP0_CSC_DC_IODC);
++		vo_write(vdp, GP0_CSC_P0, GP0_CSC_CYC_P0);
++		vo_write(vdp, GP0_CSC_P1, 0);
++		vo_write(vdp, GP0_CSC_P2, GP0_CSC_CYC_P2);
++		vo_write(vdp, GP0_CSC_P3, GP0_CSC_CYC_P3);
++		vo_write(vdp, GP0_CSC_P4, 0);
++		vo_write(vdp, GP0_CSC_IDC, GP0_CSC_EN);
++	} else if (yuv444) {
++		/*
++		 * RGB -> limited-range YCbCr 4:4:4 with the component lanes
++		 * left honest (no rotation, unlike the cycle matrix above).
++		 * The coefficients are not recomputed: they are the vendor's
++		 * own live matrix, read out of the displaying boot-logo
++		 * pipeline at the fastboot prompt (GP0_CSC P0..P4, BT.709 row
++		 * scaled by 881 = 219/255 in this stage's Q10, with the DC
++		 * offsets carrying +16 on the luma line and +128 on both
++		 * chroma lines -- value * 4, Y on the dc2 slot). BT.601 is
++		 * the same table scaled the same way for SD modes, matching
++		 * the transmitter's infoframe split.
++		 */
++		static const s16 coef709[9] = {
++			188, 629, 63, -103, -347, 450, 450, -409, -41
++		};
++		static const s16 coef601[9] = {
++			263, 517, 100, -151, -298, 450, 450, -377, -73
++		};
++		const s16 *c = (mode->hdisplay > 720 || mode->vdisplay > 576) ?
++			       coef709 : coef601;
++
++		vo_write(vdp, GP0_CSC_ODC,
++			 FIELD_PREP(GENMASK(10, 0), 128 * 4) |
++			 FIELD_PREP(GENMASK(21, 11), 128 * 4));
++		vo_write(vdp, GP0_CSC_IODC, FIELD_PREP(GENMASK(21, 11), 16 * 4));
++		vo_write(vdp, GP0_CSC_P0,
++			 GP0_CSC_PAIR(GP0_CSC_COEF(c[0]), GP0_CSC_COEF(c[1])));
++		vo_write(vdp, GP0_CSC_P1,
++			 GP0_CSC_PAIR(GP0_CSC_COEF(c[2]), GP0_CSC_COEF(c[3])));
++		vo_write(vdp, GP0_CSC_P2,
++			 GP0_CSC_PAIR(GP0_CSC_COEF(c[4]), GP0_CSC_COEF(c[5])));
++		vo_write(vdp, GP0_CSC_P3,
++			 GP0_CSC_PAIR(GP0_CSC_COEF(c[6]), GP0_CSC_COEF(c[7])));
++		vo_write(vdp, GP0_CSC_P4,
++			 GP0_CSC_PAIR(GP0_CSC_COEF(c[8]), 0));
++		vo_write(vdp, GP0_CSC_IDC, GP0_CSC_EN);
++	} else {
++		vo_write(vdp, GP0_CSC_IDC, 0);
++	}
++
++	vo_write(vdp, GP0_UPD, GP0_UPD_REGUP);
++}
++
++static void histb_vdp2_crtc_setup_timing(struct histb_vdp2 *vdp,
++					 const struct drm_display_mode *mode,
++					 bool yuv444)
++{
++	/*
++	 * The DHD totals are ACT + BB + FB -- the sync pulse lives inside the
++	 * back porch, and HPW/VPW only say how wide it is there; programming a
++	 * bare back porch leaves the transmitter counting too few lines.
++	 */
++	u32 hbb = mode->hsync_end - mode->hsync_start +	/* sync width */
++		  mode->htotal - mode->hsync_end;	/* back porch */
++	u32 hfb = mode->hsync_start - mode->hdisplay;	/* front porch */
++	u32 hpw = mode->hsync_end - mode->hsync_start;	/* sync width */
++	u32 vbb = mode->vsync_end - mode->vsync_start +
++		  mode->vtotal - mode->vsync_end;
++	u32 vfb = mode->vsync_start - mode->vdisplay;
++	u32 vpw = mode->vsync_end - mode->vsync_start;
++	bool interlaced = mode->flags & DRM_MODE_FLAG_INTERLACE;
++	/*
++	 * In an interlaced mode the channel emits one field at a time, so the
++	 * vertical counters are per field. 1080i60 is (Vact 540, Vbb 20, Vfb 2)
++	 * for the top field and (540, 21, 2) for the bottom one, which sums to
++	 * the 1125-line frame.
++	 */
++	u32 vact = interlaced ? mode->vdisplay / 2 : mode->vdisplay;
++	u32 tvbb = interlaced ? vbb / 2 : vbb;
++	u32 tvfb = interlaced ? vfb / 2 : vfb;
++	u32 bvbb = vbb - tvbb;
++	/*
++	 * HMID is where the second field starts inside the line, half a frame
++	 * line in: 908 for 1080i60 and 1128 for 1080i50.
++	 */
++	u32 hmid = interlaced ? mode->htotal / 2 - hbb : 0;
++	u32 vtthd, ctrl, inv = 0;
++
++	ctrl = vo_read(vdp, DHD0_CTRL);
++	if (interlaced)
++		ctrl &= ~DHD_CTRL_IOP;		/* field sequential */
++	else
++		ctrl |= DHD_CTRL_IOP;		/* progressive */
++	/*
++	 * hdmi_mode (bit14) and DATA_SEL.hdmi_data_sel are one decision: both
++	 * carry the interface data type, 1 meaning RGB on the HDMI pins and 0
++	 * YCbCr.
++	 *
++	 * RGB is used for every format the negotiation hands over as RGB; when
++	 * the connector picked YCbCr 4:4:4 the pins carry the GP0 CSC stage's
++	 * YCbCr and both bits stay clear -- the shape of the vendor's own
++	 * displaying channel (read at the fastboot prompt: DHD0_CTRL
++	 * 0x80008010, DATA_SEL 0x6, and the channel CSC block at 0xc040 all
++	 * zero, so the conversion happens in GP0, not here). Both bits are
++	 * decided absolutely, set or cleared: the format can flip at runtime
++	 * and the previous mode's bit would otherwise survive this
++	 * read-modify-write. The HDATE port is not touched for either data
++	 * type: on this part the transmitter hangs straight off the DHD
++	 * channel and the vendor leaves the whole HDATE block at zero while
++	 * displaying.
++	 */
++	if (vdp->chip->dhd_hdmi_mode && !yuv444)
++		ctrl |= DHD_CTRL_HDMI_MODE;
++	else
++		ctrl &= ~DHD_CTRL_HDMI_MODE;
++	/*
++	 * bit15 is reserved in the mv100 layout, but a channel that drives a
++	 * panel has it set on both parts: the Hi3716CV200 channel that was
++	 * displaying measured 0x80008010, which has it and has hdmi_mode clear.
++	 */
++	if (vdp->chip->dhd_intf_b)
++		ctrl |= DHD_CTRL_INTFB;
++	ctrl |= DHD_CTRL_INTF_EN;		/* drive the HDMI interface */
++	vo_write(vdp, DHD0_CTRL, ctrl);
++
++	/* horizontal: registers take value - 1 */
++	vo_write(vdp, DHD0_HSYNC1,
++		 FIELD_PREP(DHD_HSYNC1_HACT, histb_vdp2_m1(mode->hdisplay)) |
++		 FIELD_PREP(DHD_HSYNC1_HBB, histb_vdp2_m1(hbb)));
++	vo_write(vdp, DHD0_HSYNC2,
++		 FIELD_PREP(DHD_HSYNC2_HFB, histb_vdp2_m1(hfb)) |
++		 FIELD_PREP(DHD_HSYNC2_HMID, hmid ? hmid - 1 : 0));
++	vo_write(vdp, DHD0_PWR,
++		 FIELD_PREP(DHD_PWR_HPW, histb_vdp2_m1(hpw)) |
++		 FIELD_PREP(DHD_PWR_VPW, histb_vdp2_m1(vpw)));
++
++	/* vertical: top field in VSYNC, bottom field in VPLUS; for progressive
++	 * modes the bottom values mirror the top ones.
++	 */
++	vo_write(vdp, DHD0_VSYNC,
++		 FIELD_PREP(DHD_VSYNC_VACT, histb_vdp2_m1(vact)) |
++		 FIELD_PREP(DHD_VSYNC_VBB, histb_vdp2_m1(tvbb)) |
++		 FIELD_PREP(DHD_VSYNC_VFB, histb_vdp2_m1(tvfb)));
++	vo_write(vdp, DHD0_VPLUS,
++		 FIELD_PREP(DHD_VPLUS_BVACT, histb_vdp2_m1(vact)) |
++		 FIELD_PREP(DHD_VPLUS_BVBB, histb_vdp2_m1(bvbb)) |
++		 FIELD_PREP(DHD_VPLUS_BVFB, histb_vdp2_m1(tvfb)));
++
++	/* vblank interrupt threshold: 8/10 of the frame; frame based mode. */
++	vtthd = (tvbb + vact + tvfb) * 8 / 10;
++	vo_write(vdp, DHD0_VTTHD,
++		 FIELD_PREP(DHD_VTTHD1, vtthd) | DHD_VTTHD1_MODE);
++
++	/*
++	 * sync polarity towards the HDMI transmitter: the *_INV bits invert the
++	 * corresponding sync; non-inverted output equals DRM positive sync.
++	 */
++	if (mode->flags & DRM_MODE_FLAG_NHSYNC)
++		inv |= DHD_SYNC_HDMI_HS_INV;
++	if (mode->flags & DRM_MODE_FLAG_NVSYNC)
++		inv |= DHD_SYNC_HDMI_VS_INV;
++	vo_write(vdp, DHD0_SYNC_INV, inv);
++
++	/*
++	 * Set our bit of the interface data type and leave the rest as the
++	 * reset state has it: bit 3 is hdmi_data_sel, bit 1 is vga_data_sel and
++	 * bit 2 is reserved on mv100, so this has to be a read-modify-write.
++	 * hdmi_mode above carries the same decision; in the YCbCr case the bit
++	 * has to be actively cleared, since the boot can leave it set.
++	 */
++	ctrl = vo_read(vdp, DHD0_DATA_SEL);
++	if (yuv444)
++		ctrl &= ~DHD_DATA_SEL_HDMI;
++	else
++		ctrl |= DHD_DATA_SEL_HDMI;
++	vo_write(vdp, DHD0_DATA_SEL, ctrl);
++
++	/*
++	 * The mixer inserts its background (Cr[9:0] Cb[19:10] Y[29:20]) downstream
++	 * of GP0's colour handling, so the three numbers reach the pins as they are
++	 * written and the domain is the one just selected above. Black is
++	 * YCbCr(16,128,128) on a YCbCr link and (0,0,0) on an RGB one: with the
++	 * YCbCr triple on the RGB link the area the layer does not cover came back
++	 * on the panel as a flat grey-teal, and with all three at zero it is black.
++	 */
++	vo_write(vdp, CBM_BKG1, yuv444 ? CBM_BKG_BLACK : 0);
++
++	/* latch the timing registers */
++	ctrl = vo_read(vdp, DHD0_CTRL);
++	ctrl |= DHD_CTRL_REGUP;
++	vo_write(vdp, DHD0_CTRL, ctrl);
++
++	/*
++	 * The DSD channel (0xc400..) is left alone: the HDMI interface is
++	 * driven from DHD0, and enabling it on channel 1 would only re-route a
++	 * timing this port does not build.
++	 */
++}
++
++static enum drm_mode_status histb_vdp2_crtc_mode_valid(struct drm_crtc *crtc,
++						     const struct drm_display_mode *mode)
++{
++	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
++	long rate;
++
++	/* G0/GP0 position and resolution fields are 12 bits wide */
++	if (mode->hdisplay > 4095 || mode->vdisplay > 4095)
++		return MODE_BAD;
++
++	/* 3840x2160 is the largest mode the pipeline reaches */
++	if (mode->hdisplay > 3840 || mode->vdisplay > 2160)
++		return MODE_BAD;
++
++	if (mode->hdisplay % 2 || mode->vdisplay % 2)
++		return MODE_BAD;
++
++	/*
++	 * DHD0_VSYNC/VPLUS hold VBB/VFB in 8 bits and DHD0_PWR holds VPW in
++	 * 8 bits; H porch/sync fields are 16 bits. FIELD_PREP would truncate
++	 * an out-of-range timing into a different picture, so reject it here.
++	 */
++	{
++		unsigned int vsync = mode->vsync_end - mode->vsync_start;
++		unsigned int vbb = vsync + mode->vtotal - mode->vsync_end;
++		unsigned int vfb = mode->vsync_start - mode->vdisplay;
++		unsigned int hsync = mode->hsync_end - mode->hsync_start;
++		unsigned int hbb = hsync + mode->htotal - mode->hsync_end;
++		unsigned int hfb = mode->hsync_start - mode->hdisplay;
++
++		if (vsync > 255 || vbb > 255 || vfb > 255 ||
++		    hsync > 65535 || hbb > 65535 || hfb > 65535)
++			return MODE_BAD;
++	}
++
++	/* the HD PLL and channel divider can only produce certain rates */
++	rate = clk_round_rate(vdp->clk_pix, mode->clock * 1000);
++	if (rate < 0)
++		return MODE_ERROR;
++
++	/*
++	 * The clock can only produce the rates its own table holds, which are
++	 * what each format's timing adds up to -- a few hundred Hz away from
++	 * the nominal clock the EDID rounds into mode->clock. Allow half a
++	 * percent; keep the arithmetic in Hz so a large mismatch cannot
++	 * overflow and look like a pass.
++	 */
++	if (abs(rate - (long)mode->clock * 1000) > (long)mode->clock * 5)
++		return MODE_NOCLOCK;
++
++	return MODE_OK;
++}
++
++/*
++ * On Hi3716CV200 the composed frame reaches the HDMI transmitter through the
++ * HD digital output port (HDATE), which resamples it with an 18-tap filter.
++ * Left disabled the channel still counts frames and the transmitter's TMDS
++ * clock still locks, but the transmitter measures no input timing and the
++ * sink shows black. The taps and the format codes below are what a
++ * displaying Hi3716CV200 carries.
++ */
++static const u32 histb_vdp2_hdate_coef[] = {
++	0x00010000, 0x07fd0000, 0x00070000, 0x07f30000, 0x00160000, 0x07db0000,
++	0x003d07ff, 0x078e0003, 0x014c07f2, 0x014c0218, 0x078e07f2, 0x003d0003,
++	0x07db07ff,
++	0x00160000, 0x07f30000, 0x00070000, 0x07fd0000, 0x00010000,
++};
++
++static void histb_vdp2_hdate_setup(struct histb_vdp2 *vdp,
++				   const struct drm_display_mode *mode)
++{
++	unsigned int i, ctrl, ft = mode->hdisplay <= 1280 ? 2 : 4;
++
++	BUILD_BUG_ON(ARRAY_SIZE(histb_vdp2_hdate_coef) !=
++		     HDATE_SRC_13_COEF_HEAD + HDATE_SRC_13_COEF_TAIL);
++
++	for (i = 0; i < HDATE_SRC_13_COEF_HEAD; i++)
++		vo_write(vdp, HDATE_SRC_13_COEF1 + i * 4,
++			 histb_vdp2_hdate_coef[i]);
++	for (i = 0; i < HDATE_SRC_13_COEF_TAIL; i++)
++		vo_write(vdp, HDATE_SRC_13_COEF14 + i * 4,
++			 histb_vdp2_hdate_coef[HDATE_SRC_13_COEF_HEAD + i]);
++
++	/*
++	 * The port needs its horizontal sync inverted. With date_hs_inv clear
++	 * the port counts lines but never locks a frame -- HDATE_STATE keeps
++	 * frame_len at 0 -- and setting it makes the same read show the
++	 * programmed line total.
++	 */
++	ctrl = vo_read(vdp, DHD0_SYNC_INV);
++	vo_write(vdp, DHD0_SYNC_INV, ctrl | DHD_SYNC_DATE_HS_INV);
++
++	vo_write(vdp, HDATE_POLA_CTRL, HDATE_POLA_IN);
++	vo_write(vdp, HDATE_VIDEO_FORMAT,
++		 0xa0 | FIELD_PREP(HDATE_VIDEO_FT, ft));
++	/*
++	 * The three source slots rotate by one: measured on a displaying board,
++	 * where this word reads 0x1b0 (video1_sel 1, video2_sel 2, video3_sel 3).
++	 */
++	vo_write(vdp, HDATE_OUT_CTRL,
++		 FIELD_PREP(HDATE_OUT_VIDEO1_SEL, 1) |
++		 FIELD_PREP(HDATE_OUT_VIDEO2_SEL, 2) |
++		 FIELD_PREP(HDATE_OUT_VIDEO3_SEL, 3));
++	vo_write(vdp, HDATE_EN, HDATE_EN_HD);
++}
++
++/*
++ * Routing a capture onto the channel's tap changes no timing, so it must not be
++ * read as a mode change: a commit that re-modesets the channel drops the
++ * transmitter's clock, and the sink then takes seconds to find the picture
++ * again (board: a capture and a bare CRTC off/on cycle cost the same 4.8 s gap).
++ * Only the write-back connector's reroute is excused here; any other reroute,
++ * or a real mode or active change, still modesets. The Arm display drivers take
++ * the same step for their write-back taps.
++ */
++static int histb_vdp2_crtc_atomic_check(struct drm_crtc *crtc,
++					struct drm_atomic_commit *state)
++{
++	struct drm_crtc_state *new_state =
++		drm_atomic_get_new_crtc_state(state, crtc);
++	struct drm_connector *conn;
++	struct drm_connector_state *conn_state;
++	unsigned int i;
++	bool rerouted = false;
++
++	if (!new_state->connectors_changed || new_state->mode_changed ||
++	    new_state->active_changed)
++		return 0;
++
++	for_each_new_connector_in_state(state, conn, conn_state, i) {
++		struct drm_connector_state *old_state =
++			drm_atomic_get_old_connector_state(state, conn);
++
++		if (old_state->crtc == conn_state->crtc)
++			continue;
++		if (old_state->crtc != crtc && conn_state->crtc != crtc)
++			continue;
++		if (conn->connector_type != DRM_MODE_CONNECTOR_WRITEBACK)
++			return 0;
++		rerouted = true;
++	}
++
++	if (rerouted)
++		new_state->connectors_changed = false;
++
++	return 0;
++}
++
++static void histb_vdp2_crtc_atomic_enable(struct drm_crtc *crtc,
++					struct drm_atomic_commit *state)
++{
++	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
++	struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
++	const struct drm_display_mode *mode = &new_state->adjusted_mode;
++	struct drm_connector *conn;
++	struct drm_connector_state *conn_state;
++	struct drm_plane_state *pstate;
++	struct drm_gem_dma_object *gem;
++	struct drm_framebuffer *fb;
++	bool yuv444;
++	u32 ctrl;
++
++	/*
++	 * The link format is the connector's negotiation: the HDMI bridge
++	 * chain exposes the "color format" property and the core picks
++	 * output_format from it against the sink's EDID (and marks the commit
++	 * a modeset when it changes).  The channel data type and the GP0 CSC
++	 * stage both follow that decision.
++	 */
++	conn = drm_atomic_get_new_connector_for_encoder(state,
++							&vdp->disp->base.encoder);
++	conn_state = conn ? drm_atomic_get_new_connector_state(state, conn) :
++			    NULL;
++	yuv444 = conn_state && conn_state->hdmi.output_format ==
++				 DRM_OUTPUT_COLOR_FORMAT_YCBCR444;
++
++	/* the channel clock is what the HDMI transmitter receives, too */
++	histb_vdp2_set_pixclk(vdp, mode->clock);
++
++	histb_vdp2_pipeline_init(vdp, mode, yuv444);
++
++	histb_vdp2_crtc_setup_timing(vdp, mode, yuv444);
++
++	/*
++	 * VO_MUX bit3 names the channel the HDMI interface reads, it does not
++	 * switch the interface on: the SDK writes hdmi_sel = the channel id of
++	 * the display that owns the interface, and a displaying Hi3716CV200
++	 * carries 1 because its primary display is channel 1. This driver builds
++	 * its timing on DHD0, so the bit has to stay clear -- leaving the value
++	 * the vendor board shows pointed the interface at a channel that was
++	 * never programmed, and the transmitter measured no timing at all.
++	 * Hi3798MV100 inherits its routing from its boot and is not touched.
++	 */
++	if (vdp->chip->mux_hdmi_dhd0) {
++		ctrl = vo_read(vdp, VO_MUX);
++		ctrl &= ~VO_MUX_HDMI_SEL;
++		vo_write(vdp, VO_MUX, ctrl);
++	}
++
++	if (vdp->chip->hdate_hdmi_out)
++		histb_vdp2_hdate_setup(vdp, mode);
++
++	/* enable the channel */
++	ctrl = vo_read(vdp, DHD0_CTRL);
++	ctrl |= DHD_CTRL_INTF_EN | DHD_CTRL_REGUP;
++	vo_write(vdp, DHD0_CTRL, ctrl);
++
++	/*
++	 * commit_planes runs before modeset_enables, and G0 drops register
++	 * writes while the VDP pipeline is not up (the block then reads back
++	 * its reset values), so (re)program the layer from the fb the commit
++	 * just installed.
++	 */
++	pstate = drm_atomic_get_new_plane_state(state, crtc->primary);
++	if (!pstate)
++		pstate = crtc->primary->state;
++	fb = pstate->fb;
++	if (fb) {
++		gem = drm_fb_dma_get_gem_obj(fb, 0);
++		if (gem)
++			histb_vdp2_g0_set(vdp, fb, gem, pstate, pstate->visible);
++	}
++
++	drm_crtc_vblank_on(crtc);
++}
++
++static void histb_vdp2_crtc_atomic_disable(struct drm_crtc *crtc,
++					 struct drm_atomic_commit *state)
++{
++	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
++	struct histb_vdp2_display *disp = crtc_to_display(crtc);
++	unsigned int tap;
++	u32 ctrl;
++
++	/*
++	 * A capture still armed when the channel goes down never sees its frame
++	 * done: close it out here so the client gets a signalled fence rather
++	 * than waiting on an interrupt that cannot come.
++	 */
++	for (tap = 0; tap < ARRAY_SIZE(disp->wb_pending); tap++) {
++		if (!READ_ONCE(disp->wb_pending[tap]))
++			continue;
++		histb_wb_stop(vdp, histb_wb_base_of(tap));
++		WRITE_ONCE(disp->wb_pending[tap], false);
++		drm_writeback_signal_completion(disp->wb_running[tap], 0);
++		disp->wb_running[tap] = NULL;
++	}
++
++	drm_crtc_vblank_off(crtc);
++
++	if (vdp->chip->hdate_hdmi_out)
++		vo_write(vdp, HDATE_EN, 0);
++
++	ctrl = vo_read(vdp, DHD0_CTRL);
++	ctrl &= ~DHD_CTRL_INTF_EN;
++	ctrl |= DHD_CTRL_REGUP;
++	vo_write(vdp, DHD0_CTRL, ctrl);
++	/*
++	 * No wait here, unlike the layer latch above: the DHD block only consumes
++	 * its update request while the interface is enabled, so a write that clears
++	 * INTF_EN leaves REGUP set forever (board: the same write with INTF_EN kept
++	 * set read back cleared at once, the clear-INTF_EN one warned three times
++	 * in a row). The SDK never waits here either.
++	 */
++}
++
++static int histb_vdp2_crtc_enable_vblank(struct drm_crtc *crtc)
++{
++	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
++
++	if (vdp->irq < 0)
++		return -EOPNOTSUPP;
++
++	vo_write(vdp, VO_INTMSK,
++		 vo_read(vdp, VO_INTMSK) | VO_INT_DHD0_VTTHD1);
++	return 0;
++}
++
++static void histb_vdp2_crtc_disable_vblank(struct drm_crtc *crtc)
++{
++	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
++
++	if (vdp->irq < 0)
++		return;
++
++	vo_write(vdp, VO_INTMSK,
++		 vo_read(vdp, VO_INTMSK) & ~VO_INT_DHD0_VTTHD1);
++}
++
++static void histb_vdp2_crtc_atomic_flush(struct drm_crtc *crtc,
++				       struct drm_atomic_commit *state)
++{
++	struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
++	struct histb_vdp2_display *disp = crtc_to_display(crtc);
++	struct drm_connector_state *conn_state;
++	struct drm_framebuffer *fb;
++	const struct histb_wb_fmt *fmt;
++
++	struct drm_writeback_connector *wbs[2] = { &disp->wb, &disp->wb_gp0 };
++	unsigned int tap;
++
++	for (tap = 0; tap < ARRAY_SIZE(wbs); tap++) {
++		struct drm_writeback_connector *wb = wbs[tap];
++
++		conn_state = drm_atomic_get_new_connector_state(state, &wb->base);
++		if (!conn_state || !conn_state->writeback_job ||
++		    !conn_state->writeback_job->fb)
++			continue;
++		/*
++		 * A job whose block is still busy stays queued for the next commit
++		 * rather than being dropped silently, which would leave the client
++		 * waiting for a writeback fence.
++		 */
++		if (READ_ONCE(disp->wb_pending[tap]))
++			continue;
++		fb = conn_state->writeback_job->fb;
++		fmt = histb_wb_fmt_find(fb->format->format);
++		if (!fmt)
++			continue;
++		histb_wb_start(disp, tap, fmt, fb, wb);
++		drm_writeback_queue_job(wb, conn_state);
++	}
++
++	/*
++	 * The VDP latches the whole frame at once and the vblank IRQ only marks
++	 * the count, so send the flip event right after the commit.
++	 */
++	if (new_state->event) {
++		int ret = drm_crtc_vblank_get(crtc);
++
++		spin_lock_irq(&crtc->dev->event_lock);
++		if (ret) {
++			/*
++			 * No vblank reference: deliver it now rather than leave
++			 * the client waiting for an interrupt that will not come.
++			 */
++			drm_crtc_send_vblank_event(crtc, new_state->event);
++		} else {
++			/*
++			 * The block latches at REGUP, but the client's notion of
++			 * "on screen" is the frame boundary; arm the event there.
++			 */
++			drm_crtc_arm_vblank_event(crtc, new_state->event);
++		}
++		new_state->event = NULL;	/* consumed: keep hw_done quiet */
++		spin_unlock_irq(&crtc->dev->event_lock);
++	}
++}
++
++static const struct drm_crtc_helper_funcs histb_vdp2_crtc_helper_funcs = {
++	.mode_valid		= histb_vdp2_crtc_mode_valid,
++	.atomic_check		= histb_vdp2_crtc_atomic_check,
++	.atomic_enable		= histb_vdp2_crtc_atomic_enable,
++	.atomic_disable		= histb_vdp2_crtc_atomic_disable,
++	.atomic_flush		= histb_vdp2_crtc_atomic_flush,
++};
++
++static const struct drm_crtc_funcs histb_vdp2_crtc_funcs = {
++	.set_config		= drm_atomic_helper_set_config,
++	.page_flip		= drm_atomic_helper_page_flip,
++	.destroy		= drm_crtc_cleanup,
++	.atomic_create_state	= drm_atomic_helper_crtc_create_state,
++	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
++	.enable_vblank		= histb_vdp2_crtc_enable_vblank,
++	.disable_vblank		= histb_vdp2_crtc_disable_vblank,
++};
++
++static irqreturn_t histb_vdp2_irq_handler(int irq, void *data)
++{
++	struct histb_vdp2 *vdp = data;
++	struct histb_vdp2_display *disp = READ_ONCE(vdp->disp);
++	u32 all = vo_read(vdp, VO_INTSTA);
++	u32 expected;
++	u32 sta = all & vo_read(vdp, VO_INTMSK);
++	unsigned int t;
++
++	if (!all)
++		return IRQ_NONE;
++
++	/*
++	 * Ack every latched source, not just the vblank one: returning IRQ_NONE
++	 * while a VDP status bit stays set makes the core disable the line
++	 * ("nobody cared") and vblank dies with it. Sources the driver masks
++	 * off still latch, so dispatch on the unmasked subset only -- otherwise
++	 * the frame-threshold bits that nobody enables print a warning once per
++	 * vblank.
++	 */
++	vo_write(vdp, VO_MSKINTSTA, all);
++
++	/* an armed block's own frame-done source is expected while it runs */
++	expected = VO_INT_DHD0_VTTHD1;
++	if (disp) {
++		for (t = 0; t < ARRAY_SIZE(disp->wb_pending); t++) {
++			if (!READ_ONCE(disp->wb_pending[t]))
++				continue;
++			expected |= histb_wb_vte_bit(histb_wb_base_of(t));
++		}
++	}
++
++	if (sta & ~expected)
++		dev_warn_ratelimited(vdp->dev, "vdp irq: unexpected status %08x\n",
++				     sta);
++
++	/* the line stays requested across an aggregate unbind, no CRTC then */
++	if (disp) {
++		if (sta & VO_INT_DHD0_VTTHD1)
++			drm_crtc_handle_vblank(&disp->base.crtc);
++		histb_wb_update(disp, sta);
++	}
++
++	return IRQ_HANDLED;
++}
++
++/* ------------------------------------------------------------------ */
++/* Mode config / binding                                               */
++/* ------------------------------------------------------------------ */
++
++static const struct drm_mode_config_funcs histb_vdp2_mode_config_funcs = {
++	.fb_create		= histb_vdp2_fb_create,
++	.atomic_check		= drm_atomic_helper_check,
++	.atomic_commit		= drm_atomic_helper_commit,
++};
++
++/* ------------------------------------------------------------------ */
++/* Generation hooks                                                    */
++/* ------------------------------------------------------------------ */
++
++/*
++ * The VOU reset request is CRG54[30]. A reset only reaches the block while it
++ * is clocked, so the gates come up first: CRG54's own gate group is the clock
++ * "vo" and the HD channel clock is "pix", both enabled by
++ * histb_vdp2_runtime_resume(). The reset has to be held before it is released
++ * and the block needs settling time afterwards, so the pulse comes with delays.
++ */
++static void histb_vdp2_hw_reset(struct histb_vdp2 *vdp)
++{
++	u32 g0 = vo_read(vdp, G0_CTRL);
++	u32 gp0 = vo_read(vdp, GP0_CTRL);
++	u32 ctrl = vo_read(vdp, DHD0_CTRL);
++	bool live = (g0 & G0_CTRL_SURFACE_EN) || (gp0 & GP0_CTRL_READ_MODE) ||
++		    (ctrl & DHD_CTRL_INTF_EN);
++	unsigned int i;
++
++	/*
++	 * DHD0_CTRL is the readback that says the pulse landed: whoever used
++	 * the display before us normally leaves the HD channel enabled, and a
++	 * VOU reset clears it back to the default. Both reads happen outside
++	 * the hold window, since a block in reset need not answer.
++	 */
++	dev_dbg(vdp->dev, "before reset: DHD0_CTRL %08x\n", vo_read(vdp, DHD0_CTRL));
++
++	/*
++	 * Stop the fetchers and let an in-flight frame retire before the bus
++	 * reset: the channel the bootloader leaves running is still reading a
++	 * framebuffer the driver is about to own (EV200 user guide section 9.2.3.2
++	 * orders the same way for this block family).
++	 */
++	if (g0 & G0_CTRL_SURFACE_EN) {
++		vo_write(vdp, G0_CTRL, g0 & ~G0_CTRL_SURFACE_EN);
++		vo_write(vdp, G0_UPD, G0_UPD_REGUP);
++	}
++	if (gp0 & GP0_CTRL_READ_MODE) {
++		vo_write(vdp, GP0_CTRL, gp0 & ~GP0_CTRL_READ_MODE);
++		vo_write(vdp, GP0_UPD, GP0_UPD_REGUP);
++	}
++	if (ctrl & DHD_CTRL_INTF_EN) {
++		ctrl &= ~DHD_CTRL_INTF_EN;
++		vo_write(vdp, DHD0_CTRL, ctrl);
++	}
++	if (live) {
++		usleep_range(20000, 22000);
++		/* A live channel here means the bootloader left one behind. */
++		dev_info(vdp->dev, "quiesced before reset: DHD0_CTRL %08x\n",
++			 vo_read(vdp, DHD0_CTRL));
++	}
++
++	reset_control_assert(vdp->rst);
++	usleep_range(5000, 5200);
++	reset_control_deassert(vdp->rst);
++	usleep_range(1000, 1200);
++	/*
++	 * Completion judgement for the reset: VDPVERSION1 reads 0 while the
++	 * block is held in reset (measured on the board: 0x00000000 five
++	 * milliseconds into the assert window, 0x76756f76 at the first read
++	 * after deassert), so a non-zero version is the read-back that says
++	 * the reset actually released. It does not release if the clocking the
++	 * VOU reset domain needs is not running -- the case that used to show
++	 * up only as a register file that never answered again.
++	 */
++	for (i = 0; i < 20 && !vo_read(vdp, VO_VDPVERSION1); i++)
++		usleep_range(200, 250);
++	if (!vo_read(vdp, VO_VDPVERSION1))
++		dev_warn(vdp->dev, "vdp still in reset: VDPVERSION1 reads 0\n");
++
++	dev_dbg(vdp->dev, "after reset: DHD0_CTRL %08x\n", vo_read(vdp, DHD0_CTRL));
++}
++
++static int histb_vdp2_runtime_suspend(struct device *dev)
++{
++	struct histb_vdp2 *vdp = dev_get_drvdata(dev);
++
++	clk_disable_unprepare(vdp->clk_vo);
++	clk_disable_unprepare(vdp->clk_pix);
++	return 0;
++}
++
++static int histb_vdp2_runtime_resume(struct device *dev)
++{
++	struct histb_vdp2 *vdp = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_prepare_enable(vdp->clk_pix);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(vdp->clk_vo);
++	if (ret) {
++		clk_disable_unprepare(vdp->clk_pix);
++		return ret;
++	}
++
++	histb_vdp2_hw_reset(vdp);
++
++	return 0;
++}
++
++/*
++ * System sleep. The block keeps its clocks for the whole probed lifetime
++ * (see histb_vdp2_probe()), so what sleep has to do is keep the pipeline
++ * from being committed while the SoC is down and put the same mode back on
++ * wake: the reset in histb_vdp2_runtime_resume(), and any power gating the
++ * sleep path itself does, leave the register file at its defaults, so the
++ * saved atomic state has to be re-committed.
++ */
++static int histb_vdp2_suspend(struct device *dev)
++{
++	struct histb_vdp2 *vdp = dev_get_drvdata(dev);
++	struct histb_vdp2_display *disp = READ_ONCE(vdp->disp);
++
++	if (!disp)
++		return 0;
++
++	return drm_mode_config_helper_suspend(disp->base.drm);
++}
++
++static int histb_vdp2_resume(struct device *dev)
++{
++	struct histb_vdp2 *vdp = dev_get_drvdata(dev);
++	struct histb_vdp2_display *disp = READ_ONCE(vdp->disp);
++
++	if (!disp)
++		return 0;
++
++	return drm_mode_config_helper_resume(disp->base.drm);
++}
++
++static int histb_vdp2_probe(struct platform_device *pdev,
++			    const struct histb_vdp_variant *variant)
++{
++	struct device *dev = &pdev->dev;
++	struct histb_vdp2 *vdp;
++	int ret;
++
++	vdp = devm_kzalloc_obj(dev, *vdp);
++	if (!vdp)
++		return -ENOMEM;
++
++	vdp->chip = variant->data;
++	if (!vdp->chip)
++		return -ENODEV;
++	vdp->zme = vdp->chip->zme;
++
++	vdp->dev = dev;
++	vdp->base.dev = dev;
++	vdp->base.variant = variant;
++	platform_set_drvdata(pdev, &vdp->base);
++
++	vdp->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(vdp->regs))
++		return dev_err_probe(dev, PTR_ERR(vdp->regs), "ioremap failed\n");
++
++	/*
++	 * The HD channel clock, which the CRG driver builds from the HD PLL and
++	 * CRG54 (see histb_vdp2_set_pixclk()), and CRG54's gate group for the
++	 * rest of the channel path; the VOU reset only shifts while both of
++	 * them run.
++	 */
++	vdp->clk_pix = devm_clk_get(dev, "pix");
++	if (IS_ERR(vdp->clk_pix))
++		return dev_err_probe(dev, PTR_ERR(vdp->clk_pix), "clk pix\n");
++
++	vdp->clk_vo = devm_clk_get(dev, "vo");
++	if (IS_ERR(vdp->clk_vo))
++		return dev_err_probe(dev, PTR_ERR(vdp->clk_vo), "clk vo\n");
++
++	vdp->rst = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(vdp->rst))
++		return dev_err_probe(dev, PTR_ERR(vdp->rst), "rst\n");
++
++	/*
++	 * Power the block up before anything reads or writes a VDP register:
++	 * histb_vdp2_runtime_resume() enables the channel clock and takes the
++	 * VOU through a reset of our own, so the register file starts from its
++	 * documented defaults instead of from the state it was handed over in.
++	 * The device then stays permanently powered for the whole probe/remove
++	 * lifetime: the atomic paths and the vblank IRQ touch registers with no
++	 * pm_runtime references of their own, and the shared pixel clock makes
++	 * idle power-down of little use anyway. histb_vdp2_remove() drops the
++	 * reference again; an aggregate unbind leaves the clocks up because the
++	 * transmitter may bind again.
++	 */
++	pm_runtime_enable(dev);
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret) {
++		dev_err_probe(dev, ret, "pm_runtime_resume failed\n");
++		goto err_pm_disable;
++	}
++
++	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
++	if (ret) {
++		dev_err_probe(dev, ret, "dma_mask failed\n");
++		goto err_pm_put;
++	}
++
++	/*
++	 * Frame buffers have to be physically contiguous: this channel takes
++	 * one base address (VO_G0_ADDR), and the chip has no MMU on the display
++	 * side, so an imported buffer is refused unless its scatter/gather
++	 * table covers the whole object. Bind the pool named by the
++	 * "memory-region" property, which keeps them out of the default CMA
++	 * area the decoder queues allocate from. A board whose DTB has no such
++	 * property is not an error (-ENODEV): the device then keeps using the
++	 * default pool.
++	 */
++	ret = devm_of_reserved_mem_device_init(dev);
++	if (ret && ret != -ENODEV) {
++		dev_err_probe(dev, ret, "memory-region init failed\n");
++		goto err_pm_put;
++	}
++
++	/*
++	 * Clear any latched status and switch every source off before requesting
++	 * the line: the VOU reset leaves VO_INTMSK all ones (measured: it reads
++	 * 0xffffffff right after probe), so the frame-threshold sources would
++	 * otherwise deliver before anyone asks for them, and a pending bit on an
++	 * enabled line that the handler ignores makes the core disable the
++	 * interrupt ("nobody cared"). Each bit delivers when set (measured: with
++	 * the register written 0 the line stops, and clearing bit 0 alone takes
++	 * 121 interrupts/s down to 60/s), so this is an enable mask, and
++	 * drm_crtc_vblank_on() turns VTTHD1 on later.
++	 */
++	vdp->irq = platform_get_irq_optional(pdev, 0);
++	if (vdp->irq >= 0) {
++		vo_write(vdp, VO_MSKINTSTA, ~0u);
++		vo_write(vdp, VO_INTMSK, 0);
++
++		ret = devm_request_irq(dev, vdp->irq, histb_vdp2_irq_handler,
++				       IRQF_SHARED, dev_name(dev), vdp);
++		if (ret) {
++			dev_err_probe(dev, ret, "request_irq failed\n");
++			goto err_pm_put;
++		}
++	}
++
++	return 0;
++
++err_pm_put:
++	pm_runtime_put_sync(dev);
++err_pm_disable:
++	pm_runtime_disable(dev);
++	return ret;
++}
++
++static void histb_vdp2_remove(struct platform_device *pdev)
++{
++	pm_runtime_put_sync_suspend(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++}
++
++static int histb_vdp2_display_init(struct histb_vdp_display *base)
++{
++	struct histb_vdp2_display *disp =
++		container_of(base, struct histb_vdp2_display, base);
++	struct histb_vdp2 *vdp = (struct histb_vdp2 *)base->vdp;
++	int ret;
++
++	if (!vdp->zme_coef) {
++		size_t bytes = sizeof(histb_vdp2_zme_coef);
++		void *coef;
++
++		coef = dmam_alloc_coherent(vdp->dev, bytes,
++					     &vdp->zme_coef_dma, GFP_KERNEL);
++		if (!coef)
++			return -ENOMEM;
++		memcpy(coef, histb_vdp2_zme_coef, bytes);
++		vdp->zme_coef = coef;
++	}
++
++	disp->vdp = vdp;
++	WRITE_ONCE(vdp->disp, disp);
++
++	ret = histb_wb_init(disp);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static const struct histb_vdp_ops histb_vdp2_ops = {
++	.runtime_suspend	= histb_vdp2_runtime_suspend,
++	.runtime_resume		= histb_vdp2_runtime_resume,
++	.system_suspend		= histb_vdp2_suspend,
++	.system_resume		= histb_vdp2_resume,
++	.display_init		= histb_vdp2_display_init,
++};
++
++#define HISTB_VDP2_VARIANT(_name, _data)				\
++	const struct histb_vdp_variant _name = {				\
++		.ops			= &histb_vdp2_ops,			\
++		.data			= _data,				\
++		.probe			= histb_vdp2_probe,			\
++		.remove			= histb_vdp2_remove,			\
++		.display_size		= sizeof(struct histb_vdp2_display),	\
++		.min_width		= 64,					\
++		.min_height		= 64,					\
++		.max_width		= 3840,					\
++		.max_height		= 2160,					\
++		.formats		= histb_vdp2_formats,			\
++		.num_formats		= ARRAY_SIZE(histb_vdp2_formats),	\
++		.plane_funcs		= &histb_vdp2_plane_funcs,		\
++		.plane_helper		= &histb_vdp2_plane_helper_funcs,	\
++		.crtc_funcs		= &histb_vdp2_crtc_funcs,		\
++		.crtc_helper		= &histb_vdp2_crtc_helper_funcs,	\
++		.mode_config_funcs	= &histb_vdp2_mode_config_funcs,	\
++		.plane_possible_crtcs	= 1,					\
++		.blend_mode_property	= true,					\
++		.crtc_name		= "histb-vdp-crtc",			\
++		.encoder_name		= "histb-vdp-encoder",			\
++	}
++
++HISTB_VDP2_VARIANT(histb_vdp2_mv100_variant, &histb_vdp2_mv100);
++HISTB_VDP2_VARIANT(histb_vdp2_cv200_variant, &histb_vdp2_cv200);

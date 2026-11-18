@@ -1,0 +1,294 @@
+From 342d7652927f0ae6c1b45ba3bb3a57633cdeceb3 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sun, 4 Oct 2026 04:29:11 +0800
+Subject: [PATCH 1/3] dt-bindings: clock: add the Hi3798MV100 CRG ids
+
+The Hi3798MV100 CRG instances have no published ids. Add the per-SoC
+clock id headers for the core CRG and the system controller, numbered in
+(register offset, field low bit) order over every clock field the
+register descriptions name and append-only, so describing another clock
+later adds a table entry and renumbers nothing. The display and GPU
+enables that have no documented rate are bit groups rather than gates
+with a parent, consumed only to keep a block clocked while its reset
+request is pulsed, and the soft resets in the same words need no ids
+because they travel through the reset controller's (offset, bit) cells.
+Publish the ids the Hi3798MV100 clock driver and the board files
+consume.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../clock/hisilicon,hi3798mv100-crg.h         | 245 ++++++++++++++++++
+ .../clock/hisilicon,hi3798mv100-sysctrl.h     |  18 ++
+ 2 files changed, 263 insertions(+)
+ create mode 100644 include/dt-bindings/clock/hisilicon,hi3798mv100-crg.h
+ create mode 100644 include/dt-bindings/clock/hisilicon,hi3798mv100-sysctrl.h
+
+--- /dev/null
++++ b/include/dt-bindings/clock/hisilicon,hi3798mv100-crg.h
+@@ -0,0 +1,245 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/*
++ * Clocks provided by the core CRG of the HiSilicon Hi3798MV100
++ * SoC.  Generated from the vendor register file and ordered by
++ * (register offset, field low bit); do not renumber by hand.
++ */
++
++#ifndef __DT_BINDINGS_CLOCK_HI3798MV100_CRG_H
++#define __DT_BINDINGS_CLOCK_HI3798MV100_CRG_H
++
++/* Sources with no CRG register of their own. */
++#define HI3798MV100_OSC_CLK		0
++#define HI3798MV100_APB_CLK		1
++#define HI3798MV100_AHB_CLK		2
++
++/* PERI_CRG_PLL0 (0x000) */
++#define HI3798MV100_CPU_PLL_CLK		3
++
++/* PERI_CRG_PLL2 (0x008) */
++#define HI3798MV100_BPLL_CLK		4
++
++/* PERI_CRG_PLL4 (0x010) */
++#define HI3798MV100_DDR_PLL_CLK		5
++
++/* PERI_CRG_PLL8 (0x020) */
++#define HI3798MV100_VPLL_CLK		6
++
++/* PERI_CRG_PLL10 (0x028) */
++#define HI3798MV100_HPLL_CLK		7
++
++/* PERI_CRG_PLL12 (0x030) */
++#define HI3798MV100_EPLL_CLK		8
++
++/* PERI_CRG18 (0x048) */
++#define HI3798MV100_CPU_CLK		9
++
++/* PERI_CRG20 (0x050) */
++#define HI3798MV100_A7_PCLKDBG_CLK		10
++
++/* PERI_CRG21 (0x054) */
++#define HI3798MV100_PERI_CLK_DIV		11
++
++/* PERI_CRG22 (0x058) */
++#define HI3798MV100_CORE_BUS_CLK_SEL		12
++#define HI3798MV100_MDE0_CLK_SEL		13
++#define HI3798MV100_MDE1_CLK_SEL		14
++#define HI3798MV100_MDE2_CLK_SEL		15
++#define HI3798MV100_MDE3_CLK_SEL		16
++#define HI3798MV100_CORE_BUS_CLK_DIV		17
++
++/* PERI_CRG24 (0x060) */
++#define HI3798MV100_NF_CLK		18
++#define HI3798MV100_NF_CLK_SEL		19
++
++/* PERI_CRG25 (0x064) */
++#define HI3798MV100_DDR_CLK		20
++#define HI3798MV100_DDRPHY_CLK		21
++#define HI3798MV100_HIPACK_CLK		22
++#define HI3798MV100_DDRC_CLK		23
++#define HI3798MV100_DDRT_CLK		24
++
++/* PERI_CRG26 (0x068) */
++#define HI3798MV100_UART1_CLK		25
++#define HI3798MV100_UART2_CLK		26
++
++/* PERI_CRG27 (0x06C) */
++#define HI3798MV100_I2C0_CLK		27
++#define HI3798MV100_I2C1_CLK		28
++#define HI3798MV100_I2C2_CLK		29
++
++/* PERI_CRG28 (0x070) */
++#define HI3798MV100_SPI0_CLK		30
++
++/* PERI_CRG29 (0x074) */
++#define HI3798MV100_SCI0_CLK		31
++
++/* PERI_CRG30 (0x078) */
++#define HI3798MV100_VDH_CLK		32
++#define HI3798MV100_VDHDSP_CLK		33
++#define HI3798MV100_VDH_CLK_SEL		34
++
++/* PERI_CRG31 (0x07C) */
++#define HI3798MV100_JPGD_CLK		35
++#define HI3798MV100_JPGD_CLK_SEL		36
++
++/* PERI_CRG33 (0x084) */
++#define HI3798MV100_PGD_CLK		37
++
++/* PERI_CRG34 (0x088) */
++#define HI3798MV100_BPD_CLK		38
++
++/* PERI_CRG35 (0x08C) */
++#define HI3798MV100_VENC_CLK		39
++#define HI3798MV100_VENC_CLK_SEL		40
++
++/* PERI_CRG36 (0x090) */
++#define HI3798MV100_JPGE_CLK		41
++
++/* PERI_CRG37 (0x094) */
++#define HI3798MV100_TDE_CLK		42
++#define HI3798MV100_TDE_CLK_SEL		43
++
++/* PERI_CRG39 (0x09C) */
++#define HI3798MV100_SDIO0_BIU_CLK		44
++#define HI3798MV100_SDIO0_CIU_CLK		45
++#define HI3798MV100_SDIO0_CLK_SEL		46
++#define HI3798MV100_SDIO0_SAP_PS_SEL		47
++#define HI3798MV100_SDIO0_DRV_PS_SEL		48
++
++/* PERI_CRG40 (0x0A0) */
++#define HI3798MV100_MMC_BIU_CLK		49
++#define HI3798MV100_MMC_CIU_CLK		50
++#define HI3798MV100_SDIO1_CLK_SEL		51
++#define HI3798MV100_MMC_SAMPLE_CLK		52
++#define HI3798MV100_MMC_DRV_CLK		53
++
++/* PERI_CRG41 (0x0A4) */
++#define HI3798MV100_DMAC_CLK		54
++
++/* PERI_CRG44 (0x0B0) */
++#define HI3798MV100_USB3_BUS_CLK		55
++#define HI3798MV100_USB3_REF_CLK		56
++#define HI3798MV100_USB3_SUSPEND_CLK		57
++#define HI3798MV100_USB3_UTMI_CLK		58
++#define HI3798MV100_USB3_BUS_GS_CLK		59
++#define HI3798MV100_USB3_BUS_GM_CLK		60
++#define HI3798MV100_USB3_PCS_PCLK_CLK		61
++#define HI3798MV100_USB3_PCS_RX_CLK		62
++#define HI3798MV100_USB3_PCS_REF_CLK		63
++
++/* PERI_CRG46 (0x0B8) */
++#define HI3798MV100_USB20_BUS_CLK		64
++#define HI3798MV100_USB20_48M_CLK		65
++#define HI3798MV100_USB20_12M_CLK		66
++#define HI3798MV100_USB20_OTG_UTMI_CLK		67
++#define HI3798MV100_USB20_PHY_CLK		68
++#define HI3798MV100_USB20_UTMI_CLK		69
++#define HI3798MV100_USB20_UTMI_CLK1		70
++#define HI3798MV100_USB2_CLK48_SEL		71
++
++/* PERI_CRG47 (0x0BC) */
++#define HI3798MV100_USB20_PHY1_REF_CLK		72
++#define HI3798MV100_USB2_PHY_REFCLK_SEL		73
++
++/* PERI_CRG48 (0x0C0) */
++#define HI3798MV100_CA_CI_CLK_SEL		74
++
++/* PERI_CRG49 (0x0C4) */
++#define HI3798MV100_SHA_CLK		75
++
++/* PERI_CRG50 (0x0C8) */
++#define HI3798MV100_PMC_CLK		76
++
++/* PERI_CRG51 (0x0CC) */
++#define HI3798MV100_ETH_CLK		77
++
++/* PERI_CRG53 (0x0D4) */
++#define HI3798MV100_GPU_BUS_CLK		78
++#define HI3798MV100_GPU_CORE_CLK		79
++
++/* PERI_CRG54 (0x0D8) */
++#define HI3798MV100_VO_CLK		80
++#define HI3798MV100_VO_HD_CLK		81
++#define HI3798MV100_VO_SD_CLK_SEL		82
++#define HI3798MV100_VO_SD_CLK_DIV		83
++#define HI3798MV100_VO_HD_CLK_SEL		84
++#define HI3798MV100_VO_HD_CLK_DIV		85
++#define HI3798MV100_VDAC_CH0_CLK_SEL		86
++#define HI3798MV100_HDMI_CLK_SEL		87
++#define HI3798MV100_VO_SD_HDMI_CLK_SEL		88
++#define HI3798MV100_VDP_CLK_SEL		89
++#define HI3798MV100_VO_HD_HDMI_CLK_SEL		90
++
++/* PERI_CRG60 (0x0F0) */
++#define HI3798MV100_VPSS_CLK		91
++#define HI3798MV100_VPSS_CLK_SEL		92
++
++/* PERI_CRG63 (0x0FC) */
++#define HI3798MV100_PVR_BUS_CLK		93
++#define HI3798MV100_PVR_DMX_CLK		94
++#define HI3798MV100_PVR_27M_CLK		95
++#define HI3798MV100_PVR_TSI1_CLK		96
++#define HI3798MV100_PVR_TSI2_CLK		97
++
++/* PERI_CRG64 (0x100) */
++#define HI3798MV100_PVR_DMX_CLK_SEL		98
++#define HI3798MV100_SW_DMX_CLK_DIV		99
++
++/* PERI_CRG67 (0x10C) */
++#define HI3798MV100_HDMI_CTRL_CLK		100
++#define HI3798MV100_HDMITX_CTRL_CEC_CLK_SEL		101
++#define HI3798MV100_HDMITX_CTRL_ASCLK_SEL		102
++
++/* PERI_CRG68 (0x110) */
++#define HI3798MV100_HDMI_PHY_CLK		103
++
++/* PERI_CRG69 (0x114) */
++#define HI3798MV100_ADAC_CLK		104
++
++/* PERI_CRG70 (0x118) */
++#define HI3798MV100_AIAO_CLK		105
++#define HI3798MV100_AIAO_MCLK_SEL		106
++
++/* PERI_CRG71 (0x11C) */
++#define HI3798MV100_VDAC_CHOP_CLK		107
++
++/* PERI_CRG72 (0x120) */
++#define HI3798MV100_FEPHY_CLK		108
++#define HI3798MV100_FEPHY_CLK_SEL		109
++
++/* PERI_CRG73 (0x124) */
++#define HI3798MV100_GPU_FREQ_SEL_CFG_CRG		110
++
++/* PERI_CRG74 (0x128) */
++#define HI3798MV100_DDR_FREQ_SEL_CFG_CRG		111
++
++/* PERI_CRG94 (0x178) */
++#define HI3798MV100_WDT_CLK		112
++#define HI3798MV100_WDG1_CLK		113
++
++/* PERI_CRG95 (0x17C) */
++#define HI3798MV100_PLL_TEST_EN		114
++#define HI3798MV100_TEST_CLK_SEL		115
++#define HI3798MV100_TEST_CLK_EN		116
++
++/* PERI_CRG100 (0x190) */
++#define HI3798MV100_USB21_PHY1_REF_CLK		117
++#define HI3798MV100_USB2_PHY2_REFCLK_SEL		118
++
++/* PERI_CRG101 (0x194) */
++#define HI3798MV100_USB3_PHY_REF_CLK		119
++#define HI3798MV100_USB3_PHY_REFCLK_SEL		120
++#define HI3798MV100_USB3_REF_SSP_EN		121
++
++/* PERI_CRG102 (0x198) */
++#define HI3798MV100_USB21_BUS_CLK		122
++#define HI3798MV100_USB21_48M_CLK		123
++#define HI3798MV100_USB21_12M_CLK		124
++#define HI3798MV100_USB21_PHY_CLK		125
++#define HI3798MV100_USB21_UTMI_CLK		126
++#define HI3798MV100_USB2_CLK48_SEL1		127
++
++#define HI3798MV100_CRG_CLK_COUNT		128
++
++#endif	/* __DT_BINDINGS_CLOCK_HI3798MV100_CRG_H */
+--- /dev/null
++++ b/include/dt-bindings/clock/hisilicon,hi3798mv100-sysctrl.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/*
++ * Clocks provided by the system controller of the HiSilicon Hi3798MV100 SoC.
++ *
++ * Copyright (c) 2016 HiSilicon Technologies Co., Ltd.
++ */
++
++#ifndef __DT_BINDINGS_CLOCK_HI3798MV100_SYSCTRL_H
++#define __DT_BINDINGS_CLOCK_HI3798MV100_SYSCTRL_H
++
++/* clocks provided by the system controller */
++#define HI3798MV100_IR_CLK			0
++#define HI3798MV100_TIMER01_CLK			1
++#define HI3798MV100_UART0_CLK			2
++
++#define HI3798MV100_SYSCTRL_CLK_COUNT		3
++
++#endif	/* __DT_BINDINGS_CLOCK_HI3798MV100_SYSCTRL_H */

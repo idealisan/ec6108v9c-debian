@@ -1,0 +1,29 @@
+From 77fd8f38ba8d007e4047152299653e3a88c49f30 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Mon, 26 Oct 2026 13:36:23 +0800
+Subject: [PATCH 3/4] dt-bindings: phy: include the clock header the example
+ uses
+
+The clock id split left histb-clock.h as a forwarding shim with a
+#warning, and the INNO USB2 PHY example still includes it, so every
+dt_binding_check run pays for that warning.
+
+Include the CRG header of the SoC the example describes; the clock id it
+takes already lives there under the same HISTB_ name.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../devicetree/bindings/phy/hisilicon,inno-usb2-phy.yaml        | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/Documentation/devicetree/bindings/phy/hisilicon,inno-usb2-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/hisilicon,inno-usb2-phy.yaml
+@@ -70,7 +70,7 @@ additionalProperties: false
+ 
+ examples:
+   - |
+-    #include <dt-bindings/clock/histb-clock.h>
++    #include <dt-bindings/clock/hisilicon,hi3798cv200-crg.h>
+ 
+     usb2-phy@120 {
+         compatible = "hisilicon,hi3798cv200-usb2-phy";

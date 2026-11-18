@@ -1,0 +1,5134 @@
+From 46ee0576e5a0addf9707445040d2bf344dd150a4 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 17:43:47 +0800
+Subject: [PATCH 1/10] media: platform: add the Hi3798MV100 VDH decoder core
+ with H.264
+
+Add the driver for the VDH block of Hi3798MV100 set-top-box SoCs. It is
+a V4L2 stateless memory-to-memory decoder: userspace parses the
+bitstream and submits picture and slice parameters through request
+controls, the driver programs the descriptor tables the engine reads,
+and the engine writes 16x16-tiled NV21 frames.
+
+This patch carries the framework around the engine -- the device, the
+videobuf2 queues, the interrupt-driven job loop and the table area --
+plus the H.264 backend, the codec the block was brought up on. The table
+area is programmed once at probe, so it takes HEVC's read-only CABAC
+table with it even though that codec arrives in a later patch. The
+driver lands in its final layout: the parts that do not depend on which
+block is underneath -- media node registration, buffer handling, the
+common context lifecycle -- live in histb_vdec_core.c and the v2
+generation keeps its own files.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/media/platform/hisilicon/Kconfig      |    1 +
+ drivers/media/platform/hisilicon/Makefile     |    1 +
+ .../platform/hisilicon/histb-vdec/Kconfig     |   27 +
+ .../platform/hisilicon/histb-vdec/Makefile    |    7 +
+ .../hisilicon/histb-vdec/histb_vdec_core.c    | 1064 +++++++++++
+ .../hisilicon/histb-vdec/histb_vdec_core.h    |  217 +++
+ .../hisilicon/histb-vdec/histb_vdec_v2.h      |  414 +++++
+ .../hisilicon/histb-vdec/histb_vdec_v2_drv.c  | 1144 ++++++++++++
+ .../hisilicon/histb-vdec/histb_vdec_v2_h264.c | 1607 +++++++++++++++++
+ .../hisilicon/histb-vdec/histb_vdec_v2_hw.c   |  133 ++
+ .../hisilicon/histb-vdec/histb_vdec_v2_regs.h |  156 ++
+ .../histb-vdec/histb_vdec_v2_tables_h264.h    |  204 +++
+ .../histb-vdec/histb_vdec_v2_tables_hevc.h    |   60 +
+ 13 files changed, 5035 insertions(+)
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/Kconfig
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/Makefile
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_drv.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_h264.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_hw.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_regs.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_tables_h264.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_tables_hevc.h
+
+--- a/drivers/media/platform/hisilicon/Kconfig
++++ b/drivers/media/platform/hisilicon/Kconfig
+@@ -2,6 +2,7 @@
+ 
+ comment "HiSilicon media platform drivers"
+ 
++source "drivers/media/platform/hisilicon/histb-vdec/Kconfig"
+ source "drivers/media/platform/hisilicon/histb-venc/Kconfig"
+ 
+ config VIDEO_HISTB_JPGD
+--- a/drivers/media/platform/hisilicon/Makefile
++++ b/drivers/media/platform/hisilicon/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++obj-y += histb-vdec/
+ obj-y += histb-venc/
+ obj-$(CONFIG_VIDEO_HISTB_JPGD) += histb-jpgd.o
+ obj-$(CONFIG_VIDEO_HISTB_JPGE) += histb-jpge.o
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/Kconfig
+@@ -0,0 +1,27 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++config VIDEO_HISTB_VDEC
++	tristate "HiSilicon HiSTB video decoder driver"
++	depends on ARCH_HISI || COMPILE_TEST
++	depends on V4L_MEM2MEM_DRIVERS
++	depends on VIDEO_DEV
++	select VIDEOBUF2_DMA_CONTIG
++	select V4L2_MEM2MEM_DEV
++	select V4L2_H264
++	help
++	  Support for the VDH hardware video decoder of the HiSilicon HiSTB
++	  set-top-box SoCs. The driver implements the V4L2 stateless decoder
++	  interface: the bitstream is parsed in userspace and submitted through
++	  request controls, and the hardware decodes H.264, HEVC, MPEG-2,
++	  MPEG-4 and H.263 into NV21 frames.
++
++	  This backend serves the Hi3716CV200 part (HiVDHV200R004) and the
++	  Hi3798MV100 part (HiVDHV300R001): both pack fully parsed syntax into
++	  a downstream message pool and write 16x16-tiled frames, and the V2
++	  part has no HEVC path, so HEVC is offered only on Hi3798MV100.
++
++	  The backend suffix is the hardware generation it starts from: v2
++	  covers VDH V2/V3. It is not the vendor's vdec_vX.Y layer number,
++	  which counts these parts the other way round (vdec_v1.0 for these).
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called histb-vdec.
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/Makefile
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++obj-$(CONFIG_VIDEO_HISTB_VDEC) += histb-vdec.o
++
++histb-vdec-y += histb_vdec_core.o
++histb-vdec-y += histb_vdec_v2_drv.o
++histb-vdec-y += histb_vdec_v2_hw.o
++histb-vdec-y += histb_vdec_v2_h264.o
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.c
+@@ -0,0 +1,1064 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * V4L2 mem2mem core of the HiSilicon HiSTB stateless video decoders.
++ *
++ * Userspace hands in fully parsed syntax through request controls; one job is
++ * one OUTPUT (coded slice data) and one CAPTURE (a linear frame the backend
++ * detiled from its own surface) buffer.  What lives here is everything the two
++ * generations do the same way: the video node and its media entity, format
++ * negotiation against the generation's own list, the vb2 queues, the control
++ * handler and request validation.  The message ABI, the launch, the interrupt,
++ * the surface geometry and the clock/reset glue stay with the backends.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/dma-buf.h>
++#include <linux/dma-mapping.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <media/media-device.h>
++#include <media/media-request.h>
++#include <media/v4l2-dev.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "histb_vdec_core.h"
++
++static struct histb_vdec_common *histb_vdec_common_of_file(struct file *filp)
++{
++	return video_get_drvdata(video_devdata(filp));
++}
++
++static struct histb_vdec_core_ctx *histb_vdec_ctx_of_file(struct file *filp)
++{
++	struct v4l2_fh *fh = file_to_v4l2_fh(filp);
++
++	return container_of(fh, struct histb_vdec_core_ctx, fh);
++}
++
++/* ---------------------------------------------------------------- formats */
++
++/*
++ * dev is passed explicitly, not looked up through ctx: ->open() calls this
++ * before v4l2_fh_init(), so ctx->fh.vdev is still NULL there.
++ */
++static void histb_vdec_reset_fmts(struct histb_vdec_core_ctx *ctx,
++				  const struct histb_vdec_common *common)
++{
++	const struct histb_vdec_fmt *def = common->gen->chip->fmts[0];
++	struct v4l2_format *out = &ctx->out_fmt;
++	struct v4l2_format *cap = &ctx->cap_fmt;
++
++	ctx->desc = def;
++
++	memset(out, 0, sizeof(*out));
++	out->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	out->fmt.pix_mp.pixelformat = def->fourcc;
++	out->fmt.pix_mp.field = V4L2_FIELD_NONE;
++	out->fmt.pix_mp.num_planes = 1;
++	out->fmt.pix_mp.colorspace = V4L2_COLORSPACE_REC709;
++	out->fmt.pix_mp.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	out->fmt.pix_mp.quantization = V4L2_QUANTIZATION_DEFAULT;
++	out->fmt.pix_mp.xfer_func = V4L2_XFER_FUNC_DEFAULT;
++	common->gen->set_out_size(ctx, out, common->gen->max_width, 1088);
++	out->fmt.pix_mp.width = common->gen->max_width;
++	out->fmt.pix_mp.height = 1088;
++	out->fmt.pix_mp.plane_fmt[0].sizeimage = HISTB_VDEC_DEFAULT_OUTPUT_SIZE;
++
++	memset(cap, 0, sizeof(*cap));
++	cap->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	cap->fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV21;
++	cap->fmt.pix_mp.field = V4L2_FIELD_NONE;
++	cap->fmt.pix_mp.num_planes = 1;
++	cap->fmt.pix_mp.colorspace = V4L2_COLORSPACE_REC709;
++	cap->fmt.pix_mp.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	cap->fmt.pix_mp.quantization = V4L2_QUANTIZATION_DEFAULT;
++	cap->fmt.pix_mp.xfer_func = V4L2_XFER_FUNC_DEFAULT;
++	common->gen->set_cap_reset(ctx, cap, out->fmt.pix_mp.width,
++				   out->fmt.pix_mp.height);
++}
++
++static void histb_vdec_reset_capture_fmt(struct histb_vdec_core_ctx *ctx)
++{
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++	const struct v4l2_pix_format_mplane *out = &ctx->out_fmt.fmt.pix_mp;
++	struct v4l2_format *cap = &ctx->cap_fmt;
++
++	cap->fmt.pix_mp.field = V4L2_FIELD_NONE;
++	/* Propagate the colourspace information of the bitstream to capture. */
++	cap->fmt.pix_mp.colorspace = out->colorspace;
++	cap->fmt.pix_mp.ycbcr_enc = out->ycbcr_enc;
++	cap->fmt.pix_mp.quantization = out->quantization;
++	cap->fmt.pix_mp.xfer_func = out->xfer_func;
++	common->gen->set_cap_reset(ctx, cap, out->width, out->height);
++}
++
++static bool histb_vdec_cap_format(const struct histb_vdec_gen *gen, u32 fourcc)
++{
++	unsigned int i;
++
++	for (i = 0; i < gen->num_cap_formats; i++)
++		if (gen->cap_formats[i] == fourcc)
++			return true;
++
++	return false;
++}
++
++static const struct histb_vdec_fmt *
++histb_vdec_find_fmt(const struct histb_vdec_gen *gen, u32 fourcc)
++{
++	unsigned int i;
++
++	for (i = 0; i < gen->chip->num_fmts; i++)
++		if (gen->chip->fmts[i]->fourcc == fourcc)
++			return gen->chip->fmts[i];
++
++	return NULL;
++}
++
++static int histb_vdec_querycap(struct file *file, void *priv,
++			       struct v4l2_capability *cap)
++{
++	struct histb_vdec_common *common = histb_vdec_common_of_file(file);
++
++	strscpy(cap->driver, common->gen->name, sizeof(cap->driver));
++	strscpy(cap->card, common->gen->name, sizeof(cap->card));
++	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
++		 dev_name(common->dev));
++	return 0;
++}
++
++static int histb_vdec_enum_fmt_cap(struct file *file, void *priv,
++				   struct v4l2_fmtdesc *f)
++{
++	struct histb_vdec_common *common = histb_vdec_common_of_file(file);
++
++	if (f->index >= common->gen->num_cap_formats)
++		return -EINVAL;
++
++	f->pixelformat = common->gen->cap_formats[f->index];
++	return 0;
++}
++
++static int histb_vdec_enum_fmt_out(struct file *file, void *priv,
++				   struct v4l2_fmtdesc *f)
++{
++	struct histb_vdec_common *common = histb_vdec_common_of_file(file);
++
++	if (f->index >= common->gen->chip->num_fmts)
++		return -EINVAL;
++
++	f->pixelformat = common->gen->chip->fmts[f->index]->fourcc;
++	return 0;
++}
++
++static int histb_vdec_try_fmt_cap(struct file *file, void *priv,
++				  struct v4l2_format *f)
++{
++	struct histb_vdec_core_ctx *ctx = histb_vdec_ctx_of_file(file);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
++	unsigned int width, height;
++
++	if (!histb_vdec_cap_format(common->gen, pix->pixelformat))
++		pix->pixelformat = common->gen->cap_formats[0];
++
++	/* A decoded frame can not be smaller than the stream resolution. */
++	width = min_t(u32, pix->width, common->gen->max_width);
++	height = min_t(u32, pix->height, common->gen->max_height);
++	width = ALIGN(width, 16);
++	height = ALIGN(height, 16);
++	width = max(width, ctx->out_fmt.fmt.pix_mp.width);
++	height = max(height, ctx->out_fmt.fmt.pix_mp.height);
++	pix->width = width;
++	pix->height = height;
++
++	pix->field = V4L2_FIELD_NONE;
++	pix->num_planes = 1;
++	common->gen->set_cap_size(ctx, f, pix->width, pix->height);
++	return 0;
++}
++
++static int histb_vdec_try_fmt_out(struct file *file, void *priv,
++				  struct v4l2_format *f)
++{
++	struct histb_vdec_common *common = histb_vdec_common_of_file(file);
++	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
++
++	if (!histb_vdec_find_fmt(common->gen, pix->pixelformat))
++		pix->pixelformat = common->gen->chip->fmts[0]->fourcc;
++
++	pix->field = V4L2_FIELD_NONE;
++	pix->num_planes = 1;
++	pix->width = ALIGN(min_t(u32, pix->width, common->gen->max_width), 16);
++	pix->height = ALIGN(min_t(u32, pix->height, common->gen->max_height),
++			    16);
++
++	/*
++	 * The bitstream is consumed by the stream fetcher, not a plane
++	 * formatter; the nominal size only bounds the buffer allocation and
++	 * userspace may size it below the default.
++	 */
++	if (!pix->plane_fmt[0].sizeimage)
++		pix->plane_fmt[0].sizeimage = HISTB_VDEC_DEFAULT_OUTPUT_SIZE;
++	return 0;
++}
++
++static int histb_vdec_g_fmt_cap(struct file *file, void *priv,
++				struct v4l2_format *f)
++{
++	struct histb_vdec_core_ctx *ctx = histb_vdec_ctx_of_file(file);
++
++	*f = ctx->cap_fmt;
++	return 0;
++}
++
++static int histb_vdec_g_fmt_out(struct file *file, void *priv,
++				struct v4l2_format *f)
++{
++	struct histb_vdec_core_ctx *ctx = histb_vdec_ctx_of_file(file);
++
++	*f = ctx->out_fmt;
++	return 0;
++}
++
++static int histb_vdec_s_fmt_cap(struct file *file, void *priv,
++				struct v4l2_format *f)
++{
++	struct histb_vdec_core_ctx *ctx = histb_vdec_ctx_of_file(file);
++	struct vb2_queue *vq;
++	int ret;
++
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
++			     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++	if (vb2_is_busy(vq))
++		return -EBUSY;
++
++	ret = histb_vdec_try_fmt_cap(file, priv, f);
++	if (ret)
++		return ret;
++
++	ctx->cap_fmt = *f;
++	return 0;
++}
++
++static int histb_vdec_s_fmt_out(struct file *file, void *priv,
++				struct v4l2_format *f)
++{
++	struct histb_vdec_core_ctx *ctx = histb_vdec_ctx_of_file(file);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++	const struct histb_vdec_fmt *desc;
++	struct vb2_queue *vq, *peer_vq;
++	int ret;
++
++	/*
++	 * A protocol change resets the per-protocol hardware state, and the
++	 * frame slot geometry follows the stream resolution, so neither can
++	 * change once the queues are in use.
++	 */
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
++			     V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
++	if (vb2_is_streaming(vq) ||
++	    (vb2_is_busy(vq) &&
++	     f->fmt.pix_mp.pixelformat != ctx->out_fmt.fmt.pix_mp.pixelformat))
++		return -EBUSY;
++
++	peer_vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
++				  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++	if (vb2_is_busy(peer_vq))
++		return -EBUSY;
++
++	ret = histb_vdec_try_fmt_out(file, priv, f);
++	if (ret)
++		return ret;
++
++	desc = histb_vdec_find_fmt(common->gen, f->fmt.pix_mp.pixelformat);
++	if (!desc)
++		return -EINVAL;
++
++	if (ctx->desc != desc) {
++		ctx->desc = desc;
++		if (common->gen->protocol_changed)
++			common->gen->protocol_changed(ctx);
++	}
++	ctx->out_fmt = *f;
++	histb_vdec_reset_capture_fmt(ctx);
++	return 0;
++}
++
++static int histb_vdec_enum_framesizes(struct file *file, void *priv,
++				      struct v4l2_frmsizeenum *fsize)
++{
++	struct histb_vdec_common *common = histb_vdec_common_of_file(file);
++	unsigned int min_width = common->gen->min_coded_width ?
++				 common->gen->min_coded_width(fsize->pixel_format) :
++				 16;
++
++	if (fsize->index)
++		return -EINVAL;
++
++	if (!histb_vdec_cap_format(common->gen, fsize->pixel_format) &&
++	    !histb_vdec_find_fmt(common->gen, fsize->pixel_format))
++		return -EINVAL;
++
++	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	fsize->stepwise.min_width = min_width;
++	fsize->stepwise.max_width = common->gen->max_width;
++	fsize->stepwise.step_width = 16;
++	fsize->stepwise.min_height = 16;
++	fsize->stepwise.max_height = common->gen->max_height;
++	fsize->stepwise.step_height = 16;
++	return 0;
++}
++
++static int histb_vdec_g_selection(struct file *file, void *priv,
++				  struct v4l2_selection *s)
++{
++	struct histb_vdec_core_ctx *ctx = histb_vdec_ctx_of_file(file);
++	const struct v4l2_pix_format_mplane *pix = histb_vdec_cap_pix(ctx);
++
++	if (s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
++	    s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
++		return -EINVAL;
++
++	switch (s->target) {
++	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
++	case V4L2_SEL_TGT_COMPOSE:
++	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
++	case V4L2_SEL_TGT_COMPOSE_PADDED:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/*
++	 * The stateless controls carry no cropping information, so the coded
++	 * size is the visible size here; tiles past it are never written.
++	 */
++	s->r.left = 0;
++	s->r.top = 0;
++	s->r.width = pix->width;
++	s->r.height = pix->height;
++	return 0;
++}
++
++/* ------------------------------------------------------------ vb2 queues */
++
++static int histb_vdec_queue_setup(struct vb2_queue *vq,
++				  unsigned int *num_buffers,
++				  unsigned int *num_planes,
++				  unsigned int sizes[],
++				  struct device *alloc_devs[])
++{
++	struct histb_vdec_core_ctx *ctx = vb2_get_drv_priv(vq);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++	const struct histb_vdec_gen *gen = common->gen;
++	const struct v4l2_format *f;
++
++	if (V4L2_TYPE_IS_OUTPUT(vq->type))
++		f = &ctx->out_fmt;
++	else
++		f = &ctx->cap_fmt;
++
++	/*
++	 * The picture message names references through the capture buffer
++	 * index, so a queue deeper than the slot table could never have every
++	 * buffer addressable as a reference. The count includes the buffers the
++	 * queue already holds: VIDIOC_REQBUFS reaches this op with an empty
++	 * queue, VIDIOC_CREATE_BUFS with the existing ones in place.
++	 */
++	if (!V4L2_TYPE_IS_OUTPUT(vq->type)) {
++		unsigned int have = vb2_get_num_buffers(vq);
++
++		if (have >= gen->max_cap_buffers)
++			return gen->cap_full_einval ? -EINVAL : -ENOBUFS;
++		if (*num_buffers > gen->max_cap_buffers - have) {
++			if (gen->cap_clamp)
++				*num_buffers = gen->max_cap_buffers - have;
++			else
++				return gen->cap_full_einval ? -EINVAL :
++							      -ENOBUFS;
++		}
++	}
++
++	if (*num_planes) {
++		if (*num_planes != 1)
++			return -EINVAL;
++		if (sizes[0] < f->fmt.pix_mp.plane_fmt[0].sizeimage)
++			return -EINVAL;
++		return 0;
++	}
++
++	*num_planes = 1;
++	sizes[0] = f->fmt.pix_mp.plane_fmt[0].sizeimage;
++	return 0;
++}
++
++static int histb_vdec_buf_prepare(struct vb2_buffer *vb)
++{
++	struct histb_vdec_core_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++	const struct v4l2_format *f;
++	int ret;
++
++	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
++		f = &ctx->out_fmt;
++	else
++		f = &ctx->cap_fmt;
++
++	if (vb2_plane_size(vb, 0) < f->fmt.pix_mp.plane_fmt[0].sizeimage)
++		return -EINVAL;
++
++	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type)) {
++		if (common->gen->buf_prepare) {
++			ret = common->gen->buf_prepare(ctx, vb);
++			if (ret)
++				return ret;
++		}
++		return 0;
++	}
++
++	/* CAPTURE buffers are always fully written by the decoder. */
++	vb2_set_plane_payload(vb, 0, f->fmt.pix_mp.plane_fmt[0].sizeimage);
++
++	return 0;
++}
++
++static int histb_vdec_buf_init(struct vb2_buffer *vb)
++{
++	struct histb_vdec_core_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++
++	if (common->gen->buf_init)
++		return common->gen->buf_init(ctx, vb);
++	return 0;
++}
++
++static void histb_vdec_buf_cleanup(struct vb2_buffer *vb)
++{
++	struct histb_vdec_core_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++
++	if (common->gen->buf_cleanup)
++		common->gen->buf_cleanup(ctx, vb);
++}
++
++static int histb_vdec_buf_out_validate(struct vb2_buffer *vb)
++{
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++
++	vbuf->field = V4L2_FIELD_NONE;
++	return 0;
++}
++
++static void histb_vdec_buf_queue(struct vb2_buffer *vb)
++{
++	struct histb_vdec_core_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
++}
++
++static void histb_vdec_buf_request_complete(struct vb2_buffer *vb)
++{
++	struct histb_vdec_core_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	v4l2_ctrl_request_complete(vb->req_obj.req, &ctx->ctrl_hdl);
++}
++
++static int histb_vdec_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct histb_vdec_core_ctx *ctx = vb2_get_drv_priv(q);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++
++	if (common->gen->start)
++		return common->gen->start(ctx, q);
++	return 0;
++}
++
++static void histb_vdec_queue_cleanup(struct histb_vdec_core_ctx *ctx,
++				     struct vb2_queue *q, u32 state)
++{
++	unsigned int i;
++
++	while (true) {
++		struct vb2_v4l2_buffer *vbuf;
++
++		if (V4L2_TYPE_IS_OUTPUT(q->type))
++			vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++		else
++			vbuf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++
++		if (!vbuf)
++			break;
++
++		v4l2_ctrl_request_complete(vbuf->vb2_buf.req_obj.req,
++					   &ctx->ctrl_hdl);
++		v4l2_m2m_buf_done(vbuf, state);
++	}
++
++	/* A buffer the mem2mem lists no longer carry is still ours to return. */
++	for (i = 0; i < vb2_get_num_buffers(q); i++) {
++		struct vb2_buffer *vb = vb2_get_buffer(q, i);
++
++		if (!vb || vb->state != VB2_BUF_STATE_ACTIVE)
++			continue;
++		v4l2_ctrl_request_complete(vb->req_obj.req, &ctx->ctrl_hdl);
++		vb2_buffer_done(vb, state);
++	}
++}
++
++static void histb_vdec_stop_streaming(struct vb2_queue *q)
++{
++	struct histb_vdec_core_ctx *ctx = vb2_get_drv_priv(q);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++
++	/*
++	 * The mem2mem core drains the running job before stop_streaming can
++	 * run, so the hardware is idle here.
++	 */
++	if (common->gen->stop)
++		common->gen->stop(ctx, q);
++
++	histb_vdec_queue_cleanup(ctx, q, VB2_BUF_STATE_ERROR);
++}
++
++static const struct vb2_ops histb_vdec_queue_ops = {
++	.queue_setup = histb_vdec_queue_setup,
++	.buf_init = histb_vdec_buf_init,
++	.buf_prepare = histb_vdec_buf_prepare,
++	.buf_out_validate = histb_vdec_buf_out_validate,
++	.buf_queue = histb_vdec_buf_queue,
++	.buf_cleanup = histb_vdec_buf_cleanup,
++	.buf_request_complete = histb_vdec_buf_request_complete,
++	.start_streaming = histb_vdec_start_streaming,
++	.stop_streaming = histb_vdec_stop_streaming,
++};
++
++static int histb_vdec_queue_init(void *priv, struct vb2_queue *src_vq,
++				 struct vb2_queue *dst_vq)
++{
++	struct histb_vdec_core_ctx *ctx = priv;
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++	const struct histb_vdec_gen *gen = common->gen;
++	int ret;
++
++	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	src_vq->drv_priv = ctx;
++	src_vq->ops = &histb_vdec_queue_ops;
++	src_vq->mem_ops = &vb2_dma_contig_memops;
++	/*
++	 * The driver reads the bitstream in the kernel (slice delimitation and
++	 * header parsing), so the plane must keep a kernel mapping;
++	 * DMA_ATTR_NO_KERNEL_MAPPING would leave vb2_plane_vaddr() NULL.
++	 */
++	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
++	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	src_vq->lock = &common->vdev_lock;
++	src_vq->dev = gen->dma_dev(common);
++	src_vq->supports_requests = true;
++
++	ret = vb2_queue_init(src_vq);
++	if (ret)
++		return ret;
++
++	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	dst_vq->drv_priv = ctx;
++	dst_vq->ops = &histb_vdec_queue_ops;
++	dst_vq->mem_ops = &vb2_dma_contig_memops;
++	/* The completion writes the linear frame through a kernel mapping. */
++	dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
++	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	dst_vq->lock = &common->vdev_lock;
++	dst_vq->dev = gen->dma_dev(common);
++	dst_vq->min_queued_buffers = gen->min_queued_buffers;
++
++	return vb2_queue_init(dst_vq);
++}
++
++/* --------------------------------------------------------------- controls */
++
++static int histb_vdec_try_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct histb_vdec_core_ctx *ctx =
++		container_of(ctrl->handler, struct histb_vdec_core_ctx, ctrl_hdl);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++
++	if (common->gen->try_ctrl)
++		return common->gen->try_ctrl(ctx->desc, ctrl);
++
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops histb_vdec_ctrl_ops = {
++	.try_ctrl = histb_vdec_try_ctrl,
++};
++
++/*
++ * The control handlers of all file handles carry the controls of every
++ * protocol, like rkvdec; a protocol switch then never needs a handler rebuild.
++ */
++static int histb_vdec_init_ctrls(struct histb_vdec_core_ctx *ctx)
++{
++	const struct histb_vdec_chip *chip = histb_vdec_common_of_ctx(ctx)->gen->chip;
++	unsigned int i, j, nctrls = 0;
++	int ret;
++
++	for (i = 0; i < chip->num_fmts; i++)
++		nctrls += chip->fmts[i]->num_ctrls;
++
++	v4l2_ctrl_handler_init(&ctx->ctrl_hdl, nctrls);
++
++	for (i = 0; i < chip->num_fmts; i++) {
++		for (j = 0; j < chip->fmts[i]->num_ctrls; j++) {
++			struct v4l2_ctrl_config cfg = chip->fmts[i]->ctrls[j];
++
++			cfg.ops = &histb_vdec_ctrl_ops;
++			v4l2_ctrl_new_custom(&ctx->ctrl_hdl, &cfg, ctx);
++			if (ctx->ctrl_hdl.error) {
++				ret = ctx->ctrl_hdl.error;
++				goto err_free_handler;
++			}
++		}
++	}
++
++	ret = v4l2_ctrl_handler_setup(&ctx->ctrl_hdl);
++	if (ret)
++		goto err_free_handler;
++
++	ctx->fh.ctrl_handler = &ctx->ctrl_hdl;
++	return 0;
++
++err_free_handler:
++	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++	return ret;
++}
++
++/* --------------------------------------------------------------- ioctls */
++
++static const struct v4l2_ioctl_ops histb_vdec_ioctl_ops = {
++	.vidioc_querycap = histb_vdec_querycap,
++	.vidioc_enum_framesizes = histb_vdec_enum_framesizes,
++
++	.vidioc_enum_fmt_vid_cap = histb_vdec_enum_fmt_cap,
++	.vidioc_enum_fmt_vid_out = histb_vdec_enum_fmt_out,
++	.vidioc_g_fmt_vid_cap_mplane = histb_vdec_g_fmt_cap,
++	.vidioc_g_fmt_vid_out_mplane = histb_vdec_g_fmt_out,
++	.vidioc_try_fmt_vid_cap_mplane = histb_vdec_try_fmt_cap,
++	.vidioc_try_fmt_vid_out_mplane = histb_vdec_try_fmt_out,
++	.vidioc_s_fmt_vid_cap_mplane = histb_vdec_s_fmt_cap,
++	.vidioc_s_fmt_vid_out_mplane = histb_vdec_s_fmt_out,
++	.vidioc_g_selection = histb_vdec_g_selection,
++
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++
++	.vidioc_decoder_cmd = v4l2_m2m_ioctl_stateless_decoder_cmd,
++	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_stateless_try_decoder_cmd,
++
++	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++static int histb_vdec_open(struct file *filp)
++{
++	struct histb_vdec_common *common = histb_vdec_common_of_file(filp);
++	const struct histb_vdec_gen *gen = common->gen;
++	struct histb_vdec_core_ctx *ctx;
++	int ret;
++
++	ctx = kzalloc(gen->ctx_size, GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++
++	histb_vdec_reset_fmts(ctx, common);
++	v4l2_fh_init(&ctx->fh, video_devdata(filp));
++
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(common->m2m_dev, ctx,
++					    histb_vdec_queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		goto err_free_fh;
++	}
++
++	ret = histb_vdec_init_ctrls(ctx);
++	if (ret)
++		goto err_release_m2m;
++
++	if (gen->open) {
++		ret = gen->open(ctx);
++		if (ret)
++			goto err_free_ctrls;
++	}
++
++	v4l2_fh_add(&ctx->fh, filp);
++	return 0;
++
++err_free_ctrls:
++	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++err_release_m2m:
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++err_free_fh:
++	v4l2_fh_exit(&ctx->fh);
++	kfree(ctx);
++	return ret;
++}
++
++static int histb_vdec_release(struct file *filp)
++{
++	struct histb_vdec_core_ctx *ctx = histb_vdec_ctx_of_file(filp);
++	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
++
++	mutex_lock(&common->vdev_lock);
++	v4l2_fh_del(&ctx->fh, filp);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	if (common->gen->release)
++		common->gen->release(ctx);
++	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++	v4l2_fh_exit(&ctx->fh);
++	mutex_unlock(&common->vdev_lock);
++	kfree(ctx);
++
++	return 0;
++}
++
++static const struct v4l2_file_operations histb_vdec_fops = {
++	.owner = THIS_MODULE,
++	.open = histb_vdec_open,
++	.release = histb_vdec_release,
++	.poll = v4l2_m2m_fop_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = v4l2_m2m_fop_mmap,
++};
++
++/* ------------------------------------------------------------- requests */
++
++static int histb_vdec_request_validate(struct media_request *req)
++{
++	struct media_request_object *obj;
++	struct vb2_buffer *out = NULL;
++	struct v4l2_ctrl_handler *req_hdl;
++	struct histb_vdec_common *common;
++	struct histb_vdec_core_ctx *ctx;
++	const u32 *required;
++	unsigned int count, num, i;
++
++	count = vb2_request_buffer_cnt(req);
++	/*
++	 * A request drives one decode job, and a job is the pair of one OUTPUT
++	 * and one CAPTURE buffer, so the request must bind an OUTPUT buffer to
++	 * be queueable at all and never more than one: the engine is programmed
++	 * through a single stream base and one slice chain per run, so two
++	 * coded buffers cannot be mapped onto the one job this request
++	 * schedules.
++	 */
++	if (!count)
++		return -ENOENT;
++	if (count > 1)
++		return -EINVAL;
++
++	list_for_each_entry(obj, &req->objects, list) {
++		struct vb2_buffer *vb;
++
++		if (!vb2_request_object_is_buffer(obj))
++			continue;
++		vb = container_of(obj, struct vb2_buffer, req_obj);
++		if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type)) {
++			out = vb;
++			break;
++		}
++	}
++	if (!out)
++		return -ENOENT;
++
++	ctx = vb2_get_drv_priv(out->vb2_queue);
++	common = histb_vdec_common_of_ctx(ctx);
++	required = common->gen->required_ctrls ?
++		   common->gen->required_ctrls(ctx, &num) : NULL;
++	if (required) {
++		req_hdl = v4l2_ctrl_request_hdl_find(req, &ctx->ctrl_hdl);
++		if (!req_hdl)
++			return -ENOENT;
++		for (i = 0; i < num; i++) {
++			if (v4l2_ctrl_request_hdl_ctrl_find(req_hdl,
++							    required[i]))
++				continue;
++			v4l2_ctrl_request_hdl_put(req_hdl);
++			return -ENOENT;
++		}
++		v4l2_ctrl_request_hdl_put(req_hdl);
++	}
++
++	return vb2_request_validate(req);
++}
++
++static const struct media_device_ops histb_vdec_media_ops = {
++	.req_validate = histb_vdec_request_validate,
++	.req_queue = v4l2_m2m_request_queue,
++};
++
++/* ------------------------------------------------------------- v4l2 init */
++
++int histb_vdec_core_init(struct histb_vdec_common *common,
++			 struct platform_device *pdev,
++			 const struct histb_vdec_gen *gen)
++{
++	struct video_device *vdev;
++	int ret;
++
++	common->dev = &pdev->dev;
++	common->gen = gen;
++	mutex_init(&common->vdev_lock);
++	spin_lock_init(&common->job_lock);
++
++	ret = v4l2_device_register(&pdev->dev, &common->v4l2_dev);
++	if (ret)
++		return ret;
++
++	common->v4l2_dev.mdev = &common->mdev;
++	strscpy(common->mdev.driver_name, gen->name,
++		sizeof(common->mdev.driver_name));
++	strscpy(common->mdev.model, gen->chip->model,
++		sizeof(common->mdev.model));
++	snprintf(common->mdev.bus_info, sizeof(common->mdev.bus_info),
++		 "platform:%s", dev_name(&pdev->dev));
++	media_device_init(&common->mdev);
++	common->mdev.dev = &pdev->dev;
++	common->mdev.ops = &histb_vdec_media_ops;
++
++	common->m2m_dev = v4l2_m2m_init(gen->m2m_ops);
++	if (IS_ERR(common->m2m_dev)) {
++		ret = PTR_ERR(common->m2m_dev);
++		common->m2m_dev = NULL;
++		v4l2_err(&common->v4l2_dev, "failed to init mem2mem device\n");
++		goto err_unregister;
++	}
++
++	vdev = video_device_alloc();
++	if (!vdev) {
++		ret = -ENOMEM;
++		goto err_m2m;
++	}
++	common->vdev = vdev;
++
++	vdev->v4l2_dev = &common->v4l2_dev;
++	vdev->fops = &histb_vdec_fops;
++	vdev->ioctl_ops = &histb_vdec_ioctl_ops;
++	vdev->lock = &common->vdev_lock;
++	vdev->release = video_device_release;
++	vdev->vfl_dir = VFL_DIR_M2M;
++	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
++	strscpy(vdev->name, gen->name, sizeof(vdev->name));
++	video_set_drvdata(vdev, common);
++
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++	if (ret) {
++		v4l2_err(&common->v4l2_dev, "failed to register video device\n");
++		video_device_release(vdev);
++		common->vdev = NULL;
++		goto err_m2m;
++	}
++
++	/*
++	 * The mem2mem core creates the decoder entity and the device-node link;
++	 * without them the media node has an empty topology and userspace cannot
++	 * tie /dev/video0 to /dev/media0.
++	 */
++	ret = v4l2_m2m_register_media_controller(common->m2m_dev, vdev,
++						 MEDIA_ENT_F_PROC_VIDEO_DECODER);
++	if (ret) {
++		v4l2_err(&common->v4l2_dev, "failed to register media controller\n");
++		goto err_unregister_vdev;
++	}
++
++	ret = media_device_register(&common->mdev);
++	if (ret) {
++		dev_err(common->dev, "failed to register media device\n");
++		goto err_unregister_mc;
++	}
++
++	return 0;
++
++err_unregister_mc:
++	v4l2_m2m_unregister_media_controller(common->m2m_dev);
++err_unregister_vdev:
++	histb_vdec_core_stop(common);
++err_m2m:
++	if (common->m2m_dev)
++		v4l2_m2m_release(common->m2m_dev);
++err_unregister:
++	media_device_cleanup(&common->mdev);
++	v4l2_device_unregister(&common->v4l2_dev);
++	return ret;
++}
++
++void histb_vdec_core_stop(struct histb_vdec_common *common)
++{
++	mutex_lock(&common->mdev.req_queue_mutex);
++	mutex_lock(&common->vdev_lock);
++	WRITE_ONCE(common->removing, true);
++	if (common->vdev)
++		video_unregister_device(common->vdev);
++	if (common->m2m_dev)
++		v4l2_m2m_suspend(common->m2m_dev);
++	mutex_unlock(&common->vdev_lock);
++	mutex_unlock(&common->mdev.req_queue_mutex);
++}
++
++void histb_vdec_core_exit(struct histb_vdec_common *common)
++{
++	media_device_unregister(&common->mdev);
++	if (common->m2m_dev) {
++		v4l2_m2m_unregister_media_controller(common->m2m_dev);
++		v4l2_m2m_release(common->m2m_dev);
++	}
++	media_device_cleanup(&common->mdev);
++	v4l2_device_unregister(&common->v4l2_dev);
++}
++
++/* -------------------------------------------------------------- src dma */
++
++void *histb_vdec_src_va(struct vb2_buffer *vb)
++{
++	void *va = vb2_plane_vaddr(vb, 0);
++
++	return va ? va + vb->planes[0].data_offset : NULL;
++}
++
++dma_addr_t histb_vdec_src_dma(struct vb2_buffer *vb)
++{
++	return vb2_dma_contig_plane_dma_addr(vb, 0) + vb->planes[0].data_offset;
++}
++
++int histb_vdec_src_cpu_begin(struct vb2_buffer *vb)
++{
++	struct dma_buf *dbuf = vb->planes[0].dbuf;
++
++	/*
++	 * The bitstream may have been written by whoever exported the plane, and
++	 * videobuf2 does not bracket a driver's CPU use of it, so the window
++	 * belongs here. A plane this device allocated itself carries no dma_buf
++	 * and has nothing to sync.
++	 */
++	if (dbuf)
++		return dma_buf_begin_cpu_access(dbuf, DMA_FROM_DEVICE);
++
++	return 0;
++}
++
++void histb_vdec_src_cpu_end(struct vb2_buffer *vb)
++{
++	struct dma_buf *dbuf = vb->planes[0].dbuf;
++
++	if (dbuf)
++		dma_buf_end_cpu_access(dbuf, DMA_FROM_DEVICE);
++}
++
++/* ---------------------------------------------------------------- driver */
++
++static int histb_vdec_probe(struct platform_device *pdev)
++{
++	const struct histb_vdec_variant *variant;
++
++	variant = of_device_get_match_data(&pdev->dev);
++	if (!variant || !variant->probe)
++		return -ENODEV;
++
++	return variant->probe(pdev, variant->gen);
++}
++
++static void histb_vdec_remove(struct platform_device *pdev)
++{
++	const struct histb_vdec_variant *variant;
++
++	variant = of_device_get_match_data(&pdev->dev);
++	if (variant && variant->remove)
++		variant->remove(pdev);
++}
++
++static int histb_vdec_runtime_suspend(struct device *dev)
++{
++	const struct histb_vdec_variant *variant =
++		of_device_get_match_data(dev);
++
++	if (variant && variant->runtime_suspend)
++		return variant->runtime_suspend(dev);
++	return 0;
++}
++
++static int histb_vdec_runtime_resume(struct device *dev)
++{
++	const struct histb_vdec_variant *variant =
++		of_device_get_match_data(dev);
++
++	if (variant && variant->runtime_resume)
++		return variant->runtime_resume(dev);
++	return 0;
++}
++
++static int histb_vdec_suspend(struct device *dev)
++{
++	const struct histb_vdec_variant *variant =
++		of_device_get_match_data(dev);
++
++	if (variant && variant->system_suspend)
++		return variant->system_suspend(dev);
++	return 0;
++}
++
++static int histb_vdec_resume(struct device *dev)
++{
++	const struct histb_vdec_variant *variant =
++		of_device_get_match_data(dev);
++
++	if (variant && variant->system_resume)
++		return variant->system_resume(dev);
++	return 0;
++}
++
++static const struct dev_pm_ops histb_vdec_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(histb_vdec_suspend, histb_vdec_resume)
++	SET_RUNTIME_PM_OPS(histb_vdec_runtime_suspend, histb_vdec_runtime_resume,
++			   NULL)
++};
++
++static const struct of_device_id histb_vdec_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-vdec",
++	  .data = &histb_vdec_v2_mv100_variant },
++	{ .compatible = "hisilicon,hi3716cv200-vdec",
++	  .data = &histb_vdec_v2_cv200_variant },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, histb_vdec_of_match);
++
++static struct platform_driver histb_vdec_driver = {
++	.probe = histb_vdec_probe,
++	.remove = histb_vdec_remove,
++	.driver = {
++		.name = "histb-vdec",
++		.of_match_table = histb_vdec_of_match,
++		.pm = pm_ptr(&histb_vdec_pm_ops),
++	},
++};
++module_platform_driver(histb_vdec_driver);
++
++MODULE_AUTHOR("David Yang <mmyangfl@gmail.com>");
++MODULE_DESCRIPTION("HiSilicon HiSTB stateless video decoder driver");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.h
+@@ -0,0 +1,217 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Shared contract between the HiSTB stateless decoder core and its
++ * per-generation backends.
++ *
++ * Both generations expose the same V4L2 stateless mem2mem interface: fully
++ * parsed syntax arrives through request controls, one OUTPUT and one CAPTURE
++ * buffer per job, and the capture buffer receives a linear frame that the
++ * driver detiled from an internal surface. The core owns that interface, the
++ * node and media registration and the request validation; a backend owns the
++ * message ABI, the launch, the interrupt and the surface geometry, which are
++ * where the two generations actually differ.
++ */
++#ifndef __HISTB_VDEC_CORE_H__
++#define __HISTB_VDEC_CORE_H__
++
++/* Nominal OUTPUT (bitstream) plane size both generations start from. */
++#define HISTB_VDEC_DEFAULT_OUTPUT_SIZE	(3 * 1024 * 1024)
++
++#include <linux/device.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++#include <linux/workqueue.h>
++
++#include <media/media-device.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-v4l2.h>
++
++struct histb_vdec_common;
++struct histb_vdec_core_ctx;
++struct histb_vdec_gen;
++
++/*
++ * One protocol's description of itself. Both generations share the layout so
++ * that the core can negotiate formats without knowing which block it drives;
++ * @ops points at the protocol's own message assembly, which stays with the
++ * backend.
++ */
++struct histb_vdec_fmt {
++	u32				fourcc;
++	u32				vidstd;
++	unsigned int			num_ctrls;
++	const struct v4l2_ctrl_config	*ctrls;
++	const void			*ops;
++	unsigned int			(*stride)(unsigned int width);
++	unsigned int			grid_align;
++	const u32			*req_ctrls;
++	unsigned int			num_req;
++};
++
++struct histb_vdec_chip {
++	const char *model;
++	const struct histb_vdec_fmt *const *fmts;
++	unsigned int num_fmts;
++};
++
++/*
++ * Prefix every backend context has to start with.  The core allocates it and
++ * the backend's own structure follows it in the same allocation, so the
++ * protocol sources keep addressing their fields by name.
++ */
++struct histb_vdec_core_ctx {
++	struct v4l2_fh			fh;
++	struct v4l2_ctrl_handler	ctrl_hdl;
++	const struct histb_vdec_fmt	*desc;
++	struct v4l2_format		out_fmt;
++	struct v4l2_format		cap_fmt;
++};
++
++struct histb_vdec_job {
++	struct histb_vdec_core_ctx	*ctx;
++	unsigned int		gen;
++};
++
++struct histb_vdec_common {
++	struct device			*dev;
++	const struct histb_vdec_gen	*gen;
++	void				*priv;	/* backend device */
++
++	struct v4l2_device		v4l2_dev;
++	struct media_device		mdev;
++	struct video_device		*vdev;
++	struct v4l2_m2m_dev		*m2m_dev;
++
++	/* serialises the V4L2 ioctls: video node and both vb2 queues */
++	struct mutex			vdev_lock;
++	/* guards @job and @job_running against the completion paths */
++	spinlock_t			job_lock;
++	struct histb_vdec_job		job;
++	unsigned int			job_gen;
++	bool				job_running;
++	bool				removing;
++	struct delayed_work		watchdog;
++};
++
++struct histb_vdec_geom {
++	unsigned int	pitch;		/* tile band pitch */
++	unsigned int	lines;		/* luma rows of the coding grid */
++	unsigned int	uv_offset;	/* chroma start behind the luma base */
++};
++
++struct histb_vdec_gen {
++	const char			*name;
++	size_t				ctx_size;
++	const struct histb_vdec_chip	*chip;
++	unsigned int			max_width;
++	unsigned int			max_height;
++	unsigned int			max_cap_buffers;
++	unsigned int			min_queued_buffers;
++	/* A capture queue deeper than the slot table is refused or clamped. */
++	bool				cap_full_einval;
++	bool				cap_clamp;
++
++	const u32			*cap_formats;
++	unsigned int			num_cap_formats;
++
++	/* The device exported capture buffers are allocated against. */
++	struct device *(*dma_dev)(struct histb_vdec_common *common);
++
++	/* Frame geometry, which is where the two blocks differ. */
++	void (*set_out_size)(struct histb_vdec_core_ctx *ctx, struct v4l2_format *f,
++			     unsigned int width, unsigned int height);
++	void (*set_cap_size)(struct histb_vdec_core_ctx *ctx, struct v4l2_format *f,
++			     unsigned int width, unsigned int height);
++	void (*set_cap_reset)(struct histb_vdec_core_ctx *ctx, struct v4l2_format *f,
++			      unsigned int width, unsigned int height);
++	void (*buf_geom)(struct histb_vdec_core_ctx *ctx, struct histb_vdec_geom *g);
++	int (*buf_prepare)(struct histb_vdec_core_ctx *ctx, struct vb2_buffer *vb);
++	int (*buf_init)(struct histb_vdec_core_ctx *ctx, struct vb2_buffer *vb);
++	void (*buf_cleanup)(struct histb_vdec_core_ctx *ctx, struct vb2_buffer *vb);
++	unsigned int (*min_coded_width)(u32 fourcc);
++
++	/* Stream and buffer lifetime. */
++	int (*start)(struct histb_vdec_core_ctx *ctx, const struct vb2_queue *q);
++	void (*stop)(struct histb_vdec_core_ctx *ctx, const struct vb2_queue *q);
++	void (*buf_release)(struct histb_vdec_core_ctx *ctx, unsigned int index);
++	int (*open)(struct histb_vdec_core_ctx *ctx);
++	void (*release)(struct histb_vdec_core_ctx *ctx);
++
++	const u32 *(*required_ctrls)(const struct histb_vdec_core_ctx *ctx,
++				     unsigned int *num);
++	int (*try_ctrl)(const struct histb_vdec_fmt *fmt,
++			struct v4l2_ctrl *ctrl);
++	void (*protocol_changed)(struct histb_vdec_core_ctx *ctx);
++
++	const struct v4l2_m2m_ops	*m2m_ops;
++};
++
++struct histb_vdec_variant {
++	const struct histb_vdec_gen	*gen;
++	int (*probe)(struct platform_device *pdev,
++		     const struct histb_vdec_gen *gen);
++	void (*remove)(struct platform_device *pdev);
++	int (*runtime_suspend)(struct device *dev);
++	int (*runtime_resume)(struct device *dev);
++	int (*system_suspend)(struct device *dev);
++	int (*system_resume)(struct device *dev);
++};
++
++extern const struct histb_vdec_variant histb_vdec_v2_mv100_variant;
++extern const struct histb_vdec_variant histb_vdec_v2_cv200_variant;
++
++/* Registration and teardown of the media node; called by a backend's probe. */
++int histb_vdec_core_init(struct histb_vdec_common *common,
++			 struct platform_device *pdev,
++			 const struct histb_vdec_gen *gen);
++/* Quiesce the node: unregister the video device and stop new jobs. */
++void histb_vdec_core_stop(struct histb_vdec_common *common);
++/* Release the media controller, the m2m device and the media device. */
++void histb_vdec_core_exit(struct histb_vdec_common *common);
++
++static inline struct histb_vdec_common *
++histb_vdec_common_of_ctx(const void *p)
++{
++	const struct histb_vdec_core_ctx *ctx = p;
++	struct v4l2_device *v4l2_dev = ctx->fh.vdev->v4l2_dev;
++
++	return container_of(v4l2_dev, struct histb_vdec_common, v4l2_dev);
++}
++
++/* Geometry helpers the core and the backends both use. */
++static inline const struct v4l2_pix_format_mplane *
++histb_vdec_cap_pix(const void *p)
++{
++	const struct histb_vdec_core_ctx *ctx = p;
++
++	return &ctx->cap_fmt.fmt.pix_mp;
++}
++
++static inline const struct v4l2_pix_format_mplane *
++histb_vdec_out_pix(const void *p)
++{
++	const struct histb_vdec_core_ctx *ctx = p;
++
++	return &ctx->out_fmt.fmt.pix_mp;
++}
++
++static inline void histb_vdec_get_dims(const void *p,
++				       unsigned int *width,
++				       unsigned int *height)
++{
++	*width = histb_vdec_cap_pix(p)->width;
++	*height = histb_vdec_cap_pix(p)->height;
++}
++
++void *histb_vdec_src_va(struct vb2_buffer *vb);
++dma_addr_t histb_vdec_src_dma(struct vb2_buffer *vb);
++/* Window for the CPU reads a backend makes of an imported OUTPUT plane. */
++int histb_vdec_src_cpu_begin(struct vb2_buffer *vb);
++void histb_vdec_src_cpu_end(struct vb2_buffer *vb);
++
++#endif /* __HISTB_VDEC_CORE_H__ */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_drv.c
+@@ -0,0 +1,1144 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * HiSilicon Hi3798MV100 / Hi3716CV200 stateless decoder backend.
++ *
++ * This generation decodes out of the VDM message pool: the protocol sources
++ * pack the parsed syntax into fixed message slots, the VDM is programmed and
++ * the doorbell rung, and a threaded interrupt finishes the frame.  The V4L2
++ * node, the queues and the request validation live in histb_vdec_core.c.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/mutex.h>
++#include <linux/of_device.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/pm_runtime.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++#include <media/media-device.h>
++#include <media/media-request.h>
++#include <media/v4l2-dev.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "histb_vdec_v2.h"
++
++/* The core casts the allocation to its prefix; both layouts must agree. */
++static_assert(offsetof(struct histb_vdec_ctx, fh) == offsetof(struct histb_vdec_core_ctx, fh));
++static_assert(offsetof(struct histb_vdec_ctx, ctrl_hdl) ==
++	      offsetof(struct histb_vdec_core_ctx, ctrl_hdl));
++static_assert(offsetof(struct histb_vdec_ctx, desc) == offsetof(struct histb_vdec_core_ctx, desc));
++static_assert(offsetof(struct histb_vdec_ctx, out_fmt) ==
++	      offsetof(struct histb_vdec_core_ctx, out_fmt));
++static_assert(offsetof(struct histb_vdec_ctx, cap_fmt) ==
++	      offsetof(struct histb_vdec_core_ctx, cap_fmt));
++
++/*
++ * The core hands v4l2 the common prefix and this backend casts it back, which
++ * holds while that prefix sits at offset zero.
++ */
++static_assert(offsetof(struct histb_vdec_dev, common) == 0);
++
++
++static const struct histb_vdec_codec_ops *
++histb_vdec_v2_ops(const struct histb_vdec_ctx *ctx)
++{
++	return ctx->desc->ops;
++}
++
++/*
++ * The codec descriptors are extern objects, so C can not aggregate them into
++ * the by-value histb_vdec_fmts[] array the driver contract declares; the list
++ * is carried as pointers instead.
++ */
++static const histb_vdec_fmt_desc *const histb_vdec_fmt_list[] = {
++	&histb_vdec_h264_fmt,
++};
++
++static const histb_vdec_fmt_desc *const histb_vdec_fmt_list_cv200[] = {
++	&histb_vdec_h264_fmt,
++};
++
++static const struct histb_vdec_chip histb_vdec_v2_chip_mv100 = {
++	.model = "HI3798MV100 VDH",
++	.fmts = histb_vdec_fmt_list,
++	.num_fmts = ARRAY_SIZE(histb_vdec_fmt_list),
++};
++
++static const struct histb_vdec_chip histb_vdec_v2_chip_cv200 = {
++	.model = "HI3716CV200 VDH",
++	.fmts = histb_vdec_fmt_list_cv200,
++	.num_fmts = ARRAY_SIZE(histb_vdec_fmt_list_cv200),
++};
++
++static struct histb_vdec_dev *histb_vdec_dev_of(struct histb_vdec_ctx *ctx)
++{
++	return video_get_drvdata(ctx->fh.vdev);
++}
++
++static unsigned int histb_vdec_stride(const struct histb_vdec_ctx *ctx,
++				      unsigned int width)
++{
++	return ctx->desc->stride(width);
++}
++
++static unsigned int histb_vdec_frame_size(const struct histb_vdec_ctx *ctx,
++					  unsigned int width,
++					  unsigned int height)
++{
++	return histb_vdec_frame_bytes(histb_vdec_stride(ctx, width),
++				      ALIGN(height, ctx->desc->grid_align));
++}
++
++static void histb_vdec_set_frame_size(struct histb_vdec_ctx *ctx,
++				      struct v4l2_format *f,
++				      unsigned int width, unsigned int height)
++{
++	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
++
++	pix->width = width;
++	pix->height = height;
++	pix->plane_fmt[0].bytesperline = histb_vdec_stride(ctx, width);
++	pix->plane_fmt[0].sizeimage = histb_vdec_frame_size(ctx, width, height);
++}
++
++static void histb_vdec_set_cap_size(struct histb_vdec_ctx *ctx,
++				    struct v4l2_format *f,
++				    unsigned int width, unsigned int height)
++{
++	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
++	unsigned int bpl;
++
++	bpl = max_t(u32, ALIGN(width, 16),
++		    round_up(pix->plane_fmt[0].bytesperline, 16));
++	pix->width = width;
++	pix->height = height;
++	pix->plane_fmt[0].bytesperline = bpl;
++	pix->plane_fmt[0].sizeimage = (size_t)bpl * height * 3 / 2;
++}
++
++int histb_vdec_cap_dims(struct histb_vdec_ctx *ctx, unsigned int *w,
++			unsigned int *h)
++{
++	const struct v4l2_pix_format_mplane *pix =
++		&ctx->cap_fmt.fmt.pix_mp;
++
++	*w = pix->width;
++	*h = pix->height;
++	return 0;
++}
++
++void histb_vdec_buf_geom(struct histb_vdec_ctx *ctx, unsigned int *stride,
++			 unsigned int *lines)
++{
++	unsigned int w, h;
++
++	histb_vdec_cap_dims(ctx, &w, &h);
++	*stride = histb_vdec_stride(ctx, w);
++	*lines = ALIGN(h, ctx->desc->grid_align);
++}
++
++static struct histb_vdec_frame *
++histb_vdec_frame_get(struct histb_vdec_ctx *ctx, unsigned int index)
++{
++	struct histb_vdec_dev *dev = histb_vdec_dev_of(ctx);
++	struct histb_vdec_frame *frame;
++	unsigned int stride, lines, w, h;
++	size_t size;
++
++	if (index >= HISTB_VDEC_MAX_DPB_SLOTS)
++		return NULL;
++	frame = &ctx->frame[index];
++	histb_vdec_buf_geom(ctx, &stride, &lines);
++	histb_vdec_cap_dims(ctx, &w, &h);
++	size = histb_vdec_frame_size(ctx, w, h);
++	if (frame->dma && frame->stride == stride && frame->lines == lines &&
++	    frame->size >= size)
++		return frame;
++
++	if (frame->dma)
++		dma_free_wc(dev->memdev, frame->size, frame->va, frame->dma);
++	memset(frame, 0, sizeof(*frame));
++	frame->va = dma_alloc_wc(dev->memdev, size, &frame->dma, GFP_KERNEL);
++	if (!frame->va) {
++		memset(frame, 0, sizeof(*frame));
++		return NULL;
++	}
++	frame->size = size;
++	frame->stride = stride;
++	frame->lines = lines;
++	return frame;
++}
++
++dma_addr_t histb_vdec_frame_dma(struct histb_vdec_ctx *ctx,
++				struct vb2_buffer *vb)
++{
++	struct histb_vdec_frame *frame = histb_vdec_frame_get(ctx, vb->index);
++
++	return frame ? frame->dma : 0;
++}
++
++
++
++void histb_vdec_frames_free(struct histb_vdec_ctx *ctx)
++{
++	struct histb_vdec_dev *dev = histb_vdec_dev_of(ctx);
++	unsigned int i;
++
++	for (i = 0; i < HISTB_VDEC_MAX_DPB_SLOTS; i++) {
++		struct histb_vdec_frame *frame = &ctx->frame[i];
++
++		if (!frame->dma)
++			continue;
++		dma_free_wc(dev->memdev, frame->size, frame->va, frame->dma);
++		memset(frame, 0, sizeof(*frame));
++	}
++}
++
++static void histb_vdec_frame_to_linear(struct histb_vdec_ctx *ctx,
++				       struct vb2_v4l2_buffer *dst)
++{
++	struct v4l2_pix_format_mplane *pix =
++		&ctx->cap_fmt.fmt.pix_mp;
++	struct histb_vdec_frame *frame;
++	struct vb2_buffer *vb = &dst->vb2_buf;
++	struct dma_buf *dbuf = vb->planes[0].dbuf;
++	unsigned int w = pix->width, h = pix->height;
++	unsigned int bpl = pix->plane_fmt[0].bytesperline;
++	/*
++	 * The VDM's tile chroma is Cr first, i.e. NV21; measured on a stream
++	 * whose U and V differ (a red frame and a flat 64/192 fixture, both
++	 * checked against an ffmpeg decode of the same bitstream: V=191, U=65,
++	 * and the tile frame carries bf 41). An NV12 frame therefore swaps the
++	 * pair and an NV21 frame takes it as is.
++	 */
++	bool swap_uv = pix->pixelformat == V4L2_PIX_FMT_NV12;
++	unsigned int uv, x, y, cy;
++	const u8 *src;
++	u8 *out;
++
++	if (vb->index >= HISTB_VDEC_MAX_DPB_SLOTS)
++		goto no_frame;
++	frame = &ctx->frame[vb->index];
++	out = vb2_plane_vaddr(vb, 0);
++	if (!frame->va || !out)
++		goto no_frame;
++
++	uv = frame->stride * ALIGN(frame->lines, 32) +
++	     16 * ALIGN(frame->lines, 32);
++	src = frame->va;
++	/* The CPU writes this plane; whoever imported it reads it afterwards. */
++	if (dbuf && dma_buf_begin_cpu_access(dbuf, DMA_TO_DEVICE))
++		goto no_frame;
++
++	for (y = 0; y < h; y++) {
++		const u8 *srow = src + (y / 16) * frame->stride * 16 +
++				 (y % 16) * 256;
++		u8 *drow = out + (size_t)y * bpl;
++
++		for (x = 0; x < w; x += 256)
++			memcpy(drow + x, srow + (x / 256) * 4096,
++			       min(256u, w - x));
++	}
++	for (cy = 0; cy < h / 2; cy++) {
++		const u8 *srow = src + uv + (cy / 8) * frame->stride * 8 +
++				 (cy % 8) * 256;
++		u8 *drow = out + (size_t)bpl * h + (size_t)cy * bpl;
++
++		for (x = 0; x < w; x += 256) {
++			const u8 *s = srow + (x / 256) * 2048;
++			u8 *d = drow + x;
++			unsigned int chunk = min(256u, w - x);
++			unsigned int i;
++
++			if (!swap_uv) {
++				memcpy(d, s, chunk);
++				continue;
++			}
++			for (i = 0; i + 1 < chunk; i += 2) {
++				d[i] = s[i + 1];
++				d[i + 1] = s[i];
++			}
++		}
++	}
++	if (dbuf)
++		dma_buf_end_cpu_access(dbuf, DMA_TO_DEVICE);
++
++	vb2_set_plane_payload(vb, 0, (size_t)bpl * h * 3 / 2);
++	return;
++
++no_frame:
++	/* No deliverable copy: say so with an empty payload instead of stale
++	 * bytes from the previous job (a refusal has to be visible).
++	 */
++	vb2_set_plane_payload(vb, 0, 0);
++}
++
++static bool histb_vdec_job_take(struct histb_vdec_dev *dev,
++				struct histb_vdec_job *out)
++{
++	struct histb_vdec_common *common = &dev->common;
++	unsigned long flags;
++
++	spin_lock_irqsave(&common->job_lock, flags);
++	if (!dev->common.job_running) {
++		spin_unlock_irqrestore(&common->job_lock, flags);
++		return false;
++	}
++	*out = common->job;
++	dev->common.job_running = false;
++	common->job = (struct histb_vdec_job){};
++	spin_unlock_irqrestore(&common->job_lock, flags);
++	return true;
++}
++
++/*
++ * @produced tells the two error paths apart. The engine raising DEC_ERR over a
++ * picture it wrote is not the same event as a job that never reached the
++ * engine: the stateless API asks the driver to hand back the (likely corrupted)
++ * frame in the first case and nothing at all in the second, and only the second
++ * is what a refusal looks like from the client side.
++ */
++static void histb_vdec_job_complete(struct histb_vdec_dev *dev,
++				    const struct histb_vdec_job *job,
++				    enum vb2_buffer_state state, bool produced)
++{
++	struct vb2_v4l2_buffer *dst =
++		v4l2_m2m_next_dst_buf(job->ctx->fh.m2m_ctx);
++
++	if (dst) {
++		if (produced)
++			histb_vdec_frame_to_linear((struct histb_vdec_ctx *)job->ctx, dst);
++		else
++			vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++	}
++	v4l2_m2m_buf_done_and_job_finish(dev->common.m2m_dev, job->ctx->fh.m2m_ctx,
++					 state);
++	pm_runtime_put_autosuspend(dev->dev);
++}
++
++static unsigned int histb_vdec_count_slices(u32 state)
++{
++	unsigned int num = FIELD_GET(VDM_STATE_SLICE_NUM, state);
++
++	/*
++	 * The upstream pool carries one 4-word report per decoded slice; the
++	 * per-slice status fields are not interpreted yet, the count only feeds
++	 * the debug output.
++	 */
++	return min_t(unsigned int, num, HISTB_VDEC_MAX_UP_SLICES);
++}
++
++static void histb_vdec_dump_up(struct histb_vdec_dev *dev, unsigned int slices,
++			       bool failed)
++{
++	const u32 *up = histb_vdec_up_msgs(&dev->pool);
++	unsigned int n = min_t(unsigned int, slices, 16);
++	unsigned int i;
++
++	for (i = 0; i < n; i++)
++		dev_dbg(dev->dev, "up%u=%08x %08x %08x %08x\n", i,
++			up[4 * i], up[4 * i + 1], up[4 * i + 2],
++			up[4 * i + 3]);
++	if (failed && slices)
++		dev_err(dev->dev, "failed frame: %u slice reports\n", slices);
++}
++
++static void histb_vdec_report_failure(struct histb_vdec_dev *dev, u32 state,
++				      unsigned int slices)
++{
++	const u32 *up = histb_vdec_up_msgs(&dev->pool);
++	unsigned int n = min_t(unsigned int, slices, HISTB_VDEC_MAX_UP_SLICES);
++	unsigned int i, lines = 0;
++	u32 max_end = 0;
++	u32 off;
++
++	for (i = 0; i < n; i++)
++		max_end = max(max_end, up[4 * i + 2]);
++
++	dev_err(dev->dev,
++		"engine-flagged frame: state=%#010x slices=%u end_mb=%u/%u\n",
++		state, slices, max_end, dev->mb_total);
++
++	for (off = VDM_SED_STA; off <= VDM_SED_LAST && lines < 4; off += 0x10) {
++		u32 a = vdm_read(dev, off), b = vdm_read(dev, off + 4);
++		u32 c = vdm_read(dev, off + 8), d = vdm_read(dev, off + 12);
++
++		if (!(a | b | c | d))
++			continue;
++		dev_err(dev->dev,
++			"sed %03x=%08x %03x=%08x %03x=%08x %03x=%08x\n",
++			off, a, off + 4, b, off + 8, c, off + 12, d);
++		lines++;
++	}
++}
++
++irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
++{
++	struct histb_vdec_dev *dev = priv;
++	struct histb_vdec_job job;
++	unsigned int slices;
++	bool short_cov, deliver_err;
++	u32 state;
++
++	/*
++	 * Use the state the primary handler captured: clearing INT_STATE drops
++	 * the latched frame-done condition, so a re-read here would already
++	 * show an idle VDM and the job would never be completed.
++	 */
++	state = dev->irq_state;
++	if (!(state & VDM_STATE_DEC_OVER))
++		return IRQ_HANDLED;
++
++	if (!histb_vdec_job_take(dev, &job))
++		return IRQ_HANDLED;
++
++	slices = histb_vdec_count_slices(state);
++	dev_dbg(dev->dev, "frame done: %u slices%s\n", slices,
++		(state & VDM_STATE_DEC_ERR) ? ", decode error" : "");
++	histb_vdec_dump_up(dev, slices, state & VDM_STATE_DEC_ERR);
++
++	/*
++	 * One 4-word report per slice; word 2 is the last macroblock the slice
++	 * covered (measured: a 300-MB picture reports 0x12b, and a stream cut
++	 * mid-slice reports the shorter end). Coverage is judged whenever the front
++	 * end reports a macroblock total, and a frame whose reports stop short is
++	 * always recovered from below; only for MPEG-2 does it also decide what the
++	 * client is told, because that front end raises DEC_ERR on pictures this
++	 * check can prove complete.
++	 */
++	short_cov = false;
++	if (dev->mb_total && slices) {
++		const u32 *up = histb_vdec_up_msgs(&dev->pool);
++		u32 max_end = 0;
++		bool bad = false;
++		unsigned int i;
++
++		for (i = 0; i < slices && i < HISTB_VDEC_MAX_UP_SLICES; i++) {
++			u32 end = up[4 * i + 2];
++
++			if (end >= dev->mb_total)
++				bad = true;
++			max_end = max(max_end, end);
++		}
++		if (!bad && max_end != dev->mb_total - 1)
++			bad = true;
++		if (bad) {
++			dev_err(dev->dev,
++				"frame decoded only %u of %u macroblocks\n",
++				max_end + 1, dev->mb_total);
++			short_cov = true;
++		}
++	}
++
++	/*
++	 * A picture the engine flagged leaves the VDM pipeline in a state the next
++	 * frame cannot be programmed out of: measured on the board, an MPEG-2
++	 * picture that ended with DEC_ERR set made every subsequent frame hang
++	 * (H.264 alone 4/4 clean, H.264 right after one MPEG-2 picture 8/8 timed
++	 * out with the engine not reading a single macroblock), and only the CRG
++	 * reset recovered it. Reset here so an errored stream cannot poison the
++	 * next job, whatever opened it.
++	 */
++	if ((state & VDM_STATE_DEC_ERR) || short_cov) {
++		if (!((struct histb_vdec_ctx *)job.ctx)->diag_reported) {
++			histb_vdec_report_failure(dev, state, slices);
++			((struct histb_vdec_ctx *)job.ctx)->diag_reported = true;
++		}
++		histb_vdec_hw_reset(dev);
++	}
++
++	/*
++	 * The engine raises DEC_ERR on pictures whose data ends exactly at the
++	 * declared length even when every macroblock was decoded; measured on the
++	 * board, an MPEG-2 picture carrying the bit still matches a software decode
++	 * in luma (MSE 4, corr 0.9993). For the protocols whose front end reports a
++	 * macroblock total (MPEG-1/2) coverage decides delivery and the bit alone is
++	 * not a failure; the other front ends keep the old rule.
++	 */
++	if (dev->mb_total && slices &&
++	    job.ctx->desc->vidstd == HISTB_VIDSTD_MPEG2)
++		deliver_err = short_cov;
++	else
++		deliver_err = state & VDM_STATE_DEC_ERR;
++
++	cancel_delayed_work(&dev->watchdog);
++	histb_vdec_job_complete(dev, &job,
++				deliver_err ? VB2_BUF_STATE_ERROR :
++					      VB2_BUF_STATE_DONE, true);
++	return IRQ_HANDLED;
++}
++
++static bool histb_vdec_hw_irq_status(struct histb_vdec_dev *dev, u32 *state)
++{
++	u32 val = vdm_read(dev, VDM_STATE);
++
++	if (!(val & VDM_STATE_DEC_OVER))
++		return false;
++
++	*state = val;
++	vdm_write(dev, VDM_INT_STATE, 0xffffffff);
++	return true;
++}
++
++static irqreturn_t histb_vdec_hardirq(int irq, void *priv)
++{
++	struct histb_vdec_dev *dev = priv;
++	u32 state;
++
++	if (!histb_vdec_hw_irq_status(dev, &state))
++		return IRQ_NONE;
++
++	dev->irq_state = state;
++	return IRQ_WAKE_THREAD;
++}
++
++static void histb_vdec_watchdog(struct work_struct *work)
++{
++	struct histb_vdec_dev *dev =
++		container_of(to_delayed_work(work), struct histb_vdec_dev,
++			     watchdog);
++	struct histb_vdec_job job;
++
++	if (!histb_vdec_job_take(dev, &job))
++		return;
++
++	/* Claimed: the frame is ours to recover, and no IRQ thread can complete
++	 * it from under us any more.
++	 *
++	 * The state and the per-picture counters have to be read here: the
++	 * reset below wipes them, and a timeout whose engine never asked for a
++	 * single read is a different bug from one that decoded the whole
++	 * picture without ever raising end-of-video.
++	 */
++	dev_err(dev->dev,
++		"frame decode timed out (state=%#010x int=%#010x cycle=%u rd=%u wr=%u), resetting "
++		"the VDM\n",
++		vdm_read(dev, VDM_STATE), vdm_read(dev, VDM_INT_STATE),
++		vdm_read(dev, VDM_DEC_CYCLE_PER_PIC),
++		vdm_read(dev, VDM_RD_REQ_PER_PIC),
++		vdm_read(dev, VDM_WR_REQ_PER_PIC));
++	histb_vdec_hw_reset(dev);
++	histb_vdec_job_complete(dev, &job, VB2_BUF_STATE_ERROR, false);
++}
++
++static void histb_vdec_device_run(void *priv)
++{
++	struct histb_vdec_ctx *ctx = priv;
++	struct histb_vdec_dev *dev = histb_vdec_dev_of(ctx);
++	struct histb_vdec_common *common = &dev->common;
++	struct histb_vdec_job job_record;
++	struct vb2_v4l2_buffer *src, *dst;
++	unsigned int gen;
++	unsigned long flags;
++	int ret;
++
++	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
++	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	if (WARN_ON(!src) || WARN_ON(!dst))
++		return;
++
++	if (READ_ONCE(dev->common.removing)) {
++		/*
++		 * v4l2_m2m_suspend() waits for the context that is current, not
++		 * for every one that is queued, so a job can still be scheduled
++		 * while the teardown runs. Hand the buffers back rather than
++		 * doorbell a block that is about to lose its clock.
++		 */
++		goto err_finish_no_pm;
++	}
++
++	ret = pm_runtime_resume_and_get(dev->dev);
++	if (ret) {
++		dev_dbg(dev->dev, "pm resume failed: %d\n", ret);
++		goto err_finish_no_pm;
++	}
++
++	mutex_lock(&dev->hw_lock);
++
++	spin_lock_irqsave(&common->job_lock, flags);
++	if (WARN_ON(dev->common.job_running)) {
++		spin_unlock_irqrestore(&common->job_lock, flags);
++		mutex_unlock(&dev->hw_lock);
++		pm_runtime_put_autosuspend(dev->dev);
++		return;
++	}
++	dev->common.job_running = true;
++	common->job_gen++;
++	common->job = (struct histb_vdec_job){ (struct histb_vdec_core_ctx *)ctx, common->job_gen };
++	gen = common->job.gen;
++	spin_unlock_irqrestore(&common->job_lock, flags);
++
++	/*
++	 * Apply the controls attached to the source buffer's request; the
++	 * request is completed right away because the message assembly below
++	 * has already consumed the control values.
++	 */
++	/* The front end reports the macroblocks it submitted, if it knows. */
++	dev->mb_total = 0;
++	ret = v4l2_ctrl_request_setup(src->vb2_buf.req_obj.req,
++				      &ctx->ctrl_hdl);
++	if (ret) {
++		dev_dbg(dev->dev, "request setup failed: %d\n", ret);
++		goto err_job;
++	}
++
++	v4l2_m2m_buf_copy_metadata(src, dst);
++
++	/*
++	 * The protocol front ends walks the bitstream with the CPU to pack the
++	 * message slots, so the whole of that walk goes inside one access window
++	 * on the source plane.
++	 */
++	ret = histb_vdec_src_cpu_begin(&src->vb2_buf);
++	if (ret) {
++		dev_dbg(dev->dev, "source cpu access failed: %d\n", ret);
++		goto err_job;
++	}
++	ret = histb_vdec_v2_ops(ctx)->run(ctx, src, dst);
++	histb_vdec_src_cpu_end(&src->vb2_buf);
++	if (ret) {
++		dev_dbg(dev->dev, "run refused: %d (out fourcc %4.4s)\n", ret,
++			(char *)&ctx->desc->fourcc);
++		/*
++		 * The empty payload this path ends up delivering is the only
++		 * signal that separates a refusal from a picture the engine
++		 * flagged. Measured on the board, V4L2_BUF_FLAG_ERROR is set on
++		 * every capture buffer of these streams - the pictures that
++		 * decoded byte-exactly included - so the flag cannot tell the
++		 * two apart, while a client that reads the flag alone would
++		 * display the previous contents of the buffer as new output.
++		 */
++		goto err_job;
++	}
++
++	/*
++	 * The message assembly above consumed this request's control values, so
++	 * its control object can be completed right away; the buffer object is
++	 * completed when the job finishes.
++	 */
++	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
++
++	/* hw_lock only guards the assembly and the doorbell; completion paths
++	 * never take it, so it must not stay held across the wait.
++	 */
++	mutex_unlock(&dev->hw_lock);
++	schedule_delayed_work(&dev->watchdog, HISTB_VDEC_TIMEOUT);
++	dev_dbg(dev->dev, "job %u programmed\n", gen);
++	return;
++
++err_job:
++	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
++	mutex_unlock(&dev->hw_lock);
++	if (histb_vdec_job_take(dev, &job_record))
++		histb_vdec_job_complete(dev, &job_record,
++					VB2_BUF_STATE_ERROR, false);
++	return;
++
++err_finish_no_pm:
++	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
++	v4l2_m2m_buf_done_and_job_finish(dev->common.m2m_dev, ctx->fh.m2m_ctx,
++					 VB2_BUF_STATE_ERROR);
++}
++
++static void histb_vdec_job_abort(void *priv)
++{
++	struct histb_vdec_ctx *ctx = priv;
++	struct histb_vdec_dev *dev = histb_vdec_dev_of(ctx);
++	struct histb_vdec_job job;
++	bool got;
++
++	/*
++	 * hw_lock keeps the claim from landing in the middle of device_run's
++	 * assembly: the job is marked running before the registers are written, so
++	 * without it the reset below could interleave with those writes and the
++	 * doorbell could still be rung afterwards.
++	 */
++	mutex_lock(&dev->hw_lock);
++	got = histb_vdec_job_take(dev, &job);
++	mutex_unlock(&dev->hw_lock);
++	if (!got)
++		return;
++
++	cancel_delayed_work_sync(&dev->watchdog);
++	dev_dbg(dev->dev, "job %u aborted\n", job.gen);
++	histb_vdec_hw_reset(dev);
++	histb_vdec_job_complete(dev, &job, VB2_BUF_STATE_ERROR, false);
++}
++
++static const struct v4l2_m2m_ops histb_vdec_m2m_ops = {
++	.device_run = histb_vdec_device_run,
++	.job_abort = histb_vdec_job_abort,
++};
++
++static int histb_vdec_runtime_suspend(struct device *dev)
++{
++	struct histb_vdec_dev *vdec = dev_get_drvdata(dev);
++
++	/* Stop first, then make sure no latched report can fire on the way
++	 * down; the clocks are the last thing to go.
++	 */
++	vdm_write(vdec, VDM_START, 0);
++	vdm_write(vdec, VDM_INT_MASK, 0xffffffff);
++	vdm_write(vdec, VDM_INT_STATE, 0xffffffff);
++	clk_bulk_disable_unprepare(vdec->num_clks, vdec->clks);
++	return 0;
++}
++
++static int histb_vdec_runtime_resume(struct device *dev)
++{
++	struct histb_vdec_dev *vdec = dev_get_drvdata(dev);
++
++	int ret;
++
++	ret = clk_bulk_prepare_enable(vdec->num_clks, vdec->clks);
++	if (ret)
++		return ret;
++
++	/* Registers return whatever the power domain left; mask and clear so a
++	 * stale report cannot be taken for the next job's completion.
++	 */
++	return histb_vdec_hw_init(vdec);
++}
++
++static int histb_vdec_pool_alloc(struct histb_vdec_dev *dev)
++{
++	struct histb_vdec_msgpool *pool = &dev->pool;
++
++	/*
++	 * pic slot, slice slots, upstream report slots and the protocol table
++	 * area (CABAC M/N tables, tile info, ppfd and the band-line scratch
++	 * blocks) must all fit in the single pool.
++	 */
++	BUILD_BUG_ON(ALIGN(HISTB_VDEC_SLOT_BYTES +
++			   HISTB_VDEC_MAX_SLICE_SLOTS * HISTB_VDEC_SLOT_BYTES +
++			   HISTB_VDEC_MAX_UP_SLICES *
++			   HISTB_VDEC_UP_MSG_WORDS * 4, 64) +
++		     HISTB_TABLE_OFF_SCRATCH(HISTB_VDEC_NUM_SCRATCH - 1) +
++		     HISTB_VDEC_SCRATCH_SIZE > HISTB_VDEC_POOL_SIZE);
++
++	pool->size = HISTB_VDEC_POOL_SIZE;
++	pool->va = dma_alloc_wc(dev->memdev, pool->size, &pool->dma, GFP_KERNEL);
++	if (!pool->va)
++		return -ENOMEM;
++
++	pool->pic_off = 0;
++	pool->slice_off = HISTB_VDEC_SLOT_BYTES;
++	pool->up_off = pool->slice_off +
++		       HISTB_VDEC_MAX_SLICE_SLOTS * HISTB_VDEC_SLOT_BYTES;
++	pool->table_off = ALIGN(pool->up_off + HISTB_VDEC_MAX_UP_SLICES *
++				HISTB_VDEC_UP_MSG_WORDS * 4, 64);
++
++	memset(pool->va, 0, pool->size);
++	return 0;
++}
++
++static void histb_vdec_pool_free(void *data)
++{
++	struct histb_vdec_dev *dev = data;
++
++	dma_free_wc(dev->memdev, dev->pool.size, dev->pool.va, dev->pool.dma);
++	dev->pool.va = NULL;
++}
++
++static const u32 *histb_vdec_required_ctrls(const struct histb_vdec_ctx *ctx,
++					    unsigned int *num)
++{
++	static const u32 h264[] = {
++		V4L2_CID_STATELESS_H264_SPS,
++		V4L2_CID_STATELESS_H264_PPS,
++		V4L2_CID_STATELESS_H264_DECODE_PARAMS,
++		V4L2_CID_STATELESS_H264_SLICE_PARAMS,
++	};
++	static const u32 hevc[] = {
++		V4L2_CID_STATELESS_HEVC_SPS,
++		V4L2_CID_STATELESS_HEVC_PPS,
++		V4L2_CID_STATELESS_HEVC_DECODE_PARAMS,
++		V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
++	};
++	static const u32 mpeg2[] = {
++		V4L2_CID_STATELESS_MPEG2_SEQUENCE,
++		V4L2_CID_STATELESS_MPEG2_PICTURE,
++		V4L2_CID_STATELESS_MPEG2_QUANTISATION,
++	};
++
++	switch (ctx->desc->fourcc) {
++	case V4L2_PIX_FMT_H264_SLICE:
++		*num = ARRAY_SIZE(h264);
++		return h264;
++	case V4L2_PIX_FMT_HEVC_SLICE:
++		*num = ARRAY_SIZE(hevc);
++		return hevc;
++	case V4L2_PIX_FMT_MPEG2_SLICE:
++		*num = ARRAY_SIZE(mpeg2);
++		return mpeg2;
++	default:
++		*num = 0;
++		return NULL;
++	}
++}
++/* ---------------------------------------------------------------- probe */
++
++static void histb_vdec_v2_memdev_put(void *data)
++{
++	struct histb_vdec_dev *dev = data;
++
++	put_device(dev->memdev);
++}
++
++int histb_vdec_v2_probe(struct platform_device *pdev,
++			const struct histb_vdec_gen *gen)
++{
++	struct histb_vdec_dev *dev;
++	struct platform_device *mem;
++	int ret;
++
++	dev = devm_kzalloc_obj(&pdev->dev, *dev);
++	if (!dev)
++		return -ENOMEM;
++
++	dev->dev = &pdev->dev;
++	dev->chip = gen->chip;
++	dev->common.priv = dev;
++	platform_set_drvdata(pdev, dev);
++
++	mutex_init(&dev->hw_lock);
++	mutex_init(&dev->common.vdev_lock);
++	spin_lock_init(&dev->common.job_lock);
++	INIT_DELAYED_WORK(&dev->watchdog, histb_vdec_watchdog);
++
++	dev->vdm = devm_platform_ioremap_resource_byname(pdev, "vdm");
++	if (IS_ERR(dev->vdm))
++		return PTR_ERR(dev->vdm);
++
++	dev->scd = devm_platform_ioremap_resource_byname(pdev, "scd");
++	if (IS_ERR(dev->scd))
++		return PTR_ERR(dev->scd);
++
++	ret = devm_clk_bulk_get_all(&pdev->dev, &dev->clks);
++	if (ret < 0)
++		return ret;
++	dev->num_clks = ret;
++
++	/*
++	 * Both reset lines have to be released: the subsystem-wide one keeps
++	 * the whole VDM register window reading zero while asserted.
++	 */
++	dev->rst = devm_reset_control_array_get_exclusive(&pdev->dev);
++	if (IS_ERR(dev->rst))
++		return PTR_ERR(dev->rst);
++
++	ret = platform_get_irq(pdev, 0);
++	if (ret < 0)
++		return ret;
++	dev->irq = ret;
++
++	ret = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
++	if (ret) {
++		dev_err(&pdev->dev, "failed to set DMA mask\n");
++		return ret;
++	}
++	mem = platform_device_alloc("histb-vdec-dma", PLATFORM_DEVID_NONE);
++	if (!mem)
++		return -ENOMEM;
++	dev->memdev = &mem->dev;
++	platform_device_set_of_node_from_dev(mem, &pdev->dev);
++	ret = dev_set_name(dev->memdev, "%s-dma", dev_name(&pdev->dev));
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(&pdev->dev, histb_vdec_v2_memdev_put,
++				       dev);
++	if (ret)
++		return ret;
++	ret = of_dma_configure(dev->memdev, dev->memdev->of_node, true);
++	if (ret)
++		return ret;
++	ret = dma_set_mask_and_coherent(dev->memdev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++	vb2_dma_contig_set_max_seg_size(dev->memdev, DMA_BIT_MASK(32));
++	/* Exported buffers retain their allocator even after unbind and rebind. */
++	ret = devm_of_reserved_mem_device_init(dev->memdev);
++	if (ret && ret != -ENODEV) {
++		dev_err(&pdev->dev, "failed to bind reserved memory\n");
++		return ret;
++	}
++
++	ret = histb_vdec_pool_alloc(dev);
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(&pdev->dev, histb_vdec_pool_free, dev);
++	if (ret)
++		return ret;
++
++	histb_vdec_hw_init_tables(dev);
++
++	pm_runtime_set_autosuspend_delay(&pdev->dev, 100);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	/* The block must come up through the resume callback: the gates the
++	 * bootloader may have left on are not ours to rely on.
++	 */
++	pm_runtime_set_suspended(&pdev->dev);
++	pm_runtime_enable(&pdev->dev);
++	ret = pm_runtime_resume_and_get(&pdev->dev);
++	if (ret)
++		goto err_disable_pm;
++
++	/*
++	 * The decoder comes up held in reset; release it, mask every interrupt
++	 * source and only then register the handler.
++	 */
++	ret = reset_control_deassert(dev->rst);
++	if (ret)
++		goto err_disable_pm;
++
++	ret = histb_vdec_hw_init(dev);
++	if (ret)
++		goto err_assert_reset;
++
++	ret = devm_request_threaded_irq(&pdev->dev, dev->irq,
++					histb_vdec_hardirq,
++					histb_vdec_irq_handler,
++					IRQF_ONESHOT, dev_name(&pdev->dev), dev);
++	if (ret) {
++		dev_err(&pdev->dev, "failed to request irq\n");
++		goto err_assert_reset;
++	}
++
++	ret = histb_vdec_core_init(&dev->common, pdev, gen);
++	if (ret)
++		goto err_assert_reset;
++
++
++	dev_info(&pdev->dev, "video decoder, %s\n", dev->chip->model);
++	pm_runtime_put_autosuspend(&pdev->dev);
++
++	return 0;
++
++err_assert_reset:
++	reset_control_assert(dev->rst);
++	pm_runtime_put_sync(&pdev->dev);
++err_disable_pm:
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++	pm_runtime_set_suspended(&pdev->dev);
++	return ret;
++}
++
++void histb_vdec_v2_remove(struct platform_device *pdev)
++{
++	struct histb_vdec_dev *dev = platform_get_drvdata(pdev);
++
++	histb_vdec_core_stop(&dev->common);
++	disable_irq(dev->irq);
++	cancel_delayed_work_sync(&dev->watchdog);
++	histb_vdec_core_exit(&dev->common);
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++	reset_control_assert(dev->rst);
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		histb_vdec_runtime_suspend(&pdev->dev);
++	pm_runtime_set_suspended(&pdev->dev);
++}
++
++
++/* ------------------------------------------------------------- gen ops */
++
++static const u32 histb_vdec_v2_cap_formats[] = {
++	V4L2_PIX_FMT_NV21,
++	V4L2_PIX_FMT_NV12,
++};
++
++static struct device *histb_vdec_v2_dma_dev(struct histb_vdec_common *common)
++{
++	struct histb_vdec_dev *dev = common->priv;
++
++	return dev->memdev;
++}
++
++static void histb_vdec_v2_buf_geom_hook(struct histb_vdec_core_ctx *cctx,
++					struct histb_vdec_geom *g)
++{
++	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
++
++	g->uv_offset = 0;
++	histb_vdec_buf_geom(ctx, &g->pitch, &g->lines);
++}
++
++static int histb_vdec_v2_buf_prepare_hook(struct histb_vdec_core_ctx *cctx,
++					  struct vb2_buffer *vb)
++{
++	dma_addr_t dma = vb2_dma_contig_plane_dma_addr(vb, 0);
++
++	/*
++	 * The bitstream segment descriptors carry the length in 24 bits;
++	 * anything larger would wrap around silently.
++	 */
++	if (vb2_get_plane_payload(vb, 0) > BIT(24) - 1)
++		return -EINVAL;
++	if (vb->planes[0].data_offset + vb2_get_plane_payload(vb, 0) >
++	    vb2_plane_size(vb, 0))
++		return -EINVAL;
++
++	/*
++	 * The message words carry the bitstream start in one 32-bit field
++	 * (lower_32_bits), so a plane that ends above 4 GiB would be read from a
++	 * truncated address. This device's mask keeps its own allocations inside
++	 * that window; say it here rather than rely on the mask alone.
++	 */
++	if ((u64)dma + vb2_plane_size(vb, 0) - 1 > DMA_BIT_MASK(32))
++		return -ERANGE;
++
++	return 0;
++}
++
++static unsigned int histb_vdec_v2_min_coded_width(u32 fourcc)
++{
++	/*
++	 * An H.264 picture one macroblock column wide cannot be delivered at
++	 * all: the shared luma write path needs two macroblock columns, measured
++	 * on the board with a 32-wide stream declared as one column.
++	 */
++	return fourcc == V4L2_PIX_FMT_H264_SLICE ? 32 : 16;
++}
++
++static int histb_vdec_v2_start(struct histb_vdec_core_ctx *cctx,
++			       const struct vb2_queue *q)
++{
++	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
++	if (!V4L2_TYPE_IS_OUTPUT(q->type))
++		return 0;
++
++	ctx->diag_reported = false;
++	if (histb_vdec_v2_ops(ctx)->start)
++		return histb_vdec_v2_ops(ctx)->start(ctx);
++
++	return 0;
++}
++
++static void histb_vdec_v2_stop(struct histb_vdec_core_ctx *cctx,
++			       const struct vb2_queue *q)
++{
++	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
++	if (V4L2_TYPE_IS_OUTPUT(q->type) && histb_vdec_v2_ops(ctx)->stop)
++		histb_vdec_v2_ops(ctx)->stop(ctx);
++
++	/* With the stream stopped no dpb index survives, so neither do the
++	 * tile frames that stood in for the client buffers.
++	 */
++	histb_vdec_frames_free(ctx);
++}
++
++static void histb_vdec_v2_release_ctx(struct histb_vdec_core_ctx *cctx)
++{
++	histb_vdec_frames_free((struct histb_vdec_ctx *)cctx);
++}
++
++static void histb_vdec_v2_protocol_changed(struct histb_vdec_core_ctx *cctx)
++{
++	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
++
++	/* The dpb -> pmv slot map is per-protocol. */
++	memset(ctx->pmv_map, 0, sizeof(ctx->pmv_map));
++	ctx->pmv_next = 0;
++}
++
++static int histb_vdec_v2_try_ctrl(const struct histb_vdec_fmt *fmt,
++				  struct v4l2_ctrl *ctrl)
++{
++	const struct histb_vdec_codec_ops *ops = fmt->ops;
++
++	if (ops->try_ctrl)
++		return ops->try_ctrl(ctrl);
++
++	return 0;
++}
++
++static void histb_vdec_v2_set_out_size(struct histb_vdec_core_ctx *cctx,
++				       struct v4l2_format *f,
++				       unsigned int width, unsigned int height)
++{
++	histb_vdec_set_frame_size((struct histb_vdec_ctx *)cctx, f, width,
++				  height);
++}
++
++static void histb_vdec_v2_set_cap_size(struct histb_vdec_core_ctx *cctx,
++				       struct v4l2_format *f,
++				       unsigned int width, unsigned int height)
++{
++	histb_vdec_set_cap_size((struct histb_vdec_ctx *)cctx, f, width,
++				height);
++}
++
++static const u32 *histb_vdec_v2_required_ctrls(
++				const struct histb_vdec_core_ctx *cctx,
++				unsigned int *num)
++{
++	return histb_vdec_required_ctrls((const struct histb_vdec_ctx *)cctx,
++					 num);
++}
++
++#define HISTB_VDEC_V2_GEN(_chip, _caps)					\
++	{								\
++		.name			= "histb-vdec",			\
++		.ctx_size		= sizeof(struct histb_vdec_ctx),	\
++		.chip			= _chip,				\
++		.max_width		= HISTB_VDEC_MAX_WIDTH,		\
++		.max_height		= HISTB_VDEC_MAX_HEIGHT,		\
++		.max_cap_buffers	= HISTB_VDEC_MAX_APC_SLOTS,	\
++		.min_queued_buffers	= 4,					\
++		.cap_clamp		= true,				\
++		.cap_formats		= _caps,				\
++		.num_cap_formats	= ARRAY_SIZE(_caps),			\
++		.dma_dev		= histb_vdec_v2_dma_dev,		\
++		.set_out_size		= histb_vdec_v2_set_out_size,		\
++		.set_cap_size		= histb_vdec_v2_set_cap_size,		\
++		.set_cap_reset		= histb_vdec_v2_set_out_size,		\
++		.buf_geom		= histb_vdec_v2_buf_geom_hook,		\
++		.buf_prepare		= histb_vdec_v2_buf_prepare_hook,	\
++		.min_coded_width	= histb_vdec_v2_min_coded_width,	\
++		.start			= histb_vdec_v2_start,			\
++		.stop			= histb_vdec_v2_stop,			\
++		.release		= histb_vdec_v2_release_ctx,		\
++		.required_ctrls		= histb_vdec_v2_required_ctrls,		\
++		.try_ctrl		= histb_vdec_v2_try_ctrl,		\
++		.protocol_changed	= histb_vdec_v2_protocol_changed,	\
++		.m2m_ops		= &histb_vdec_m2m_ops,			\
++	}
++
++static const struct histb_vdec_gen histb_vdec_v2_gen_mv100 =
++	HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_mv100, histb_vdec_v2_cap_formats);
++static const struct histb_vdec_gen histb_vdec_v2_gen_cv200 =
++	HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_cv200, histb_vdec_v2_cap_formats);
++
++const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {
++	.gen			= &histb_vdec_v2_gen_mv100,
++	.probe			= histb_vdec_v2_probe,
++	.remove			= histb_vdec_v2_remove,
++	.runtime_suspend	= histb_vdec_runtime_suspend,
++	.runtime_resume		= histb_vdec_runtime_resume,
++	.system_suspend		= pm_runtime_force_suspend,
++	.system_resume		= pm_runtime_force_resume,
++};
++
++const struct histb_vdec_variant histb_vdec_v2_cv200_variant = {
++	.gen			= &histb_vdec_v2_gen_cv200,
++	.probe			= histb_vdec_v2_probe,
++	.remove			= histb_vdec_v2_remove,
++	.runtime_suspend	= histb_vdec_runtime_suspend,
++	.runtime_resume		= histb_vdec_runtime_resume,
++	.system_suspend		= pm_runtime_force_suspend,
++	.system_resume		= pm_runtime_force_resume,
++};
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2.h
+@@ -0,0 +1,414 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * HiSilicon VDH v2 stateless video decoder backend, for the Hi3716CV200
++ * (HiVDHV200R004) and Hi3798MV100 (HiVDHV300R001) parts.
++ *
++ * The hardware decoder consumes fully parsed syntax: the userspace submits
++ * per-frame parsing results through V4L2 stateless controls, and the driver
++ * packs them into the hardware's downstream message pool, programs the VDM
++ * registers and rings the doorbell. Frame storage uses a table+index model:
++ * capture buffers are registered by index and referenced by id from the message
++ * pool. The engine writes 16x16-tiled NV21 frames; CAPTURE is linear and
++ * each dpb index keeps such a tile frame internally (see histb_vdec_frame).
++ *
++ * The register layouts, message slot encodings and buffer geometries recorded
++ * below were derived from the vendor decoder firmware and then checked against
++ * the hardware.
++ */
++#ifndef HISTB_VDEC_H
++#define HISTB_VDEC_H
++
++#include <linux/delay.h>
++#include <linux/platform_device.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-v4l2.h>
++
++#include "histb_vdec_core.h"
++#include "histb_vdec_v2_regs.h"
++
++struct regmap;
++
++#define HISTB_VDEC_NAME			"histb-vdec"
++
++/* One downstream message slot: 5 x 64-word bursts. */
++#define HISTB_VDEC_SLOT_WORDS		320
++#define HISTB_VDEC_SLOT_BYTES		(HISTB_VDEC_SLOT_WORDS * 4)
++#define HISTB_VDEC_MAX_SLICE_SLOTS	140
++#define HISTB_VDEC_UP_MSG_WORDS		4
++#define HISTB_VDEC_MAX_UP_SLICES	200
++
++#define HISTB_VDEC_MAX_DPB_SLOTS	32
++#define HISTB_VDEC_MAX_APC_SLOTS	16
++#define HISTB_VDEC_MAX_PMV_SLOTS	20
++#define HISTB_VDEC_MAX_WIDTH		1920
++#define HISTB_VDEC_MAX_HEIGHT		1920
++
++/* Watchdog, matching the fixed timeout the vendor firmware arms here. */
++#define HISTB_VDEC_TIMEOUT		msecs_to_jiffies(500)
++
++/* Sizes of the fixed per-protocol lookup tables (extracted from the vendor
++ * firmware's constant pools).
++ */
++#define HISTB_VDEC_CABAC_MN_H264_SIZE	5120
++#define HISTB_VDEC_CABAC_MN_HEVC_SIZE	928
++/* The tile/segment info image that picture message D55 points at, sized by the
++ * reservation the vendor firmware makes for its own copy of the same area (64 *
++ * 4 * 128 bytes); growing it from the 2 KB first used here changed no board
++ * reading, so this is fidelity to the vendor layout rather than a fix.
++ */
++#define HISTB_VDEC_TILE_INFO_SIZE	(64 * 4 * 128)
++#define HISTB_VDEC_PPFD_SIZE		(64 * 4 * 800)
++
++/* Band-line scratch buffers, sized by the vendor layout: 64 * 4 * width bytes
++ * each at 1920 columns. Which of these a protocol actually references is fixed
++ * per protocol (see the codec sources).
++ */
++#define HISTB_VDEC_SCRATCH_SIZE		(64 * 4 * HISTB_VDEC_MAX_WIDTH)
++enum histb_vdec_scratch {
++	HISTB_SCRATCH_SED_TOP,
++	HISTB_SCRATCH_PMV_TOP,
++	HISTB_SCRATCH_RCNTOP,
++	HISTB_SCRATCH_DBLK_TOP,
++	HISTB_SCRATCH_SAO_TOP,
++	HISTB_SCRATCH_PMV_LEFT,
++	HISTB_SCRATCH_SAO_LEFT,
++	HISTB_SCRATCH_DBLK_LEFT,
++	HISTB_SCRATCH_ITRANS_TOP,
++	HISTB_VDEC_NUM_SCRATCH,
++};
++
++/*
++ * Single downstream/upstream message pool, allocated once per device: the VDM
++ * decodes one frame at a time, so the pool is owned by the device and borrowed
++ * by whichever job is running. Write-combining mapping: both the CPU (message
++ * producer/consumer) and the VDM DMA master access it, and the vendor firmware
++ * uses uncached mappings for the same purpose.
++ *
++ * Layout:
++ *   [0]                          picture slot
++ *   [slot 1 .. N]                slice slots
++ *   [after slices]               upstream report messages
++ *   [aligned]                    per-protocol tables & scratch
++ */
++struct histb_vdec_msgpool {
++	dma_addr_t	dma;
++	void		*va;
++	size_t		size;
++	/* Fixed offsets inside va, initialised at allocation time. */
++	unsigned int	pic_off;
++	unsigned int	slice_off;
++	unsigned int	up_off;
++	unsigned int	table_off;
++};
++
++/*
++ * Mirror of the luma-stride rule the vendor firmware applies to the tiled write
++ * path: a stride that is already a multiple of 256 is kept, otherwise round up
++ * to the next 256-byte tile column count and skip to an odd one. 320 -> 768,
++ * 640 -> 768, 192 -> 256, 512 -> 512, 1920 -> 2304.
++ */
++static inline unsigned int histb_vdec_tile_stride(unsigned int width)
++{
++	unsigned int cols = width / 256;
++
++	if (!(width % 256))
++		return width;
++	cols += (cols % 2) ? 2 : 1;
++
++	return cols * 256;
++}
++
++/*
++ * HEVC's band pitch is a plain ALIGN(width, 256), not the odd/even column rule
++ * above: 320 -> 512 and 1920 -> 2048. Board-measured line by line - the HEVC
++ * corpus only untiles byte-exactly at this pitch.
++ */
++static inline unsigned int histb_vdec_hevc_stride(unsigned int width)
++{
++	return ALIGN(width, 256);
++}
++
++/*
++ * Frame-buffer geometry of the 1D (tiled) write path, measured on the board
++ * and matched to the geometry the firmware programs for H.264. The VDM writes
++ * tiles of 256 bytes by 16 picture rows: inside a band the line pitch is the
++ * tile width, VDM_YSTRIDE_1D carries the pitch *between* bands, and the chroma
++ * tiles start behind the whole luma band array plus a per-picture 1D area. The
++ * band count rounds up to an even number because field coding reserves a pair.
++ */
++static inline unsigned int histb_vdec_band_bytes(unsigned int tile_stride)
++{
++	return tile_stride * 16;
++}
++
++static inline unsigned int histb_vdec_head_inf_bytes(unsigned int lines)
++{
++	return 16 * ALIGN(lines, 32);
++}
++
++static inline unsigned int histb_vdec_luma_bytes(unsigned int tile_stride,
++						 unsigned int lines)
++{
++	return tile_stride * ALIGN(lines, 32);
++}
++
++/* Luma bands, the 1D area behind them, then the chroma bands at half size. */
++static inline unsigned int histb_vdec_frame_bytes(unsigned int tile_stride,
++						  unsigned int lines)
++{
++	return histb_vdec_luma_bytes(tile_stride, lines) / 2 * 3 +
++	       histb_vdec_head_inf_bytes(lines);
++}
++
++static inline void *histb_vdec_pic_slot(const struct histb_vdec_msgpool *p)
++{
++	return p->va + p->pic_off;
++}
++
++static inline dma_addr_t
++histb_vdec_pic_slot_dma(const struct histb_vdec_msgpool *p)
++{
++	return p->dma + p->pic_off;
++}
++
++static inline void *histb_vdec_slice_slot(const struct histb_vdec_msgpool *p,
++					  unsigned int i)
++{
++	return p->va + p->slice_off + i * HISTB_VDEC_SLOT_BYTES;
++}
++
++static inline dma_addr_t
++histb_vdec_slice_slot_dma(const struct histb_vdec_msgpool *p, unsigned int i)
++{
++	return p->dma + p->slice_off + i * HISTB_VDEC_SLOT_BYTES;
++}
++
++static inline void *histb_vdec_up_msgs(const struct histb_vdec_msgpool *p)
++{
++	return p->va + p->up_off;
++}
++
++static inline dma_addr_t
++histb_vdec_up_msgs_dma(const struct histb_vdec_msgpool *p)
++{
++	return p->dma + p->up_off;
++}
++
++static inline void *histb_vdec_tables_base(const struct histb_vdec_msgpool *p)
++{
++	return p->va + p->table_off;
++}
++
++static inline dma_addr_t
++histb_vdec_tables_dma(const struct histb_vdec_msgpool *p)
++{
++	return p->dma + p->table_off;
++}
++
++struct histb_vdec_dev {
++	struct histb_vdec_common common;
++	struct device		*dev;
++	struct device		*memdev;
++	const struct histb_vdec_chip *chip;
++	void __iomem		*vdm;
++	void __iomem		*scd;
++	struct clk_bulk_data	*clks;
++	int			num_clks;
++	struct reset_control	*rst;
++	int			irq;
++
++	struct delayed_work	watchdog;
++
++	/* VDM state captured by the primary handler for the IRQ thread */
++	u32			irq_state;
++	/* Macroblocks the submitted picture covers, 0 when the front end does
++	 * not report them; the slice reports are checked against it.
++	 */
++	u32			mb_total;
++
++	/* protects the message pool and the VDM against concurrent jobs */
++	struct mutex		hw_lock;
++	struct histb_vdec_msgpool pool;
++	bool			job_running;
++
++	struct regmap		*crg;
++};
++
++/*
++ * One internal frame: the engine only writes 16x16 tiles, while CAPTURE is a
++ * linear format, so every dpb index owns a tile buffer here and the job's
++ * completion detiles it into the client's buffer. References are read from
++ * these buffers too, which is why they have to outlive the job.
++ */
++struct histb_vdec_frame {
++	void		*va;
++	dma_addr_t	dma;
++	size_t		size;
++	unsigned int	stride;
++	unsigned int	lines;
++};
++
++struct histb_vdec_ctx {
++	struct v4l2_fh		fh;
++	struct v4l2_ctrl_handler ctrl_hdl;
++	const struct histb_vdec_fmt *desc;
++	struct v4l2_format	out_fmt;
++	struct v4l2_format	cap_fmt;
++
++	/* dpb (capture buffer) index -> pmv slot id, filled on demand by the
++	 * codec layers; pmv slots are a private 20-entry pool.
++	 */
++	u8			pmv_map[HISTB_VDEC_MAX_DPB_SLOTS];
++	u8			pmv_next;
++
++	struct histb_vdec_frame	frame[HISTB_VDEC_MAX_DPB_SLOTS];
++
++	/* MPEG-2 front end: the submitted stream carries no sequence
++	 * extension, so the block has to be told MPEG-1 syntax.
++	 */
++	bool			mpeg1;
++
++	/* One verbose engine-flag report per stream: the flag is set on frames
++	 * that still traverse every macroblock, so a per-frame report is noise.
++	 */
++	bool			diag_reported;
++
++	void			*priv;
++};
++
++struct histb_vdec_codec_ops {
++	int (*start)(struct histb_vdec_ctx *ctx);
++	void (*stop)(struct histb_vdec_ctx *ctx);
++	/*
++	 * Assemble the message pool and program the VDM for one frame, then
++	 * ring the doorbell via histb_vdec_hw_kick(). Runs with dev->hw_lock
++	 * held and the runtime PM reference taken.
++	 */
++	int (*run)(struct histb_vdec_ctx *ctx, struct vb2_v4l2_buffer *src,
++		   struct vb2_v4l2_buffer *dst);
++	int (*try_ctrl)(struct v4l2_ctrl *ctrl);
++};
++
++/* One protocol's descriptor, shared with the core. */
++typedef struct histb_vdec_fmt histb_vdec_fmt_desc;
++typedef struct histb_vdec_chip histb_vdec_chip_t;
++
++/* Per-protocol descriptors, defined by the codec sources. */
++extern const histb_vdec_fmt_desc histb_vdec_h264_fmt;
++extern const histb_vdec_fmt_desc histb_vdec_hevc_fmt;
++extern const histb_vdec_fmt_desc histb_vdec_mpeg2_fmt;
++extern const histb_vdec_fmt_desc histb_vdec_mpeg4_fmt;
++extern const histb_vdec_fmt_desc histb_vdec_h263_fmt;
++
++/* drv.c */
++int histb_vdec_v2_probe(struct platform_device *pdev,
++			const struct histb_vdec_gen *gen);
++void histb_vdec_v2_remove(struct platform_device *pdev);
++irqreturn_t histb_vdec_irq_handler(int irq, void *priv);
++int histb_vdec_cap_dims(struct histb_vdec_ctx *ctx, unsigned int *w,
++			unsigned int *h);
++void histb_vdec_buf_geom(struct histb_vdec_ctx *ctx, unsigned int *stride,
++			 unsigned int *lines);
++dma_addr_t histb_vdec_frame_dma(struct histb_vdec_ctx *ctx,
++				struct vb2_buffer *vb);
++void histb_vdec_frames_free(struct histb_vdec_ctx *ctx);
++/* Bitstream start, honouring the plane's data_offset. */
++void *histb_vdec_src_va(struct vb2_buffer *vb);
++dma_addr_t histb_vdec_src_dma(struct vb2_buffer *vb);
++
++/* hw.c */
++int histb_vdec_hw_init(struct histb_vdec_dev *dev);
++void histb_vdec_hw_reset(struct histb_vdec_dev *dev);
++void histb_vdec_hw_kick(struct histb_vdec_dev *dev,
++			enum histb_vdec_vidstd std);
++/* Program the constant tables once at probe. */
++void histb_vdec_hw_init_tables(struct histb_vdec_dev *dev);
++
++static inline void vdm_write(struct histb_vdec_dev *dev, unsigned int reg,
++			     u32 val)
++{
++	writel(val, dev->vdm + reg);
++}
++
++static inline u32 vdm_read(struct histb_vdec_dev *dev, unsigned int reg)
++{
++	return readl(dev->vdm + reg);
++}
++
++/* Convert an OUTPUT plane into the vendor's bitstream segment descriptor: a
++ * (byte offset from the aligned stream base, bit offset, bit length) triple.
++ * The hardware fetches on 16-byte granularity, so the bits inside the granule
++ * join the bit offset, which is what the vendor firmware programs for every
++ * segment it hands over. data_addr must be the address of the segment's first
++ * bit, not of the plane start.
++ */
++static inline void histb_vdec_seg_pack(u32 *words, dma_addr_t stream_base,
++				       dma_addr_t data_addr,
++				       unsigned int bit_offset,
++				       unsigned int bit_len)
++{
++	unsigned int bytes = (unsigned int)(data_addr - (stream_base & ~15u));
++
++	words[0] = bytes & ~15u;
++	words[1] = bit_offset + ((bytes & 15u) * 8u);
++	words[2] = bit_len;
++}
++
++/*
++ * Zero bits at the tail of a segment, counted from the end of the byte range
++ * backwards: whole zero bytes, then the zeros below the lowest set bit of the
++ * last non-zero byte (the stream is MSB-first, so the tail of the last byte is
++ * the last thing written). This is the same scan the vendor firmware runs over
++ * a segment before handing it to the engine; the '1' stop bit above those zeros
++ * belongs to the rbsp trailing too, so callers add one. The VDM counts every
++ * bit of a segment as macroblock layer, so a length that still covers the
++ * padding makes it report surplus bits at the end of the segment (measured on
++ * the board: one bit of padding in an interior slice is enough to set the error
++ * flag).
++ */
++static inline u32 histb_vdec_trail_zero_bits(const u8 *va, u32 end_bit)
++{
++	u32 bits = 0;
++	u32 byte = end_bit / 8;
++
++	if (!va)
++		return 0;
++	while (byte--) {
++		u8 value = va[byte];
++
++		if (value)
++			return bits + __ffs(value);
++		bits += 8;
++	}
++	return bits;
++}
++
++/* The VDM's tile geometry, kept internal; CAPTURE itself is linear. */
++
++/* Nominal OUTPUT (bitstream) plane size. */
++#define HISTB_VDEC_OUTPUT_SIZE_DEFAULT	(3 * 1024 * 1024)
++
++/* Message pool allocation size. */
++#define HISTB_VDEC_POOL_SIZE		(6 * 1024 * 1024)
++
++/*
++ * Layout of the per-protocol table area, as offsets from
++ * histb_vdec_msgpool::table_off. The CABAC M/N tables are constant and are
++ * programmed once at probe, the tile info image is zeroed there because no
++ * accepted picture uses it, and the remaining areas are filled per frame by the
++ * message assembly code. The scratch blocks follow in enum histb_vdec_scratch
++ * order, HISTB_VDEC_SCRATCH_SIZE bytes each.
++ */
++#define HISTB_TABLE_OFF_CABAC_MN_H264	0
++#define HISTB_TABLE_OFF_CABAC_MN_HEVC	5120
++#define HISTB_TABLE_OFF_TILE_INFO	6048
++#define HISTB_TABLE_OFF_PPFD		(HISTB_TABLE_OFF_TILE_INFO + \
++					 HISTB_VDEC_TILE_INFO_SIZE)
++#define HISTB_TABLE_OFF_SCRATCH_BASE	286720
++#define HISTB_TABLE_OFF_SCRATCH(i)	(HISTB_TABLE_OFF_SCRATCH_BASE + \
++					 (i) * HISTB_VDEC_SCRATCH_SIZE)
++
++#endif /* HISTB_VDEC_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_h264.c
+@@ -0,0 +1,1607 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * HiSilicon VDH v2 stateless H.264 decoder (Hi3716CV200, Hi3798MV100).
++ *
++ * One job decodes one frame: the picture slot of the message pool carries the
++ * frame-level state (POC, DPB address table, CABAC table pointer, quantisation
++ * matrix), followed by one chained slice slot per slice. Every slot word layout
++ * implemented here reproduces what the vendor firmware programs for the same
++ * syntax; where only a measurement on the board settles a choice, the numbers
++ * are in that comment. The frame storage model (APC/PMV tables, tile frame
++ * slots) comes from the same message assembly.
++ *
++ * Hardware facts worth keeping next to the code:
++ *
++ *  - The decoder consumes fully parsed syntax. It never reads slice
++ *    headers from the bitstream; the only bitstream it fetches is
++ *    slice_data(), addressed through a per-slice stream segment (byte
++ *    offset from the stream base on a 16-byte granule, bit offset within
++ *    the granule, valid bit length).
++ *  - That fetch is byte-literal: the VDM does not undo NAL emulation
++ *    prevention, so a span containing 00 00 03 decodes wrong from the first
++ *    escaped macroblock on. The uAPI delivers the escaped form, hence
++ *    histb_h264_pack_rbsp() copies the slice span with the prevention bytes
++ *    removed and re-bases the segment offsets onto the copy.
++ *  - Frame storage is table based: the picture message carries 16 frame
++ *    addresses (the APC table) plus two POC tables, and slice slots
++ *    reference frames by table index. This driver uses the capture
++ *    buffer index as the APC slot, so up to 16 capture buffers are
++ *    addressable.
++ *  - Motion vectors of reference frames persist in a private pool of 20
++ *    PMV slots, addressed independently of the frame table.
++ */
++
++#include <linux/bitops.h>
++#include <linux/dma-mapping.h>
++#include <media/v4l2-h264.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "histb_vdec_v2.h"
++
++/*
++ * Motion-vector slot size for the largest supported frame: 120 x 68
++ * macroblocks, 32 bytes per macroblock, 128-byte aligned. The top half of a
++ * slot holds one field's worth of motion vectors, the bottom half the other;
++ * field pictures reach the second half at an offset of half the slot size.
++ */
++/*
++ * The collocated bottom-field half of a PMV slot is deliberately not
++ * programmed: writing base + half the slot size there was measured on the board
++ * and changed nothing (10 of 50 pictures correct either way), so the engine
++ * does not take that slot for an MBAFF reference; see the slice-side comment
++ * for what is refused instead.
++ */
++#define HISTB_H264_PMV_SLOT_MIN		261120u
++
++/*
++ * The vendor firmware's per-macroblock PMV size: it picks 64 bytes per
++ * macroblock when the picture is at most 45 columns by 36 rows, or whenever the
++ * SPS clears direct_8x8_inference_flag, and 32 otherwise, then aligns the plane
++ * up to 128. Half of that plane is the offset the firmware adds to reach the
++ * second field's vectors. A picture larger than 45 x 36 macroblocks with
++ * direct_8x8_inference_flag clear needs twice what a 32-byte-per-macroblock
++ * calculation gives, so the pool has to be sized from this formula and not from
++ * the 32-byte one: the floor alone only covers it up to 720x576.
++ */
++static unsigned int histb_h264_pmv_per_mb(unsigned int width_mbs,
++					  unsigned int height_mbs,
++					  bool direct_8x8)
++{
++	if ((width_mbs <= 45 && height_mbs <= 36) || !direct_8x8)
++		return 64;
++
++	return 32;
++}
++
++/*
++ * The picture message carries a 16-entry frame address table, so capture buffer
++ * indexes double as APC slots up to this limit. dpb2apc[] uses
++ * HISTB_H264_APC_NONE for DPB entries that map to no slot.
++ *
++ * Both vendor fill loops stop at entry 15 -- each tests its index against 15
++ * before the tail of the address loop and of the POC pair loop -- and the words
++ * in between are spoken for: D10..D25 frame addresses, D26 the CABAC MN table,
++ * D27..D56 the paired POC table. Sizing this by the uAPI DPB (32) instead makes
++ * the address fill overlap D26 and the POC entries of every slot below 8, so
++ * the reference POCs a picture is given end up holding the current frame
++ * address.
++ */
++#define HISTB_H264_NUM_APC_SLOTS		16u
++#define HISTB_H264_APC_NONE			0xffu
++
++/*
++ * Hardware slice-type codes, indexed by slice_type % 5: P=1, B=2, I=0. This is
++ * the ordering the firmware's per-slice-type PMV table uses for H.264; the HEVC
++ * path orders it differently, so the table is not shared between the two. SP/SI
++ * have no entry of their own and fold onto the P and I codes.
++ */
++static u8 histb_h264_slice_type_code(u8 slice_type)
++{
++	static const u8 code[5] = { 1, 2, 0, 1, 0 };
++
++	return code[slice_type];
++}
++
++/*
++ * Picture-structure code for picture-message word D0 bits [15:14], indexed 2 *
++ * pic_structure + mbaff exactly as the firmware's own table is: 0 = frame, 1 =
++ * top field, 2 = bottom field, 3 = paired fields.
++ */
++static const u8 histb_h264_struct_trans[8] = { 0, 3, 1, 1, 2, 2, 3, 3 };
++
++/*
++ * Reference entry structure code for the slice declist nibble: the firmware
++ * table indexed 2 * struct + mbaff, of which only the frame-coded even indices
++ * are used here, masked to 2 bits.
++ */
++static const u8 histb_h264_list_struct_frame[8] = { 0, 1, 3, 3, 3, 3, 2, 2 };
++
++/* Per-frame assembly state shared by the picture and slice packers. */
++struct histb_h264_run {
++	const struct v4l2_ctrl_h264_sps *sps;
++	const struct v4l2_ctrl_h264_pps *pps;
++	const struct v4l2_ctrl_h264_decode_params *dec;
++	const struct v4l2_ctrl_h264_pred_weights *weights;
++	const struct v4l2_ctrl_h264_scaling_matrix *scaling;
++	const struct v4l2_ctrl_h264_slice_params *slices;
++	unsigned int		num_slices;
++	unsigned int		num_valid;
++	unsigned int		width_mbs;
++	unsigned int		height_mbs;
++	unsigned int		mbamt;
++	u32			tile_stride;
++	u32			buf_lines;
++	const u8		*src_va;
++	dma_addr_t		src_dma;
++	dma_addr_t		dst_dma;
++	u8			dpb2apc[V4L2_H264_NUM_DPB_ENTRIES];
++	u32			img_addr[HISTB_H264_NUM_APC_SLOTS];
++	s32			apc_poc[2][HISTB_H264_NUM_APC_SLOTS];
++	struct v4l2_h264_reference reflist_p[V4L2_H264_REF_LIST_LEN];
++	struct v4l2_h264_reference reflist_b0[V4L2_H264_REF_LIST_LEN];
++	struct v4l2_h264_reference reflist_b1[V4L2_H264_REF_LIST_LEN];
++	u32			slice_starts[HISTB_VDEC_MAX_SLICE_SLOTS];
++};
++
++struct histb_vdec_h264_ctx {
++	void		*pmv_va[HISTB_VDEC_MAX_PMV_SLOTS];
++	dma_addr_t	pmv_dma[HISTB_VDEC_MAX_PMV_SLOTS];
++	unsigned int	pmv_slot_size;
++	unsigned int	pmv_width_mbs;
++	unsigned int	pmv_height_mbs;
++	unsigned int	pmv_per_mb;
++	/*
++	 * Sticky for the lifetime of the reference chain: a picture has been
++	 * refused because its collocated motion vectors live in a PMV half this
++	 * driver cannot name, so every picture that still references it would
++	 * be delivered wrong. Cleared by an IDR.
++	 */
++	bool			col_half_lost;
++	void		*rbsp_va;
++	dma_addr_t	rbsp_dma;
++	unsigned int	rbsp_size;
++	/* per-job assembly state, kept out of the kernel stack */
++	struct histb_h264_run run;
++};
++
++static struct histb_vdec_dev *histb_vdec_h264_dev(struct histb_vdec_ctx *ctx)
++{
++	return video_get_drvdata(ctx->fh.vdev);
++}
++
++/*
++ * Tile frame geometry, taken from the firmware's frame-storage setup and
++ * confirmed on I_PCM pictures: the VDM writes 256-byte by 16-row tiles, so
++ * stride it is handed is a whole band and the chroma plane starts behind the
++ * luma bands plus the per-picture 1D area. histb_vdec_tile_stride() gives the
++ * tile-column count in bytes.
++ */
++static u32 histb_h264_tile_stride(unsigned int width)
++{
++	return histb_vdec_tile_stride(width);
++}
++
++static unsigned int histb_h264_ref_struct_code(u8 fields)
++{
++	switch (fields) {
++	case V4L2_H264_TOP_FIELD_REF:
++		return 1;
++	case V4L2_H264_BOTTOM_FIELD_REF:
++		return 2;
++	default:
++		return 0;
++	}
++}
++
++/*
++ * Only B slices read collocated motion vectors: the firmware looks the slice
++ * type up in its per-slice-type PMV table and zeroes slot[8] and slot[9] for
++ * anything else.
++ */
++static bool histb_h264_has_b_slice(const struct histb_h264_run *run)
++{
++	unsigned int i;
++
++	for (i = 0; i < run->num_slices; i++)
++		if (run->slices[i].slice_type % 5 == V4L2_H264_SLICE_TYPE_B)
++			return true;
++
++	return false;
++}
++
++/*
++ * PMV slot allocator: capture buffer index -> PMV slot id. Slot ids are stored
++ * +1 so that a zeroed pmv_map[] means "unallocated"; ids wrap around the
++ * 20-slot pool.
++ */
++static u8 histb_h264_pmv_alloc(struct histb_vdec_ctx *ctx, unsigned int index)
++{
++	u8 id = ctx->pmv_map[index];
++
++	if (!id) {
++		id = ctx->pmv_next++ % HISTB_VDEC_MAX_PMV_SLOTS + 1;
++		ctx->pmv_map[index] = id;
++	}
++
++	return id - 1;
++}
++
++/*
++ * Start-code scan over the OUTPUT plane. Returns the bit position of every
++ * slice NAL unit (nal_unit_type 1 or 5, the only slice NALs the message ABI can
++ * describe; data partitions 2..4 are not supported). A 4-byte start code
++ * matches once: the extra leading zero byte never forms a 00 00 01 triple with
++ * the prefix. Returns the total number of slice NALs found (may exceed @max).
++ */
++static unsigned int histb_h264_find_slice_nals(const u8 *buf, u32 size,
++					       u32 *starts, unsigned int max)
++{
++	unsigned int n = 0;
++	u32 i;
++
++	for (i = 0; i + 3 < size; i++) {
++		u8 nal_type;
++
++		if (buf[i] || buf[i + 1] || buf[i + 2] != 0x01)
++			continue;
++
++		nal_type = buf[i + 3] & 0x1f;
++		if (nal_type != 1 && nal_type != 5)
++			continue;
++
++		if (n < max)
++			starts[n] = (i + 3) * 8;
++		n++;
++	}
++
++	return n;
++}
++
++/*
++ * Stream segment descriptor of a slice (slice slot words D0..D2). The VDM
++ * fetches the bitstream on 16-byte granules: word0 is the granule start as a
++ * byte offset from the programmed stream base (the OUTPUT plane address), word1
++ * the bit offset within that granule, word2 the number of valid bits. This is
++ * the vendor arithmetic: reduce the first data bit to a byte position, round
++ * that down to a granule for word0, and put in word1 the bit offset inside the
++ * granule the granule base already moved past.
++ */
++static void histb_h264_pack_segment(u32 *w, u32 data_bit, u32 valid_bits)
++{
++	w[0] = (data_bit / 8) & ~15u;
++	w[1] = data_bit & 127u;
++	w[2] = valid_bits;
++}
++
++static u32 histb_h264_scaling_word(const u8 *coeffs)
++{
++	return coeffs[0] | coeffs[1] << 8 | coeffs[2] << 16 | coeffs[3] << 24;
++}
++
++/*
++ * Quantisation matrix, picture slot words D63..D118. Vendor packing order: each
++ * scaling list in raster order, four coefficients per word, least significant
++ * byte first; six 4x4 lists followed by the two 8x8 luma lists the H.264
++ * protocol defines (V4L2 indices 0 and 1). Without a picture matrix the spec
++ * default of 16 per coefficient applies.
++ */
++static void histb_h264_pack_scaling(u32 *dst,
++				    const struct v4l2_ctrl_h264_scaling_matrix *m,
++				    bool present)
++{
++	unsigned int i, j;
++
++	for (i = 0; i < 6; i++) {
++		for (j = 0; j < 4; j++)
++			*dst++ = present ?
++				 histb_h264_scaling_word(m->scaling_list_4x4[i] + 4 * j) :
++				 0x10101010u;
++	}
++
++	for (i = 0; i < 2; i++) {
++		for (j = 0; j < 16; j++)
++			*dst++ = present ?
++				 histb_h264_scaling_word(m->scaling_list_8x8[i] + 4 * j) :
++				 0x10101010u;
++	}
++}
++
++/*
++ * Prediction weight factors of one list (slice slot words W64.. for
++ * list 0, W96.. for list 1): luma and first chroma component pack as
++ * offset<<12 | weight<<3 | log2_denom, the second chroma component as
++ * weight<<9 | offset. Offsets are truncated to 8 bits and weights to 9
++ * bits exactly like the vendor packing loop, which places luma 0 and 64
++ * words later the two chroma components.
++ */
++static void histb_h264_pack_weights(u32 *slot,
++				    const struct v4l2_ctrl_h264_pred_weights *pw,
++				    unsigned int count, bool list1)
++{
++	const struct v4l2_h264_weight_factors *f = &pw->weight_factors[list1];
++	unsigned int base = list1 ? 96u : 64u;
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		slot[base + i] = ((u32)(u8)f->luma_offset[i] << 12) |
++				 ((u32)f->luma_weight[i] & 0x1ff) << 3 |
++				 (pw->luma_log2_weight_denom & 7);
++		slot[base + 64 + i] = ((u32)(u8)f->chroma_offset[i][0] << 12) |
++				      ((u32)f->chroma_weight[i][0] & 0x1ff) << 3 |
++				      (pw->chroma_log2_weight_denom & 7);
++		slot[base + 128 + i] = ((u32)f->chroma_weight[i][1] & 0x1ff) |
++				       ((u32)(u8)f->chroma_offset[i][1] << 9);
++	}
++}
++
++/*
++ * Reference list of one slice into the slice declist: 4 structure bits per
++ * entry (8 entries per word, words D12.. for list 0, D16.. for list 1) and a
++ * 5-bit APC slot id per entry (4 entries per word, D20.. and D28..), stored
++ * shifted by one like the vendor packer. Bit 0 carries no list identity:
++ * setting it on every list 1 entry leaves the output byte-identical.
++ */
++static void histb_h264_pack_declist(u32 *slot,
++				    const struct v4l2_h264_reference *list,
++				    unsigned int count, unsigned int distinct,
++				    const u8 *dpb2apc,
++				    const struct v4l2_ctrl_h264_decode_params *dec,
++				    bool list1)
++{
++	/*
++	 * List 0 takes the 4-bit structure nibbles at D12..D15 and the 5-bit
++	 * APC slot ids at D20..D27, list 1 the nibbles at D16..D19 and the ids
++	 * at D28..D35: the vendor fill loops start at D12/D20 for list 0 and at
++	 * D16/D28 for list 1. 32 entries at 4 bits are 4 words, at 5 bits with
++	 * four per word they are 8 words, so the two lists really are disjoint.
++	 */
++	unsigned int nib_word = list1 ? 16 : 12;
++	unsigned int apc_word = list1 ? 28 : 20;
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		/*
++		 * A slice may declare more entries than the list carries
++		 * pictures. The padded positions repeat the last picture the
++		 * list really carries: that is what the encoders that declare
++		 * the extra slot assume, measured by decoding the same content
++		 * with and without it (a weightp=2 x264 stream codes every
++		 * macroblock at its padded index and the software decode is
++		 * byte-identical to the same stream coded one index shorter).
++		 * Only the in-kernel list reaches this: an application's list
++		 * is used when no position of it is empty.
++		 */
++		const struct v4l2_h264_reference *ref =
++			&list[distinct ? min_t(unsigned int, i, distinct - 1) : 0];
++		unsigned int code = histb_h264_ref_struct_code(ref->fields);
++		const struct v4l2_h264_dpb_entry *dpb = &dec->dpb[ref->index];
++		u32 nib = histb_h264_list_struct_frame[2 * code] & 3;
++
++		if (code == 1)
++			nib |= 4;
++		/* declist entry field frame_is_long_term -> nibble bit 3 */
++		if (dpb->flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM)
++			nib |= 8;
++
++		slot[nib_word + (i >> 3)] |= nib << ((i & 7) * 4);
++		slot[apc_word + (i >> 2)] |=
++			((u32)dpb2apc[ref->index] << 1 & 0x1f) << ((i & 3) * 5);
++	}
++}
++
++/*
++ * Reverse map APC slot -> first reference list position (slice slot words
++ * D36..D43, 5 bits per entry); every field holds a list position.
++ *
++ * The firmware keys this map by 2 * apc + field parity and writes *both* halves
++ * with the same list position: its reference-index search walks all 16 slots
++ * unconditionally and stores the result at both 2i and 2i+1, the message then
++ * ships all 32 entries, and they are packed five bits at a time into D36..D43.
++ * A slot no list entry names keeps the memset zero, which is exactly the
++ * firmware default of "list position 0".
++ *
++ * Board-measured, and the reason this stays shaped like the firmware's rather
++ * than like the uAPI: with the key switched between bare apc (word D36 reads
++ * 0x00000020 for tx_m2) and 2 * apc + field (0x00008400) - both forms read
++ * back from the live message - the decoded pixels do not move at all, four
++ * frames each. The engine indexes references through the 5-bit list slots the
++ * macroblock layer carries, not through this map.
++ */
++static void histb_h264_pack_apc_ref_idx(u32 *slot,
++					const struct v4l2_h264_reference *list,
++					unsigned int count, const u8 *dpb2apc,
++					u32 *seen)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		unsigned int apc = dpb2apc[list[i].index];
++		unsigned int key;
++
++		if (*seen & BIT(apc))
++			continue;
++		*seen |= BIT(apc);
++		for (key = 2 * apc; key < 2 * apc + 2; key++)
++			slot[36 + (key >> 2)] |= (u32)i << ((key & 3) * 5);
++	}
++}
++
++static void histb_h264_assemble_pic(struct histb_vdec_dev *dev,
++				    const struct histb_vdec_h264_ctx *h264,
++				    const struct histb_h264_run *run,
++				    u8 cur_pmv_slot, u32 *pic)
++{
++	const struct v4l2_ctrl_h264_sps *sps = run->sps;
++	const struct v4l2_ctrl_h264_pps *pps = run->pps;
++	const struct v4l2_ctrl_h264_decode_params *dec = run->dec;
++	dma_addr_t tables = histb_vdec_tables_dma(&dev->pool);
++	bool mbaff = sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD;
++	bool field_pic = dec->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
++	u32 pic_struct = 0;
++	u32 chroma = 1;
++	u32 i;
++
++	memset(pic, 0, HISTB_VDEC_SLOT_BYTES);
++
++	if (field_pic)
++		pic_struct = (dec->flags &
++			      V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD) ? 2 : 1;
++	if (V4L2_H264_SPS_HAS_CHROMA_FORMAT(sps))
++		chroma = sps->chroma_format_idc;
++
++	pic[0] = (run->width_mbs - 1) |
++		 ((u32)histb_h264_struct_trans[2 * pic_struct + mbaff] << 14) |
++		 ((run->height_mbs - 1) << 16) |
++		 ((chroma == 1 ? BIT(25) : 0)) |
++		 ((pps->flags & V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED) ? BIT(26) : 0) |
++		 ((pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) ? BIT(27) : 0) |
++		 ((pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE) ? BIT(28) : 0) |
++		 (dec->nal_ref_idc ? BIT(31) : 0);
++	/* current frame, 2D tile output */
++	pic[1] = lower_32_bits(run->dst_dma);
++	/*
++	 * Picture order count of the coded picture: a field uses its own count,
++	 * a PAFF frame picture uses the earlier of the two fields.
++	 */
++	if (field_pic && (dec->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD))
++		pic[2] = (u32)dec->bottom_field_order_cnt;
++	else if (field_pic)
++		pic[2] = (u32)dec->top_field_order_cnt;
++	else
++		pic[2] = min_t(s32, dec->top_field_order_cnt,
++			       dec->bottom_field_order_cnt);
++	/* field POCs, MBAFF only */
++	pic[3] = mbaff ? (u32)dec->top_field_order_cnt : 0;
++	pic[4] = mbaff ? (u32)dec->bottom_field_order_cnt : 0;
++	/* band-line scratch buffers and the CABAC context table */
++	pic[5] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_SED_TOP));
++	pic[6] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_PMV_TOP));
++	pic[7] = lower_32_bits(h264->pmv_dma[cur_pmv_slot]);
++	pic[8] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_RCNTOP));
++	/* head of the slice chain */
++	pic[9] = lower_32_bits(histb_vdec_slice_slot_dma(&dev->pool, 0));
++	/* APC frame address table, then the paired top/bottom POC tables */
++	for (i = 0; i < HISTB_H264_NUM_APC_SLOTS; i++) {
++		pic[10 + i] = run->img_addr[i];
++		pic[27 + 2 * i] = (u32)run->apc_poc[0][i];
++		pic[28 + 2 * i] = (u32)run->apc_poc[1][i];
++	}
++	pic[26] = lower_32_bits(tables + HISTB_TABLE_OFF_CABAC_MN_H264);
++	pic[59] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_DBLK_TOP));
++
++	/*
++	 * The quantiser matrix burst starts at D64: the firmware copy loop
++	 * bases itself 252 bytes into the slot and stores through pointers that
++	 * step four bytes at a time, so the first word lands at byte 256 and
++	 * the 56th at byte 476.
++	 */
++	histb_h264_pack_scaling(&pic[64], run->scaling,
++				pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT);
++}
++
++/*
++ * End of the coded slice data inside the span handed to the hardware.
++ *
++ * Slice NAL units are separated by annex-b start codes in the OUTPUT buffer,
++ * and the last slice of an access unit runs into the start code of whichever
++ * NAL follows it in the stream, so a segment delimited by the next slice (or by
++ * bytesused) ends on bytes that are not slice data. Drop them: the pattern 00
++ * 00 01 cannot occur inside a NAL unit (emulation prevention rewrites any 00 00
++ * followed by 00 or 01), and it cannot be the tail of rbsp_trailing_bits
++ * either, because the last coded bit of a slice is end_of_slice_flag, a one.
++ */
++static u32 histb_h264_data_end_bit(const u8 *va, u32 end_bit)
++{
++	if (!va || end_bit < 24)
++		return end_bit;
++	if (!va[end_bit / 8 - 3] && !va[end_bit / 8 - 2] &&
++	    va[end_bit / 8 - 1] == 1)
++		return end_bit - 24;
++	return end_bit;
++}
++
++/*
++ * A reference list is only usable when every entry the slice actually reads
++ * names an active DPB entry: an application that leaves the arrays zeroed would
++ * otherwise be taken as "DPB entry 0, no fields".
++ */
++static bool histb_h264_ref_list_ok(const struct v4l2_h264_reference *list,
++				   unsigned int count,
++				   const struct v4l2_ctrl_h264_decode_params *dec)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		if (!(list[i].fields & V4L2_H264_FRAME_REF))
++			return false;
++		if (list[i].index >= V4L2_H264_NUM_DPB_ENTRIES)
++			return false;
++		if (!(dec->dpb[list[i].index].flags &
++		      V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
++			return false;
++	}
++
++	return true;
++}
++
++/*
++ * The reference lists a slice uses: the application's submitted lists when they
++ * name active DPB entries (only they can carry 8.2.4.3 reordering), otherwise
++ * the 8.2.4.2 initial construction prepared during run assembly. Returns true
++ * when the application's lists were taken.
++ */
++static bool histb_h264_slice_lists(const struct histb_h264_run *run,
++				   unsigned int index, unsigned int count0,
++				   unsigned int count1, bool is_b,
++				   const struct v4l2_h264_reference **pl0,
++				   const struct v4l2_h264_reference **pl1)
++{
++	const struct v4l2_ctrl_h264_slice_params *slice = &run->slices[index];
++
++	*pl0 = is_b ? run->reflist_b0 : run->reflist_p;
++	*pl1 = run->reflist_b1;
++	if (histb_h264_ref_list_ok(slice->ref_pic_list0, count0, run->dec) &&
++	    (!is_b || histb_h264_ref_list_ok(slice->ref_pic_list1, count1,
++					    run->dec))) {
++		*pl0 = slice->ref_pic_list0;
++		*pl1 = slice->ref_pic_list1;
++		return true;
++	}
++
++	return false;
++}
++
++static void histb_h264_assemble_slice(struct histb_vdec_dev *dev,
++				      struct histb_vdec_ctx *ctx,
++				      const struct histb_h264_run *run,
++				      const struct histb_vdec_h264_ctx *h264,
++				      unsigned int index,
++				      u32 nal_bit, u32 next_bit)
++{
++	const struct v4l2_ctrl_h264_slice_params *slice = &run->slices[index];
++	const struct v4l2_ctrl_h264_pps *pps = run->pps;
++	const struct v4l2_h264_reference *l0;
++	const struct v4l2_h264_reference *l1;
++	const struct v4l2_h264_reference *col;
++	u32 *slot = histb_vdec_slice_slot(&dev->pool, index);
++	unsigned int type = slice->slice_type % 5;
++	unsigned int last = run->num_slices - 1;
++	unsigned int count0 = 0, count1 = 0;
++	unsigned int distinct0 = 0, distinct1 = 0;
++	u32 seen = 0;
++	u32 data_bit = nal_bit + slice->header_bit_size;
++	bool is_b = type == V4L2_H264_SLICE_TYPE_B;
++	bool from_app;
++	bool weighted;
++	unsigned int wmode;
++	bool cabac;
++	u32 trail, valid;
++	u32 qp;
++
++	memset(slot, 0, HISTB_VDEC_SLOT_BYTES);
++
++	if (type != V4L2_H264_SLICE_TYPE_I && type != V4L2_H264_SLICE_TYPE_SI)
++		count0 = min_t(unsigned int,
++			       slice->num_ref_idx_l0_active_minus1 + 1,
++			       V4L2_H264_REF_LIST_LEN);
++	if (is_b)
++		count1 = min_t(unsigned int,
++			       slice->num_ref_idx_l1_active_minus1 + 1,
++			       V4L2_H264_REF_LIST_LEN);
++
++	/*
++	 * The uAPI hands the reference lists "after applying the per-slice
++	 * modifications" (include/uapi/linux/v4l2-controls.h), which no
++	 * in-kernel helper can know: 8.2.4.3 reordering is syntax, and x264
++	 * uses it in every B-pyramid encode.
++	 */
++	from_app = histb_h264_slice_lists(run, index, count0, count1, is_b,
++					 &l0, &l1);
++	/*
++	 * How many positions of the list carry a picture: the declist repeats
++	 * the last one over the rest. An application's list only gets used when
++	 * every position names an active DPB entry, so all of its positions
++	 * carry one - including a position that names the same picture as its
++	 * neighbour does, which 8.2.4.3 allows (a long-term and a short-term
++	 * entry can hold the same picture, and x264's weighted lists do exactly
++	 * that). Taking num_valid for the count here would clamp such a list
++	 * and hand every padded macroblock the picture after the one the slice
++	 * asked for. The in-kernel 8.2.4.2 list has no such marker: it fills
++	 * its tail with DPB entry 0, and only its first num_valid positions
++	 * carry a picture.
++	 */
++	if (count0) {
++		distinct0 = from_app ? count0 :
++			min_t(unsigned int, count0, run->num_valid);
++		if (!distinct0)
++			count0 = 0;
++	}
++	if (count1) {
++		distinct1 = from_app ? count1 :
++			min_t(unsigned int, count1, run->num_valid);
++		if (!distinct1)
++			count1 = 0;
++	}
++
++	/*
++	 * Collocated picture for direct prediction. 8.8.2 picks it by
++	 * ColFromL0Flag (List0[0] for a P slice or a spatial-direct B slice,
++	 * List1[1] - falling back to List1[0] - for a temporal-direct B slice),
++	 * but the vendor's live path addresses the collocated motion vectors
++	 * from `declist[1][0]` for every B slice whatever the direct type is,
++	 * and the board follows the vendor, not the spec: switching the choice
++	 * to `declist[1][0]` took the regression from 38 to 46 of 48 cases with
++	 * all frames byte-exact (the eight that turned were the spatial-direct
++	 * ones). On the one stream where the two readings differ by syntax
++	 * alone (a temporal-direct B slice declaring two list1 entries, corpus
++	 * arm bx_b3t), 8.8.2's refIdx=1 scored 7/12 where list1[0] scored 9/12,
++	 * and both of those leave the sibling arm bx_b3 (same lists, spatial
++	 * direct) at 2/12 until the spatial case moves to list1[0] too.
++	 */
++	col = l1;
++
++	/*
++	 * Slice data segment. The hardware never reads slice headers, so the
++	 * segment points behind the header bits. The second segment (words
++	 * D3..D5) stays clear: the frame arrives as one contiguous OUTPUT
++	 * buffer.
++	 *
++	 * CABAC decodes whole bytes, so its start moves up to the next byte
++	 * boundary, which is what the firmware does when it computes the slice
++	 * bit offset. Measured: an OpenH264 CABAC slice whose header ends at
++	 * bit 51 gives zero correct lines without the rounding and a byte-exact
++	 * frame with it, while that same 51-bit header under CAVLC is
++	 * byte-exact unrounded. CAVLC therefore keeps the exact bit position.
++	 *
++	 * The rbsp_trailing_bits padding at the end of a CAVLC slice is not
++	 * slice data: the firmware takes the length down to the last non-zero
++	 * bit and drops the stop bit with it. Leaving the padding in makes
++	 * every CAVLC picture come back with the up-message error flag and the
++	 * hardware status register's non-syntax error bit (bit18) set, and
++	 * moving the length one byte either way brings the flag straight back,
++	 * so the length must be exact, not merely long enough. Under CABAC that
++	 * subtraction is wrong on this hardware: it cost the 1920x1088 frame
++	 * its last macroblock row, so the padding stays in the length there.
++	 */
++	cabac = pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
++	if (cabac)
++		data_bit = (data_bit + 7) & ~7U;
++	/*
++	 * Neither the annex-b start code in front of the next slice (or of the
++	 * NAL that follows the access unit) nor the rbsp_trailing_bits padding
++	 * behind the last coded bit is slice data, and the length has to be
++	 * exact rather than merely long enough: measured by adding slack to the
++	 * declared end, one bit of padding in an interior slice segment is
++	 * enough to bring the error flag back, while a four-slice CAVLC picture
++	 * written with both removed is byte-exact and reports none. Under CABAC
++	 * the padding subtraction is wrong on this hardware: it cost the
++	 * 1920x1088 frame its last macroblock row, so the padding stays in the
++	 * length there.
++	 */
++	next_bit = histb_h264_data_end_bit(run->src_va, next_bit);
++	valid = next_bit - data_bit;
++	if (!cabac) {
++		trail = histb_vdec_trail_zero_bits(run->src_va, next_bit) + 1;
++		if (valid > trail)
++			valid -= trail;
++	}
++	histb_h264_pack_segment(&slot[0], data_bit, valid);
++
++	/* D6 carries the absolute slice QP, the spec's SliceQPy value. */
++	qp = clamp_t(int, 26 + pps->pic_init_qp_minus26 + slice->slice_qp_delta,
++		     0, 51);
++	slot[6] = (slice->first_mb_in_slice & 0xfffff) |
++		  ((qp & 63) << 26) |
++		  ((slice->cabac_init_idc & 3) << 24);
++	slot[7] = histb_h264_slice_type_code(type) |
++		  (count0 << 2) | (count1 << 8) |
++		  ((run->sps->flags & V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE) ?
++		   BIT(14) : 0) |
++		  ((slice->flags & V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED) ?
++		   BIT(15) : 0) |
++		  ((slice->num_ref_idx_l0_active_minus1 & 31) << 16) |
++		  ((slice->num_ref_idx_l1_active_minus1 & 31) << 21);
++
++	/*
++	 * Collocated motion-vector base address: the PMV slot of the collocated
++	 * picture chosen above. The firmware splits that slot between the two
++	 * fields and names both halves for a reference that is a field pair -
++	 * slot[8] = base, slot[9] = base + half the slot size - where its
++	 * frame-structure code 3 means a field pair, and MBAFF is a separate
++	 * flag that plays no part in PMV addressing. Measured here: naming the
++	 * second half for an MBAFF reference changes nothing (10 of 50 pictures
++	 * correct with slot[9] written and the same 10 without), so no engine
++	 * path reads it for that case, and the pictures that need a half this
++	 * driver cannot name are refused by run() instead of delivered.
++	 */
++	if (is_b && count0 + count1 > 0 &&
++	    run->dpb2apc[col[0].index] != HISTB_H264_APC_NONE)
++		slot[8] = lower_32_bits(h264->pmv_dma[histb_h264_pmv_alloc(ctx,
++					run->dpb2apc[col[0].index])]);
++
++	/*
++	 * Weighting mode: the firmware moves its per-slice weighting-mode byte
++	 * into D10 bits [17:16] unmasked, and that byte holds the PPS
++	 * weighted_bipred_idc for a B slice and the PPS weighted_pred_flag for
++	 * any other inter slice. The field is therefore a mode, and mode 2 --
++	 * implicit weighted prediction, 8.4.2.3 -- is one the hardware carries
++	 * out itself; only mode 1 has a pred_weight_table to hand down.
++	 *
++	 * V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED() compares slice_type against
++	 * the V4L2_H264_SLICE_TYPE_* enum, so it has to see the normalised
++	 * type: a bitstream may code a P slice as 5, and that still carries a
++	 * pred_weight_table().
++	 */
++	if (is_b)
++		wmode = pps->weighted_bipred_idc & 3;
++	else
++		wmode = ((pps->flags & V4L2_H264_PPS_FLAG_WEIGHTED_PRED) &&
++			 (type == V4L2_H264_SLICE_TYPE_P ||
++			  type == V4L2_H264_SLICE_TYPE_SP)) ? 1 : 0;
++	weighted = wmode == 1;
++	slot[10] = (((u32)pps->chroma_qp_index_offset & 31) << 5) |
++		   ((u32)pps->second_chroma_qp_index_offset & 31) |
++		   (wmode << 16);
++	slot[11] = (((u32)slice->slice_alpha_c0_offset_div2 & 15) << 16) |
++		   (((u32)slice->slice_beta_offset_div2 & 15) << 8) |
++		   (slice->disable_deblocking_filter_idc & 0xff);
++
++	histb_h264_pack_declist(slot, l0, count0, distinct0, run->dpb2apc,
++				run->dec, false);
++	histb_h264_pack_declist(slot, l1, count1, distinct1, run->dpb2apc,
++				run->dec, true);
++	histb_h264_pack_apc_ref_idx(slot, l0, distinct0, run->dpb2apc, &seen);
++	histb_h264_pack_apc_ref_idx(slot, l1, distinct1, run->dpb2apc, &seen);
++
++	/*
++	 * Slice chain words. D44 is a macroblock index: the firmware's caller
++	 * passes the next slice's first_mb_in_slice minus one, or the picture's
++	 * MB count minus one on the last slice. D63 takes the successor slot
++	 * address on every slice -- the store sits in a tail reached by both
++	 * branches of the slice loop, so no slot ever leaves a null link. No
++	 * counter bounds the chain, so a run ends when the chain reaches a slot
++	 * with an empty segment; run() therefore clears the slot after the last
++	 * one.
++	 */
++	slot[44] = index < last ? run->slices[index + 1].first_mb_in_slice - 1 :
++				  run->mbamt - 1;
++	slot[63] = lower_32_bits(histb_vdec_slice_slot_dma(&dev->pool,
++							   index + 1));
++
++	if (weighted) {
++		histb_h264_pack_weights(slot, run->weights, count0, false);
++		if (is_b)
++			histb_h264_pack_weights(slot, run->weights, count1, true);
++	}
++}
++
++static void histb_h264_program_regs(struct histb_vdec_dev *dev,
++				    const struct histb_h264_run *run)
++{
++	unsigned int lines = run->buf_lines;
++	unsigned int i;
++
++	/* decoded macroblock budget: the field counts MBs minus one */
++	/*
++	 * The firmware's CFG0 build ends by setting bit 30 (the
++	 * quantiser-matrix load) and bit 24 (the coefficient-index detect) on
++	 * byte 3 of the word, and by clearing bit 23 and bit 25. Without bit 24
++	 * the VDM reconstructs intra prediction but drops every coefficient.
++	 */
++	vdm_write(dev, VDM_CFG0, ((run->mbamt - 1) & VDM_CFG0_MBAMT) |
++				  VDM_CFG0_COEFIDX_DETECT | VDM_CFG0_LD_QMATRIX);
++	/*
++	 * The firmware's CFG1 build also sets VDM_CFG1_MAX_SLCGRP_NUM to 1,
++	 * keeps a single slice group for every picture (VDM_CFG1_FST_SLC_GRP
++	 * carries the picture's "new picture" byte, which is true for each
++	 * frame a stateless decoder is handed) and leaves the deblocker in 1D
++	 * mode.
++	 */
++	vdm_write(dev, VDM_CFG1, FIELD_PREP(VDM_CFG1_VID_STD, HISTB_VIDSTD_H264) |
++		  FIELD_PREP(VDM_CFG1_DDR_STRIDE, run->tile_stride >> 6) |
++		  FIELD_PREP(VDM_CFG1_MAX_SLCGRP_NUM, 1) |
++		  VDM_CFG1_FST_SLC_GRP | VDM_CFG1_DBLK_1D_EN);
++	vdm_write(dev, VDM_AVM_ADDR,
++		  lower_32_bits(histb_vdec_pic_slot_dma(&dev->pool)));
++	vdm_write(dev, VDM_VAM_ADDR,
++		  lower_32_bits(histb_vdec_up_msgs_dma(&dev->pool)));
++	vdm_write(dev, VDM_STREAM_BASE, lower_32_bits(run->src_dma));
++
++	/* one timeout per pipeline stage, windows 0x3c..0x54 only */
++	for (i = 1; i <= 7; i++)
++		vdm_write(dev, VDM_TO(i), VDM_TIMEOUT_MOD);
++	vdm_write(dev, VDM_PPFD_BUF_ADDR,
++		  (histb_vdec_tables_dma(&dev->pool) +
++		   HISTB_TABLE_OFF_PPFD) & ~15u);
++	vdm_write(dev, VDM_PPFD_BUF_LEN, HISTB_VDEC_PPFD_SIZE / 64 - 1);
++	/*
++	 * FF_APT_EN takes histb_h264_struct_trans[2 * pic_structure + mb_aff];
++	 * the firmware maps that table entry to 2 only for the frame structure
++	 * code, and to 0 for every other one. Field and MBAFF pictures stay at
++	 * 0 until they are supported.
++	 */
++	vdm_write(dev, VDM_FF_APT_EN,
++		  !(run->dec->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) &&
++		  !(run->sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD) ?
++		  2 : 0);
++
++	vdm_write(dev, VDM_YSTADDR_1D, lower_32_bits(run->dst_dma));
++	/*
++	 * The 1D path writes 256x16-byte tiles, so the stride it is given is
++	 * the pitch of a whole 16-row band, not of a picture line: the firmware
++	 * puts its decoded-picture stride there and computes the chroma offset
++	 * as two bands' worth of that stride plus the 1D area. Measured on the
++	 * board: with the picture-line stride here, band b+1 landed exactly on
++	 * band b's rows 3..15, so only the first three lines of every 16-row
++	 * band survived and the frame looked "truncated at 8-20%".
++	 */
++	vdm_write(dev, VDM_YSTRIDE_1D, histb_vdec_band_bytes(run->tile_stride));
++	vdm_write(dev, VDM_UVOFFSET_1D,
++		  histb_vdec_luma_bytes(run->tile_stride, lines) +
++		  histb_vdec_head_inf_bytes(lines));
++	vdm_write(dev, VDM_HEAD_INF_OFFSET, histb_vdec_head_inf_bytes(lines));
++	vdm_write(dev, VDM_INT_STATE, 0xffffffffu);
++	vdm_write(dev, VDM_INT_MASK, 0xfffffffeu);
++	/*
++	 * Per-slot picture-type flags; frame pictures need none and field
++	 * coding is not modelled yet. TODO: field coding needs per-reference
++	 * field flags that no control carries.
++	 */
++	vdm_write(dev, VDM_REF_PIC_TYPE, 0);
++}
++
++static int histb_vdec_h264_try_ctrl(struct v4l2_ctrl *ctrl)
++{
++	const struct v4l2_ctrl_h264_sps *sps;
++
++	if (ctrl->id != V4L2_CID_STATELESS_H264_SPS)
++		return 0;
++
++	sps = ctrl->p_new.p_h264_sps;
++
++	/*
++	 * The VDM reconstructs NV21 16x16 tiles: 8-bit 4:2:0 only. The chroma
++	 * format and bit depth fields only exist for the high profiles
++	 * (V4L2_H264_SPS_HAS_CHROMA_FORMAT); baseline and main streams are
++	 * 4:2:0 8-bit by definition.
++	 *
++	 * The geometry is not checked here: the control handler holds an
++	 * all-zero default, which TRY_EXT_CTRLS (v4l2-compliance) reads back as
++	 * if a client had set it, and a picture size cannot be judged before
++	 * one is actually submitted. histb_vdec_h264_run() refuses the job
++	 * instead.
++	 */
++	if (V4L2_H264_SPS_HAS_CHROMA_FORMAT(sps) &&
++	    (sps->chroma_format_idc != 1 ||
++	     (sps->flags & V4L2_H264_SPS_FLAG_SEPARATE_COLOUR_PLANE) ||
++	     sps->bit_depth_luma_minus8 || sps->bit_depth_chroma_minus8))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int histb_vdec_h264_start(struct histb_vdec_ctx *ctx)
++{
++	struct histb_vdec_h264_ctx *h264;
++
++	h264 = kzalloc_obj(*h264);
++	if (!h264)
++		return -ENOMEM;
++
++	/*
++	 * The CABAC table is resident in the device-wide message pool; the PMV
++	 * pool grows on demand in run(), once the SPS fixes the frame geometry.
++	 */
++	ctx->priv = h264;
++
++	return 0;
++}
++
++/*
++ * Make sure the PMV pool slots hold the active frame. The vendor slot is 32
++ * bytes per macroblock, at least one 1080p-frame slot; growing drops the slot
++ * map, which is harmless at a resolution change.
++ *
++ * The pool is one dma_alloc_wc() per slot: 20 slots at the 1080p floor is a 5.0
++ * MB (order-11, 8 MB aligned) request, and the board refuses that against its
++ * 16 MB CMA region even with 9.9 MB free, which came back as -ENOMEM on every
++ * job.
++ */
++static void histb_h264_pmv_free(struct histb_vdec_dev *dev,
++				struct histb_vdec_h264_ctx *h264)
++{
++	int i;
++
++	for (i = 0; i < HISTB_VDEC_MAX_PMV_SLOTS; i++) {
++		if (!h264->pmv_va[i])
++			continue;
++		dma_free_wc(dev->memdev, h264->pmv_slot_size, h264->pmv_va[i],
++			    h264->pmv_dma[i]);
++		h264->pmv_va[i] = NULL;
++	}
++	h264->pmv_slot_size = 0;
++	h264->pmv_width_mbs = 0;
++	h264->pmv_height_mbs = 0;
++	h264->pmv_per_mb = 0;
++}
++
++/*
++ * Whether this submission discards every stored picture, which is what makes
++ * rebuilding the pool here lose nothing: an IDR starts a new reference chain
++ * and the uAPI hands it with no DPB entry still flagged VALID or ACTIVE. HEVC
++ * has no such per-entry flag (only V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE),
++ * which is why the same relax is not available there.
++ */
++static bool histb_h264_pmv_flush(const struct v4l2_ctrl_h264_decode_params *dec)
++{
++	unsigned int i;
++
++	if (!(dec->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC))
++		return false;
++
++	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++)
++		if (dec->dpb[i].flags & (V4L2_H264_DPB_ENTRY_FLAG_VALID |
++					 V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
++			return false;
++
++	return true;
++}
++
++static int histb_h264_pmv_grow(struct histb_vdec_ctx *ctx,
++			       unsigned int width_mbs,
++			       unsigned int height_mbs,
++			       bool direct_8x8,
++			       bool flush)
++{
++	struct histb_vdec_dev *dev = histb_vdec_h264_dev(ctx);
++	struct histb_vdec_h264_ctx *h264 = ctx->priv;
++	unsigned int per_mb = histb_h264_pmv_per_mb(width_mbs, height_mbs,
++						    direct_8x8);
++	unsigned int len = ALIGN(width_mbs * height_mbs * per_mb, 128);
++	unsigned int slot = ALIGN(width_mbs * height_mbs * 32, 128);
++	int i;
++
++	slot = max3(slot, len, HISTB_H264_PMV_SLOT_MIN);
++	if (h264->pmv_slot_size) {
++		/*
++		 * The allocation size alone cannot say the pool still fits: two
++		 * geometries reach the same number wherever the
++		 * HISTB_H264_PMV_SLOT_MIN floor flattens them, so the grid and
++		 * the bytes per macroblock the engine strides by have to match
++		 * as well before the pool is kept.
++		 */
++		if (h264->pmv_slot_size == slot &&
++		    h264->pmv_width_mbs == width_mbs &&
++		    h264->pmv_height_mbs == height_mbs &&
++		    h264->pmv_per_mb == per_mb)
++			return 0;
++		/*
++		 * Reaching here with a pool already built means the SPS changed
++		 * mid-session. Rebuild it only where this submission flushes
++		 * the reference chain: freeing the pool wipes the motion
++		 * vectors of every picture a later job can still name, so the
++		 * grid and the bytes per macroblock may both move together with
++		 * it, but only at that point. A change inside a live chain
++		 * stays refused - the pool, its slot map and the collocated
++		 * read target would then follow two different geometries, and
++		 * no source-change event tells the client. Restarting the
++		 * queues runs ->stop() and zeroes pmv_slot_size. Where the
++		 * payload lands is not the reason: with the tile geometry
++		 * programmed from the negotiated rectangle a smaller picture
++		 * still fills that rectangle exactly (measured: pictures on a
++		 * smaller grid inside a larger session)
++		 */
++		if (!flush)
++			return -EINVAL;
++	}
++
++	histb_h264_pmv_free(dev, h264);
++
++	for (i = 0; i < HISTB_VDEC_MAX_PMV_SLOTS; i++) {
++		h264->pmv_va[i] = dma_alloc_wc(dev->memdev, slot,
++					       &h264->pmv_dma[i], GFP_KERNEL);
++		if (!h264->pmv_va[i])
++			break;
++	}
++	if (i < HISTB_VDEC_MAX_PMV_SLOTS) {
++		histb_h264_pmv_free(dev, h264);
++		return -ENOMEM;
++	}
++	h264->pmv_slot_size = slot;
++	h264->pmv_width_mbs = width_mbs;
++	h264->pmv_height_mbs = height_mbs;
++	h264->pmv_per_mb = per_mb;
++	memset(ctx->pmv_map, 0, sizeof(ctx->pmv_map));
++	ctx->pmv_next = 0;
++
++	return 0;
++}
++
++static void histb_vdec_h264_stop(struct histb_vdec_ctx *ctx)
++{
++	struct histb_vdec_dev *dev = histb_vdec_h264_dev(ctx);
++	struct histb_vdec_h264_ctx *h264 = ctx->priv;
++
++	if (!h264)
++		return;
++
++	histb_h264_pmv_free(dev, h264);
++	if (h264->rbsp_va)
++		dma_free_wc(dev->memdev, h264->rbsp_size, h264->rbsp_va,
++			    h264->rbsp_dma);
++	kfree(h264);
++	ctx->priv = NULL;
++
++	memset(ctx->pmv_map, 0, sizeof(ctx->pmv_map));
++	ctx->pmv_next = 0;
++}
++
++/*
++ * Hand the engine the slice span without its emulation-prevention bytes.
++ *
++ * The VDM decodes the bytes it is given literally: measured with a picture
++ * whose samples contain 00 00 00, the conformant Annex-B form
++ * (four 03 bytes inserted in the slice data) lands 31 of 4096 luma lines, while
++ * the same RBSP written without prevention bytes is byte-exact and reports no
++ * error. The uAPI delivers the escaped form for both start-code modes
++ * (ext-ctrls-codec-stateless.rst: V4L2_STATELESS_H264_START_CODE_*), so
++ * removing them is the driver's job, not the encoder's.
++ *
++ * The copy starts at the first slice's NAL header byte and the slice offsets
++ * are rewritten into its own domain; the OUTPUT plane is left untouched. When
++ * the span holds no prevention byte the plane is used as is, so the common case
++ * pays no copy.
++ */
++static int histb_h264_pack_rbsp(struct histb_vdec_ctx *ctx,
++				struct histb_h264_run *run,
++				unsigned int *payload_bits)
++{
++	struct histb_vdec_dev *dev = histb_vdec_h264_dev(ctx);
++	struct histb_vdec_h264_ctx *h264 = ctx->priv;
++	unsigned int first = run->slice_starts[0] / 8;
++	unsigned int end = *payload_bits / 8;
++	unsigned int esc_next = first;
++	unsigned int out = 0, idx = 0, zeros = 0;
++	unsigned int i;
++	u8 *dst;
++
++	if (!run->src_va || first >= end)
++		return 0;
++
++	for (i = first; i + 2 < end; i++) {
++		if (!run->src_va[i] && !run->src_va[i + 1] &&
++		    run->src_va[i + 2] == 0x03)
++			break;
++	}
++	if (i + 2 >= end)
++		return 0;
++
++	if (h264->rbsp_size < end - first) {
++		if (h264->rbsp_va)
++			dma_free_wc(dev->memdev, h264->rbsp_size, h264->rbsp_va,
++				    h264->rbsp_dma);
++		h264->rbsp_size = 0;
++		h264->rbsp_va = dma_alloc_wc(dev->memdev,
++					     round_up(end - first, 64 * 1024),
++					     &h264->rbsp_dma, GFP_KERNEL);
++		if (!h264->rbsp_va)
++			return -ENOMEM;
++		h264->rbsp_size = round_up(end - first, 64 * 1024);
++	}
++	dst = h264->rbsp_va;
++
++	for (i = first; i < end; i++) {
++		u8 byte = run->src_va[i];
++
++		if (i == esc_next) {
++			esc_next = idx + 1 < run->num_slices ?
++				run->slice_starts[idx + 1] / 8 : end;
++			run->slice_starts[idx++] = out * 8;
++			zeros = 0;
++		}
++		if (zeros >= 2 && byte == 0x03) {
++			zeros = 0;
++			continue;
++		}
++		dst[out++] = byte;
++		zeros = byte ? 0 : zeros + 1;
++	}
++
++	*payload_bits = out * 8;
++	run->src_va = dst;
++	run->src_dma = h264->rbsp_dma;
++	return 0;
++}
++
++/*
++ * True when every coefficient the picture message carries is one repeated value
++ * per list (the six 4x4 lists plus the two luma 8x8 lists the 4:2:0 path uses;
++ * the remaining rows of scaling_list_8x8 are never packed) and the three intra
++ * 4x4 lists share that value. Only this shape has been measured to decode
++ * byte-exactly: with the intra lists equal to each other, an inter 4x4 or 8x8
++ * list carrying a different value still matched the reference, while any stream
++ * whose intra lists differed from each other did not.
++ */
++static bool histb_h264_scaling_supported(const struct v4l2_ctrl_h264_scaling_matrix *m)
++{
++	u8 v = m->scaling_list_4x4[0][0];
++	unsigned int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(m->scaling_list_4x4); i++)
++		for (j = 0; j < ARRAY_SIZE(m->scaling_list_4x4[i]); j++) {
++			if (m->scaling_list_4x4[i][j] != m->scaling_list_4x4[i][0])
++				return false;
++			if (i < 3 && m->scaling_list_4x4[i][0] != v)
++				return false;
++		}
++
++	for (i = 0; i < 2; i++)
++		for (j = 1; j < ARRAY_SIZE(m->scaling_list_8x8[i]); j++)
++			if (m->scaling_list_8x8[i][j] != m->scaling_list_8x8[i][0])
++				return false;
++
++	return true;
++}
++
++static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
++			       struct vb2_v4l2_buffer *src,
++			       struct vb2_v4l2_buffer *dst)
++{
++	struct histb_vdec_dev *dev = histb_vdec_h264_dev(ctx);
++	struct histb_vdec_h264_ctx *h264 = ctx->priv;
++	struct v4l2_h264_reflist_builder builder;
++	struct histb_h264_run *run = &h264->run;
++	struct v4l2_ctrl *ctrl;
++	unsigned int cap_w, cap_h;
++	int ret;
++
++	memset(run, 0, sizeof(*run));
++	struct vb2_queue *cap_q;
++	u32 *pic;
++	u32 payload_bits;
++	unsigned int n_slices, found;
++	unsigned long start_code;
++	unsigned int i;
++
++	/*
++	 * The driver core has applied the request to the control handler before
++	 * scheduling this job, so p_cur carries this frame's values.
++	 */
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_SPS);
++	run->sps = ctrl ? ctrl->p_cur.p_h264_sps : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_PPS);
++	run->pps = ctrl ? ctrl->p_cur.p_h264_pps : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_DECODE_PARAMS);
++	run->dec = ctrl ? ctrl->p_cur.p_h264_decode_params : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_PRED_WEIGHTS);
++	run->weights = ctrl ? ctrl->p_cur.p_h264_pred_weights : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_SCALING_MATRIX);
++	run->scaling = ctrl ? ctrl->p_cur.p_h264_scaling_matrix : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_SLICE_PARAMS);
++	run->slices = ctrl ? ctrl->p_cur.p_h264_slice_params : NULL;
++	n_slices = ctrl ? ctrl->new_elems : 0;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_START_CODE);
++	start_code = ctrl ? ctrl->cur.val : V4L2_STATELESS_H264_START_CODE_ANNEX_B;
++
++	/*
++	 * Every word of the picture message comes from these controls: the
++	 * frame-level state (size, POC, DPB addresses, CABAC table) has no
++	 * other source, and the slice chain is built from the slice-parameter
++	 * array. A missing or empty control therefore leaves words unwritable
++	 * rather than guessed at, so the job is refused before anything is
++	 * programmed.
++	 */
++	if (!run->sps || !run->pps || !run->dec || !run->slices || !n_slices)
++		return -EINVAL;
++
++	/*
++	 * One hardware run consumes one chained slice slot per slice and the
++	 * chain is capped by the message pool layout; longer frames would need
++	 * the vendor multi-start split, which does not fit the
++	 * one-frame-per-job stateless model. One slot is left over because the
++	 * chain has to end on a zeroed slot, not on the last real one.
++	 */
++	if (n_slices >= HISTB_VDEC_MAX_SLICE_SLOTS)
++		return -EINVAL;
++
++	payload_bits = vb2_get_plane_payload(&src->vb2_buf, 0) * 8;
++	/*
++	 * A zero-length submission carries no slice data at all. Each slice is
++	 * addressed through a segment descriptor whose bit length is part of
++	 * the word, so there is nothing for those words to point at and the job
++	 * cannot be programmed in this state.
++	 */
++	if (!payload_bits)
++		return -EINVAL;
++	run->src_dma = histb_vdec_src_dma(&src->vb2_buf);
++	run->dst_dma = histb_vdec_frame_dma(ctx, &dst->vb2_buf);
++	if (!run->dst_dma)
++		return -ENOMEM;
++	run->num_slices = n_slices;
++
++	run->src_va = histb_vdec_src_va(&src->vb2_buf);
++	if (start_code == V4L2_STATELESS_H264_START_CODE_ANNEX_B) {
++		/*
++		 * Locating slices in Annex-B mode reads the OUTPUT plane
++		 * through the kernel mapping: histb_h264_find_slice_nals()
++		 * walks it byte by byte and the slice segments are taken from
++		 * where it finds each NAL. The source queue carries a kernel
++		 * mapping for this reason (its dma_attrs omit
++		 * DMA_ATTR_NO_KERNEL_MAPPING, see histb_vdec_queue_init()), so
++		 * a NULL here means the mapping came back unavailable and no
++		 * slice boundary is known; the job is refused rather than
++		 * programmed from offsets nothing verified.
++		 */
++		if (!run->src_va) {
++			dev_warn_once(dev->dev,
++				      "OUTPUT queue has no kernel mapping, cannot delimit "
++				      "slices\n");
++			return -EINVAL;
++		}
++		found = histb_h264_find_slice_nals(run->src_va,
++						   payload_bits / 8,
++						   run->slice_starts,
++						   ARRAY_SIZE(run->slice_starts));
++		/*
++		 * The scan must find exactly one NAL per slice the control
++		 * declares. Each declared slice gets one chained slice slot,
++		 * addressed by the start found here, so a different count would
++		 * mean programming slots from spans the control does not
++		 * describe.
++		 */
++		if (found != n_slices)
++			return -EINVAL;
++	} else {
++		/*
++		 * Without start codes the slices in the OUTPUT buffer cannot be
++		 * delimited, so a single-slice submission is the only layout
++		 * the driver can consume. Start codes are never part of the
++		 * hardware ABI either way: every slice segment is computed from
++		 * the slice's data bit offset, which for frame-based
++		 * submissions already includes the NAL unit header bits.
++		 */
++		if (n_slices != 1)
++			return -EINVAL;
++		run->slice_starts[0] = 0;
++	}
++
++	ret = histb_h264_pack_rbsp(ctx, run, &payload_bits);
++	if (ret)
++		return ret;
++
++	/*
++	 * Slice-group partitioning (FMO/ASO) and redundant coded pictures both
++	 * move where a slice's data starts, and neither survives this API: the
++	 * PPS has a slice-group count but no map, and the per-slice
++	 * redundant_pic_cnt is read by nothing here - the VDM is programmed one
++	 * raster-slice per submission and would present a secondary copy as a
++	 * picture of its own. The vendor parser rejects both shapes, a baseline
++	 * stream with FMO and a redundant picture, so this costs nothing the
++	 * hardware could deliver. No stream in the scored corpus declares
++	 * either field. Which neighbouring parameter-set features the API can
++	 * even see are named where they are consumed: the SPS and PPS flag
++	 * words above, and the scaling-matrix control.
++	 */
++	if (run->pps->num_slice_groups_minus1 ||
++	    (run->pps->flags & V4L2_H264_PPS_FLAG_REDUNDANT_PIC_CNT_PRESENT))
++		return -EINVAL;
++
++	/*
++	 * Quantisation matrices do arrive here, and the VDM consumes the words:
++	 * submitting them zeroed instead of decoded changes the picture in a
++	 * different way. But the engine does not apply the intra 4x4 lists as
++	 * the protocol says. Measured on the board, a stream whose three intra
++	 * 4x4 lists differ from each other delivers 68487 of 115200 samples off
++	 * by up to 58, spread over every macroblock row, while one whose intra
++	 * lists agree decodes byte-exactly even when an inter 4x4 or 8x8 list
++	 * carries a different value - and no reordering of the eight lists, nor
++	 * reading the 8x8 slots, nor a scan-order submission explains where the
++	 * intra ones go (all three measured on the board). Finding that out
++	 * needs the vendor's intra inverse-quantiser arithmetic, which is not a
++	 * lightweight bypass, so until it is known only the shapes measured
++	 * correct are accepted, and a present flag with no list control behind
++	 * it carries no values to check either way. No stream in the scored
++	 * corpus declares matrices - the parameter-set walk and the reference
++	 * decoder's own header trace agree on that - so this costs no frame
++	 * that decodes byte-exactly today.
++	 */
++	if (run->pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT) {
++		if (!run->scaling ||
++		    !histb_h264_scaling_supported(run->scaling))
++			return -EINVAL;
++	}
++
++	/*
++	 * Lossless streams are visible here - the SPS control carries
++	 * V4L2_H264_SPS_FLAG_QPPRIME_Y_ZERO_TRANSFORM_BYPASS - but the VDM has
++	 * no bypass path: measured on the board, a stream with the flag set
++	 * (x264 -qp 0, which picks profile 244) delivers 0 of 115200 samples
++	 * right in every frame, while the same clip at qp 4 without the flag
++	 * decodes byte-exactly, so the deviation is the bypass itself and not
++	 * the profile or the encoder. The vendor firmware's own H.264 syntax
++	 * parser reports that same SPS bit as unsupported. No stream in the
++	 * scored corpus sets it, and nothing in this driver can implement it:
++	 * the inverse transform would have to be skipped per macroblock.
++	 */
++	if (run->sps->flags & V4L2_H264_SPS_FLAG_QPPRIME_Y_ZERO_TRANSFORM_BYPASS)
++		return -EINVAL;
++
++	run->width_mbs = run->sps->pic_width_in_mbs_minus1 + 1;
++	run->height_mbs = (run->sps->pic_height_in_map_units_minus1 + 1) *
++			 ((run->sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY) ?
++			  1u : 2u);
++
++	/*
++	 * The luma write path needs two macroblock columns per row: a picture
++	 * declared one MB wide delivers wrong luma whatever its slice data is
++	 * (a 32-wide stream declared as one column reproduces the 16x16 failure
++	 * down to the write counters, and that same 16x16 stream declared as
++	 * two columns decodes byte-exactly), so 16-column pictures cannot be
++	 * delivered at all. Cropping does not help - the coded count is what
++	 * the engine writes by. The picture message D0 budgets 9 bits of MB
++	 * width and 10 of MB height.
++	 */
++	if (run->width_mbs < 2 ||
++	    run->width_mbs * 16 > HISTB_VDEC_MAX_WIDTH ||
++	    run->height_mbs * 16 > HISTB_VDEC_MAX_HEIGHT)
++		return -EINVAL;
++	run->mbamt = run->width_mbs * run->height_mbs;
++
++	/* The VDM writes full frames into the queued CAPTURE slots; a stream
++	 * larger than the negotiated geometry could not be held.
++	 */
++	ret = histb_vdec_cap_dims(ctx, &cap_w, &cap_h);
++	if (ret)
++		return ret;
++	if (run->width_mbs * 16 > cap_w || run->height_mbs * 16 > cap_h)
++		return -EINVAL;
++
++	/*
++	 * The band layout the engine is told to use is the one the CAPTURE
++	 * format reported, not the coded picture's own: the negotiated
++	 * rectangle may be larger, and a client addressing the buffer per
++	 * bytesperline has to find the payload there.
++	 */
++	histb_vdec_buf_geom(ctx, &run->tile_stride, &run->buf_lines);
++
++	/*
++	 * Collocated motion vectors live in the two halves of a PMV slot, and
++	 * the firmware names those halves per *frame store* (one address
++	 * selection per stored picture) while this API hands each field
++	 * picture its own DPB entry and capture buffer. So the half a B slice
++	 * needs cannot be named here, and a picture whose direct
++	 * prediction depends on it is refused rather than delivered:
++	 *  - a field picture with B slices;
++	 * - an MBAFF frame with B slices. Writing slot[9] = base + half for
++	 *   such a
++	 *    reference changed nothing on the board (10 of 50 pictures correct with
++	 *    and without it), so that is not the missing piece either.
++	 * Nothing else reads the collocated vectors - the firmware zeroes
++	 * slot[8]/slot[9] for every other slice type, by the same slice-type
++	 * table as histb_h264_slice_type_code() - so progressive pictures and
++	 * MBAFF without B slices keep decoding byte-exactly (both 50 of 50 on
++	 * the corpus).
++	 *
++	 * One known residual is deliberately left un-gated. On a spatial-direct
++	 * B slice whose collocated picture is a single-direction (P) picture,
++	 * the engine averages both lists where 8.4.1.1 asks for the co-located
++	 * macroblock's own motion: measured on the board, the 384 samples of
++	 * macroblock (0,0) of one B frame are all off, up to 76, with the
++	 * deblocking across that macroblock's edge spreading it to its
++	 * neighbours, while every other frame of the same stream is byte-exact.
++	 * No cheap predicate separates that frame from the ones that are right:
++	 * direct_8x8_inference_flag is set in every B-bearing case in the
++	 * corpus (so it has no discriminating power), and all 791 B pictures
++	 * scored are B-skip pictures, so refusing "B-skip only" costs exactly
++	 * what refusing every B picture costs - 731 of 1928 byte-exact frames
++	 * (37.9%), since the only refusal this interface can express is per
++	 * job. Deciding it correctly would mean decoding the co-located
++	 * macroblock layer for one macroblock (its entropy state and
++	 * partitioning) before programming the job, which is software decoding;
++	 * the one fact that could make a narrow gate possible is how the motion
++	 * plane encodes "collocated motion unavailable", and that encoding is
++	 * undocumented. A known gap is recorded here rather than traded for a
++	 * third of the frame rate.
++	 *
++	 * Once one picture has been refused, every later picture of the chain
++	 * still references it, so those are refused too until an IDR restarts
++	 * the chain: per-slice-type refusal alone delivered 17 frames that were
++	 * written but wrong. With this stickiness the same stream delivers 10
++	 * byte-exact frames (the two leading pictures of each GOP) and the
++	 * other 40 come back with a zeroed payload, so none is wrong.
++	 */
++	if (run->dec->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC)
++		h264->col_half_lost = false;
++	if (h264->col_half_lost)
++		return -EINVAL;
++	if (histb_h264_has_b_slice(run)) {
++		bool field_pic = run->dec->flags &
++			V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
++
++		if (field_pic ||
++		    (run->sps->flags &
++		     V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD)) {
++			h264->col_half_lost = true;
++			return -EINVAL;
++		}
++	}
++
++	ret = histb_h264_pmv_grow(ctx, run->width_mbs, run->height_mbs,
++				  run->sps->flags &
++				  V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE,
++				  histb_h264_pmv_flush(run->dec));
++	if (ret)
++		return ret;
++
++	/*
++	 * Map the DPB onto the APC frame table. Capture buffer indexes are the
++	 * APC slots; the POC tail is zeroed like the vendor's and the address
++	 * tail points at the output frame. The vendor repeats the picture at
++	 * list position 0 through the unused tail entries past the slots it
++	 * counts as present - filling the same slots that way was measured here
++	 * and left every case of the corpus byte-identical (QDC81 over the
++	 * tx/cy/i12/pb/cb/cl/sc families), and renumbering the slots in
++	 * reference-list order changed nothing either, so no engine path reads
++	 * an APC slot that no declist id names.
++	 */
++	if (dst->vb2_buf.index >= HISTB_VDEC_MAX_DPB_SLOTS)
++		return -EINVAL;
++
++	cap_q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++	for (i = 0; i < HISTB_H264_NUM_APC_SLOTS; i++) {
++		run->img_addr[i] = lower_32_bits(run->dst_dma);
++		run->apc_poc[0][i] = 0;
++		run->apc_poc[1][i] = 0;
++	}
++	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
++		const struct v4l2_h264_dpb_entry *entry = &run->dec->dpb[i];
++		struct vb2_buffer *vb;
++
++		run->dpb2apc[i] = HISTB_H264_APC_NONE;
++		if (!(entry->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
++			continue;
++
++		vb = vb2_find_buffer(cap_q, entry->reference_ts);
++		if (!vb || vb->index >= HISTB_H264_NUM_APC_SLOTS)
++			return -EINVAL;
++
++		run->dpb2apc[i] = vb->index;
++		run->img_addr[vb->index] =
++			lower_32_bits(histb_vdec_frame_dma(ctx, vb));
++		if (!run->img_addr[vb->index])
++			return -ENOMEM;
++		run->apc_poc[0][vb->index] = entry->top_field_order_cnt;
++		run->apc_poc[1][vb->index] = entry->bottom_field_order_cnt;
++	}
++
++	v4l2_h264_init_reflist_builder(&builder, run->dec, run->sps,
++				       run->dec->dpb);
++	run->num_valid = builder.num_valid;
++	v4l2_h264_build_p_ref_list(&builder, run->reflist_p);
++	v4l2_h264_build_b_ref_lists(&builder, run->reflist_b0, run->reflist_b1);
++
++	pic = histb_vdec_pic_slot(&dev->pool);
++	histb_h264_assemble_pic(dev, h264, run,
++				histb_h264_pmv_alloc(ctx, dst->vb2_buf.index),
++				pic);
++
++	for (i = 0; i < n_slices; i++) {
++		u32 nal_bit = run->slice_starts[i];
++		u32 next_bit = i + 1 < n_slices ? run->slice_starts[i + 1] :
++						  payload_bits;
++
++		if (nal_bit + run->slices[i].header_bit_size >= next_bit)
++			return -EINVAL;
++		/*
++		 * CABAC starts the segment at the next byte boundary (see
++		 * histb_h264_assemble_slice()), so a header ending inside the last
++		 * seven bits of the segment leaves nothing behind that rounding and
++		 * the u32 length wraps. Refuse it, as the HEVC path does for the
++		 * same shape.
++		 */
++		if (run->pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE &&
++		    ALIGN(nal_bit + run->slices[i].header_bit_size, 8) >= next_bit)
++			return -EINVAL;
++
++		histb_h264_assemble_slice(dev, ctx, run, h264, i, nal_bit,
++					  next_bit);
++	}
++
++	/*
++	 * The last real slot links to this one, so it has to present as an
++	 * empty segment even when an earlier job left a longer chain here.
++	 */
++	memset(histb_vdec_slice_slot(&dev->pool, n_slices), 0,
++	       HISTB_VDEC_SLOT_BYTES);
++
++	histb_h264_program_regs(dev, run);
++	dev->mb_total = run->width_mbs * run->height_mbs;
++	histb_vdec_hw_kick(dev, HISTB_VIDSTD_H264);
++
++	return 0;
++}
++
++static const struct v4l2_ctrl_config histb_vdec_h264_ctrls[] = {
++	{
++		.id = V4L2_CID_STATELESS_H264_SPS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_PPS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_SCALING_MATRIX,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_PRED_WEIGHTS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_DECODE_PARAMS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_SLICE_PARAMS,
++		/*
++		 * v4l2_ctrl_new_custom() only preserves cfg->flags when the
++		 * config carries an explicit name: otherwise it runs
++		 * v4l2_ctrl_fill(), which zeroes the flags and would drop the
++		 * dynamic-array property.
++		 */
++		.name = "H264 Slice Parameters",
++		.type = V4L2_CTRL_TYPE_H264_SLICE_PARAMS,
++		.dims = { 8 },
++		.flags = V4L2_CTRL_FLAG_DYNAMIC_ARRAY,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_DECODE_MODE,
++		.min = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++		.max = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++		.def = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_START_CODE,
++		.min = V4L2_STATELESS_H264_START_CODE_NONE,
++		.max = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
++		.def = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
++	},
++};
++
++static const struct histb_vdec_codec_ops histb_vdec_h264_codec_ops = {
++	.start = histb_vdec_h264_start,
++	.stop = histb_vdec_h264_stop,
++	.run = histb_vdec_h264_run,
++	.try_ctrl = histb_vdec_h264_try_ctrl,
++};
++
++const histb_vdec_fmt_desc histb_vdec_h264_fmt = {
++	.fourcc = V4L2_PIX_FMT_H264_SLICE,
++	.stride = histb_h264_tile_stride,
++	.grid_align = 16,
++	.num_ctrls = ARRAY_SIZE(histb_vdec_h264_ctrls),
++	.ctrls = histb_vdec_h264_ctrls,
++	.ops = &histb_vdec_h264_codec_ops,
++	.vidstd = HISTB_VIDSTD_H264,
++};
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_hw.c
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * VDM hardware sequencing for the HiSilicon VDH v2 video decoder.
++ *
++ * The VDM is started by a doorbell register and reports completion through a
++ * single level-triggered interrupt; the message pool it reads and writes is a
++ * plain DMA region prepared by the codec layers.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/regmap.h>
++#include <linux/bitfield.h>
++#include <linux/build_bug.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/limits.h>
++#include <linux/reset.h>
++
++#include "histb_vdec_v2.h"
++#include "histb_vdec_v2_tables_h264.h"
++#include "histb_vdec_v2_tables_hevc.h"
++
++/**
++ * histb_vdec_hw_init() - prepare the VDM register interface
++ * @dev: decoder device
++ *
++ * Masks every interrupt source and drops anything latched across the reset.
++ * Runs once at probe, after the reset is released and before the interrupt
++ * handler is registered; the per-frame start path unmasks the frame-done source
++ * again.
++ *
++ * Return: 0 on success, a negative error code otherwise.
++ */
++int histb_vdec_hw_init(struct histb_vdec_dev *dev)
++{
++	vdm_write(dev, VDM_INT_MASK, 0xffffffff);
++	vdm_write(dev, VDM_INT_STATE, 0xffffffff);
++
++	return 0;
++}
++
++/**
++ * histb_vdec_hw_reset() - pulse the VDM main FSM reset
++ * @dev: decoder device
++ *
++ * Asserts the decoder reset line for a short pulse and re-applies the
++ * all-masked interrupt state, which the reset clears. Used to recover from a
++ * wedged frame.
++ */
++void histb_vdec_hw_reset(struct histb_vdec_dev *dev)
++{
++	reset_control_assert(dev->rst);
++	usleep_range(10, 20);
++	reset_control_deassert(dev->rst);
++
++	vdm_write(dev, VDM_INT_MASK, 0xffffffff);
++	vdm_write(dev, VDM_INT_STATE, 0xffffffff);
++}
++
++
++/**
++ * histb_vdec_hw_kick() - start decoding of the programmed frame
++ * @dev: decoder device
++ * @std: protocol of the frame about to be decoded
++ *
++ * Selects the protocol's clock gating mode in the SCD block's global register
++ * window (0 for HEVC, 3 for every other protocol) and rings the VDM doorbell
++ * with the 0-1-0 write sequence the start logic expects.
++ */
++void histb_vdec_hw_kick(struct histb_vdec_dev *dev, enum histb_vdec_vidstd std)
++{
++	writel(std == HISTB_VIDSTD_HEVC ? VDH_CK_GT_HEVC : VDH_CK_GT_OTHER,
++	       dev->scd + SCD_VDH_CK_GT);
++
++	/* Drain the message pool writes before ringing the doorbell. */
++	wmb();
++
++	vdm_write(dev, VDM_START, 0);
++	vdm_write(dev, VDM_START, 1);
++	vdm_write(dev, VDM_START, 0);
++}
++
++/**
++ * histb_vdec_hw_init_tables() - program the constant protocol tables
++ * @dev: decoder device
++ *
++ * Copies the CABAC M/N tables of H.264 and HEVC into the table area of the
++ * message pool, from where the VDM fetches them by DMA. The VDM expects them at
++ * fixed offsets once per probe; they are read-only afterwards.
++ */
++void histb_vdec_hw_init_tables(struct histb_vdec_dev *dev)
++{
++	void *tables = histb_vdec_tables_base(&dev->pool);
++	unsigned int i;
++
++	BUILD_BUG_ON(HISTB_TABLE_OFF_CABAC_MN_H264 +
++		     HISTB_VDEC_CABAC_MN_H264_SIZE >
++		     HISTB_TABLE_OFF_CABAC_MN_HEVC);
++	BUILD_BUG_ON(HISTB_TABLE_OFF_CABAC_MN_HEVC +
++		     HISTB_VDEC_CABAC_MN_HEVC_SIZE >
++		     HISTB_TABLE_OFF_TILE_INFO);
++	BUILD_BUG_ON(HISTB_TABLE_OFF_TILE_INFO + HISTB_VDEC_TILE_INFO_SIZE >
++		     HISTB_TABLE_OFF_PPFD);
++	BUILD_BUG_ON(HISTB_TABLE_OFF_PPFD + HISTB_VDEC_PPFD_SIZE >
++		     HISTB_TABLE_OFF_SCRATCH_BASE);
++
++	memcpy(tables + HISTB_TABLE_OFF_CABAC_MN_H264,
++	       histb_vdec_cabac_mn_h264, HISTB_VDEC_CABAC_MN_H264_SIZE);
++
++	/*
++	 * The HEVC table is stored as readable (m, n) pairs; the vendor loader
++	 * finishes with a byte-swap pass that interleaves every pair as (n, m)
++	 * in memory, which is what the hardware fetcher expects. The H.264
++	 * loader does not swap.
++	 */
++	for (i = 0; i < HISTB_VDEC_CABAC_MN_HEVC_SIZE / 4; i++) {
++		u32 v = histb_vdec_cabac_mn_hevc[i];
++
++		v = ((v & 0xff00ff00) >> 8) | ((v & 0x00ff00ff) << 8);
++		((u32 *)tables)[HISTB_TABLE_OFF_CABAC_MN_HEVC / 4 + i] = v;
++	}
++
++	/*
++	 * Every HEVC picture message points at the tile info image, but untiled
++	 * pictures decode with it all zero and the HEVC run path refuses tiled
++	 * ones, so it is programmed once here rather than per frame.
++	 */
++	memset(tables + HISTB_TABLE_OFF_TILE_INFO, 0,
++	       HISTB_VDEC_TILE_INFO_SIZE);
++}
++
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_regs.h
+@@ -0,0 +1,156 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Register definitions for the HiSilicon VDH v2 video decoder: the
++ * Hi3716CV200 (HiVDHV200R004) and Hi3798MV100 (HiVDHV300R001) parts, whose
++ * register files the vendor headers hold identical for every offset this
++ * driver names. Derived from the vendor firmware's register description
++ * headers and cross-checked against the firmware's own assembly and the
++ * hardware.
++ */
++#ifndef HISTB_VDEC_REGS_H
++#define HISTB_VDEC_REGS_H
++
++#include <linux/bits.h>
++
++/*
++ * VDM register window, 4 KiB plus the SED block at 0xF8C30000. Offsets are
++ * register indices as used by the vendor firmware. The syntax-error statistics
++ * at 0x1000 belong to the same hardware block (the firmware reads them as its
++ * syntax-error record pair), so the mapping covers them while the luminance
++ * histogram past 0x8100 stays outside.
++ */
++#define VDM_START			0x000	/* doorbell: write 0, 1, 0 */
++#define VDM_REPAIR			0x004	/* RealVideo repair engine start */
++#define VDM_CFG0			0x008
++#define VDM_CFG0_MBAMT			GENMASK(19, 0)
++#define VDM_CFG0_MEM_CG			BIT(20)	/* memory clock gating */
++#define VDM_CFG0_MOD_CG			BIT(21)	/* module clock gating */
++#define VDM_CFG0_MARKER_DETECT	BIT(22)
++#define VDM_CFG0_ACLAST_DETECT	BIT(23)
++#define VDM_CFG0_COEFIDX_DETECT	BIT(24)
++#define VDM_CFG0_VOPTYPE_DETECT	BIT(25)
++#define VDM_CFG0_LD_QMATRIX		BIT(30)
++#define VDM_CFG1			0x00c
++#define VDM_CFG1_VID_STD		GENMASK(3, 0)
++#define VDM_CFG1_DDR_STRIDE		GENMASK(13, 4)	/* stride >> 6 */
++#define VDM_CFG1_FST_SLC_GRP		BIT(14)
++#define VDM_CFG1_MV_OUT_EN		BIT(15)
++#define VDM_CFG1_MAX_SLCGRP_NUM		GENMASK(27, 16)
++#define VDM_CFG1_LINE_NUM_OUT_EN	BIT(28)
++#define VDM_CFG1_DBLK_1D_EN		BIT(29)
++#define VDM_CFG1_COMPRESS_EN		BIT(30)
++#define VDM_CFG1_PPFD_EN			BIT(31)
++#define VDM_AVM_ADDR			0x010	/* downstream msg pool */
++#define VDM_VAM_ADDR			0x014	/* upstream msg pool */
++#define VDM_STREAM_BASE			0x018
++#define VDM_STATE			0x01c
++#define VDM_STATE_SLICE_NUM		GENMASK(16, 0)
++#define VDM_STATE_DEC_OVER		BIT(17)
++#define VDM_STATE_DEC_ERR		BIT(18)
++/* Bits 26:19 read zero on both chips of this generation with the clock gate
++ * open - the whole word is 0x2 on Hi3798MV100 at probe and 0x6db0 on
++ * Hi3716CV200 in its bootloader - so it holds no version.
++ */
++#define VDM_INT_STATE			0x020	/* write 1 to clear */
++#define VDM_INT_MASK			0x024	/* write 1 to mask */
++#define VDM_INT_DEC_OVER		BIT(0)
++#define VDM_CTRL_STATE			0x028	/* == 1 means idle */
++#define VDM_EMAR_ID			0x030
++#define VDM_RPT_CNT			0x034
++#define VDM_TO(n)			(0x038 + 4 * (n)) /* 8 module timeouts */
++
++/* The firmware programs the seven module timeout windows 0x3c..0x54 with one
++ * common value and never touches VDM_RPT_CNT / VDM_TO(0).
++ */
++#define VDM_TIMEOUT_MOD			0x00300c03
++#define VDM_TIMEOUT_HEVC			0x00300003
++
++#define VDM_PART_DEC_OVER_LEVEL		0x05c
++#define VDM_YSTADDR_1D			0x060	/* current output frame */
++#define VDM_YSTRIDE_1D			0x064
++#define VDM_UVOFFSET_1D			0x068
++#define VDM_HEAD_INF_OFFSET		0x06c
++#define VDM_PRCMEM1			0x070
++#define VDM_PRCMEM2			0x074	/* line number table */
++#define VDM_PPFD_BUF_ADDR		0x080
++#define VDM_PPFD_BUF_LEN		0x084
++#define VDM_PRC_CACHE_TYPE		0x098	/* HEVC: the vendor programs 2 there */
++#define VDM_DNR_MBINFO_STADDR		0x090
++#define VDM_REF_PIC_TYPE		0x094	/* 16 x 2-bit frame types */
++#define VDM_FF_APT_EN			0x098
++
++/* Per-picture performance counters, updated by the VDM at frame end. */
++#define VDM_DEC_CYCLE_PER_PIC		0x0b0
++#define VDM_RD_BDWIDTH_PER_PIC		0x0b4
++#define VDM_WR_BDWIDTH_PER_PIC		0x0b8
++#define VDM_RD_REQ_PER_PIC		0x0bc
++#define VDM_WR_REQ_PER_PIC		0x0c0
++#define VDM_MB0_QP_IN_CURR_PIC		0x0d0
++#define VDM_SWITCH_ROUNDING		0x0d4
++#define VDM_AXI_TEST_ST			0x0e0
++#define VDM_AXI_TEST_STA		0x0f0
++
++/*
++ * Syntax error detection status. These live past the first 4 KiB of the block
++ * and are where the vendor firmware reads its syntax-error record pair from
++ * (the non-low-delay path looks only at 0x1000 and 0x1014). The block runs to
++ * the end of the mapped window, and the firmware's low-delay path walks it as
++ * 16-byte per-slice records (status at +0, record end at +8, slice index
++ * 1..200), so the dump covers all of it.
++ */
++#define VDM_SED_STA			0x1000
++#define VDM_SED_END0			0x1014
++#define VDM_SED_LAST			0x10f0
++
++/*
++ * VDEC global registers inside the SCD block at 0xF8C3C000. The decoder
++ * data path does not use the SCD. The firmware pokes these registers
++ * around its VDM starts, and the live paths here follow it for the VDH
++ * gate on every picture (histb_vdec_hw.c) and for the MPEG-4 width bit of
++ * EMAR_ID (histb_vdec_mpeg4.c); AVS_FLAG and SELRST are not written by any
++ * live path.
++ */
++#define SCD_AVS_FLAG			0x000
++#define SCD_EMAR_ID			0x004
++/*
++ * VDH select/reset. The vendor firmware's decoder start path writes 1 here
++ * before every picture; no live path in this driver touches the offset.
++ */
++#define SCD_VDH_SELRST			0x008
++#define SCD_VDH_CK_GT			0x00c
++
++/* CRG window offsets: gate/reset/clk_sel of the VDH and its ack window. The
++ * soft-reset request is bit 5 of CRG30 and the reset acknowledge is bit 1 of
++ * CRG93, matching the CRG register descriptions the vendor firmware programs
++ * against.
++ */
++#define VDH_CRG30				0x078
++#define VDH_CRG93				0x174
++
++/* Per-protocol value written to SCD_VDH_CK_GT before each VDM start. */
++#define VDH_CK_GT_HEVC			0x0
++#define VDH_CK_GT_OTHER			0x3
++
++/*
++ * Firmware channel type codes (dispatch table); the VDM_CFG1_VID_STD register
++ * field carries its own per-protocol codes, which each codec source defines
++ * separately (they disagree for HEVC).
++ */
++enum histb_vdec_vidstd {
++	HISTB_VIDSTD_H264	= 0,
++	HISTB_VIDSTD_VC1	= 1,
++	HISTB_VIDSTD_MPEG4	= 2,
++	HISTB_VIDSTD_MPEG2	= 3,
++	HISTB_VIDSTD_H263	= 4,
++	HISTB_VIDSTD_DIVX3	= 5,
++	HISTB_VIDSTD_AVS	= 6,
++	HISTB_VIDSTD_JPEG	= 7,
++	HISTB_VIDSTD_REAL8	= 8,
++	HISTB_VIDSTD_REAL9	= 9,
++	HISTB_VIDSTD_VP6F	= 10,
++	HISTB_VIDSTD_VP6	= 11,
++	HISTB_VIDSTD_VP6A	= 12,
++	HISTB_VIDSTD_HEVC	= 17,
++};
++
++#endif /* HISTB_VDEC_REGS_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_tables_h264.h
+@@ -0,0 +1,204 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * H.264 CABAC context table (5120 bytes) for the VDH v2 VDM.
++ *
++ * The decoder reads the table through picture-message word D26; the hardware
++ * indexes it with the (SliceQPy, context) pair and produces the CABAC
++ * (pStateIdxM, valMps) pair per context. The contents are the constant pool the
++ * vendor firmware copies into its HAL memory on init (Write_V300R001_CabacTab,
++ * 5120 bytes); reproduced verbatim, little-endian word order.
++ */
++#ifndef HISTB_VDEC_TABLES_H264_H
++#define HISTB_VDEC_TABLES_H264_H
++
++#include <linux/types.h>
++
++#define HISTB_VDEC_CABAC_MN_H264_WORDS	1280
++
++static const u32 histb_vdec_cabac_mn_h264[HISTB_VDEC_CABAC_MN_H264_WORDS] = {
++	0x17211702, 0x15001240, 0x092b1d00, 0x000b0137, 0x00450029, 0x003f003f, 0x003f0000,
++	0x00000000, 0x14f10236, 0x034ae47f, 0xe968fa35, 0xff360733, 0x1f151f1f, 0x19320000,
++	0x00000000, 0x00000000, 0x0539f34e, 0xf541013e, 0x01090031, 0xdb760d29, 0x033ef753,
++	0x04560061, 0xf9480000, 0x00000000, 0x0143f34e, 0xf541013e, 0x1a43105a, 0x0968d27f,
++	0xec680000, 0x00000000, 0x00000000, 0x00000000, 0x0c31fc49, 0x1132fa56, 0xef5ffa3d,
++	0x092df943, 0xfb4afc4a, 0xfb50f948, 0x013a0000, 0x00000000, 0xfd45fa51, 0xf5600637,
++	0x0743fb56, 0x0258003a, 0xfd4cf65e, 0x05360445, 0xfd510058, 0x00000000, 0x16192200,
++	0x10001a22, 0x13162800, 0x000b0137, 0x00450029, 0x003f003f, 0x003f0000, 0x00000000,
++	0x14f10236, 0x034ae47f, 0xe968fa35, 0xff360733, 0x1f151f1f, 0x19320000, 0x00000000,
++	0x00000000, 0x0241fa47, 0xf34f0534, 0xfe090429, 0xe3760d29, 0x033ef753, 0x04560061,
++	0xf9480000, 0x00000000, 0xfc4cfa47, 0xf34f0534, 0x39022924, 0x1a45d37f, 0xf1650000,
++	0x00000000, 0x00000000, 0x00000000, 0x0932fd46, 0x0a360645, 0xf35a0034, 0x082bff42,
++	0xff4d0146, 0xfe56fb48, 0x003d0000, 0x00000000, 0xfe45fb52, 0xf660023b, 0x024bfd57,
++	0xfd640138, 0xfd4afa55, 0x003bfd51, 0xf956fb5f, 0x00000000, 0x1d101900, 0x0e001428,
++	0x140a1d00, 0x000b0137, 0x00450029, 0x003f003f, 0x003f0000, 0x00000000, 0x14f10236,
++	0x034ae47f, 0xe968fa35, 0xff360733, 0x1f151f1f, 0x19320000, 0x00000000, 0x00000000,
++	0x1a10fc55, 0xe8660539, 0xf633fd3e, 0xe5630d29, 0x033ef753, 0x04560061, 0xf9480000,
++	0x00000000, 0xfe4afc55, 0xe8660539, 0x3600252a, 0x0c61e07f, 0xea750000, 0x00000000,
++	0x00000000, 0x00000000, 0x0639ef49, 0x0e39fa5d, 0xf258fa2c, 0x04370337, 0xfc4ffe4b,
++	0xf461f932, 0x013c0000, 0x00000000, 0xf559f167, 0xeb741339, 0x143a0454, 0x0660013f,
++	0xfb55f36a, 0x053f064b, 0xfd5aff65, 0x00000000, 0x17211702, 0x15001240, 0x092b1d00,
++	0x002dfc4e, 0xfd600029, 0x003f003f, 0x003f0000, 0x00000000, 0x14f10236, 0x034ae47f,
++	0xe968fa35, 0xff360733, 0x0c280b33, 0x0e3b0000, 0x00000000, 0x00000000, 0x0539f34e,
++	0xf541013e, 0x01090031, 0xdb760d29, 0x033ef753, 0x04560061, 0xf9480000, 0x00000000,
++	0x0143f34e, 0xf541013e, 0x1a43105a, 0x0968d27f, 0xec680000, 0x00000000, 0x00000000,
++	0x00000000, 0x0c31fc49, 0x1132fa56, 0xef5ffa3d, 0x092df943, 0xfb4afc4a, 0xfb50f948,
++	0x013a0000, 0x00000000, 0xfd45fa51, 0xf5600637, 0x0743fb56, 0x0258003a, 0xfd4cf65e,
++	0x05360445, 0xfd510058, 0x00000000, 0x16192200, 0x10001a22, 0x13162800, 0x0d0f0733,
++	0x02500029, 0x003f003f, 0x003f0000, 0x00000000, 0x14f10236, 0x034ae47f, 0xe968fa35,
++	0xff360733, 0x19201531, 0x15360000, 0x00000000, 0x00000000, 0x0241fa47, 0xf34f0534,
++	0xfe090429, 0xe3760d29, 0x033ef753, 0x04560061, 0xf9480000, 0x00000000, 0xfc4cfa47,
++	0xf34f0534, 0x39022924, 0x1a45d37f, 0xf1650000, 0x00000000, 0x00000000, 0x00000000,
++	0x0932fd46, 0x0a360645, 0xf35a0034, 0x082bff42, 0xff4d0146, 0xfe56fb48, 0x003d0000,
++	0x00000000, 0xfe45fb52, 0xf660023b, 0x024bfd57, 0xfd640138, 0xfd4afa55, 0x003bfd51,
++	0xf956fb5f, 0x00000000, 0x1d101900, 0x0e001428, 0x140a1d00, 0x0722f758, 0xec7f0029,
++	0x003f003f, 0x003f0000, 0x00000000, 0x14f10236, 0x034ae47f, 0xe968fa35, 0xff360733,
++	0x15211332, 0x113d0000, 0x00000000, 0x00000000, 0x1a10fc55, 0xe8660539, 0xf633fd3e,
++	0xe5630d29, 0x033ef753, 0x04560061, 0xf9480000, 0x00000000, 0xfe4afc55, 0xe8660539,
++	0x3600252a, 0x0c61e07f, 0xea750000, 0x00000000, 0x00000000, 0x00000000, 0x0639ef49,
++	0x0e39fa5d, 0xf258fa2c, 0x04370337, 0xfc4ffe4b, 0xf461f932, 0x013c0000, 0x00000000,
++	0xf559f167, 0xeb741339, 0x143a0454, 0x0660013f, 0xfb55f36a, 0x053f064b, 0xfd5aff65,
++	0x00000000, 0xef7ff366, 0x0052f94a, 0xeb6be57f, 0xe17fe87f, 0xee5fe57f, 0xeb72e27f,
++	0x00000000, 0x00000000, 0xef7bf473, 0xf07af573, 0xfd47fa2a, 0xfb32fd36, 0xfe3e003a,
++	0x013ffe48, 0xff4af75b, 0x00000000, 0xf95df557, 0xfd4dfb47, 0xfc3ffc44, 0xf454f93e,
++	0xf941083d, 0x0538fe42, 0x0140003d, 0xfe4e0000, 0x18000f09, 0x08190d12, 0x0f090d13,
++	0x0a250c12, 0x061d1421, 0x0f1e042d, 0x013a003e, 0x073d0000, 0xfa5dfa54, 0xf84f0042,
++	0xff47003e, 0xfe3cfe3b, 0xfb4bfd3e, 0xfc3af742, 0xff4f0047, 0x03440000, 0x0f060613,
++	0x07100c0e, 0x120d0d0b, 0x0d0f0f10, 0x0c170d17, 0x0f140e1a, 0x0e2c1128, 0x112f0000,
++	0xf43ffe44, 0xf154f368, 0xfb43fb1b, 0xfd27fe2c, 0x002ef040, 0xf844f64e, 0xfa4df656,
++	0x00000000, 0x01320734, 0x0a23002c, 0x0b26012d, 0x002e052c, 0x1f110133, 0x07321c13,
++	0x10210e3e, 0x00000000, 0x0c260b2d, 0x0f270b2a, 0x0d2c102d, 0x0c290a31, 0x1e22122a,
++	0x0a371133, 0x112e0059, 0x00000000, 0x0a2cf93e, 0x0f240e28, 0x101b0c1d, 0x012c1424,
++	0x1220052a, 0x01300a3e, 0x112e0940, 0x00000000, 0x18111515, 0x19161f1b, 0x161d1323,
++	0x0e320a39, 0x073ffe4d, 0xfc52fd5e, 0x0945f46d, 0x00000000, 0xfd46f85d, 0xf65ae27f,
++	0xf45cf137, 0xf63cfa3e, 0xfc41f449, 0xf84cf950, 0xf758ef6e, 0x00000000, 0xf36cf164,
++	0xf365f35b, 0xf45ef658, 0xf054f656, 0xf953f357, 0xed5e0146, 0x0048fb4a, 0x123b0000,
++	0x1aed16ef, 0x1aef1ee7, 0x1cec21e9, 0x25e521e9, 0x28e426ef, 0x21f528f1, 0x29fa2601,
++	0x29110000, 0xf468f561, 0xf060f958, 0xf855f955, 0xf755f358, 0x0442fd4d, 0xfd4cfa4c,
++	0x0a3aff4c, 0xff530000, 0x24dd24de, 0x20e625e2, 0x2ce022ee, 0x22f128f1, 0x21f923fb,
++	0x21002602, 0x210d1723, 0x0d3a0000, 0xff4afa61, 0xf95bec7f, 0xf561ec54, 0xf54ffa49,
++	0xfc4af356, 0xf360f561, 0xed750000, 0x00000000, 0xf866f164, 0x005f0000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x1efa1b03, 0x1a160000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xf963f25f,
++	0x025f0000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x1dfd1a00, 0x161e0000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0xfc38fb52, 0xf94cea7d, 0xf84efb21, 0xfc30fe35, 0xfd3ef347, 0xf64ff456,
++	0xf35af261, 0x00000000, 0xfc4b0248, 0xf54bfd47, 0x0f2ef345, 0x003e0041, 0x1525f148,
++	0x09391036, 0x003e0c48, 0x00000000, 0x25f023fc, 0x26f826fd, 0x25032605, 0x2a002310,
++	0x27160e30, 0x1b25153c, 0x0c440261, 0x00000000, 0x004cfb4a, 0x0046f54b, 0x01440041,
++	0xf249033e, 0x043eff44, 0xf34b0b37, 0x05400c46, 0x00000000, 0x1ff923f1, 0x22fd2203,
++	0x24ff2205, 0x200b2305, 0x220c270b, 0x1e1d221a, 0x1d271342, 0x00000000, 0x00000000,
++	0x00000000, 0xfd4bff17, 0x0122012b, 0x0036fe37, 0x003d0140, 0x0044f75c, 0x00000000,
++	0xef78ec70, 0xee72f555, 0xf15cf259, 0xe647f151, 0xf2500044, 0xf246e838, 0xe944e832,
++	0xf54a0000, 0x17f31af3, 0x28f131f2, 0x2c032d06, 0x2c222136, 0x13520000, 0x00000000,
++	0x00000000, 0x00000000, 0xf26af361, 0xf15af45a, 0xee58f649, 0xf74ff256, 0xf649f646,
++	0xf645fb42, 0xf740fb3a, 0x023b0000, 0x15f618f5, 0x1cf81cff, 0x1d031d09, 0x23141d24,
++	0x0e430000, 0x00000000, 0x00000000, 0x00000000, 0xe57ee462, 0xe765e943, 0xe452ec5e,
++	0xf053ea6e, 0xeb5bee66, 0xf35de37f, 0x00000000, 0x00000000, 0xf95cfb59, 0xf960f36c,
++	0xfa4cfe2c, 0x002d0034, 0xfd40fe3b, 0xfc46fc4b, 0xf852ef66, 0x00000000, 0xfe55fa4e,
++	0xff4bf94d, 0x02360532, 0xfd440132, 0x062afc51, 0x013ffc46, 0x00430239, 0xfe4c0000,
++	0x0b1c0228, 0x032c0031, 0x002e022c, 0x0233002f, 0x0427023e, 0x062e0036, 0x0336023a,
++	0x043f0000, 0xf36af06a, 0xf657eb72, 0xee6ef262, 0xea6eeb6a, 0xee67eb6b, 0xe96ce670,
++	0xf660f45f, 0xfb5b0000, 0x0e0b0b0e, 0x090b120b, 0x150917fe, 0x20f120f1, 0x22eb27e9,
++	0x2adf29e1, 0x2ee426f4, 0x151d0000, 0xfd2eff41, 0xff39f75d, 0xf74d0318, 0x002a0030,
++	0x0037fa3b, 0xf947f453, 0xf557e277, 0x00000000, 0x0b230440, 0x013d0b23, 0x12190c18,
++	0x0d1d0d24, 0xf65df949, 0xfe490d2e, 0x0931f964, 0x00000000, 0x06330639, 0x07350634,
++	0x06370b2d, 0x0e240835, 0xff520737, 0xfd4e0f2e, 0x161fff54, 0x00000000, 0xf75dea5e,
++	0xfb560943, 0xfc50f655, 0xff46073c, 0x093a053d, 0x0c320f32, 0x12311136, 0x00000000,
++	0x2de835d3, 0x30e641d5, 0x2bed27f6, 0x1e09121a, 0x141b0039, 0xf252fb4b, 0xed61dd7d,
++	0x00000000, 0xfd4af75c, 0xf857e97e, 0x013afd1d, 0xff240126, 0x022bfa37, 0x003a0040,
++	0xfd4af65a, 0x00000000, 0x09350235, 0x0535fe3d, 0x00380038, 0xf33ffb3c, 0xff3e0439,
++	0xfa450439, 0x0e270433, 0x0d440000, 0x19071ef9, 0x1c031c04, 0x200022ff, 0x1e061e06,
++	0x20091f13, 0x1a1b1a1e, 0x25141c22, 0x11460000, 0x0a29072e, 0xff330731, 0x08340929,
++	0x062f0237, 0x0d290a2c, 0x06320535, 0x0d31043f, 0x06400000, 0x1b001c00, 0x1ffc1b06,
++	0x22081e0a, 0x18162113, 0x16201a1f, 0x15291a2c, 0x172f1041, 0x0e470000, 0x0536063c,
++	0x063b0645, 0x0046fc1d, 0x051f072a, 0x013bfe3a, 0xfd48fd51, 0xf5610000, 0x00000000,
++	0x0340013d, 0x093f0000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x0143053b, 0x09430000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0xfe45fe3b, 0x06460000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x083c063f, 0x11410000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xff300044, 0xfc45f858, 0x003a0805,
++	0x0a0e0e12, 0x0d1b0228, 0x003afd46, 0xfa4ff855, 0x00000000, 0x07321027, 0x052c0434,
++	0x0b30fb3c, 0xff3b003b, 0x1621052c, 0x0e2bff4e, 0x003c0945, 0x00000000, 0x101e1220,
++	0x1223161d, 0x181f1726, 0x122b1429, 0x0b3f093b, 0x0940ff5e, 0xfe59f76c, 0x00000000,
++	0x0a2c091f, 0x0c2b0335, 0x0e220a26, 0xfd340d28, 0x1120072c, 0x07260d32, 0x0a391a2b,
++	0x00000000, 0x15181714, 0x1a171b20, 0x1c171c18, 0x17281820, 0x1c1d172a, 0x13391635,
++	0x163d0b56, 0x00000000, 0x00000000, 0x00000000, 0xfa42f923, 0xf92af82d, 0xfb30f438,
++	0xfa3cfb3e, 0xf842f84c, 0x00000000, 0xfc4ff947, 0xfb45f746, 0xf842f644, 0xed49f445,
++	0xf046f143, 0xec3eed46, 0xf042ea41, 0xec3f0000, 0x09fe1af7, 0x21f727f9, 0x29fe2d03,
++	0x31092d1b, 0x243b0000, 0x00000000, 0x00000000, 0x00000000, 0xfb55fa51, 0xf64df951,
++	0xef50ee49, 0xfc4af653, 0xf747f743, 0xff3df842, 0xf242003b, 0x023b0000, 0x15f321f2,
++	0x27f92efe, 0x33023c06, 0x3d113722, 0x2a3e0000, 0x00000000, 0x00000000, 0x00000000,
++	0xd97fee5b, 0xef60e651, 0xdd62e866, 0xe961e577, 0xe863eb6e, 0xee66dc7f, 0x00000000,
++	0x00000000, 0x0050fb59, 0xf95efc5c, 0xe970f147, 0xf93d0035, 0xfb42f54d, 0xf750f754,
++	0xf657de7f, 0x00000000, 0xf367f35b, 0xf759f25c, 0xf84cf457, 0xe96ee869, 0xf64eec70,
++	0xef63b27f, 0xba7fce7f, 0xd27f0000, 0x042d0a1c, 0x0a1f21f5, 0x34d5120f, 0x1c0023ea,
++	0x26e72200, 0x27ee20f4, 0x66a20000, 0x38f10000, 0xeb7ee97c, 0xec6ee67e, 0xe77cef69,
++	0xe579e575, 0xef66e675, 0xe574df7a, 0xf65ff264, 0xf85f0000, 0x13fa12fa, 0x0e001af4,
++	0x1ff021e7, 0x21ea25e4, 0x27e22ae2, 0x2fd62ddc, 0x31de29ef, 0x20090000, 0x00270041,
++	0xf154dd7f, 0xeb65fd27, 0xfb35f93d, 0xf54bf14d, 0xef5be76b, 0xe76fe47a, 0x00000000,
++	0xfc42fb4e, 0xfc47f848, 0x023bff37, 0xf946fa4b, 0xf859de77, 0xfd4b2014, 0x1e16d47f,
++	0x00000000, 0x21fc1d0a, 0x25fb33e3, 0x27f734de, 0x45c643c1, 0x2cfb2007, 0x37e32001,
++	0x00001b24, 0x00000000, 0xef6fe472, 0xfa59fe50, 0xfc52f755, 0xf851ff48, 0x05400143,
++	0x09380045, 0x01450745, 0x00000000, 0x45b93fc1, 0x42c04db6, 0x36d934dd, 0x29f62400,
++	0x28ff1e0e, 0x1c1a1725, 0x0c370b41, 0x00000000, 0xfe49f468, 0xf75be17f, 0xf54cf62c,
++	0xf634f639, 0xf73af048, 0xf945fc45, 0xfb4af756, 0x00000000, 0x0036fb3d, 0x003aff3c,
++	0xfd3df843, 0xe754f24a, 0xfb410534, 0x0239003d, 0xf745f546, 0x12370000, 0x21e722e2,
++	0x24e426e4, 0x26e522ee, 0x23f022f2, 0x20f825fa, 0x23001e0a, 0x1c121a19, 0x1d290000,
++	0xf945fa43, 0xf04dfe40, 0x023dfa43, 0xfd400239, 0xfd41fd42, 0x003e0933, 0xff42fe47,
++	0xfe4b0000, 0x25df27dc, 0x28db26e2, 0x2edf2ae2, 0x28e831e3, 0x26f428f6, 0x26fd2efb,
++	0x1f141d1e, 0x192c0000, 0x03370738, 0x0737083d, 0x0242f722, 0x01200b1f, 0x0534fe37,
++	0xfe430049, 0xf8590000, 0x00000000, 0xfc47003a, 0x073d0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x004b0248, 0x084d0000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xff46f748, 0x0e3c0000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0c300b31,
++	0x1a2d0000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0xfd350044, 0xf94af758, 0x03340704, 0x0a081108, 0x10130325, 0xff3dfb49, 0xff46fc4e,
++	0x00000000, 0x09291219, 0x0920052b, 0x092f002c, 0x0033022e, 0x1326fc42, 0x0f260c2a,
++	0x09220059, 0x00000000, 0x0e23121f, 0x1123151e, 0x112d142a, 0x122d1b1a, 0x10360742,
++	0x10380b49, 0x0a43f674, 0x00000000, 0x1025002f, 0x12230b25, 0x0c290a29, 0x02300c29,
++	0x0d29003b, 0x03321328, 0x03421232, 0x00000000, 0x16161716, 0x1b152114, 0x1a1c1e18,
++	0x1b22122a, 0x19271232, 0x0c461536, 0x0e470b53, 0x00000000, 0x00000000, 0x00000000,
++	0xfb470018, 0xff24fe2a, 0xfe34f739, 0xfa3ffc41, 0xfc43f952, 0x00000000, 0xfb55fa51,
++	0xf64df951, 0xef50ee49, 0xfc4af653, 0xf747f743, 0xff3df842, 0xf242003b, 0x023b0000,
++	0x11f620f3, 0x2af731fb, 0x35004003, 0x440a421b, 0x2f390000, 0x00000000, 0x00000000,
++	0x00000000, 0xfd51fd4c, 0xf948fa4e, 0xf448f244, 0xfd46fa4c, 0xfb42fb3e, 0x0039fc3d,
++	0xf73c0136, 0x023a0000, 0x11f620f3, 0x2af731fb, 0x35004003, 0x440a421b, 0x2f390000,
++	0x00000000, 0x00000000, 0x00000000, 0xdc7fef5b, 0xf25fe754, 0xe756f459, 0xef5be17f,
++	0xf24cee67, 0xf35adb7f, 0x00000000, 0x00000000, 0x0b50054c, 0x0254054e, 0xe873ea52,
++	0xf73e0035, 0x003bf255, 0xf359f35e, 0xf55ce37f, 0x00000000, 0xfc56f458, 0xfb52fd48,
++	0xfc43f848, 0xf059f745, 0xff3b0542, 0x0439fc47, 0xfe47023a, 0xff4a0000, 0x0427002a,
++	0x07220b1d, 0x081f0625, 0x072a0328, 0x08210d2b, 0x0d24042f, 0x0337023a, 0x063c0000,
++	0xea7fe77f, 0xe778e57f, 0xed72e975, 0xe776e675, 0xe871e476, 0xe178db7c, 0xf65ef166,
++	0xf6630000, 0x11f310f7, 0x11f41beb, 0x25e229d8, 0x2ad730d1, 0x27e02ed8, 0x34cd2ed7,
++	0x34d92bed, 0x200b0000, 0xfa37043d, 0xf253db7f, 0xeb64f239, 0xf443f547, 0xf64deb55,
++	0xf058e968, 0xf162db7f, 0x00000000, 0xfc2cff45, 0x003ef933, 0xfc2ffa2a, 0xfd29fa35,
++	0x084cf74e, 0xf5530934, 0x0043fb5a, 0x00000000, 0x082c0b2c, 0x0e2a0730, 0x04380434,
++	0x0d250931, 0x133a0a30, 0x0c2d0045, 0x1421083f, 0x00000000, 0xf36ace7f, 0xfb5c1139,
++	0xfb56f35e, 0xf45bfe4d, 0x0047ff49, 0x0440f951, 0x05400f39, 0x00000000, 0x3dc938d2,
++	0x3ece51bd, 0x2dec23fe, 0x1c0f2201, 0x27011e11, 0x1426122d, 0x0f36004f, 0x00000000,
++	0xfb4ff568, 0xf55be27f, 0xf652f830, 0xf83df842, 0xf946f24b, 0xf64ff753, 0xf45cee6c,
++	0x00000000, 0x0143f148, 0xfb4bf850, 0xeb53eb40, 0xf31fe740, 0xe35e094b, 0x113ff84a,
++	0xfb23fe1b, 0x0d5b0000, 0x23ee21e7, 0x1cfd180a, 0x1b0022f2, 0x34d427e8, 0x13111f19,
++	0x241d1821, 0x220f1e14, 0x16490000, 0x01430044, 0xf6430144, 0x004d0240, 0x0044fb4e,
++	0x0737053b, 0x02410e36, 0x0f2c053c, 0x02460000, 0x24f025f2, 0x25ef2001, 0x220f1d0f,
++	0x18192216, 0x1f102312, 0x1f1c2129, 0x241c1b2f, 0x153e0000, 0x0041fe4f, 0x0048fc5c,
++	0xfc4fea45, 0xf04bfe3a, 0x013af34e, 0xf753fc51, 0xf3630000, 0x00000000, 0x0341f945,
++	0x084d0000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x1422131f, 0x1b2c0000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0xfe4cee56, 0x0c460000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x121f131a, 0x24180000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0xfa380344, 0xf847f362, 0xf351fa26, 0xf33efa3a,
++	0xfe3bf049, 0xf64cf356, 0xf753f657, 0x00000000, 0xf642033e, 0xfd44ec51, 0x001e0107,
++	0xfd17eb4a, 0x1042e97c, 0x11252cee, 0x32deea7f, 0x00000000, 0x13100f24, 0x0f24151c,
++	0x19151e14, 0x1f0c1b10, 0x182a005d, 0x0e380f39, 0x1a26e87f, 0x00000000, 0x0540f446,
++	0x0b370538, 0x00450241, 0xfa4a0536, 0x0736fa4c, 0xf552fe4d, 0xfe4d192a, 0x00000000,
++	0x18171b10, 0x181e1f1d, 0x1629162a, 0x103c0f34, 0x0e3c034e, 0xf07b1535, 0x1638193d,
++	0x00000000, 0x00000000, 0x00000000, 0xf747f925, 0xf82cf531, 0xf638f43b, 0xf83ff743,
++	0xfa44f64f, 0x00000000, 0xfd4ef84a, 0xf748f648, 0xee4bf447, 0xf53ffb46, 0xef4bf248,
++	0xf043f835, 0xf23bf734, 0xf5440000, 0x09fe1ef6, 0x1ffc21ff, 0x21071f0c, 0x25171f26,
++	0x14400000, 0x00000000, 0x00000000, 0x00000000, 0xfd4ef84a, 0xf748f648, 0xee4bf447,
++	0xf53ffb46, 0xef4bf248, 0xf043f835, 0xf23bf734, 0xf5440000, 0x09fe1ef6, 0x1ffc21ff,
++	0x21071f0c, 0x25171f26, 0x14400000, 0x00000000, 0x00000000, 0x00000000,
++};
++
++#endif /* HISTB_VDEC_TABLES_H264_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v2_tables_hevc.h
+@@ -0,0 +1,60 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * HEVC CABAC context table (928 bytes) for the Hi3798MV100 VDM.
++ *
++ * The decoder reads the table through picture-message word D25. For each of the
++ * 464 hardware CABAC contexts it holds the byte pair (m, n) of the
++ * initialisation process of ITU-T Rec. H.265 section 9.3.1.1 (m = 5 *
++ * slopeIdx - 45, n = 8 * offsetIdx - 16, slopeIdx/offsetIdx being the nibbles
++ * of the spec initValue); the hardware derives the running (pStateIdx, valMps)
++ * from the slice QP itself, so no QP-expanded image is needed. Contexts are
++ * stored per slice type: 144 entries for I slices followed by two 160-entry
++ * blocks for the inter slice types; contexts the hardware does not use carry
++ * the (0, 0) pair. Two contexts pack into one word in little-endian byte order
++ * (m0, n0, m1, n1).
++ */
++#ifndef HISTB_VDEC_TABLES_HEVC_H
++#define HISTB_VDEC_TABLES_HEVC_H
++
++#include <linux/types.h>
++
++#define HISTB_VDEC_CABAC_MN_HEVC_WORDS	232
++
++static const u32 histb_vdec_cabac_mn_hevc[HISTB_VDEC_CABAC_MN_HEVC_WORDS] = {
++	0x300f3800, 0x58fb48fb, 0x40005800, 0x00000000, 0x00000000, 0x0000300a, 0x00000000,
++	0x68e2300a, 0x40fb60ec, 0x4000200a, 0x58fb68f1, 0x40004000, 0x48fb48fb, 0x380040fb,
++	0x280530fb, 0x30003000, 0x60f160f1, 0x58f650f6, 0x380050fb, 0x68f658f6, 0x58f150fb,
++	0x68fb68f1, 0x68f168f6, 0x50f168e7, 0x68e248f6, 0x60f160f1, 0x58f650f6, 0x380050fb,
++	0x68f658f6, 0x58f150fb, 0x68fb68f1, 0x68f168f6, 0x50f168e7, 0x68e248f6, 0x480548ec,
++	0x58fb20fb, 0x50ec50fb, 0x40fb38fb, 0x300050fb, 0x48fb40fb, 0x40e73800, 0x50ec1800,
++	0x48f148fb, 0x300040f6, 0x080a50fb, 0x200a2005, 0x081950fb, 0x180f40f6, 0x68f168f1,
++	0x60f158f6, 0x60ec60f1, 0x50f150f6, 0x48f150f6, 0x58fb58f6, 0x3800080a, 0x48f158f6,
++	0x58fb58f6, 0x3800080a, 0x48f158f6, 0x58fb58f6, 0x3800080a, 0x50fb58f6, 0x200a48fb,
++	0x3000200a, 0x300030fb, 0x380030fb, 0x48fb30fb, 0x30fb68f1, 0x68f148fb, 0x38000000,
++	0x40fb40fb, 0x00000000, 0x60f168e7, 0x68ec40f6, 0x68e268e7, 0x68d868d8, 0x38003800,
++	0x50fb3005, 0x0000200f, 0x00000000, 0x380a3800, 0x48fb48f1, 0x400060f6, 0x380a180f,
++	0x1800380f, 0x48fb4000, 0x40004000, 0x30004000, 0x48f11800, 0x40002805, 0x68f13800,
++	0x40004000, 0x48fb48fb, 0x280548f1, 0x40f648ec, 0x280548f1, 0x60f158f6, 0x60f160ec,
++	0x68e768ec, 0x68f158f6, 0x60e760f1, 0x68f160f1, 0x68ec68f1, 0x50f160ec, 0x50f148f6,
++	0x60f158f6, 0x60f160ec, 0x68e768ec, 0x68f158f6, 0x60e760f1, 0x68f160f1, 0x68ec68f1,
++	0x50f160ec, 0x50f148f6, 0x50fb38f6, 0x400058e2, 0x100f4000, 0x2805100f, 0x30004000,
++	0x200a2805, 0x20fb200a, 0x30fb1800, 0x38f63800, 0x38fb30fb, 0x000f3805, 0x28052005,
++	0x28054000, 0x200a38fb, 0x40004800, 0x380048fb, 0x48f648fb, 0x68e248f6, 0x20053800,
++	0x50fb280a, 0x380030fb, 0x20054000, 0x50fb280a, 0x380030fb, 0x20054000, 0x50fb280a,
++	0x380030fb, 0x40054000, 0x48f63800, 0x48f148f6, 0x48f138f6, 0x280538f6, 0x280a2800,
++	0x280050fb, 0x50fb280a, 0x50f60000, 0x60ec40fb, 0x00000000, 0x400068e7, 0x68ec38fb,
++	0x68e268e7, 0x68d868d8, 0x38003800, 0x38053005, 0x0000200f, 0x00000000, 0xf0053800,
++	0x48fb48f1, 0x400060f6, 0x380a180f, 0x20fb380f, 0x48fb4000, 0x40004000, 0x3000280a,
++	0x50ec1800, 0x40002805, 0x68f13800, 0x40004000, 0x48fb48fb, 0x280548f1, 0x48f148ec,
++	0x280548f1, 0x60f158f6, 0x60f150f6, 0x60ec68ec, 0x68f158f6, 0x68e768f1, 0x60f658f6,
++	0x68f168f1, 0x50f168e7, 0x58ec48f6, 0x60f158f6, 0x60f150f6, 0x60ec68ec, 0x68f158f6,
++	0x68e768f1, 0x60f658f6, 0x68f168f1, 0x50f168e7, 0x58ec48f6, 0x50fb38f6, 0x400058e2,
++	0x100f4000, 0x28052805, 0x30004000, 0x200a2805, 0x20fb200a, 0x30fb1800, 0x38f63800,
++	0x40f630fb, 0xf0143805, 0x28052005, 0x30004000, 0x200a2805, 0x40004005, 0x380048fb,
++	0x48f648fb, 0x68e248f6, 0x200550f6, 0x50fb280a, 0x380030fb, 0x20054000, 0x50fb280a,
++	0x380030fb, 0x20054000, 0x50fb280a, 0x380030fb, 0x40054000, 0x40fb3800, 0x40f640fb,
++	0x40f638f6, 0x280538f6, 0x280a2800, 0x280050fb, 0x50fb280a, 0xf0190000, 0x40f62805,
++	0x00000000,
++};
++
++#endif /* HISTB_VDEC_TABLES_HEVC_H */

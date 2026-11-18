@@ -1,0 +1,37 @@
+From ef3d5eaf345e349e843887ec16602554bd77c206 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 16:52:23 +0800
+Subject: [PATCH 5/5] MAINTAINERS: add the HiSilicon STB display driver entry
+
+The HiSTB display pipeline has no maintainer entry. The DRM driver, the
+SiI9134 transmitter glue and both bindings are reviewed as one unit
+through dri-devel.
+
+Register the DRM directory, the bridge driver and the VDP and HDMI
+bindings.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ MAINTAINERS | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -8354,6 +8354,17 @@ T:	git https://gitlab.freedesktop.org/dr
+ F:	Documentation/devicetree/bindings/display/panel/himax,hx8394.yaml
+ F:	drivers/gpu/drm/panel/panel-himax-hx8394.c
+ 
++DRM DRIVER FOR HISILICON STB VDP2 AND HDMI TRANSMITTER
++M:	David Yang <mmyangfl@gmail.com>
++L:	dri-devel@lists.freedesktop.org
++S:	Supported
++F:	Documentation/devicetree/bindings/display/bridge/hisilicon,hi3798mv100-hdmi.yaml
++F:	Documentation/devicetree/bindings/display/hisilicon/hisilicon,hi3716cv200-vdp.yaml
++F:	drivers/gpu/drm/bridge/hi3798mv100-hdmi.c
++F:	drivers/gpu/drm/bridge/sii9134.c
++F:	drivers/gpu/drm/bridge/sii9134.h
++F:	drivers/gpu/drm/histb/
++
+ DRM DRIVER FOR HX8357D PANELS
+ S:	Orphan
+ T:	git https://gitlab.freedesktop.org/drm/misc/kernel.git

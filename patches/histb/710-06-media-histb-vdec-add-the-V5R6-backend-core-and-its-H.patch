@@ -1,0 +1,3717 @@
+From 3fda0a9c3b5bad4e38af78a82385a04c142ae1c0 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 3 Nov 2026 14:41:30 +0800
+Subject: [PATCH 6/10] media: histb-vdec: add the V5R6 backend core and its
+ H.264 path
+
+The HiVDHV5R6C02 block of Hi3798MV200H takes a command image in DMA
+memory instead of packed syntax registers, owns a memory-management unit
+of its own and writes NV21 in 16-row bands. Add the plumbing that starts
+a job and the H.264 command path, registered through the variant the
+shared core already dispatches on. HEVC, MPEG-2 and MPEG-4 follow.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../platform/hisilicon/histb-vdec/Kconfig     |   19 +-
+ .../platform/hisilicon/histb-vdec/Makefile    |    4 +
+ .../hisilicon/histb-vdec/histb_vdec_core.c    |    2 +
+ .../hisilicon/histb-vdec/histb_vdec_core.h    |    1 +
+ .../hisilicon/histb-vdec/histb_vdec_v5.h      |  332 ++++
+ .../hisilicon/histb-vdec/histb_vdec_v5_core.c |  718 +++++++++
+ .../hisilicon/histb-vdec/histb_vdec_v5_drv.c  |  210 +++
+ .../hisilicon/histb-vdec/histb_vdec_v5_h264.c | 1408 +++++++++++++++++
+ .../hisilicon/histb-vdec/histb_vdec_v5_hw.c   |  311 ++++
+ .../hisilicon/histb-vdec/histb_vdec_v5_regs.h |  217 +++
+ .../histb-vdec/histb_vdec_v5_tables_h264.h    |  340 ++++
+ .../histb-vdec/histb_vdec_v5_tables_hevc.h    |   61 +
+ 12 files changed, 3616 insertions(+), 7 deletions(-)
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_core.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_drv.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_h264.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_hw.c
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_regs.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_tables_h264.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_tables_hevc.h
+
+--- a/drivers/media/platform/hisilicon/histb-vdec/Kconfig
++++ b/drivers/media/platform/hisilicon/histb-vdec/Kconfig
+@@ -14,14 +14,19 @@ config VIDEO_HISTB_VDEC
+ 	  request controls, and the hardware decodes H.264, HEVC, MPEG-2,
+ 	  MPEG-4 and H.263 into NV21 frames.
+ 
+-	  This backend serves the Hi3716CV200 part (HiVDHV200R004) and the
+-	  Hi3798MV100 part (HiVDHV300R001): both pack fully parsed syntax into
+-	  a downstream message pool and write 16x16-tiled frames, and the V2
+-	  part has no HEVC path, so HEVC is offered only on Hi3798MV100.
++	  Two hardware generations are covered. The v2 backend serves the
++	  Hi3716CV200 part (HiVDHV200R004) and the Hi3798MV100 part
++	  (HiVDHV300R001): both pack fully parsed syntax into a downstream
++	  message pool and write 16x16-tiled frames, and the V2 part has no
++	  HEVC path, so HEVC is offered only on Hi3798MV100. The v5 backend
++	  drives the HiVDHV5R6C02 block of hi3798mv200h, which takes a command
++	  image and writes NV21 in 16-row bands.
+ 
+-	  The backend suffix is the hardware generation it starts from: v2
+-	  covers VDH V2/V3. It is not the vendor's vdec_vX.Y layer number,
+-	  which counts these parts the other way round (vdec_v1.0 for these).
++	  The backend suffix is the hardware generation it starts from, taken
++	  the same way in both video blocks: v2 covers VDH V2/V3, v5 covers VDH
++	  V5R6. It is not the vendor's vdec_vX.Y layer number, which counts
++	  these parts the other way round (vdec_v1.0 for the v2 backends,
++	  vdec_v2.1 for the v5 ones).
+ 
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called histb-vdec.
+--- a/drivers/media/platform/hisilicon/histb-vdec/Makefile
++++ b/drivers/media/platform/hisilicon/histb-vdec/Makefile
+@@ -8,3 +8,7 @@ histb-vdec-y += histb_vdec_v2_h264.o
+ histb-vdec-y += histb_vdec_v2_hevc.o
+ histb-vdec-y += histb_vdec_v2_mpeg2.o
+ histb-vdec-y += histb_vdec_v2_mpeg4.o
++histb-vdec-y += histb_vdec_v5_drv.o
++histb-vdec-y += histb_vdec_v5_hw.o
++histb-vdec-y += histb_vdec_v5_core.o
++histb-vdec-y += histb_vdec_v5_h264.o
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.c
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.c
+@@ -1044,6 +1044,8 @@ static const struct of_device_id histb_v
+ 	  .data = &histb_vdec_v2_mv100_variant },
+ 	{ .compatible = "hisilicon,hi3716cv200-vdec",
+ 	  .data = &histb_vdec_v2_cv200_variant },
++	{ .compatible = "hisilicon,hi3798mv200-vdec",
++	  .data = &histb_vdec_v5_mv200h_variant },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, histb_vdec_of_match);
+--- a/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.h
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_core.h
+@@ -164,6 +164,7 @@ struct histb_vdec_variant {
+ 
+ extern const struct histb_vdec_variant histb_vdec_v2_mv100_variant;
+ extern const struct histb_vdec_variant histb_vdec_v2_cv200_variant;
++extern const struct histb_vdec_variant histb_vdec_v5_mv200h_variant;
+ 
+ /* Registration and teardown of the media node; called by a backend's probe. */
+ int histb_vdec_core_init(struct histb_vdec_common *common,
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5.h
+@@ -0,0 +1,332 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * HiSilicon HiSTB V5R6 video decoder, driver contract.
++ *
++ * The hardware consumes fully parsed syntax: userspace submits per-frame
++ * parsing results through the V4L2 stateless controls, the driver packs them
++ * into the downstream message slots, programs the core and rings the doorbell.
++ * Slot geometry, the launch sequence and the message fields follow
++ * the V5R6 ABI note of this project; the register names come from the
++ * vendor header for the sibling revision of this core.
++ */
++#ifndef HISTB_VDEC_V5_H
++#define HISTB_VDEC_V5_H
++
++#include <linux/dma-mapping.h>
++#include <linux/kernel.h>
++#include <linux/wait.h>
++#include <linux/videodev2.h>
++
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-v4l2.h>
++
++#include "histb_vdec_core.h"
++#include "histb_vdec_v5_regs.h"
++
++#define HISTB_VDEC_V5_NAME		"histb-vdec-v5"
++
++/*
++ * One downstream message slot holds 256 words and, for this channel, the slots
++ * step by one slot: the H.264 assembly indexes a slot as index times 2 to the
++ * 10, the picture message of a frame sits at the table's fourth slot, and the
++ * first slice message right behind it. The engine takes the slice message at
++ * one step past the picture message, so the stride is what puts a descriptor
++ * where the core looks for it.
++ */
++#define V5R6_SLOT_WORDS			256
++#define V5R6_SLOT_BYTES			(V5R6_SLOT_WORDS * 4)
++#define V5R6_SLOT_STRIDE		1024
++#define V5R6_SLOT_NUM			210
++
++/* Slot indices: upstream reports, repair, picture, then the slice chain. */
++#define V5R6_SLOT_UP			0
++#define V5R6_SLOT_RP			2
++#define V5R6_SLOT_PIC			4
++#define V5R6_SLOT_SLICE			5
++#define V5R6_MAX_SLICES			136
++
++/* The upstream record is four words per slice, up to 200 slices. */
++#define V5R6_UP_WORDS_PER_SLICE		4
++#define V5R6_UP_MAX_SLICES		200
++
++/* Reference and motion-history limits this generation offers. */
++#define V5R6_MAX_DPB_SLOTS		16
++#define V5R6_MAX_FRAMES			32
++#define V5R6_MAX_PMV_SLOTS		20
++#define V5R6_MAX_WIDTH			4096
++#define V5R6_MAX_HEIGHT			2304
++
++/* A launch that does not report in that long is not going to. */
++#define V5R6_TIMEOUT			msecs_to_jiffies(500)
++#define V5R6_TIMEOUT_MS_POLL		200
++
++/* Nominal OUTPUT (bitstream) plane size. */
++#define V5R6_OUTPUT_SIZE_DEFAULT	(3 * 1024 * 1024)
++
++struct histb_vdec_v5;
++struct histb_vdec_v5_ctx;
++
++/**
++ * struct histb_vdec_v5_codec_ops - message production for one protocol.
++ * @run:	pack the picture slot and the slice chain of one access unit,
++ *		program the core and wait for it, for the frame the caller
++ *		handed as destination surface.
++ * @try_ctrl:	reject control values this protocol cannot express to the core.
++ * @stop:	drop whatever per-stream state the protocol kept for a context.
++ */
++struct histb_vdec_v5_codec_ops {
++	int (*run)(struct histb_vdec_v5_ctx *ctx, struct vb2_v4l2_buffer *src,
++		   struct vb2_v4l2_buffer *dst);
++	int (*try_ctrl)(struct v4l2_ctrl *ctrl);
++	void (*stop)(struct histb_vdec_v5_ctx *ctx);
++	/* @buf_release: the capture buffer at @index is gone; drop whatever
++	 * slots this protocol gave it. @index is not a slot id here. */
++	void (*buf_release)(struct histb_vdec_v5_ctx *ctx, unsigned int index);
++};
++
++/**
++ * histb_vdec_v5_fmt_desc - one protocol's description of itself.
++ * @fourcc:	OUTPUT format.
++ * @vidstd:	value for CFG1's video_standard field.
++ * @ctrls:	stateless controls this protocol needs, and how many.
++ * @ops:	how to turn the controls of one access unit into message slots.
++ * @stride:	band pitch the core writes for a coded width, which is also the
++ *		bytesperline the capture queue has to advertise.
++ * @grid_align:	height granularity of that pitch, in lines.
++ */
++typedef struct histb_vdec_fmt histb_vdec_v5_fmt_desc;
++typedef struct histb_vdec_chip histb_vdec_v5_chip_t;
++
++/* Per-protocol descriptors, defined by the codec sources. */
++extern const histb_vdec_v5_fmt_desc histb_vdec_v5_h264_fmt;
++extern const histb_vdec_v5_fmt_desc histb_vdec_v5_hevc_fmt;
++extern const histb_vdec_v5_fmt_desc histb_vdec_v5_mpeg2_fmt;
++extern const histb_vdec_v5_fmt_desc histb_vdec_v5_mpeg4_fmt;
++extern const histb_vdec_v5_fmt_desc histb_vdec_v5_h263_fmt;
++
++/*
++ * A capture buffer as the core sees it: the luma start, the geometry the
++ * launch is programmed with, and the two slot ids the messages use -- the
++ * picture container the reference lists name, and the motion-history area the
++ * core keeps for this surface.
++ */
++struct histb_vdec_v5_frame {
++	dma_addr_t	dma;
++	void		*va;
++	unsigned int	index;
++	unsigned int	apc_slot;
++	unsigned int	pmv_slot;
++	unsigned int	pitch;
++	unsigned int	height;
++	size_t		size;
++	bool		used;
++};
++
++/*
++ * The motion-history areas the core keeps per reference surface, one block per
++ * picture container in one allocation per context. The vendor sizes a block as
++ * one macroblock row of 64 bytes per macroblock, with room for the row beyond
++ * the coded grid.
++ */
++struct histb_vdec_v5_pmv {
++	struct device	*dev;
++	dma_addr_t	dma;
++	void		*va;
++	size_t		slot_bytes;
++	unsigned int	slots;
++};
++
++struct histb_vdec_v5_ctx {
++	struct v4l2_fh		fh;
++	struct v4l2_ctrl_handler ctrl_hdl;
++	const struct histb_vdec_fmt *desc;
++	struct v4l2_format	out_fmt;
++	struct v4l2_format	cap_fmt;
++
++	/* One record per capture buffer of this context's capture queue, so a
++	 * reference can be named by the buffer index the engine is given.
++	 */
++	struct histb_vdec_v5_frame frames[V5R6_MAX_FRAMES];
++	u8			apc_next;
++	u8			pmv_next;
++	struct histb_vdec_v5_pmv	pmv;
++
++	/* What the last submitted picture claims to cover, for the
++	 * report-coverage check the completion path runs.
++	 */
++	unsigned int		mbs;
++	unsigned int		slices;
++
++	void			*priv;
++};
++
++/*
++ * Pool layout, taken from the vendor build's own OpenHAL: the slot array
++ * starts at the 1024-aligned pool base and the constant tables and the
++ * neighbour-history areas follow at fixed offsets. Several unrelated names
++ * point at one area, which is why they are grouped here rather than one per
++ * message word.
++ */
++#define V5R6_POOL_BYTES			0x96000	/* GetHalMemSize(): 614400 */
++#define V5R6_POOL_SED_LEFT_PHY		0x41000	/* also pmv_top and pmv_left */
++#define V5R6_POOL_CABAC_MN_H264		0x41c00
++#define V5R6_POOL_RCNTOP_PHY		0x42c00	/* also the tile/segment image */
++#define V5R6_POOL_CABAC_MN_HEVC		0x43000
++#define V5R6_POOL_DBLKLEFT_PHY		0x43300
++#define V5R6_POOL_DBLKTOP_PHY		0x49600	/* also sao_left */
++#define V5R6_POOL_NEIGHBOURS		0x4c000	/* the CPU-side view of all five */
++#define V5R6_POOL_SAO_TOP_PHY		0x55000	/* also the upstream slot image */
++#define V5R6_POOL_PPFD			0x55c00
++
++/*
++ * The per-picture tables each get a span of the length this revision's
++ * firmware gives it, so that the history one stage writes cannot land inside
++ * the input of another. They sit past the vendor pool's own map, which the
++ * constants above keep describing.
++ */
++#define V5R6_TBL_SED_TOP		0x56000
++#define V5R6_TBL_PMV_TOP		(V5R6_TBL_SED_TOP + 352 * 96)
++#define V5R6_TBL_RCNT_TOP		(V5R6_TBL_PMV_TOP + 352 * 128)
++#define V5R6_TBL_DBLK_TOP		(V5R6_TBL_RCNT_TOP + 352 * 128)
++#define V5R6_TBL_PMV_FRAME		(V5R6_TBL_DBLK_TOP + 352 * 192)
++#define V5R6_TBL_END			(V5R6_TBL_PMV_FRAME + 25600)
++
++static_assert(V5R6_TBL_END <= V5R6_POOL_BYTES,
++	      "the per-picture tables do not fit the pool");
++
++/*
++ * Frame geometry the vendor's ArrangeMem programs, for the uncompressed 8-bit
++ * write path: the luma band pitch is ALIGN256(ALIGN16(width)) for the
++ * macroblock protocols, the chroma plane starts at pitch * ALIGN32(height),
++ * and a frame slot is the two planes plus their 1.5x accounting.
++ */
++#define V5R6_BAND_PITCH(width)	ALIGN(ALIGN(width, 16), 256)
++
++
++/*
++ * Message pool: one allocation, owned by the device, borrowed by the job in
++ * flight. The slots hold the downstream messages, the upstream reports and the
++ * per-protocol constant tables; the neighbour-history areas the core reads back
++ * sit after them. Addresses handed to the core are 16-byte aligned.
++ */
++struct histb_vdec_v5_pool {
++	dma_addr_t	dma;
++	void		*va;
++	size_t		size;
++	unsigned int	slot_off;	/* the vendor's own pool base alignment */
++};
++
++struct histb_vdec_v5 {
++	struct histb_vdec_common common;
++	struct device		*dev;
++	void __iomem		*base;
++	int			irq;
++
++	const struct histb_vdec_chip *chip;
++
++	struct histb_vdec_v5_pool	pool;
++	struct mutex		hw_lock;	/* one frame at a time */
++	spinlock_t		irq_lock;
++	struct completion	done;
++	u32			int_state;
++	u32			last_state;
++	struct regmap		*crg;
++	atomic_t		open_count;
++	wait_queue_head_t	open_wq;
++};
++
++static inline void *histb_vdec_v5_slot(struct histb_vdec_v5 *dec,
++				     unsigned int index)
++{
++	return dec->pool.va + dec->pool.slot_off + index * V5R6_SLOT_STRIDE;
++}
++
++static inline dma_addr_t histb_vdec_v5_slot_dma(struct histb_vdec_v5 *dec,
++					      unsigned int index)
++{
++	return dec->pool.dma + dec->pool.slot_off +
++	       index * (dma_addr_t)V5R6_SLOT_STRIDE;
++}
++
++/*
++ * One frame handed to the core. The message slots are already packed by the
++ * protocol layer; the launch only programs the addresses and rings the doorbell.
++ */
++struct histb_vdec_v5_job {
++	u32	cfg0;		/* the engine's first config word, as the protocol builds it */
++	u32	cfg1;		/* the engine's second config word */
++	u32	to_val;		/* stage watchdog value for all eight stages */
++	u32	reg_shift;	/* unit of the address registers, as a right shift */
++	unsigned int pitch;		/* band pitch in bytes, as the core counts it */
++	dma_addr_t stream;		/* bitstream base, 16-byte aligned */
++	dma_addr_t recon;		/* reconstructed frame base */
++	unsigned int uv_offset;		/* chroma start from the luma base */
++	dma_addr_t pic_dma;		/* picture message slot the core reads */
++	dma_addr_t up_dma;		/* report slot the core fills */
++	void		*pic;		/* packed picture slot */
++	void		*slice;		/* packed first slice slot */
++};
++
++/* hw.c */
++void histb_vdec_v5_clocks(struct histb_vdec_v5 *dec, bool on);
++int histb_vdec_v5_pool_alloc(struct histb_vdec_v5 *dec);
++void histb_vdec_v5_pool_seed(struct histb_vdec_v5 *dec);
++int histb_vdec_v5_launch(struct histb_vdec_v5 *dec, const struct histb_vdec_v5_job *job);
++void histb_vdec_v5_abort(struct histb_vdec_v5 *dec);
++
++/* drv.c, used by the protocol sources */
++
++/* v4l2.c, the media node this driver offers. */
++int histb_vdec_v5_probe(struct platform_device *pdev,
++			const struct histb_vdec_gen *gen);
++void histb_vdec_v5_remove(struct platform_device *pdev);
++int histb_vdec_v5_runtime_suspend(struct device *dev);
++int histb_vdec_v5_runtime_resume(struct device *dev);
++void histb_vdec_v5_watchdog(struct work_struct *work);
++
++/* hw.c, the per-context motion-history areas. */
++int histb_vdec_v5_pmv_alloc(struct histb_vdec_v5 *dec, struct histb_vdec_v5_ctx *ctx,
++			  unsigned int mbs);
++void histb_vdec_v5_pmv_free(struct histb_vdec_v5_ctx *ctx);
++static inline void histb_vdec_v5_write(struct histb_vdec_v5 *dec, unsigned int reg,
++				     u32 val)
++{
++	writel(val, dec->base + reg);
++}
++
++static inline u32 histb_vdec_v5_read(struct histb_vdec_v5 *dec, unsigned int reg)
++{
++	return readl(dec->base + reg);
++}
++
++/*
++ * This generation hands the core 16-byte granules, in the address registers
++ * and in the address words of the messages alike. The older engine takes byte
++ * addresses, so nothing here may be shared between the two.
++ */
++#define V5R6_ADDR_SHIFT			4
++
++static inline u32 histb_vdec_v5_addr_at(dma_addr_t dma, unsigned int shift)
++{
++	return (lower_32_bits(dma) & ~15U) >> shift;
++}
++
++static inline u32 histb_vdec_v5_addr(dma_addr_t dma)
++{
++	return histb_vdec_v5_addr_at(dma, V5R6_ADDR_SHIFT);
++}
++
++/* drv.c, for the protocol sources. */
++struct histb_vdec_v5 *histb_vdec_v5_of_ctx(const struct histb_vdec_v5_ctx *ctx);
++void histb_vdec_v5_buf_geom(const struct histb_vdec_v5_ctx *ctx, unsigned int *pitch,
++			  unsigned int *lines, unsigned int *uv_offset);
++unsigned int histb_vdec_v5_frame_size(const struct histb_vdec_v5_ctx *ctx,
++				    unsigned int width, unsigned int height);
++unsigned int histb_vdec_v5_linear_size(unsigned int width, unsigned int height);
++struct histb_vdec_v5_frame *
++histb_vdec_v5_frame_of(struct histb_vdec_v5_ctx *ctx, unsigned int index);
++
++#endif /* HISTB_VDEC_V5_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_core.c
+@@ -0,0 +1,718 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * HiSilicon HiSTB V5R6 stateless decoder backend.
++ *
++ * This generation decodes out of a command-image pool: the protocol sources
++ * pack the message slots, the launch programs the core and the job thread
++ * waits for the interrupt the platform driver owns. The V4L2 node, the queues,
++ * the format negotiation and the request validation live in histb_vdec_core.c.
++ */
++
++#include <linux/dma-buf.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/media.h>
++#include <linux/mutex.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++#include <media/media-device.h>
++#include <media/v4l2-dev.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "histb_vdec_v5.h"
++
++/* The core casts the allocation to its prefix; both layouts must agree. */
++static_assert(offsetof(struct histb_vdec_v5_ctx, fh) == offsetof(struct histb_vdec_core_ctx, fh));
++static_assert(offsetof(struct histb_vdec_v5_ctx, ctrl_hdl) ==
++	      offsetof(struct histb_vdec_core_ctx, ctrl_hdl));
++static_assert(offsetof(struct histb_vdec_v5_ctx, desc) ==
++	      offsetof(struct histb_vdec_core_ctx, desc));
++static_assert(offsetof(struct histb_vdec_v5_ctx, out_fmt) ==
++	      offsetof(struct histb_vdec_core_ctx, out_fmt));
++static_assert(offsetof(struct histb_vdec_v5_ctx, cap_fmt) ==
++	      offsetof(struct histb_vdec_core_ctx, cap_fmt));
++
++/*
++ * The core hands v4l2 the common prefix and this backend casts it back, which
++ * holds while that prefix sits at offset zero.
++ */
++static_assert(offsetof(struct histb_vdec_v5, common) == 0);
++
++
++static bool histb_vdec_v5_frames_empty(const struct histb_vdec_v5_ctx *ctx);
++
++static const struct histb_vdec_v5_codec_ops *
++histb_vdec_v5_ops(const void *p)
++{
++	const struct histb_vdec_core_ctx *ctx = p;
++
++	return ctx->desc->ops;
++}
++
++struct histb_vdec_v5 *histb_vdec_v5_of_ctx(const struct histb_vdec_v5_ctx *ctx)
++{
++	return video_get_drvdata(ctx->fh.vdev);
++}
++
++/*
++ * This generation is one part, so the protocol list the node negotiates is the
++ * one the block was built for, and its first entry is the fourcc a freshly
++ * opened file starts on.
++ */
++static const histb_vdec_v5_fmt_desc *const histb_vdec_v5_fmt_list[] = {
++	&histb_vdec_v5_h264_fmt,
++};
++
++static const struct histb_vdec_chip histb_vdec_v5_chip_mv200h = {
++	.model = "HI3798MV200H VDH",
++	.fmts = histb_vdec_v5_fmt_list,
++	.num_fmts = ARRAY_SIZE(histb_vdec_v5_fmt_list),
++};
++
++unsigned int histb_vdec_v5_frame_size(const struct histb_vdec_v5_ctx *ctx,
++				    unsigned int width, unsigned int height)
++{
++	return V5R6_BAND_PITCH(width) *
++	       ALIGN(ALIGN(height, ctx->desc->grid_align), 32) * 3 / 2;
++}
++
++unsigned int histb_vdec_v5_linear_size(unsigned int width, unsigned int height)
++{
++	return ALIGN(width, 16) * height * 3 / 2;
++}
++
++void histb_vdec_v5_buf_geom(const struct histb_vdec_v5_ctx *ctx,
++			  unsigned int *pitch, unsigned int *lines,
++			  unsigned int *uv_offset)
++{
++	const struct v4l2_pix_format_mplane *pix = histb_vdec_cap_pix(ctx);
++
++	*pitch = V5R6_BAND_PITCH(pix->width);
++	*lines = ALIGN(pix->height, ctx->desc->grid_align);
++	*uv_offset = *pitch * ALIGN(*lines, 32);
++}
++
++static int histb_vdec_v5_buf_init(struct vb2_buffer *vb)
++{
++	struct histb_vdec_v5_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct histb_vdec_v5 *dec = histb_vdec_v5_of_ctx(ctx);
++	struct histb_vdec_v5_frame *frame;
++	unsigned int pitch, lines, uv_offset;
++
++	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
++		return 0;
++
++	frame = &ctx->frames[vb->index];
++	frame->index = vb->index;
++	histb_vdec_v5_buf_geom(ctx, &pitch, &lines, &uv_offset);
++	frame->pitch = pitch;
++	frame->height = lines;
++
++	/*
++	 * The core writes the tiled surface; the buffer userspace owns is the
++	 * linear frame the completion path de-tiles into.
++	 */
++	frame->size = histb_vdec_v5_frame_size(ctx, histb_vdec_cap_pix(ctx)->width,
++					     histb_vdec_cap_pix(ctx)->height);
++	frame->va = dma_alloc_coherent(dec->dev, frame->size, &frame->dma,
++				       GFP_KERNEL);
++	if (!frame->va)
++		return -ENOMEM;
++
++	/* The slot ids are the protocol's to give, when a message needs them. */
++	frame->used = true;
++
++	return 0;
++}
++
++static void histb_vdec_v5_buf_cleanup(struct vb2_buffer *vb)
++{
++	struct histb_vdec_v5_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
++		return;
++
++	if (ctx->desc && histb_vdec_v5_ops(ctx)->buf_release)
++		histb_vdec_v5_ops(ctx)->buf_release(ctx, vb->index);
++	if (ctx->frames[vb->index].va) {
++		struct histb_vdec_v5 *dec = histb_vdec_v5_of_ctx(ctx);
++
++		dma_free_coherent(dec->dev, ctx->frames[vb->index].size,
++				  ctx->frames[vb->index].va,
++				  ctx->frames[vb->index].dma);
++	}
++	ctx->frames[vb->index] = (struct histb_vdec_v5_frame){};
++
++	if (histb_vdec_v5_frames_empty(ctx)) {
++		ctx->apc_next = 0;
++		ctx->pmv_next = 0;
++	}
++}
++
++struct histb_vdec_v5_frame *
++histb_vdec_v5_frame_of(struct histb_vdec_v5_ctx *ctx, unsigned int index)
++{
++	if (index >= V5R6_MAX_FRAMES || !ctx->frames[index].used)
++		return NULL;
++
++	return &ctx->frames[index];
++}
++
++static bool histb_vdec_v5_frames_empty(const struct histb_vdec_v5_ctx *ctx)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(ctx->frames); i++) {
++		if (ctx->frames[i].used)
++			return false;
++	}
++
++	return true;
++}
++
++static unsigned int histb_vdec_v5_coded_mbs(const struct histb_vdec_v5_ctx *ctx)
++{
++	const struct v4l2_pix_format_mplane *pix = histb_vdec_cap_pix(ctx);
++
++	return (pix->width / 16) *
++	       (ALIGN(pix->height, ctx->desc->grid_align) / 16);
++}
++
++static bool histb_vdec_v5_job_take(struct histb_vdec_common *common,
++				 struct histb_vdec_job *out)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&common->job_lock, flags);
++	if (!common->job_running) {
++		spin_unlock_irqrestore(&common->job_lock, flags);
++		return false;
++	}
++	*out = common->job;
++	common->job_running = false;
++	common->job = (struct histb_vdec_job){};
++	spin_unlock_irqrestore(&common->job_lock, flags);
++	return true;
++}
++
++static void histb_vdec_v5_job_finish(struct histb_vdec_v5 *dec,
++				   const struct histb_vdec_job *job,
++				   enum vb2_buffer_state state)
++{
++	v4l2_m2m_buf_done_and_job_finish(dec->common.m2m_dev, job->ctx->fh.m2m_ctx, state);
++	pm_runtime_put(dec->dev);
++}
++
++static void histb_vdec_v5_job_failed(struct histb_vdec_v5 *dec,
++				   const struct histb_vdec_job *job)
++{
++	struct histb_vdec_common *common = &dec->common;
++	struct vb2_v4l2_buffer *dst;
++
++	cancel_delayed_work(&common->watchdog);
++
++	/*
++	 * A launch that was rung but did not report leaves the core writing
++	 * into the surface this job named, so the next job would be programmed
++	 * against a busy pipeline. The pulse costs nothing on an idle core,
++	 * which is what a run() that refused before the doorbell leaves behind.
++	 */
++	histb_vdec_v5_abort(dec);
++
++	/*
++	 * Nothing was copied out of the internal surface, so the capture buffer
++	 * holds the picture before it, and the ERROR flag alone cannot tell that
++	 * apart: an empty payload says the engine delivered nothing, the same
++	 * rule the older backend's refusals follow.
++	 */
++	dst = v4l2_m2m_next_dst_buf(job->ctx->fh.m2m_ctx);
++	if (dst)
++		vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++
++	histb_vdec_v5_job_finish(dec, job, VB2_BUF_STATE_ERROR);
++}
++
++static void histb_vdec_v5_recover(struct histb_vdec_common *common, const char *why)
++{
++	struct histb_vdec_v5 *dec = common->priv;
++	struct histb_vdec_job job;
++
++	if (!histb_vdec_v5_job_take(common, &job))
++		return;
++
++	dev_err(dec->dev,
++		"%s: state=%#010x int=%#010x cycles=%u rd=%u wr=%u\n",
++		why, dec->last_state, dec->int_state,
++		histb_vdec_v5_read(dec, V5R6_DEC_CYCLES),
++		histb_vdec_v5_read(dec, V5R6_RD_REQ_PER_PIC),
++		histb_vdec_v5_read(dec, V5R6_WR_REQ_PER_PIC));
++
++	histb_vdec_v5_job_failed(dec, &job);
++}
++
++void histb_vdec_v5_watchdog(struct work_struct *work)
++{
++	struct histb_vdec_common *common =
++		container_of(to_delayed_work(work), struct histb_vdec_common,
++			     watchdog);
++
++	histb_vdec_v5_recover(common, "frame decode timed out");
++}
++
++static bool histb_vdec_v5_short_coverage(struct histb_vdec_v5 *dec,
++				       const struct histb_vdec_v5_ctx *ctx)
++{
++	const u32 *rep = histb_vdec_v5_slot(dec, V5R6_SLOT_UP);
++	unsigned int i, slices = ctx->mbs ? ctx->slices : 0;
++	u32 max_end = 0;
++
++	if (!slices || !ctx->mbs)
++		return false;
++
++	for (i = 0; i < slices && i < V5R6_MAX_SLICES; i++)
++		max_end = max(max_end, rep[4 * i + 2]);
++
++	if (max_end + 1 == ctx->mbs)
++		return false;
++
++	dev_err(dec->dev, "picture reports %u of %u macroblocks\n",
++		max_end + 1, ctx->mbs);
++	return true;
++}
++
++static inline unsigned int histb_vdec_v5_tile_luma(unsigned int row,
++						 unsigned int col,
++						 unsigned int pitch)
++{
++	unsigned int band = row / 16, r = row % 16;
++	unsigned int tile = col / 256, c = col % 256;
++	unsigned int group = c / 64, inner = c % 64;
++	unsigned int sub = r / 4, line = r % 4;
++	unsigned int block = (4 * group + sub) ^ group;
++
++	return band * pitch * 16 + tile * 4096 + block * 256 + line * 64 + inner;
++}
++
++static inline unsigned int histb_vdec_v5_tile_chroma(unsigned int row,
++						   unsigned int col,
++						   unsigned int pitch,
++						   unsigned int uv)
++{
++	unsigned int band = row / 8, r = row % 8;
++	unsigned int byte = col * 2;
++	unsigned int tile = byte / 256, c = byte % 256;
++	unsigned int group = c / 64, inner = c % 64;
++	unsigned int sub = r / 4, line = r % 4;
++	unsigned int block = 2 * group + (sub ^ (group & 1));
++
++	return uv + band * pitch * 8 + tile * 2048 + block * 256 + line * 64 +
++	       inner;
++}
++
++static void histb_vdec_v5_detile_frame(const u8 *src, u8 *dst, unsigned int width,
++				     unsigned int height, unsigned int pitch,
++				     unsigned int uv, unsigned int stride)
++{
++	unsigned int row, col;
++
++	for (row = 0; row < height; row++)
++		for (col = 0; col < width; col++)
++			dst[row * stride + col] =
++				src[histb_vdec_v5_tile_luma(row, col, pitch)];
++	for (row = 0; row < height / 2; row++)
++		for (col = 0; col < width / 2; col++) {
++			unsigned int off =
++				histb_vdec_v5_tile_chroma(row, col, pitch, uv);
++			u8 *p = dst + stride * height + row * stride + 2 * col;
++
++			p[0] = src[off];
++			p[1] = src[off + 1];
++		}
++}
++
++static bool histb_vdec_v5_detile_dst(struct histb_vdec_v5_ctx *ctx,
++				   struct vb2_v4l2_buffer *dst)
++{
++	struct histb_vdec_v5_frame *frame =
++		histb_vdec_v5_frame_of(ctx, dst->vb2_buf.index);
++	const struct v4l2_pix_format_mplane *pix = histb_vdec_cap_pix(ctx);
++	struct dma_buf *dbuf = dst->vb2_buf.planes[0].dbuf;
++	unsigned int pitch, lines, uv, stride = ALIGN(pix->width, 16);
++	u8 *out;
++	int ret;
++
++	if (frame == NULL || frame->va == NULL)
++		return false;
++	out = vb2_plane_vaddr(&dst->vb2_buf, 0);
++	if (out == NULL)
++		return false;
++
++	histb_vdec_v5_buf_geom(ctx, &pitch, &lines, &uv);
++	if (dbuf) {
++		ret = dma_buf_begin_cpu_access(dbuf, DMA_TO_DEVICE);
++		if (ret)
++			return false;
++	}
++	histb_vdec_v5_detile_frame(frame->va, out, pix->width, pix->height,
++				 pitch, uv, stride);
++	if (dbuf)
++		dma_buf_end_cpu_access(dbuf, DMA_TO_DEVICE);
++
++	return true;
++}
++
++static void histb_vdec_v5_device_run(void *priv)
++{
++	struct histb_vdec_v5_ctx *ctx = priv;
++	struct histb_vdec_v5 *dec = histb_vdec_v5_of_ctx(ctx);
++	struct histb_vdec_common *common = &dec->common;
++	struct histb_vdec_job job;
++	struct vb2_v4l2_buffer *src, *dst;
++	unsigned int gen;
++	bool failed, short_cov, timed_out;
++	unsigned long flags;
++	int ret;
++
++	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
++	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	if (WARN_ON(!src) || WARN_ON(!dst))
++		return;
++
++	if (READ_ONCE(dec->common.removing)) {
++		v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req,
++					   &ctx->ctrl_hdl);
++		vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++		v4l2_m2m_buf_done_and_job_finish(dec->common.m2m_dev, ctx->fh.m2m_ctx,
++						 VB2_BUF_STATE_ERROR);
++		return;
++	}
++
++	ret = pm_runtime_resume_and_get(dec->dev);
++	if (ret) {
++		dev_dbg(dec->dev, "runtime resume failed: %d\n", ret);
++		goto err_no_pm;
++	}
++
++	mutex_lock(&dec->hw_lock);
++
++	spin_lock_irqsave(&common->job_lock, flags);
++	if (WARN_ON(common->job_running)) {
++		spin_unlock_irqrestore(&common->job_lock, flags);
++		mutex_unlock(&dec->hw_lock);
++		pm_runtime_put(dec->dev);
++		return;
++	}
++	common->job_running = true;
++	common->job_gen++;
++	common->job = (struct histb_vdec_job){ (struct histb_vdec_core_ctx *)ctx, common->job_gen };
++	gen = common->job.gen;
++	spin_unlock_irqrestore(&common->job_lock, flags);
++
++	/*
++	 * Apply the controls the source buffer's request carries; the message
++	 * assembly below consumes their values, so the request object can be
++	 * completed as soon as that has run.
++	 */
++	ret = v4l2_ctrl_request_setup(src->vb2_buf.req_obj.req,
++				      &ctx->ctrl_hdl);
++	if (ret) {
++		dev_dbg(dec->dev, "request setup failed: %d\n", ret);
++		goto err_job;
++	}
++
++	v4l2_m2m_buf_copy_metadata(src, dst);
++
++	/*
++	 * One deadline covers the whole frame. The protocol layer packs the
++	 * message slots and launches the core under hw_lock; if the frame that
++	 * started is still unreported when the deadline passes, the watchdog
++	 * rather than this thread owns its recovery.
++	 */
++	schedule_delayed_work(&common->watchdog, V5R6_TIMEOUT);
++
++	/*
++	 * The protocol layer walks the bitstream with the CPU to pack the
++	 * message slots, so the whole of that walk goes inside one access window
++	 * on the source plane.
++	 */
++	ret = histb_vdec_src_cpu_begin(&src->vb2_buf);
++	if (ret) {
++		dev_dbg(dec->dev, "source cpu access failed: %d\n", ret);
++		goto err_job;
++	}
++	ret = histb_vdec_v5_ops(ctx)->run(ctx, src, dst);
++	histb_vdec_src_cpu_end(&src->vb2_buf);
++	if (ret) {
++		dev_dbg(dec->dev, "run refused: %d (out fourcc %4.4s)\n", ret,
++			(char *)&ctx->desc->fourcc);
++		/*
++		 * A refusal has to be readable without the buffer flag: a
++		 * picture the core flagged as failed comes back with
++		 * V4L2_BUF_FLAG_ERROR set just like this one, so the payload
++		 * length is what says the surface holds nothing. Dropping the
++		 * contents is the client's job once bytesused is zero.
++		 */
++		vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++		goto err_job;
++	}
++
++	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
++
++	/*
++	 * The wait stays inside hw_lock: the message pool, the registers and the
++	 * completion are one pipeline, so a second job may not pack its slots or
++	 * ring its doorbell until this one has reported.
++	 */
++	timed_out = wait_for_completion_timeout(&dec->done, V5R6_TIMEOUT) == 0;
++	mutex_unlock(&dec->hw_lock);
++
++	if (timed_out) {
++		histb_vdec_v5_recover(common, "frame decode timed out");
++		return;
++	}
++
++	if (!histb_vdec_v5_job_take(common, &job))
++		return;
++
++	dec->last_state = histb_vdec_v5_read(dec, V5R6_STATE);
++	failed = (dec->int_state & V5R6_INT_DEC_ERR) ||
++		 (dec->last_state & V5R6_STATE_DEC_ERR);
++	short_cov = histb_vdec_v5_short_coverage(dec, ctx);
++	if (!histb_vdec_v5_detile_dst(ctx, dst)) {
++		dev_err(dec->dev, "capture buffer has no linear mapping\n");
++		vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++		failed = true;
++	}
++
++	dev_dbg(dec->dev, "job %u done: int=%#010x state=%#010x short=%u reports=%u\n",
++		gen, dec->int_state, dec->last_state, short_cov,
++		histb_vdec_v5_read(dec, V5R6_RPT_CNT));
++
++	cancel_delayed_work(&common->watchdog);
++
++	/*
++	 * The core keeps no clean state after a picture it flagged, and a
++	 * picture whose reports stop short of the last macroblock is in the
++	 * same position: the next launch is programmed against areas the
++	 * core wrote while the picture was going wrong. Reset here, as the
++	 * older engine's driver does.
++	 */
++	if (failed || short_cov)
++		histb_vdec_v5_abort(dec);
++
++	/*
++	 * What the client is told follows the older engine's rule: a flagged
++	 * picture is delivered as an error even though its pixels are there,
++	 * because the flag is the only sign the engine gave that something in
++	 * the stream was not consumed as written. A picture that merely fell
++	 * short of a macroblock total nobody asked it to report is not.
++	 */
++	if (failed)
++		dev_info(dec->dev,
++			 "picture delivered with the core's error flag (int %#x state %#x)\n",
++			 dec->int_state, dec->last_state);
++
++	histb_vdec_v5_job_finish(dec, &job,
++			       failed ? VB2_BUF_STATE_ERROR :
++					VB2_BUF_STATE_DONE);
++	return;
++
++err_job:
++	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
++	mutex_unlock(&dec->hw_lock);
++	if (histb_vdec_v5_job_take(common, &job))
++		histb_vdec_v5_job_failed(dec, &job);
++	return;
++
++err_no_pm:
++	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
++	vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++	v4l2_m2m_buf_done_and_job_finish(dec->common.m2m_dev, ctx->fh.m2m_ctx,
++					 VB2_BUF_STATE_ERROR);
++}
++
++static const struct v4l2_m2m_ops histb_vdec_v5_m2m_ops = {
++	.device_run = histb_vdec_v5_device_run,
++};
++
++
++/* ------------------------------------------------------------- gen ops */
++
++static const u32 histb_vdec_v5_cap_formats[] = {
++	V4L2_PIX_FMT_NV21,
++};
++
++static struct device *histb_vdec_v5_dma_dev(struct histb_vdec_common *common)
++{
++	return common->dev;
++}
++
++static void histb_vdec_v5_set_size(struct histb_vdec_core_ctx *ctx,
++				   struct v4l2_format *f,
++				   unsigned int width, unsigned int height)
++{
++	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
++
++	pix->width = width;
++	pix->height = height;
++	pix->plane_fmt[0].bytesperline = ALIGN(width, 16);
++	pix->plane_fmt[0].sizeimage = histb_vdec_v5_linear_size(width, height);
++}
++
++static void histb_vdec_v5_geom_hook(struct histb_vdec_core_ctx *cctx,
++				    struct histb_vdec_geom *g)
++{
++	histb_vdec_v5_buf_geom((struct histb_vdec_v5_ctx *)cctx, &g->pitch,
++			       &g->lines, &g->uv_offset);
++}
++
++static int histb_vdec_v5_buf_prepare_hook(struct histb_vdec_core_ctx *cctx,
++					  struct vb2_buffer *vb)
++{
++	dma_addr_t dma = vb2_dma_contig_plane_dma_addr(vb, 0);
++
++	/*
++	 * The core reads for the length the client reported, starting where the
++	 * client said its data starts, so that window has to stay inside the
++	 * plane. The mem2mem core bounds the report by the plane, not by the
++	 * plane left over after the start.
++	 */
++	if (vb->planes[0].data_offset + vb2_get_plane_payload(vb, 0) >
++	    vb2_plane_size(vb, 0))
++		return -EINVAL;
++
++	/*
++	 * The message slots name the bitstream start in one 32-bit field, so a
++	 * plane ending above 4 GiB would be read from a truncated address. The
++	 * device's 32-bit DMA mask keeps its own allocations inside that window;
++	 * say it here rather than rely on the mask alone.
++	 */
++	if ((u64)dma + vb2_plane_size(vb, 0) - 1 > DMA_BIT_MASK(32))
++		return -ERANGE;
++
++	return 0;
++}
++
++static int histb_vdec_v5_buf_init_hook(struct histb_vdec_core_ctx *cctx,
++				       struct vb2_buffer *vb)
++{
++	return histb_vdec_v5_buf_init(vb);
++}
++
++static void histb_vdec_v5_buf_cleanup_hook(struct histb_vdec_core_ctx *cctx,
++					   struct vb2_buffer *vb)
++{
++	histb_vdec_v5_buf_cleanup(vb);
++}
++
++static int histb_vdec_v5_start(struct histb_vdec_core_ctx *cctx,
++			       const struct vb2_queue *q)
++{
++	struct histb_vdec_v5_ctx *ctx = (struct histb_vdec_v5_ctx *)cctx;
++
++	if (V4L2_TYPE_IS_OUTPUT(q->type))
++		return 0;
++
++	/*
++	 * The motion-history areas are per reference surface of this stream, so
++	 * they come into existence with the capture queue that holds them and
++	 * not before: a job can only be scheduled once both queues are
++	 * streaming.
++	 */
++	return histb_vdec_v5_pmv_alloc(histb_vdec_v5_of_ctx(ctx), ctx,
++				       histb_vdec_v5_coded_mbs(ctx));
++}
++
++static void histb_vdec_v5_stop(struct histb_vdec_core_ctx *cctx,
++			       const struct vb2_queue *q)
++{
++	struct histb_vdec_v5_ctx *ctx = (struct histb_vdec_v5_ctx *)cctx;
++
++	if (V4L2_TYPE_IS_OUTPUT(q->type)) {
++		if (histb_vdec_v5_ops(ctx)->stop)
++			histb_vdec_v5_ops(ctx)->stop(ctx);
++	} else {
++		histb_vdec_v5_pmv_free(ctx);
++	}
++}
++
++static int histb_vdec_v5_open_ctx(struct histb_vdec_core_ctx *cctx)
++{
++	struct histb_vdec_v5_ctx *ctx = (struct histb_vdec_v5_ctx *)cctx;
++	struct histb_vdec_v5 *dec = histb_vdec_v5_of_ctx(ctx);
++
++	atomic_inc(&dec->open_count);
++	return 0;
++}
++
++static void histb_vdec_v5_release_ctx(struct histb_vdec_core_ctx *cctx)
++{
++	struct histb_vdec_v5_ctx *ctx = (struct histb_vdec_v5_ctx *)cctx;
++	struct histb_vdec_v5 *dec = histb_vdec_v5_of_ctx(ctx);
++
++	histb_vdec_v5_pmv_free(ctx);
++	if (atomic_dec_and_test(&dec->open_count))
++		wake_up_all(&dec->open_wq);
++}
++
++static const u32 *histb_vdec_v5_required_ctrls(
++				const struct histb_vdec_core_ctx *ctx,
++				unsigned int *num)
++{
++	*num = ctx->desc->num_req;
++	return ctx->desc->req_ctrls ? ctx->desc->req_ctrls : NULL;
++}
++
++static int histb_vdec_v5_try_ctrl_hook(const struct histb_vdec_fmt *fmt,
++				       struct v4l2_ctrl *ctrl)
++{
++	const struct histb_vdec_v5_codec_ops *ops = fmt->ops;
++
++	if (ops->try_ctrl)
++		return ops->try_ctrl(ctrl);
++
++	return 0;
++}
++
++static const struct histb_vdec_gen histb_vdec_v5_gen = {
++	.name			= "histb-vdec",
++	.ctx_size		= sizeof(struct histb_vdec_v5_ctx),
++	.chip			= &histb_vdec_v5_chip_mv200h,
++	.max_width		= V5R6_MAX_WIDTH,
++	.max_height		= V5R6_MAX_HEIGHT,
++	.max_cap_buffers	= V5R6_MAX_DPB_SLOTS,
++	.min_queued_buffers	= 4,
++	.cap_full_einval	= true,
++	.cap_formats		= histb_vdec_v5_cap_formats,
++	.num_cap_formats	= ARRAY_SIZE(histb_vdec_v5_cap_formats),
++	.dma_dev		= histb_vdec_v5_dma_dev,
++	.set_out_size		= histb_vdec_v5_set_size,
++	.set_cap_size		= histb_vdec_v5_set_size,
++	.set_cap_reset		= histb_vdec_v5_set_size,
++	.buf_geom		= histb_vdec_v5_geom_hook,
++	.buf_prepare		= histb_vdec_v5_buf_prepare_hook,
++	.buf_init		= histb_vdec_v5_buf_init_hook,
++	.buf_cleanup		= histb_vdec_v5_buf_cleanup_hook,
++	.start			= histb_vdec_v5_start,
++	.stop			= histb_vdec_v5_stop,
++	.open			= histb_vdec_v5_open_ctx,
++	.release		= histb_vdec_v5_release_ctx,
++	.required_ctrls		= histb_vdec_v5_required_ctrls,
++	.try_ctrl		= histb_vdec_v5_try_ctrl_hook,
++	.m2m_ops		= &histb_vdec_v5_m2m_ops,
++};
++
++const struct histb_vdec_variant histb_vdec_v5_mv200h_variant = {
++	.gen			= &histb_vdec_v5_gen,
++	.probe			= histb_vdec_v5_probe,
++	.remove			= histb_vdec_v5_remove,
++	.runtime_suspend	= histb_vdec_v5_runtime_suspend,
++	.runtime_resume		= histb_vdec_v5_runtime_resume,
++	.system_suspend		= pm_runtime_force_suspend,
++	.system_resume		= pm_runtime_force_resume,
++};
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_drv.c
+@@ -0,0 +1,210 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * HiSilicon HiSTB video decoder driver, V5R6 generation.
++ *
++ * Claims the block, checks its clock-enable, reset and interrupt contract
++ * on the board and hands frames to the protocol sources.
++ */
++#include <linux/bitfield.h>
++#include <linux/mfd/syscon.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#include "histb_vdec_v5.h"
++
++/*
++ * A reset request only takes effect while the unit is clocked, and its
++ * acknowledgement is a level in the status word rather than a latch, so the
++ * request is held until the bit arrives and then dropped.
++ *
++ * The decode core is reset through its own request bit (the vendor
++ * names that unit MFDE). Pulling the whole
++ * block down instead would take the stream distributor and the bitplane engine
++ * with it, and the vendor's bring-up for this part does not do that.
++ */
++static int histb_vdec_v5_reset(struct histb_vdec_v5 *dec)
++{
++	u32 state;
++	int ret;
++
++	histb_vdec_v5_clocks(dec, true);
++	histb_vdec_v5_write(dec, V5R6_RESET, V5R6_RESET_CORE);
++	ret = readl_relaxed_poll_timeout(dec->base + V5R6_RST_STATE, state,
++					 state & V5R6_RST_STATE_CORE, 10, 30000);
++	histb_vdec_v5_write(dec, V5R6_RESET, 0);
++	if (ret)
++		return dev_err_probe(dec->dev, ret,
++				     "core reset never acknowledged (status %#x)\n",
++				     state);
++
++	ret = readl_relaxed_poll_timeout(dec->base + V5R6_RST_STATE, state,
++					 !(state & V5R6_RST_STATE_CORE), 10, 30000);
++	if (ret)
++		return dev_err_probe(dec->dev, ret,
++				     "core stayed in reset (status %#x)\n", state);
++
++	/*
++	 * The mask word disables by setting a bit, so asking for the completion
++	 * line alone means masking everything else. Both latches are cleared
++	 * first, because the block was left running by whoever held it last.
++	 */
++	histb_vdec_v5_write(dec, V5R6_INT_STATE,
++			  V5R6_INT_DEC_OVER | V5R6_INT_DEC_ERR);
++	histb_vdec_v5_write(dec, V5R6_INT_MASK,
++			  U32_MAX ^ (V5R6_INT_DEC_OVER | V5R6_INT_DEC_ERR));
++
++	dev_dbg(dec->dev, "ready: clksel %#x status %#x\n",
++		histb_vdec_v5_read(dec, V5R6_CLKSEL),
++		histb_vdec_v5_read(dec, V5R6_RST_STATE));
++
++	return 0;
++}
++
++int histb_vdec_v5_runtime_resume(struct device *dev)
++{
++	struct histb_vdec_v5 *dec = dev_get_drvdata(dev);
++
++	return histb_vdec_v5_reset(dec);
++}
++
++int histb_vdec_v5_runtime_suspend(struct device *dev)
++{
++	struct histb_vdec_v5 *dec = dev_get_drvdata(dev);
++
++	/* A level line must not stay armed on an unclocked block. */
++	histb_vdec_v5_write(dec, V5R6_INT_MASK, ~0U);
++	histb_vdec_v5_write(dec, V5R6_INT_STATE, ~0U);
++	histb_vdec_v5_clocks(dec, false);
++
++	return 0;
++}
++
++static irqreturn_t histb_vdec_v5_irq(int irq, void *data)
++{
++	struct histb_vdec_v5 *dec = data;
++	u32 state;
++
++	spin_lock(&dec->irq_lock);
++	state = histb_vdec_v5_read(dec, V5R6_INT_STATE);
++	histb_vdec_v5_write(dec, V5R6_INT_STATE, state);
++	dec->int_state = state;
++	spin_unlock(&dec->irq_lock);
++
++	/*
++	 * A picture the core flagged has stopped just as one it finished
++	 * has: the wait is for the core to let go of the surface, and the
++	 * state word says what came of it.
++	 */
++	if (state & (V5R6_INT_DEC_OVER | V5R6_INT_DEC_ERR))
++		complete(&dec->done);
++
++	return IRQ_HANDLED;
++}
++
++int histb_vdec_v5_probe(struct platform_device *pdev,
++			const struct histb_vdec_gen *gen)
++{
++	struct device *dev = &pdev->dev;
++	struct histb_vdec_v5 *dec;
++	int ret;
++
++	dec = devm_kzalloc_obj(dev, *dec);
++	if (!dec)
++		return -ENOMEM;
++
++	dec->dev = dev;
++	dec->chip = gen->chip;
++	dec->common.priv = dec;
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "no 32-bit DMA aperture\n");
++	dec->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(dec->base))
++		return PTR_ERR(dec->base);
++
++	dec->irq = platform_get_irq_byname(pdev, "vdm");
++	if (dec->irq < 0)
++		return dec->irq;
++
++	ret = devm_request_threaded_irq(dev, dec->irq, NULL, histb_vdec_v5_irq,
++					IRQF_ONESHOT | IRQF_NO_AUTOEN,
++					dev_name(dev), dec);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request the decode irq\n");
++
++	/*
++	 * The request above starts masked: nothing may be latched until the
++	 * handler's own completion object and locks exist, which is the case
++	 * from here on.
++	 */
++
++	mutex_init(&dec->hw_lock);
++	mutex_init(&dec->common.vdev_lock);
++	spin_lock_init(&dec->common.job_lock);
++	spin_lock_init(&dec->irq_lock);
++	init_completion(&dec->done);
++	init_waitqueue_head(&dec->open_wq);
++	INIT_DELAYED_WORK(&dec->common.watchdog, histb_vdec_v5_watchdog);
++
++	ret = histb_vdec_v5_pool_alloc(dec);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot allocate the message pool\n");
++
++	dec->crg = syscon_regmap_lookup_by_compatible("hisilicon,hi3798mv200-crg");
++	if (IS_ERR(dec->crg))
++		return dev_err_probe(dev, PTR_ERR(dec->crg),
++				     "cannot reach the clock and reset generator\n");
++
++	platform_set_drvdata(pdev, dec);
++
++	pm_runtime_set_suspended(dev);
++	pm_runtime_enable(dev);
++
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret)
++		goto disable_pm;
++	enable_irq(dec->irq);
++	ret = histb_vdec_core_init(&dec->common, pdev, gen);
++	if (ret)
++		goto put_pm;
++
++	dev_info(dev, "V5R6 core claimed\n");
++	pm_runtime_put(dev);
++
++	return 0;
++
++put_pm:
++	pm_runtime_put(dev);
++	pm_runtime_set_suspended(dev);
++disable_pm:
++	pm_runtime_disable(dev);
++
++	return ret;
++}
++
++void histb_vdec_v5_remove(struct platform_device *pdev)
++{
++	struct histb_vdec_v5 *dec = platform_get_drvdata(pdev);
++
++	histb_vdec_core_stop(&dec->common);
++	/*
++	 * A file handle that was open when the node went away still owns driver
++	 * state and its release runs after this point. Let those drain before
++	 * the mem2mem device and the v4l2 device go, or the close path
++	 * dereferences memory the platform device gave back.
++	 */
++	if (!wait_event_timeout(dec->open_wq,
++				atomic_read(&dec->open_count) == 0,
++				msecs_to_jiffies(10000)))
++		dev_warn(dec->dev, "%d file handles still open at remove\n",
++			 atomic_read(&dec->open_count));
++	disable_irq(dec->irq);
++	cancel_delayed_work_sync(&dec->common.watchdog);
++	histb_vdec_core_exit(&dec->common);
++	pm_runtime_disable(&pdev->dev);
++}
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_h264.c
+@@ -0,0 +1,1408 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * HiSilicon HiSTB V5R6 stateless H.264 decoder.
++ *
++ * One job decodes one frame. The core takes fully parsed syntax: it never reads
++ * a slice header, and the only bitstream it fetches is slice_data(), addressed
++ * per slice as a stream segment. The picture slot of the message pool carries
++ * the frame-level state -- the coded size, the picture order counts, the
++ * reference-picture table and the quantiser matrix -- and the slices follow it
++ * as a chain of slots, each naming its successor, the chain ending on a zero
++ * link.
++ *
++ * Three encodings are what the packers below exist to produce: an address word
++ * is a 16-byte granule index rather than a byte address; a reference picture is
++ * named by the picture-container slot the driver assigned to the surface that
++ * holds it, so that id is kept per capture buffer next to the motion-history
++ * slot; and a segment runs to the end of its slice's NAL, trailing bits and
++ * all, because nothing in the tail of a CABAC slice tells data from padding.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-mapping.h>
++#include <linux/slab.h>
++
++#include <media/v4l2-h264.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "histb_vdec_v5.h"
++
++/* A DPB entry that owns neither a picture-container nor a motion slot. */
++#define V5R6_H264_SLOT_NONE		0xffu
++
++/*
++ * Slice-type codes the engine counts motion history by, indexed by slice_type %
++ * 5: P, B, I, SP, SI. The switch types share the P and I codes.
++ */
++static const u8 histb_vdec_v5_h264_slice_type[5] = { 1, 2, 0, 1, 0 };
++
++/*
++ * Reference-entry flags, indexed by 2 * picture structure + MBAFF, of which the
++ * low two bits are kept. Only the frame-coding entry is reachable, because
++ * run() refuses the other shapes.
++ */
++static const u8 histb_vdec_v5_h264_list_struct[8] = { 0, 1, 3, 3, 3, 3, 2, 2 };
++
++/* Assembly state one frame shares between the picture and the slice packers. */
++struct histb_vdec_v5_h264_run {
++	const struct v4l2_ctrl_h264_sps *sps;
++	const struct v4l2_ctrl_h264_pps *pps;
++	const struct v4l2_ctrl_h264_decode_params *dec;
++	const struct v4l2_ctrl_h264_pred_weights *weights;
++	const struct v4l2_ctrl_h264_scaling_matrix *scaling;
++	const struct v4l2_ctrl_h264_slice_params *slices;
++	struct histb_vdec_v5_frame *frame;
++	unsigned int		num_slices;
++	unsigned int		num_valid;
++	unsigned int		width_mbs;
++	unsigned int		height_mbs;
++	unsigned int		mbs;
++	u32			payload_bits;	/* end of the OUTPUT span */
++	u32			stream_base;	/* granule of the first slice */
++	const u8		*src_va;
++	dma_addr_t		src_dma;
++	dma_addr_t		dst_dma;
++	u8			dpb2apc[V4L2_H264_NUM_DPB_ENTRIES];
++	u8			dpb2pmv[V4L2_H264_NUM_DPB_ENTRIES];
++	u32			img_addr[V5R6_MAX_DPB_SLOTS];
++	s32			apc_poc[2][V5R6_MAX_DPB_SLOTS];
++	struct v4l2_h264_reference reflist_p[V4L2_H264_REF_LIST_LEN];
++	struct v4l2_h264_reference reflist_b0[V4L2_H264_REF_LIST_LEN];
++	struct v4l2_h264_reference reflist_b1[V4L2_H264_REF_LIST_LEN];
++	u32			slice_starts[V5R6_MAX_SLICES + 1];
++};
++
++/*
++ * Per-context state of this protocol. The two slot tables are kept offset by
++ * one so that a zeroed entry says "no slot given yet", and the assembly state
++ * lives here rather than on the kernel stack.
++ */
++struct histb_vdec_v5_h264 {
++	u8			apc_map[V5R6_MAX_FRAMES];
++	u8			pmv_map[V5R6_MAX_FRAMES];
++	void			*rbsp_va;
++	dma_addr_t		rbsp_dma;
++	size_t			rbsp_size;
++	struct histb_vdec_v5_h264_run run;
++};
++
++/* Address word of a device-pool area, as the messages want it. */
++static u32 histb_vdec_v5_h264_pool_addr(struct histb_vdec_v5 *dec, unsigned int off)
++{
++	return histb_vdec_v5_addr_at(dec->pool.dma + off, V5R6_ADDR_SHIFT);
++}
++
++/* The motion-history area one slot of this context's pool holds. */
++static dma_addr_t histb_vdec_v5_h264_pmv_dma(const struct histb_vdec_v5_ctx *ctx,
++					   unsigned int slot)
++{
++	return ctx->pmv.dma + (dma_addr_t)slot * ctx->pmv.slot_bytes;
++}
++
++/*
++ * Slot ids of one capture buffer, taken modulo the pool each one wraps over.
++ * The picture-container slot is what the reference tables of every slice name;
++ * the motion-history slot indexes the per-context areas, which the caller has
++ * given this context by the time it is asked for.
++ */
++static unsigned int histb_vdec_v5_h264_apc_alloc(struct histb_vdec_v5_ctx *ctx,
++					       unsigned int index)
++{
++	struct histb_vdec_v5_h264 *h264 = ctx->priv;
++	u8 id = h264->apc_map[index];
++
++	if (id == 0) {
++		id = ctx->apc_next % V5R6_MAX_DPB_SLOTS + 1;
++		ctx->apc_next++;
++		h264->apc_map[index] = id;
++	}
++
++	return id - 1;
++}
++
++static unsigned int histb_vdec_v5_h264_pmv_alloc(struct histb_vdec_v5_ctx *ctx,
++					       unsigned int index)
++{
++	struct histb_vdec_v5_h264 *h264 = ctx->priv;
++	u8 id = h264->pmv_map[index];
++
++	if (id == 0) {
++		id = ctx->pmv_next % ctx->pmv.slots + 1;
++		ctx->pmv_next++;
++		h264->pmv_map[index] = id;
++	}
++
++	return id - 1;
++}
++
++/*
++ * Bit position of every slice NAL in the OUTPUT plane: nal_unit_type 1 or 5,
++ * the two a message slot can describe, data partitions among them not. A
++ * four-byte start code matches once, because its extra leading zero never forms
++ * a 00 00 01 triple with the prefix. The count returned is the number found,
++ * which may exceed @max.
++ */
++static unsigned int histb_vdec_v5_h264_find_nals(const u8 *buf, u32 size,
++					       u32 *starts, unsigned int max)
++{
++	unsigned int n = 0;
++	u32 i;
++
++	for (i = 0; i + 3 < size; i++) {
++		u8 nal_type = buf[i + 3] & 0x1f;
++
++		if (buf[i] != 0 || buf[i + 1] != 0 || buf[i + 2] != 1)
++			continue;
++		if (nal_type != 1 && nal_type != 5)
++			continue;
++		if (n < max)
++			starts[n] = (i + 3) * 8;
++		n++;
++	}
++
++	return n;
++}
++
++/* The first bit of a slice's data, behind the header the core never reads. */
++static u32 histb_vdec_v5_h264_data_bit(const struct histb_vdec_v5_h264_run *run,
++				     unsigned int index)
++{
++	return run->slice_starts[index] + run->slices[index].header_bit_size;
++}
++
++/*
++ * End of one slice's data inside the span handed to the core. Slice NAL units
++ * are separated by annex-b start codes, and 00 00 01 cannot occur inside a NAL
++ * unit because emulation prevention rewrites any 00 00 followed by 00 or 01, so
++ * the start code before the next NAL is the one byte pattern that marks where
++ * this slice stops. Everything between the last coded bin and that start code
++ * stays in the segment: the core takes it and only flags surplus bits.
++ */
++static u32 histb_vdec_v5_h264_trim_nal(const u8 *va, u32 end_bit)
++{
++	if (va == NULL || end_bit < 24)
++		return end_bit;
++	if (va[end_bit / 8 - 3] == 0 && va[end_bit / 8 - 2] == 0 &&
++	    va[end_bit / 8 - 1] == 1)
++		return end_bit - 24;
++
++	return end_bit;
++}
++
++/*
++ * Stream segment of one slice, slice words 0 to 2. The core fetches on 16-byte
++ * granules: word 0 is the granule holding the first data bit, as a distance
++ * from the granule the stream base was programmed at; word 1 is the bit offset
++ * inside that granule; and word 2 the number of valid bits.
++ */
++static void histb_vdec_v5_h264_pack_segment(u32 *w, u32 data_bit, u32 base,
++					  u32 valid_bits)
++{
++	w[0] = (((data_bit / 8) & ~15u) - base) >> V5R6_ADDR_SHIFT;
++	w[1] = data_bit & 127u;
++	w[2] = valid_bits;
++}
++
++static u32 histb_vdec_v5_h264_qm_word(const u8 *coeffs)
++{
++	return coeffs[0] | coeffs[1] << 8 | coeffs[2] << 16 | coeffs[3] << 24;
++}
++
++/*
++ * One scaling list in raster order, four coefficients per word, least
++ * significant byte first. Without a picture matrix the spec's default of 16 per
++ * coefficient applies.
++ */
++static u32 *histb_vdec_v5_h264_pack_qm_list(u32 *dst, const u8 *list,
++					 unsigned int words, bool present)
++{
++	unsigned int i;
++
++	for (i = 0; i < words; i++) {
++		if (present)
++			*dst++ = histb_vdec_v5_h264_qm_word(list + 4 * i);
++		else
++			*dst++ = 0x10101010u;
++	}
++
++	return dst;
++}
++
++/*
++ * Quantiser matrix, picture words 64 to 119: the six 4x4 lists followed by the
++ * two 8x8 luma lists the 4:2:0 path uses.
++ */
++static void
++histb_vdec_v5_h264_pack_qm(u32 *dst,
++			 const struct v4l2_ctrl_h264_scaling_matrix *m,
++			 bool present)
++{
++	unsigned int i;
++
++	for (i = 0; i < 6; i++)
++		dst = histb_vdec_v5_h264_pack_qm_list(dst, m->scaling_list_4x4[i],
++						    16, present);
++	for (i = 0; i < 2; i++)
++		dst = histb_vdec_v5_h264_pack_qm_list(dst, m->scaling_list_8x8[i],
++						    64, present);
++}
++
++/* Whether one scaling list repeats a single coefficient through the row. */
++static bool histb_vdec_v5_h264_qm_flat(const u8 *list, unsigned int len)
++{
++	unsigned int i;
++
++	for (i = 1; i < len; i++) {
++		if (list[i] != list[0])
++			return false;
++	}
++
++	return true;
++}
++
++/*
++ * Which matrices this core takes as the protocol says. It applies the six 4x4
++ * lists and the two luma 8x8 lists, but a picture whose three intra 4x4 lists
++ * differ from each other comes back wrong, so only the shape known to match is
++ * accepted here.
++ */
++static bool
++histb_vdec_v5_h264_qm_ok(const struct v4l2_ctrl_h264_scaling_matrix *m)
++{
++	u8 v = m->scaling_list_4x4[0][0];
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(m->scaling_list_4x4); i++) {
++		if (!histb_vdec_v5_h264_qm_flat(m->scaling_list_4x4[i], 16))
++			return false;
++		if (i < 3 && m->scaling_list_4x4[i][0] != v)
++			return false;
++	}
++
++	for (i = 0; i < 2; i++) {
++		if (!histb_vdec_v5_h264_qm_flat(m->scaling_list_8x8[i], 64))
++			return false;
++	}
++
++	return true;
++}
++
++/*
++ * Prediction weights of one list, slice words 64 to 255: six blocks of 32
++ * words, the luma and the two chroma components of list 0 then of list 1. Luma
++ * and the first chroma component pack as offset, weight and denominator; the
++ * second chroma component as weight and offset. Weights keep nine bits, offsets
++ * eight.
++ */
++static void
++histb_vdec_v5_h264_pack_weights(u32 *slot,
++			      const struct v4l2_ctrl_h264_pred_weights *pw,
++			      unsigned int count, bool list1)
++{
++	const struct v4l2_h264_weight_factors *f = &pw->weight_factors[list1];
++	unsigned int base = list1 ? 96u : 64u;
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		slot[base + i] = ((u32)(u8)f->luma_offset[i] << 12) |
++				 ((u32)f->luma_weight[i] & 0x1ff) << 3 |
++				 (pw->luma_log2_weight_denom & 7);
++		slot[base + 64 + i] =
++			((u32)(u8)f->chroma_offset[i][0] << 12) |
++			((u32)f->chroma_weight[i][0] & 0x1ff) << 3 |
++			(pw->chroma_log2_weight_denom & 7);
++		slot[base + 128 + i] =
++			((u32)f->chroma_weight[i][1] & 0x1ff) |
++			((u32)(u8)f->chroma_offset[i][1] << 9);
++	}
++}
++
++/*
++ * Reference list of one slice. The entry flags take four bits each, eight per
++ * word from word 12 for list 0 and word 16 for list 1; the picture-container
++ * ids take five bits each, four per word from word 20 for list 0 and word 28
++ * for list 1, holding the slot number and the bottom-field marker, which frame
++ * coding leaves clear.
++ */
++static void
++histb_vdec_v5_h264_pack_declist(u32 *slot, const struct v4l2_h264_reference *list,
++			      unsigned int count, unsigned int distinct,
++			      const u8 *dpb2apc,
++			      const struct v4l2_ctrl_h264_decode_params *dec,
++			      bool list1)
++{
++	unsigned int flag_word = list1 ? 16 : 12;
++	unsigned int apc_word = list1 ? 28 : 20;
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		const struct v4l2_h264_dpb_entry *dpb;
++		const struct v4l2_h264_reference *ref;
++		unsigned int pos = i;
++		u32 flags;
++
++		/*
++		 * A slice may declare more list positions than the pictures its
++		 * list carries; the padded positions repeat the last picture
++		 * that is really there, which is what encoders that declare the
++		 * extra position assume.
++		 */
++		if (distinct != 0 && pos >= distinct)
++			pos = distinct - 1;
++		ref = &list[pos];
++		dpb = &dec->dpb[ref->index];
++
++		/*
++		 * The table entry of a whole picture in a frame-coded stream,
++		 * with the DPB entry's long-term flag on top of it.
++		 */
++		flags = histb_vdec_v5_h264_list_struct[0] & 3;
++		if (dpb->flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM)
++			flags |= 8;
++
++		slot[flag_word + (i >> 3)] |= flags << (4 * (i & 7));
++		slot[apc_word + (i >> 2)] |=
++			((u32)dpb2apc[ref->index] << 1) << (5 * (i & 3));
++	}
++}
++
++/*
++ * Whether any slice needs the prediction weight table: implicit weighted
++ * prediction is a mode the core derives by itself and hands it nothing.
++ */
++static bool
++histb_vdec_v5_h264_needs_weights(const struct histb_vdec_v5_h264_run *run)
++{
++	unsigned int i;
++
++	for (i = 0; i < run->num_slices; i++) {
++		const struct v4l2_ctrl_h264_slice_params *slice =
++			&run->slices[i];
++
++		if (V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(run->pps, slice))
++			return true;
++	}
++
++	return false;
++}
++
++/*
++ * A reference list is usable only when every entry the slice reads names an
++ * active DPB entry: a client that left the arrays zeroed would otherwise be
++ * taken as meaning "DPB entry 0, no fields".
++ */
++static bool
++histb_vdec_v5_h264_ref_list_ok(const struct v4l2_h264_reference *list,
++			     unsigned int count,
++			     const struct v4l2_ctrl_h264_decode_params *dec)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		if ((list[i].fields & V4L2_H264_FRAME_REF) == 0)
++			return false;
++		if (list[i].index >= V4L2_H264_NUM_DPB_ENTRIES)
++			return false;
++		if ((dec->dpb[list[i].index].flags &
++		     V4L2_H264_DPB_ENTRY_FLAG_ACTIVE) == 0)
++			return false;
++	}
++
++	return true;
++}
++
++/*
++ * The lists one slice uses: the submitted ones when they name active DPB
++ * entries, because only they can carry the reordering of 8.2.4.3, else the
++ * initial construction of 8.2.4.2 prepared during job assembly. Returns true
++ * when the submitted lists were taken.
++ */
++static bool
++histb_vdec_v5_h264_slice_lists(const struct histb_vdec_v5_h264_run *run,
++			     unsigned int index, unsigned int count0,
++			     unsigned int count1, bool is_b,
++			     const struct v4l2_h264_reference **pl0,
++			     const struct v4l2_h264_reference **pl1)
++{
++	const struct v4l2_ctrl_h264_slice_params *slice = &run->slices[index];
++	bool usable;
++
++	*pl0 = is_b ? run->reflist_b0 : run->reflist_p;
++	*pl1 = run->reflist_b1;
++
++	usable = histb_vdec_v5_h264_ref_list_ok(slice->ref_pic_list0, count0,
++					      run->dec);
++	if (is_b)
++		usable = usable &&
++			histb_vdec_v5_h264_ref_list_ok(slice->ref_pic_list1,
++						     count1, run->dec);
++	if (!usable)
++		return false;
++
++	*pl0 = slice->ref_pic_list0;
++	*pl1 = slice->ref_pic_list1;
++
++	return true;
++}
++
++static void histb_vdec_v5_h264_pack_pic(struct histb_vdec_v5 *dec,
++				      const struct histb_vdec_v5_ctx *ctx,
++				      const struct histb_vdec_v5_h264_run *run,
++				      u32 *pic)
++{
++	const struct v4l2_ctrl_h264_pps *pps = run->pps;
++	const struct v4l2_ctrl_h264_decode_params *par = run->dec;
++	dma_addr_t pmv;
++	unsigned int i;
++
++	memset(pic, 0, V5R6_SLOT_BYTES);
++
++	/*
++	 * Word 0 is the coded size in macroblocks, the flags of the picture
++	 * parameter set and the reference flag. Bits 15:14 hold the picture
++	 * structure, of which frame coding is the zero this path can express,
++	 * and the 4:2:0 flag stands for every picture it accepts.
++	 */
++	pic[0] = FIELD_PREP(GENMASK(8, 0), run->width_mbs - 1) |
++		 FIELD_PREP(GENMASK(24, 16), run->height_mbs - 1) |
++		 BIT(25) |
++		 ((pps->flags & V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED) ?
++		  BIT(26) : 0) |
++		 ((pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) ?
++		  BIT(27) : 0) |
++		 ((pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE) ?
++		  BIT(28) : 0) |
++		 (par->nal_ref_idc != 0 ? BIT(31) : 0);
++	pic[1] = histb_vdec_v5_addr_at(run->dst_dma, V5R6_ADDR_SHIFT);
++
++	/*
++	 * Word 2 is the picture's order count: 8.5.1.1 gives the greater of the
++	 * two field counts, which for the frame coding this path accepts is the
++	 * top one. Words 3 and 4 are the per-field counts, which this
++	 * generation's HAL writes only for macroblock-adaptive frame-field
++	 * pictures -- refused here, so they stay zero as the reset leaves them.
++	 */
++	pic[2] = max_t(s32, par->top_field_order_cnt,
++		       par->bottom_field_order_cnt);
++
++	/* The neighbour tables, then this picture's own motion-history area. */
++	pic[5] = histb_vdec_v5_h264_pool_addr(dec, V5R6_TBL_SED_TOP);
++	pic[6] = histb_vdec_v5_h264_pool_addr(dec, V5R6_TBL_PMV_TOP);
++	pmv = histb_vdec_v5_h264_pmv_dma(ctx, run->frame->pmv_slot);
++	pic[7] = histb_vdec_v5_addr_at(pmv, V5R6_ADDR_SHIFT);
++	pic[8] = histb_vdec_v5_h264_pool_addr(dec, V5R6_TBL_RCNT_TOP);
++
++	/* Head of the slice chain. */
++	pic[9] = histb_vdec_v5_addr_at(histb_vdec_v5_slot_dma(dec, V5R6_SLOT_SLICE),
++				     V5R6_ADDR_SHIFT);
++
++	/* Reference addresses by slot, and the POC pair of each slot. */
++	for (i = 0; i < V5R6_MAX_DPB_SLOTS; i++) {
++		pic[10 + i] = run->img_addr[i];
++		pic[27 + 2 * i] = (u32)run->apc_poc[0][i];
++		pic[28 + 2 * i] = (u32)run->apc_poc[1][i];
++	}
++
++	pic[26] = histb_vdec_v5_h264_pool_addr(dec, V5R6_POOL_CABAC_MN_H264);
++	pic[59] = histb_vdec_v5_h264_pool_addr(dec, V5R6_TBL_DBLK_TOP);
++
++	histb_vdec_v5_h264_pack_qm(&pic[64], run->scaling,
++				 pps->flags &
++				 V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT);
++}
++
++static int histb_vdec_v5_h264_pack_slice(struct histb_vdec_v5 *dec,
++				       const struct histb_vdec_v5_ctx *ctx,
++				       const struct histb_vdec_v5_h264_run *run,
++				       unsigned int index)
++{
++	const struct v4l2_ctrl_h264_slice_params *slice = &run->slices[index];
++	const struct v4l2_ctrl_h264_pps *pps = run->pps;
++	const struct v4l2_h264_reference *l0, *l1, *col;
++	unsigned int type = slice->slice_type % 5;
++	unsigned int last = run->num_slices - 1;
++	unsigned int count0 = 0, count1 = 0;
++	unsigned int distinct0 = 0, distinct1 = 0;
++	bool is_b = type == V4L2_H264_SLICE_TYPE_B;
++	bool from_app, weighted;
++	unsigned int wmode, qp;
++	u32 data_bit, end_bit, valid;
++	u32 *slot = histb_vdec_v5_slot(dec, V5R6_SLOT_SLICE + index);
++
++	memset(slot, 0, V5R6_SLOT_BYTES);
++
++	if (type != V4L2_H264_SLICE_TYPE_I && type != V4L2_H264_SLICE_TYPE_SI) {
++		count0 = min_t(unsigned int,
++			       slice->num_ref_idx_l0_active_minus1 + 1,
++			       V4L2_H264_REF_LIST_LEN);
++	}
++	if (is_b) {
++		count1 = min_t(unsigned int,
++			       slice->num_ref_idx_l1_active_minus1 + 1,
++			       V4L2_H264_REF_LIST_LEN);
++	}
++
++	from_app = histb_vdec_v5_h264_slice_lists(run, index, count0, count1,
++						is_b, &l0, &l1);
++
++	/*
++	 * How many positions of the list carry a picture. A submitted list is
++	 * only taken when all of its positions name an active entry, so all of
++	 * them carry a picture -- including a position naming the same picture
++	 * as its neighbour does, which 8.2.4.3 allows. The in-kernel list has
++	 * no such marker: it fills its tail with DPB entry 0, and only its
++	 * first num_valid positions carry a picture.
++	 */
++	if (count0 != 0) {
++		distinct0 = from_app ? count0 :
++			min_t(unsigned int, count0, run->num_valid);
++		if (distinct0 == 0)
++			count0 = 0;
++	}
++	if (count1 != 0) {
++		distinct1 = from_app ? count1 :
++			min_t(unsigned int, count1, run->num_valid);
++		if (distinct1 == 0)
++			count1 = 0;
++	}
++
++	/*
++	 * Collocated picture for direct prediction. 8.8.2 picks it by the
++	 * slice's own flag, but this generation addresses the collocated motion
++	 * vectors from the first list 1 entry whatever the direct mode is, so
++	 * that is the one handed over.
++	 */
++	col = l1;
++
++	end_bit = run->payload_bits;
++	if (index < last)
++		end_bit = run->slice_starts[index + 1];
++	end_bit = histb_vdec_v5_h264_trim_nal(run->src_va, end_bit);
++	data_bit = histb_vdec_v5_h264_data_bit(run, index);
++	if (data_bit >= end_bit) {
++		dev_dbg(dec->dev, "slice %u leaves no data bits\n", index);
++		return -EINVAL;
++	}
++
++	/*
++	 * The segment runs to the end of this slice's NAL, rbsp_trailing_bits
++	 * included. Walking the tail back to a stop bit is not possible here: a
++	 * CABAC slice's last byte is arithmetic-coded data, so the lowest set bit
++	 * is a bin as often as it is the stop bit, and cutting at it truncates
++	 * the entropy stream -- measured as garbage in the last macroblocks of
++	 * the picture. The core takes the padding and only sets its surplus-bits
++	 * error flag.
++	 */
++	valid = end_bit - data_bit;
++	histb_vdec_v5_h264_pack_segment(&slot[0], data_bit, run->stream_base,
++				      valid);
++
++	/*
++	 * Word 6 holds the slice's first macroblock, its cabac initial idc and
++	 * the absolute slice qp, the spec's SliceQPy.
++	 */
++	qp = clamp_t(int, 26 + pps->pic_init_qp_minus26 + slice->slice_qp_delta,
++		     0, 51);
++	slot[6] = (slice->first_mb_in_slice & 0xfffffu) | ((qp & 63) << 26) |
++		  ((slice->cabac_init_idc & 3) << 24);
++
++	/*
++	 * Word 7 is the slice type, the two list sizes the entries below carry,
++	 * the declared lengths and the macroblock-level flags.
++	 */
++	slot[7] = histb_vdec_v5_h264_slice_type[type] |
++		  (count0 << 2) | (count1 << 8) |
++		  ((slice->num_ref_idx_l0_active_minus1 & 31) << 16) |
++		  ((slice->num_ref_idx_l1_active_minus1 & 31) << 21);
++	if (run->sps->flags & V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE)
++		slot[7] |= BIT(14);
++	if (slice->flags & V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED)
++		slot[7] |= BIT(15);
++
++	/*
++	 * Words 8 and 9 address the collocated picture's motion history, the
++	 * second its far half; both stay zero unless the access unit has a B
++	 * slice, because nothing else reads them.
++	 */
++	if (is_b && count1 != 0) {
++		unsigned int col_slot = run->dpb2pmv[col[0].index];
++		dma_addr_t pmv = histb_vdec_v5_h264_pmv_dma(ctx, col_slot);
++
++		slot[8] = histb_vdec_v5_addr_at(pmv, V5R6_ADDR_SHIFT);
++		slot[9] = histb_vdec_v5_addr_at(pmv + (ctx->pmv.slot_bytes >> 1),
++					      V5R6_ADDR_SHIFT);
++	}
++
++	/*
++	 * Weighting mode: the PPS's bipred mode for a B slice, its weighted
++	 * prediction flag for an inter slice of any other type. Mode 2 is
++	 * implicit weighted prediction, which the core carries out by itself,
++	 * so only mode 1 has a table to hand down.
++	 */
++	if (is_b) {
++		wmode = pps->weighted_bipred_idc & 3;
++	} else {
++		wmode = ((pps->flags & V4L2_H264_PPS_FLAG_WEIGHTED_PRED) &&
++			 (type == V4L2_H264_SLICE_TYPE_P ||
++			  type == V4L2_H264_SLICE_TYPE_SP)) ? 1 : 0;
++	}
++	weighted = wmode == 1;
++
++	slot[10] = (((u32)pps->chroma_qp_index_offset & 31) << 5) |
++		   ((u32)pps->second_chroma_qp_index_offset & 31) |
++		   (wmode << 16);
++	slot[11] = (((u32)slice->slice_alpha_c0_offset_div2 & 15) << 16) |
++		   (((u32)slice->slice_beta_offset_div2 & 15) << 8) |
++		   (slice->disable_deblocking_filter_idc & 0xff);
++
++	histb_vdec_v5_h264_pack_declist(slot, l0, count0, distinct0, run->dpb2apc,
++				      run->dec, false);
++	histb_vdec_v5_h264_pack_declist(slot, l1, count1, distinct1, run->dpb2apc,
++				      run->dec, true);
++
++	/*
++	 * Word 44 is the last macroblock this slice covers, because the core
++	 * starts the next one at the macroblock after it; word 63 links the
++	 * next slot, and a zero there ends the chain.
++	 */
++	slot[44] = run->mbs - 1;
++	slot[63] = 0;
++	if (index < last) {
++		unsigned int next = V5R6_SLOT_SLICE + index + 1;
++
++		slot[44] = run->slices[index + 1].first_mb_in_slice - 1;
++		slot[63] = histb_vdec_v5_addr_at(histb_vdec_v5_slot_dma(dec, next),
++					       V5R6_ADDR_SHIFT);
++	}
++
++	if (weighted) {
++		const struct v4l2_ctrl_h264_pred_weights *pw = run->weights;
++
++		histb_vdec_v5_h264_pack_weights(slot, pw, count0, false);
++		if (is_b)
++			histb_vdec_v5_h264_pack_weights(slot, pw, count1, true);
++	}
++
++	return 0;
++}
++
++/*
++ * Whether this submission discards every stored picture, which is what makes
++ * recycling the slot ids here lose nothing: an IDR starts a new reference chain
++ * and the uAPI hands it with no entry still flagged as a stored picture.
++ */
++static bool
++histb_vdec_v5_h264_flush(const struct v4l2_ctrl_h264_decode_params *dec)
++{
++	unsigned int i;
++
++	if ((dec->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC) == 0)
++		return false;
++
++	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
++		if (dec->dpb[i].flags & (V4L2_H264_DPB_ENTRY_FLAG_VALID |
++					 V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
++			return false;
++	}
++
++	return true;
++}
++
++/*
++ * Syntax this core cannot be handed. Each of these leaves a message word with
++ * no value that means what the bitstream says, so the picture is refused rather
++ * than programmed from a guess.
++ */
++static int histb_vdec_v5_h264_check_syntax(struct histb_vdec_v5 *dec,
++					 const struct histb_vdec_v5_h264_run *run)
++{
++	const struct v4l2_ctrl_h264_sps *sps = run->sps;
++	const struct v4l2_ctrl_h264_pps *pps = run->pps;
++
++	if (V4L2_H264_SPS_HAS_CHROMA_FORMAT(sps) &&
++	    (sps->chroma_format_idc != 1 || sps->bit_depth_luma_minus8 != 0 ||
++	     sps->bit_depth_chroma_minus8 != 0 ||
++	     (sps->flags & V4L2_H264_SPS_FLAG_SEPARATE_COLOUR_PLANE))) {
++		dev_dbg(dec->dev, "only 8-bit 4:2:0 reaches this core\n");
++		return -EINVAL;
++	}
++
++	if (sps->flags & V4L2_H264_SPS_FLAG_QPPRIME_Y_ZERO_TRANSFORM_BYPASS) {
++		dev_dbg(dec->dev, "the core has no transform bypass path\n");
++		return -EINVAL;
++	}
++
++	/*
++	 * Slice-group partitioning moves where a slice's data starts and the
++	 * PPS carries no map for it; a redundant picture would have to be
++	 * presented as a picture of its own.
++	 */
++	if (pps->num_slice_groups_minus1 != 0 ||
++	    (pps->flags & V4L2_H264_PPS_FLAG_REDUNDANT_PIC_CNT_PRESENT)) {
++		dev_dbg(dec->dev,
++			"no message for slice groups or redundant pictures\n");
++		return -EINVAL;
++	}
++
++	if (pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT) {
++		if (run->scaling == NULL ||
++		    !histb_vdec_v5_h264_qm_ok(run->scaling)) {
++			dev_dbg(dec->dev,
++				"quantiser matrix this core cannot apply\n");
++			return -EINVAL;
++		}
++	}
++
++	if (sps->max_num_ref_frames > V5R6_MAX_DPB_SLOTS) {
++		dev_dbg(dec->dev, "%u reference frames exceed %u slots\n",
++			sps->max_num_ref_frames, V5R6_MAX_DPB_SLOTS);
++		return -EINVAL;
++	}
++
++	if (histb_vdec_v5_h264_needs_weights(run) && run->weights == NULL) {
++		dev_dbg(dec->dev, "no weight table for this slice\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/*
++ * Hand the engine the slice spans with the emulation prevention bytes of the
++ * NAL units taken out. Whether the core undoes that escaping itself is not
++ * settled for this generation, and the copy is right either way: a span that
++ * still carries 00 00 03 is wrong for a core that reads its bytes literally,
++ * and taking them out is inert for one that undoes them.
++ *
++ * The copy starts at the first slice's NAL header byte and the slice offsets
++ * are rebased onto it, leaving the OUTPUT plane alone; a span with no
++ * prevention byte is used where it lies, so the common case pays no copy.
++ */
++static int histb_vdec_v5_h264_unpack(struct histb_vdec_v5 *dec,
++				   struct histb_vdec_v5_ctx *ctx,
++				   struct histb_vdec_v5_h264_run *run)
++{
++	struct histb_vdec_v5_h264 *h264 = ctx->priv;
++	unsigned int first = run->slice_starts[0] / 8;
++	unsigned int end = run->payload_bits / 8;
++	unsigned int esc_next = first;
++	unsigned int out = 0, idx = 0, zeros = 0;
++	unsigned int i;
++	u8 *dst;
++
++	if (run->src_va == NULL || first >= end)
++		return 0;
++
++	for (i = first; i + 2 < end; i++) {
++		if (run->src_va[i] == 0 && run->src_va[i + 1] == 0 &&
++		    run->src_va[i + 2] == 0x03)
++			break;
++	}
++	if (i + 2 >= end)
++		return 0;
++
++	if (h264->rbsp_size < end - first) {
++		size_t want = round_up(end - first, 64 * 1024);
++
++		if (h264->rbsp_va != NULL)
++			dma_free_coherent(dec->dev, h264->rbsp_size,
++					  h264->rbsp_va, h264->rbsp_dma);
++		h264->rbsp_va = dma_alloc_coherent(dec->dev, want,
++						   &h264->rbsp_dma, GFP_KERNEL);
++		if (h264->rbsp_va == NULL) {
++			h264->rbsp_size = 0;
++			return -ENOMEM;
++		}
++		h264->rbsp_size = want;
++	}
++	dst = h264->rbsp_va;
++
++	for (i = first; i < end; i++) {
++		u8 byte = run->src_va[i];
++
++		if (i == esc_next) {
++			esc_next = idx + 1 < run->num_slices ?
++				run->slice_starts[idx + 1] / 8 : end;
++			run->slice_starts[idx++] = out * 8;
++			zeros = 0;
++		}
++		if (zeros >= 2 && byte == 0x03) {
++			zeros = 0;
++			continue;
++		}
++		dst[out++] = byte;
++		zeros = byte != 0 ? 0 : zeros + 1;
++	}
++
++	run->payload_bits = out * 8;
++	run->src_va = dst;
++	run->src_dma = h264->rbsp_dma;
++
++	return 0;
++}
++
++/*
++ * Map the DPB onto the reference table: every active entry has to name a
++ * capture buffer of this context, and the picture-container slot given to that
++ * buffer is what the messages refer to. An entry with no buffer, or a buffer
++ * with no record, leaves a reference the core would fetch from nowhere.
++ */
++static int histb_vdec_v5_h264_map_refs(struct histb_vdec_v5 *dec,
++				     struct histb_vdec_v5_ctx *ctx,
++				     struct histb_vdec_v5_h264_run *run,
++				     struct vb2_v4l2_buffer *dst)
++{
++	struct histb_vdec_v5_h264 *h264 = ctx->priv;
++	struct histb_vdec_v5_frame *frame;
++	struct vb2_queue *cap_q;
++	unsigned long owned = 0;
++	unsigned int i;
++
++	if (dst->vb2_buf.index >= V5R6_MAX_FRAMES) {
++		dev_dbg(dec->dev, "capture buffer %u beyond the frame table\n",
++			dst->vb2_buf.index);
++		return -EINVAL;
++	}
++
++	/*
++	 * A fresh chain may reuse every slot, so recycle the ids before any of
++	 * this picture's own gets handed out.
++	 */
++	if (histb_vdec_v5_h264_flush(run->dec)) {
++		memset(h264->apc_map, 0, sizeof(h264->apc_map));
++		memset(h264->pmv_map, 0, sizeof(h264->pmv_map));
++		ctx->apc_next = 0;
++		ctx->pmv_next = 0;
++	}
++
++	frame = histb_vdec_v5_frame_of(ctx, dst->vb2_buf.index);
++	if (frame == NULL) {
++		dev_dbg(dec->dev, "no frame record for buffer %u\n",
++			dst->vb2_buf.index);
++		return -EINVAL;
++	}
++
++	frame->apc_slot = histb_vdec_v5_h264_apc_alloc(ctx, dst->vb2_buf.index);
++	frame->pmv_slot = histb_vdec_v5_h264_pmv_alloc(ctx, dst->vb2_buf.index);
++	run->frame = frame;
++	owned = BIT(frame->apc_slot);
++
++	/*
++	 * Until a surface owns a slot it holds this picture's address, which is
++	 * what the tail of the fill loop below repeats.
++	 */
++	for (i = 0; i < V5R6_MAX_DPB_SLOTS; i++) {
++		run->img_addr[i] = histb_vdec_v5_addr_at(run->dst_dma,
++						       V5R6_ADDR_SHIFT);
++		run->apc_poc[0][i] = 0;
++		run->apc_poc[1][i] = 0;
++	}
++
++	cap_q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
++		const struct v4l2_h264_dpb_entry *entry = &run->dec->dpb[i];
++		struct histb_vdec_v5_frame *ref;
++		struct vb2_buffer *vb;
++
++		run->dpb2apc[i] = V5R6_H264_SLOT_NONE;
++		run->dpb2pmv[i] = V5R6_H264_SLOT_NONE;
++		if ((entry->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE) == 0)
++			continue;
++
++		vb = vb2_find_buffer(cap_q, entry->reference_ts);
++		if (vb == NULL || vb->index >= V5R6_MAX_FRAMES) {
++			dev_dbg(dec->dev, "reference %u names no buffer\n", i);
++			return -EINVAL;
++		}
++		ref = histb_vdec_v5_frame_of(ctx, vb->index);
++		if (ref == NULL) {
++			dev_dbg(dec->dev, "reference %u has no record\n", i);
++			return -EINVAL;
++		}
++
++		run->dpb2apc[i] = histb_vdec_v5_h264_apc_alloc(ctx, vb->index);
++		run->dpb2pmv[i] = histb_vdec_v5_h264_pmv_alloc(ctx, vb->index);
++		ref->apc_slot = run->dpb2apc[i];
++		ref->pmv_slot = run->dpb2pmv[i];
++		owned |= BIT(run->dpb2apc[i]);
++		run->img_addr[run->dpb2apc[i]] =
++			histb_vdec_v5_addr_at(ref->dma, V5R6_ADDR_SHIFT);
++		run->apc_poc[0][run->dpb2apc[i]] = entry->top_field_order_cnt;
++		run->apc_poc[1][run->dpb2apc[i]] =
++			entry->bottom_field_order_cnt;
++	}
++
++	/*
++	 * A slot no surface owns still has to hold an address the core may
++	 * lawfully fetch: a zero word is a real DMA target, so those entries
++	 * repeat the first one.
++	 */
++	for (i = 0; i < V5R6_MAX_DPB_SLOTS; i++) {
++		if ((owned & BIT(i)) == 0)
++			run->img_addr[i] = run->img_addr[0];
++	}
++
++	return 0;
++}
++
++
++/*
++ * An imported OUTPUT buffer is read through the CPU to find the slice NALs,
++ * and its exporter may be a cached one. Copy the access unit into the driver's
++ * own coherent buffer, so that every later read, and the core's own fetch, work
++ * on memory whose contents the CPU has already observed. The caller holds the
++ * CPU access window on the source plane for the whole job, which is what makes
++ * this copy safe; a locally allocated buffer needs no window and no copy.
++ */
++static int histb_vdec_v5_h264_copy_import(struct histb_vdec_v5 *dec,
++					struct histb_vdec_v5_h264 *h264,
++					struct vb2_v4l2_buffer *src,
++					struct histb_vdec_v5_h264_run *run)
++{
++	struct dma_buf *dbuf = src->vb2_buf.planes[0].dbuf;
++	size_t len = run->payload_bits / 8;
++	u8 *dst;
++
++	if (dbuf == NULL)
++		return 0;
++	if (h264 == NULL || run->src_va == NULL)
++		return -EINVAL;
++
++	if (h264->rbsp_size < len) {
++		size_t want = round_up(len, 64 * 1024);
++
++		if (h264->rbsp_va != NULL)
++			dma_free_coherent(dec->dev, h264->rbsp_size,
++					  h264->rbsp_va, h264->rbsp_dma);
++		h264->rbsp_va = dma_alloc_coherent(dec->dev, want,
++						   &h264->rbsp_dma, GFP_KERNEL);
++		if (h264->rbsp_va == NULL) {
++			h264->rbsp_size = 0;
++			return -ENOMEM;
++		}
++		h264->rbsp_size = want;
++	}
++
++	dst = h264->rbsp_va;
++	memcpy(dst, run->src_va, len);
++
++	run->src_va = dst;
++	run->src_dma = h264->rbsp_dma;
++
++	return 0;
++}
++
++static int histb_vdec_v5_h264_run(struct histb_vdec_v5_ctx *ctx,
++			       struct vb2_v4l2_buffer *src,
++			       struct vb2_v4l2_buffer *dst)
++{
++	struct histb_vdec_v5 *dec = histb_vdec_v5_of_ctx(ctx);
++	struct histb_vdec_v5_h264_run *run;
++	struct v4l2_h264_reflist_builder builder;
++	struct histb_vdec_v5_job job = {
++		.to_val		= V5R6_TIMEOUT_DEFAULT,
++		.reg_shift	= V5R6_ADDR_SHIFT,
++	};
++	struct histb_vdec_v5_h264 *h264 = ctx->priv;
++	struct histb_vdec_v5_frame *dst_frame;
++	struct v4l2_ctrl *ctrl;
++	unsigned int found, i, pitch, lines, uv_offset, n_slices;
++	unsigned long bytes, start_code;
++	u32 *pic;
++	const u32 *sl0;
++	int ret;
++
++	if (h264 == NULL) {
++		h264 = kzalloc_obj(*h264);
++		if (h264 == NULL)
++			return -ENOMEM;
++		ctx->priv = h264;
++	}
++	run = &h264->run;
++
++	/*
++	 * The driver core has applied the request to the control handler before
++	 * scheduling this job, so p_cur carries this frame's values. One OUTPUT
++	 * buffer carries the whole access unit, so the slice array is what says
++	 * how many slice slots the chain needs.
++	 */
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_SPS);
++	run->sps = ctrl != NULL ? ctrl->p_cur.p_h264_sps : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_PPS);
++	run->pps = ctrl != NULL ? ctrl->p_cur.p_h264_pps : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_DECODE_PARAMS);
++	run->dec = ctrl != NULL ? ctrl->p_cur.p_h264_decode_params : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_PRED_WEIGHTS);
++	run->weights = ctrl != NULL ? ctrl->p_cur.p_h264_pred_weights : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_SCALING_MATRIX);
++	run->scaling = ctrl != NULL ? ctrl->p_cur.p_h264_scaling_matrix : NULL;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_SLICE_PARAMS);
++	run->slices = ctrl != NULL ? ctrl->p_cur.p_h264_slice_params : NULL;
++	n_slices = ctrl != NULL ? ctrl->new_elems : 0;
++	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
++			      V4L2_CID_STATELESS_H264_START_CODE);
++	start_code = ctrl != NULL ? ctrl->cur.val :
++		V4L2_STATELESS_H264_START_CODE_ANNEX_B;
++
++	/*
++	 * Every word of the picture message comes from these controls: the
++	 * frame-level state has no other source, and the slice chain is built
++	 * from the slice array, so a missing or empty one leaves words that
++	 * nothing can write.
++	 */
++	if (run->sps == NULL || run->pps == NULL || run->dec == NULL ||
++	    run->slices == NULL || n_slices == 0) {
++		dev_dbg(dec->dev, "no controls for this access unit\n");
++		return -EINVAL;
++	}
++	if (n_slices > V5R6_MAX_SLICES) {
++		dev_dbg(dec->dev, "%u slices exceed the %u a chain holds\n",
++			n_slices, V5R6_MAX_SLICES);
++		return -EINVAL;
++	}
++	run->num_slices = n_slices;
++
++	bytes = vb2_get_plane_payload(&src->vb2_buf, 0);
++	if (bytes <= src->vb2_buf.planes[0].data_offset) {
++		dev_dbg(dec->dev, "submission carries no bitstream\n");
++		return -EINVAL;
++	}
++	bytes -= src->vb2_buf.planes[0].data_offset;
++	run->payload_bits = (u32)bytes * 8;
++	run->src_dma = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0) +
++			       src->vb2_buf.planes[0].data_offset;
++	dst_frame = histb_vdec_v5_frame_of(ctx, dst->vb2_buf.index);
++	if (dst_frame == NULL)
++		return -EINVAL;
++	run->dst_dma = dst_frame->dma;
++	run->src_va = vb2_plane_vaddr(&src->vb2_buf, 0);
++	if (run->src_va != NULL)
++		run->src_va += src->vb2_buf.planes[0].data_offset;
++
++	ret = histb_vdec_v5_h264_copy_import(dec, h264, src, run);
++	if (ret)
++		return ret;
++
++	ret = histb_vdec_v5_h264_check_syntax(dec, run);
++	if (ret)
++		return ret;
++
++	/*
++	 * Field and field/frame coding is refused outright. A stored field pair
++	 * keeps half of its motion history in each half of an area and this API
++	 * hands every field picture its own DPB entry and capture buffer, so
++	 * the half a B slice needs cannot be named; delivering the picture
++	 * without it would leave a surface wrong that later pictures still
++	 * reference.
++	 */
++	if (run->dec->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) {
++		dev_dbg(dec->dev, "field pictures are not expressible\n");
++		return -EINVAL;
++	}
++	if (run->sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD) {
++		dev_dbg(dec->dev,
++			"macroblock-adaptive frame/field is not expressible\n");
++		return -EINVAL;
++	}
++
++	/*
++	 * The coded grid, and the capture geometry the launch is programmed
++	 * with. The engine writes the coded picture rather than the visible
++	 * rectangle, and sizes the motion-history areas from the capture grid,
++	 * so a coded picture has to stay inside that grid and inside the buffer
++	 * the grid was agreed for. Comparing the coded width through the band
++	 * pitch is what makes that exact: the pitch says which 256-column class
++	 * the negotiated width falls in, and a coded width in a higher class
++	 * needs columns the grid does not offer.
++	 */
++	run->width_mbs = run->sps->pic_width_in_mbs_minus1 + 1;
++	run->height_mbs = run->sps->pic_height_in_map_units_minus1 + 1;
++	if ((run->sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY) == 0)
++		run->height_mbs *= 2;
++	run->mbs = run->width_mbs * run->height_mbs;
++	if (run->width_mbs * 16 > V5R6_MAX_WIDTH ||
++	    run->height_mbs * 16 > V5R6_MAX_HEIGHT) {
++		dev_dbg(dec->dev, "coded size %ux%u beyond this core\n",
++			run->width_mbs * 16, run->height_mbs * 16);
++		return -EINVAL;
++	}
++	histb_vdec_v5_buf_geom(ctx, &pitch, &lines, &uv_offset);
++	if (V5R6_BAND_PITCH(run->width_mbs * 16) > pitch ||
++	    run->height_mbs * 16 > lines ||
++	    vb2_get_plane_payload(&dst->vb2_buf, 0) <
++	    histb_vdec_v5_linear_size(run->width_mbs * 16,
++				    run->height_mbs * 16)) {
++		dev_dbg(dec->dev, "capture grid too small for %ux%u coded\n",
++			run->width_mbs * 16, run->height_mbs * 16);
++		return -EINVAL;
++	}
++
++	ret = histb_vdec_v5_pmv_alloc(dec, ctx, run->mbs);
++	if (ret)
++		return ret;
++
++	if (start_code == V4L2_STATELESS_H264_START_CODE_ANNEX_B) {
++		/*
++		 * Locating the slices reads the OUTPUT plane through the kernel
++		 * mapping, so a mapping that came back unavailable leaves every
++		 * slice boundary unknown and the job is refused rather than
++		 * programmed from offsets nothing verified.
++		 */
++		if (run->src_va == NULL) {
++			dev_dbg(dec->dev, "OUTPUT queue has no mapping\n");
++			return -EINVAL;
++		}
++		found = histb_vdec_v5_h264_find_nals(run->src_va,
++					run->payload_bits / 8,
++					run->slice_starts,
++					ARRAY_SIZE(run->slice_starts));
++		/*
++		 * The scan has to find exactly one NAL per declared slice: each
++		 * declared slice gets one slot, addressed by the start found
++		 * here, so a different count would mean programming spans the
++		 * control does not describe.
++		 */
++		if (found != n_slices) {
++			dev_dbg(dec->dev, "%u slice NALs for %u declared\n",
++				found, n_slices);
++			return -EINVAL;
++		}
++	} else {
++		/*
++		 * Without start codes nothing in the buffer separates one slice
++		 * from the next, so a single-slice submission is the only
++		 * layout that can be consumed. The NAL header bits belong to
++		 * the offset either way: a segment is computed from the first
++		 * data bit.
++		 */
++		if (n_slices != 1) {
++			dev_dbg(dec->dev,
++				"no start codes to separate %u slices\n",
++				n_slices);
++			return -EINVAL;
++		}
++		run->slice_starts[0] = 0;
++	}
++
++	ret = histb_vdec_v5_h264_unpack(dec, ctx, run);
++	if (ret)
++		return ret;
++
++	ret = histb_vdec_v5_h264_map_refs(dec, ctx, run, dst);
++	if (ret)
++		return ret;
++
++	v4l2_h264_init_reflist_builder(&builder, run->dec, run->sps,
++				       run->dec->dpb);
++	run->num_valid = builder.num_valid;
++	v4l2_h264_build_p_ref_list(&builder, run->reflist_p);
++	v4l2_h264_build_b_ref_lists(&builder, run->reflist_b0, run->reflist_b1);
++
++	/*
++	 * The stream base is the granule the first slice's data starts in, so
++	 * every segment is a distance from there.
++	 */
++	run->stream_base = (histb_vdec_v5_h264_data_bit(run, 0) / 8) & ~15u;
++
++	pic = histb_vdec_v5_slot(dec, V5R6_SLOT_PIC);
++	histb_vdec_v5_h264_pack_pic(dec, ctx, run, pic);
++
++	for (i = 0; i < n_slices; i++) {
++		ret = histb_vdec_v5_h264_pack_slice(dec, ctx, run, i);
++		if (ret)
++			return ret;
++	}
++
++	/*
++	 * The last real slot links to this one, so it has to read as an empty
++	 * segment even where an earlier job left a longer chain here.
++	 */
++	memset(histb_vdec_v5_slot(dec, V5R6_SLOT_SLICE + n_slices), 0,
++	       V5R6_SLOT_BYTES);
++
++	/*
++	 * The neighbour-history areas the core reads back are consumed by a
++	 * launch, so they have to be seeded again every time it is given one.
++	 */
++	histb_vdec_v5_pool_seed(dec);
++
++	job.cfg0 = ((run->mbs - 1) & V5R6_CFG0_MBAMT) |
++		   V5R6_CFG0_COEFIDX_DETECT | V5R6_CFG0_LD_QMATRIX;
++	/*
++	 * One slice group per picture, which is every picture a stateless
++	 * decoder is handed, and the motion-vector output the reference chain
++	 * of the next picture reads back.
++	 */
++	job.cfg1 = FIELD_PREP(V5R6_CFG1_VID_STD, ctx->desc->vidstd) |
++		   FIELD_PREP(V5R6_CFG1_MAX_SLCGRP_NUM, 3) |
++		   V5R6_CFG1_MV_OUT | V5R6_CFG1_FST_SLC_GRP;
++	job.pitch = pitch;
++	job.stream = run->src_dma + run->stream_base;
++	job.recon = run->dst_dma;
++	job.uv_offset = uv_offset;
++	job.pic_dma = histb_vdec_v5_slot_dma(dec, V5R6_SLOT_PIC);
++	job.up_dma = histb_vdec_v5_slot_dma(dec, V5R6_SLOT_UP);
++	job.pic = pic;
++	job.slice = histb_vdec_v5_slot(dec, V5R6_SLOT_SLICE);
++	ctx->mbs = run->mbs;
++	ctx->slices = n_slices;
++
++	/*
++	 * The words the engine is about to read. A refused picture or a wrong
++	 * one has nothing else to look at: these are derived here and reach no
++	 * other interface.
++	 */
++	sl0 = (const u32 *)job.slice;
++	dev_dbg(dec->dev, "pic %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		pic[0], pic[1], pic[2], pic[7], pic[9], pic[10], pic[11],
++		pic[26]);
++	dev_dbg(dec->dev, "slc %08x %08x %08x %08x %08x %08x\n",
++		sl0[0], sl0[2], sl0[6], sl0[7], sl0[8], sl0[11]);
++
++	ret = histb_vdec_v5_launch(dec, &job);
++	if (ret) {
++		dev_err(dec->dev, "launch failed: int %#x state %#x\n",
++			dec->int_state, dec->last_state);
++		return ret;
++	}
++
++	return 0;
++}
++
++/*
++ * The picture and slice messages of this protocol take 8-bit 4:2:0 frames and
++ * nothing else. The geometry is not judged here: the handler holds an all-zero
++ * default, which TRY_EXT_CTRLS reads back as though a client had set it, and no
++ * picture size can be judged before one is submitted, so run() refuses those.
++ */
++static int histb_vdec_v5_h264_try_ctrl(struct v4l2_ctrl *ctrl)
++{
++	const struct v4l2_ctrl_h264_sps *sps;
++
++	if (ctrl->id != V4L2_CID_STATELESS_H264_SPS)
++		return 0;
++
++	sps = ctrl->p_new.p_h264_sps;
++	if (V4L2_H264_SPS_HAS_CHROMA_FORMAT(sps) &&
++	    (sps->chroma_format_idc != 1 || sps->bit_depth_luma_minus8 != 0 ||
++	     sps->bit_depth_chroma_minus8 != 0 ||
++	     (sps->flags & V4L2_H264_SPS_FLAG_SEPARATE_COLOUR_PLANE)))
++		return -EINVAL;
++
++	return 0;
++}
++
++static void histb_vdec_v5_h264_stop(struct histb_vdec_v5_ctx *ctx)
++{
++	struct histb_vdec_v5_h264 *h264 = ctx->priv;
++	struct histb_vdec_v5 *dec;
++
++	if (h264 == NULL)
++		return;
++
++	dec = histb_vdec_v5_of_ctx(ctx);
++	histb_vdec_v5_pmv_free(ctx);
++	if (h264->rbsp_va != NULL)
++		dma_free_coherent(dec->dev, h264->rbsp_size, h264->rbsp_va,
++				  h264->rbsp_dma);
++	kfree(h264);
++	ctx->priv = NULL;
++	ctx->apc_next = 0;
++	ctx->pmv_next = 0;
++}
++
++static const struct v4l2_ctrl_config histb_vdec_v5_h264_ctrls[] = {
++	{
++		.id = V4L2_CID_STATELESS_H264_SPS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_PPS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_SCALING_MATRIX,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_PRED_WEIGHTS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_DECODE_PARAMS,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_SLICE_PARAMS,
++		/*
++		 * v4l2_ctrl_new_custom() only preserves cfg->flags when the
++		 * config carries an explicit name: otherwise it runs
++		 * v4l2_ctrl_fill(), which zeroes the flags and would drop the
++		 * dynamic-array property.
++		 */
++		.name = "H264 Slice Parameters",
++		.type = V4L2_CTRL_TYPE_H264_SLICE_PARAMS,
++		.dims = { 8 },
++		.flags = V4L2_CTRL_FLAG_DYNAMIC_ARRAY,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_DECODE_MODE,
++		.min = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++		.max = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++		.def = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++	},
++	{
++		.id = V4L2_CID_STATELESS_H264_START_CODE,
++		.min = V4L2_STATELESS_H264_START_CODE_NONE,
++		.max = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
++		.def = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
++	},
++};
++
++/* A request without these can not be built into a picture message. */
++static const u32 histb_vdec_v5_h264_req_ctrls[] = {
++	V4L2_CID_STATELESS_H264_SPS,
++	V4L2_CID_STATELESS_H264_PPS,
++	V4L2_CID_STATELESS_H264_DECODE_PARAMS,
++	V4L2_CID_STATELESS_H264_SLICE_PARAMS,
++};
++
++/* A surface the capture queue dropped no longer holds slots of either kind.
++ */
++static void histb_vdec_v5_h264_buf_release(struct histb_vdec_v5_ctx *ctx,
++					   unsigned int index)
++{
++	struct histb_vdec_v5_h264 *h264 = ctx->priv;
++
++	/* Before the first job there are no slot tables to give back. */
++	if (h264 == NULL || index >= V5R6_MAX_FRAMES)
++		return;
++
++	h264->apc_map[index] = 0;
++	h264->pmv_map[index] = 0;
++}
++
++static const struct histb_vdec_v5_codec_ops histb_vdec_v5_h264_ops = {
++	.run		= histb_vdec_v5_h264_run,
++	.try_ctrl	= histb_vdec_v5_h264_try_ctrl,
++	.stop		= histb_vdec_v5_h264_stop,
++	.buf_release	= histb_vdec_v5_h264_buf_release,
++};
++
++/* The band pitch this protocol's pictures are written at, in bytes per line. */
++static unsigned int histb_vdec_v5_h264_stride(unsigned int width)
++{
++	return V5R6_BAND_PITCH(width);
++}
++
++const histb_vdec_v5_fmt_desc histb_vdec_v5_h264_fmt = {
++	.fourcc		= V4L2_PIX_FMT_H264_SLICE,
++	.vidstd		= 0,
++	.num_ctrls	= ARRAY_SIZE(histb_vdec_v5_h264_ctrls),
++	.ctrls		= histb_vdec_v5_h264_ctrls,
++	.ops		= &histb_vdec_v5_h264_ops,
++	.stride		= histb_vdec_v5_h264_stride,
++	.grid_align	= 32,
++	.req_ctrls	= histb_vdec_v5_h264_req_ctrls,
++	.num_req	= ARRAY_SIZE(histb_vdec_v5_h264_req_ctrls),
++};
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_hw.c
+@@ -0,0 +1,311 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * HiSilicon HiSTB V5R6 decoder: message pool and launch.
++ *
++ * The register order is the one the vendor's own build for this family runs;
++ * the ABI note lists it with its sources.
++ */
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/jiffies.h>
++#include <linux/mm.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++
++#include <linux/mfd/syscon.h>
++#include <linux/regmap.h>
++
++#include "histb_vdec_v5.h"
++#include "histb_vdec_v5_tables_h264.h"
++#include "histb_vdec_v5_tables_hevc.h"
++
++int histb_vdec_v5_pool_alloc(struct histb_vdec_v5 *dec)
++{
++	struct histb_vdec_v5_pool *pool = &dec->pool;
++
++	/*
++	 * The layout below is absolute from the pool base, so the base only has
++	 * to be the 1024 bytes the vendor aligns to; a coherent allocation is
++	 * page-aligned already. Both the CPU and the core's DMA master touch it,
++	 * so it is allocated coherent rather than cached and flushed by hand. It
++	 * goes with the device, because a launch keeps pointing at it until the
++	 * node is gone.
++	 */
++	pool->va = dmam_alloc_coherent(dec->dev, V5R6_POOL_BYTES, &pool->dma,
++				       GFP_KERNEL);
++	if (!pool->va)
++		return -ENOMEM;
++
++	pool->size = V5R6_POOL_BYTES;
++	pool->slot_off = 0;
++
++	histb_vdec_v5_pool_seed(dec);
++
++	return 0;
++}
++
++/*
++ * Fill the tables a launch is told to read. The neighbour, deblocking and
++ * motion areas start empty, because the core takes the samples and the
++ * coefficient counts of the macroblocks above and left of the picture from
++ * them, and the CABAC initialisation image goes in at the address the picture
++ * message carries.
++ */
++void histb_vdec_v5_pool_seed(struct histb_vdec_v5 *dec)
++{
++	struct histb_vdec_v5_pool *pool = &dec->pool;
++
++	memset(pool->va + V5R6_POOL_SED_LEFT_PHY, 0,
++	       V5R6_TBL_END - V5R6_POOL_SED_LEFT_PHY);
++	memcpy(pool->va + V5R6_POOL_CABAC_MN_H264, histb_vdec_v5_cabac_mn,
++	       sizeof(histb_vdec_v5_cabac_mn));
++	memcpy(pool->va + V5R6_POOL_CABAC_MN_HEVC, histb_vdec_v5_cabac_mn_hevc,
++	       sizeof(histb_vdec_v5_cabac_mn_hevc));
++}
++
++/*
++ * Program the core for one frame and ring the doorbell. The caller has already
++ * filled the picture slot and the slice chain, and has registered the frame the
++ * core is about to write.
++ */
++/*
++ * Program the core for one frame and ring the doorbell. The protocol layer has
++ * already filled the picture slot and the slice chain.
++ */
++/*
++ * The SoC's clock and reset generator holds a selector and a pulse-skipping
++ * configuration for the decode core, and the vendor build programs both on
++ * every launch: select, clear the skip count, then pulse the load enable so
++ * the choice actually latches. This tree has no clock for those bits because
++ * nothing documents what the selector's codes give on this part, so the launch
++ * reaches for the CRG the way the vendor's own MV310 build does.
++ */
++#define V5R6_CRG_VDH		0x78
++#define V5R6_CRG_VDH_SEL	GENMASK(9, 8)
++#define V5R6_CRG_VDH_SKIP	GENMASK(16, 12)
++#define V5R6_CRG_VDH_LOAD	BIT(17)
++
++/*
++ * The sub-block clock enables are two bits wide, and V5R6_CLKSEL_RUN is
++ * the value each one carries on a board that has decoded pictures. The decode
++ * core, its MMU and the stream distributor are the three a picture needs; the
++ * DSP, bitplane and MFDE units keep whatever the boot gave them until a format
++ * asks for them.
++ */
++void histb_vdec_v5_clocks(struct histb_vdec_v5 *dec, bool on)
++{
++	static const unsigned int units[] = {
++		V5R6_CLKSEL_VDEC, V5R6_CLKSEL_MMU, V5R6_CLKSEL_SCD,
++	};
++	u32 val = histb_vdec_v5_read(dec, V5R6_CLKSEL);
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(units); i++) {
++		u32 field = V5R6_CLKSEL_FIELD(units[i]);
++
++		val &= ~field;
++		if (on)
++			val |= V5R6_CLKSEL_RUN << (units[i] * 2);
++	}
++
++	histb_vdec_v5_write(dec, V5R6_CLKSEL, val);
++}
++
++
++static int histb_vdec_v5_clock_select(struct histb_vdec_v5 *dec)
++{
++	struct regmap *crg = dec->crg;
++	int ret;
++
++	if (IS_ERR(crg))
++		return PTR_ERR(crg);
++
++	ret = regmap_update_bits(crg, V5R6_CRG_VDH, V5R6_CRG_VDH_SEL,
++				 FIELD_PREP(V5R6_CRG_VDH_SEL, 2));
++	if (ret)
++		return ret;
++
++	ret = regmap_update_bits(crg, V5R6_CRG_VDH,
++				 V5R6_CRG_VDH_SKIP | V5R6_CRG_VDH_LOAD, 0);
++	if (ret)
++		return ret;
++
++	return regmap_update_bits(crg, V5R6_CRG_VDH, V5R6_CRG_VDH_LOAD,
++				  V5R6_CRG_VDH_LOAD);
++}
++
++int histb_vdec_v5_launch(struct histb_vdec_v5 *dec, const struct histb_vdec_v5_job *job)
++{
++	unsigned int i;
++	u32 *rep;
++	int ret;
++
++	ret = histb_vdec_v5_clock_select(dec);
++	if (ret)
++		return ret;
++	histb_vdec_v5_clocks(dec, true);
++
++	histb_vdec_v5_write(dec, V5R6_AVM_ADDR,
++			  histb_vdec_v5_addr_at(job->pic_dma, job->reg_shift));
++	histb_vdec_v5_write(dec, V5R6_VAM_ADDR,
++			  histb_vdec_v5_addr_at(job->up_dma, job->reg_shift));
++	histb_vdec_v5_write(dec, V5R6_STREAM_BASE,
++			  histb_vdec_v5_addr_at(job->stream, job->reg_shift));
++
++	/* Reconstructed picture: luma start, band pitch, chroma offset. */
++	histb_vdec_v5_write(dec, V5R6_YSTADDR_1D,
++			  histb_vdec_v5_addr_at(job->recon, job->reg_shift));
++	/*
++	 * The pitch goes in as bytes per line. The older engine wants sixteen
++	 * lines of the pitch here, so this word is not portable between them.
++	 */
++	histb_vdec_v5_write(dec, V5R6_YSTRIDE_1D, job->pitch);
++	histb_vdec_v5_write(dec, V5R6_UVOFFSET_1D, job->uv_offset);
++	/* The head-info image only exists on the compressed write path. */
++	histb_vdec_v5_write(dec, V5R6_HEAD_INF_OFFSET, 0);
++
++	histb_vdec_v5_write(dec, V5R6_CFG0, job->cfg0);
++	histb_vdec_v5_write(dec, V5R6_CFG1, job->cfg1);
++
++	histb_vdec_v5_write(dec, V5R6_DOWN_CLK_CFG, V5R6_DOWN_CLK_VALUE);
++
++	/*
++	 * The seven stage watchdogs. Reset leaves them at zero, which times a stage
++	 * out as soon as it starts, so a launch that never writes them can only end
++	 * with an error and nothing decoded. The word ahead of the run of seven is
++	 * not a watchdog and stays untouched.
++	 */
++	for (i = 0; i < V5R6_TIMEOUT_STAGES; i++)
++		histb_vdec_v5_write(dec, V5R6_SED_TO + i * 4, job->to_val);
++
++	/*
++	 * The stream distributor is programmed at every launch. Its reference
++	 * cache is used up to the part's whole width range, so the enable is
++	 * kept set rather than re-derived from the frame width.
++	 */
++	histb_vdec_v5_write(dec, V5R6_SCD_AVS_FLAG, 0);
++	histb_vdec_v5_write(dec, V5R6_SCD_EMAR_CFG, V5R6_SCD_EMAR_ENABLE);
++	histb_vdec_v5_write(dec, V5R6_SCD_VDH_SELRST, 1);
++	histb_vdec_v5_write(dec, V5R6_SCD_CLOCK_GATE, V5R6_SCD_GATE_VALUE);
++
++	/*
++	 * Translation stays off, which is what lets the messages and the
++	 * reference surfaces carry physical addresses. The fault latches share
++	 * this core's interrupt line, so they are cleared along with it.
++	 */
++	histb_vdec_v5_write(dec, V5R6_SMMU_SCR, 0);
++	histb_vdec_v5_write(dec, V5R6_SMMU_INTMASK, V5R6_SMMU_FAULT_BITS);
++	histb_vdec_v5_write(dec, V5R6_SMMU_INTCLR_S, V5R6_SMMU_FAULT_BITS);
++	histb_vdec_v5_write(dec, V5R6_SMMU_INTCLR_NS, V5R6_SMMU_FAULT_BITS);
++
++	histb_vdec_v5_write(dec, V5R6_INT_STATE, ~0U);
++	/*
++	 * The mask word disables by setting a bit, so the two lines that end a
++	 * picture are the ones left clear: the completion, and the error the
++	 * core raises instead of it when it stops on something it could not
++	 * consume. Both are waited for through dec->done.
++	 */
++	histb_vdec_v5_write(dec, V5R6_INT_MASK,
++			  U32_MAX ^ (V5R6_INT_DEC_OVER | V5R6_INT_DEC_ERR));
++
++	reinit_completion(&dec->done);
++
++	/*
++	 * The picture report lands in this slot, and clearing it first is what
++	 * makes the end-of-picture mark the core writes belong to this launch
++	 * rather than to the one before it.
++	 */
++	rep = histb_vdec_v5_slot(dec, V5R6_SLOT_UP);
++	rep[0] = 0;
++	rep[1] = 0;
++	rep[2] = 0;
++	rep[3] = 0;
++	wmb();
++
++	/* The doorbell is a pulse held long enough for the core to see it. */
++	udelay(30);
++	wmb();
++	histb_vdec_v5_write(dec, V5R6_START, 0);
++	udelay(1);
++	histb_vdec_v5_write(dec, V5R6_START, V5R6_START_GO);
++	udelay(30);
++	histb_vdec_v5_write(dec, V5R6_START, 0);
++
++	/*
++	 * The core reports the picture through its interrupt, which is masked
++	 * and latched: waiting on the state word instead would read a bit that
++	 * does not track the picture. The caller waits on dec->done.
++	 */
++
++	return 0;
++}
++
++/*
++ * The motion-history area one surface gets, as this revision's firmware sizes
++ * it: one macroblock grid of 64 bytes each, rounded up past the row the engine
++ * reads ahead of the picture. Half of that block is the bottom-field view, so
++ * the collocated pointer for a field pair is this size shifted by one.
++ */
++#define V5R6_PMV_PER_MB		64
++#define V5R6_PMV_ROUND		143
++
++int histb_vdec_v5_pmv_alloc(struct histb_vdec_v5 *dec, struct histb_vdec_v5_ctx *ctx,
++			  unsigned int mbs)
++{
++	struct histb_vdec_v5_pmv *pmv = &ctx->pmv;
++	size_t bytes;
++
++	if (pmv->va && pmv->slots == V5R6_MAX_DPB_SLOTS &&
++	    pmv->slot_bytes >= ((mbs * V5R6_PMV_PER_MB + V5R6_PMV_ROUND) &
++				  ~127U))
++		return 0;
++
++	histb_vdec_v5_pmv_free(ctx);
++
++	pmv->dev = dec->dev;
++	pmv->slot_bytes = (mbs * V5R6_PMV_PER_MB + V5R6_PMV_ROUND) & ~127U;
++	pmv->slots = V5R6_MAX_DPB_SLOTS;
++	bytes = pmv->slot_bytes * pmv->slots;
++
++	pmv->va = dma_alloc_coherent(dec->dev, bytes, &pmv->dma, GFP_KERNEL);
++	if (!pmv->va) {
++		pmv->slots = 0;
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++void histb_vdec_v5_pmv_free(struct histb_vdec_v5_ctx *ctx)
++{
++	struct histb_vdec_v5_pmv *pmv = &ctx->pmv;
++
++	if (!pmv->va)
++		return;
++
++	dma_free_coherent(pmv->dev, pmv->slot_bytes * pmv->slots, pmv->va,
++			  pmv->dma);
++	pmv->va = NULL;
++	pmv->dma = 0;
++	pmv->slot_bytes = 0;
++	pmv->slots = 0;
++}
++
++void histb_vdec_v5_abort(struct histb_vdec_v5 *dec)
++{
++	u32 state = 0;
++	int ret;
++
++	histb_vdec_v5_clocks(dec, true);
++	histb_vdec_v5_write(dec, V5R6_INT_MASK, ~0U);
++	histb_vdec_v5_write(dec, V5R6_RESET, V5R6_RESET_CORE);
++	ret = readl_relaxed_poll_timeout(dec->base + V5R6_RST_STATE,
++					   state, state & V5R6_RST_STATE_CORE,
++					   10, 30000);
++	histb_vdec_v5_write(dec, V5R6_RESET, 0);
++	if (ret)
++		dev_err(dec->dev, "abort reset not acknowledged (%#x)\n",
++			state);
++}
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_regs.h
+@@ -0,0 +1,217 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Registers of the HiSilicon HiSTB video decoder, V5R6 generation
++ * (the core the vendor calls HiVDHV5R6C02 on Hi3798MV200H / Hi3798MV310).
++ * Derived from the vendor firmware's register description header for this
++ * family (vdm_hal_v5r6c1_local.h), cross-checked against that firmware's own
++ * ARM32 assembly and against the live board.
++ */
++#ifndef HISTB_VDEC_V5_REGS_H
++#define HISTB_VDEC_V5_REGS_H
++
++#include <linux/bits.h>
++
++/*
++ * One 64 KiB window holds the decode core, the stream distributor 0xc000
++ * bytes in and the bitplane unpacker 0xd000 bytes in. The clock enable, reset
++ * request and status of every sub-block live inside this window rather than in
++ * the SoC's clock and reset generator, which offers only a clock selector for
++ * the core.
++ */
++#define V5R6_START			0x000
++#define V5R6_REPAIR			0x004
++#define V5R6_CFG0			0x008
++#define V5R6_CFG1			0x00c
++/*
++ * The three addresses the core reads first are the picture message, the report
++ * area it fills in, and the bitstream, each as a 16-byte granule index.
++ */
++#define V5R6_AVM_ADDR			0x010
++#define V5R6_VAM_ADDR			0x014
++#define V5R6_STREAM_BASE		0x018
++#define V5R6_YSTADDR_1D			0x060
++#define V5R6_YSTRIDE_1D			0x064
++#define V5R6_UVOFFSET_1D		0x068
++#define V5R6_HEAD_INF_OFFSET	0x06c
++#define V5R6_PPFD_ADDR			0x080
++#define V5R6_PPFD_LEN			0x084
++#define V5R6_STATE			0x01c
++#define V5R6_INT_STATE			0x020
++#define V5R6_INT_MASK			0x024
++#define V5R6_VCTRL_STATE		0x028
++/* Which reference-memory arrangement the core was built with; read-only. */
++#define V5R6_EMAR_ID			0x030
++#define V5R6_REF_PIC_TYPE		0x094
++#define V5R6_DOWN_CLK_CFG		0x09c
++
++/*
++ * What the syntax-error stage recorded for the last launch: the first and the
++ * last macroblock it accepted, its own state word, and the number of report
++ * entries it queued. These sit past the 64 KiB mark, so the window has to reach
++ * 0x1100 to read them.
++ */
++#define V5R6_RPT_CNT			0x034
++/* End-of-picture mark of the report word the core fills in. */
++#define V5R6_REPORT_ENDOFPIC		BIT(17)
++#define V5R6_SED_STA			0x1000
++#define V5R6_SED_FSTMB			0x1008
++#define V5R6_SED_LSTMB			0x100c
++#define V5R6_SED_STATE1			0x1014
++
++/*
++ * Per-picture performance counters: the cycles the core spent on the picture,
++ * the bus bandwidth and request counts for reads and writes, and the qp it used
++ * for macroblock 0. The request counts are what say whether the core fetched the
++ * bitstream and wrote a surface at all.
++ */
++#define V5R6_DEC_CYCLES			0x0b0
++#define V5R6_RD_BW_PER_PIC		0x0b4
++#define V5R6_WR_BW_PER_PIC		0x0b8
++#define V5R6_RD_REQ_PER_PIC		0x0bc
++#define V5R6_WR_REQ_PER_PIC		0x0c0
++#define V5R6_MB0_QP			0x0d0
++
++/* The reconstruction post-process block, which starts on its own. */
++#define V5R6_RPR_START			0x140
++
++/* The doorbell is a pulse: 0, then 1, then back to 0. */
++#define V5R6_START_GO			BIT(0)
++
++/* CFG0: what the engine checks and how it works. */
++#define V5R6_CFG0_MBAMT			GENMASK(19, 0)
++#define V5R6_CFG0_MEM_CG		BIT(20)	/* memory clock gating */
++#define V5R6_CFG0_MOD_CG		BIT(21)	/* module clock gating */
++#define V5R6_CFG0_MARKER_DETECT		BIT(22)
++#define V5R6_CFG0_ACLAST_DETECT		BIT(23)
++#define V5R6_CFG0_COEFIDX_DETECT	BIT(24)
++#define V5R6_CFG0_VOPTYPE_DETECT	BIT(25)
++#define V5R6_CFG0_WORK_MODE		GENMASK(27, 26)
++#define V5R6_CFG0_LUMA_SUM		BIT(28)
++#define V5R6_CFG0_LUMA_HISTOGRAM	BIT(29)
++#define V5R6_CFG0_LD_QMATRIX		BIT(30)
++#define V5R6_CFG0_SEC_MODE		BIT(31)	/* HEVC: safe flag for the core */
++
++/*
++ * CFG1: the protocol plus the output geometry knobs. There is no stride field
++ * here, unlike the older generation: the pitch is a 32-bit register of its own
++ * at V5R6_YSTRIDE_1D.
++ */
++#define V5R6_CFG1_VID_STD		GENMASK(3, 0)
++#define V5R6_CFG1_VPSS_INFO		BIT(11)
++#define V5R6_CFG1_MFD_MMU		BIT(12)
++#define V5R6_CFG1_UV_ORDER		BIT(13)
++#define V5R6_CFG1_FST_SLC_GRP		BIT(14)
++#define V5R6_CFG1_MV_OUT		BIT(15)
++#define V5R6_CFG1_MAX_SLCGRP_NUM	GENMASK(27, 16)
++#define V5R6_CFG1_LINE_NUM_OUT		BIT(28)
++#define V5R6_CFG1_2D			BIT(29)	/* HEVC: vdh_2d_en */
++#define V5R6_CFG1_COMPRESS		BIT(30)	/* HEVC: frame compression */
++#define V5R6_CFG1_PPFD			BIT(31)
++
++/*
++ * State of the core after a launch. The header of the sibling revision calls
++ * bit 19 a version field, while the firmware's assembly polls the very same
++ * bit as the partial-decode completion; a board that has decoded pictures
++ * reports 0 there, so which one it is stays open until a launch with a known
++ * macroblock count says otherwise. Bits 16:0 count slices or macroblocks and
++ * were seen at 94621 on an idle block, so they are not a status.
++ */
++#define V5R6_STATE_SLICES		GENMASK(16, 0)
++#define V5R6_STATE_DEC_OVER		BIT(17)
++#define V5R6_STATE_DEC_ERR		BIT(18)
++#define V5R6_STATE_PART_DEC_OVER	BIT(19)
++
++/*
++ * Latched events. A set bit in the mask word disables the interrupt, so the
++ * driver masks everything it does not ask for. Bit 2 is the partial-decode
++ * completion, named by the firmware's assembly rather than by the header.
++ */
++#define V5R6_INT_DEC_OVER		BIT(0)
++#define V5R6_INT_DEC_ERR		BIT(1)
++#define V5R6_INT_PART_DEC_OVER		BIT(2)
++
++/*
++ * Watchdogs of the pipeline stages, all seven of which the older firmware of
++ * this family programs to the same value at launch. The word ahead of the run
++ * of seven is not one of them.
++ */
++#define V5R6_TIMEOUT_STAGES	7
++#define V5R6_VCTRL_TO		0x038
++#define V5R6_SED_TO			0x03c
++#define V5R6_ITRANS_TO			0x040
++#define V5R6_PMV_TO			0x044
++#define V5R6_PRC_TO			0x048
++#define V5R6_RCN_TO			0x04c
++#define V5R6_DBLK_TO			0x050
++#define V5R6_PPFD_TO			0x054
++#define V5R6_PART_DEC_LEVEL		0x05c
++#define V5R6_TIMEOUT_DEFAULT		0x00300c03
++
++/* Written at every launch by the firmware this revision descends from. */
++#define V5R6_DOWN_CLK_VALUE		0xaaaaaaaa
++
++/* The sub-block clock enables, two bits each. */
++#define V5R6_CLKSEL			0xf804
++#define V5R6_CLKSEL_FIELD(which)	GENMASK((which) * 2 + 1, (which) * 2)
++#define V5R6_CLKSEL_VDEC		0
++#define V5R6_CLKSEL_DSP			1
++#define V5R6_CLKSEL_MMU			2
++#define V5R6_CLKSEL_BPD			3
++#define V5R6_CLKSEL_SCD			4
++#define V5R6_CLKSEL_MFDE		5
++#define V5R6_CLKSEL_RUN			2
++
++/*
++ * Reset requests and their acknowledgement, plus the idle flags. Reading the
++ * request word as zero with the status word's top four bits set is the quiet
++ * state: out of reset, every sub-block idle. The decode core is the unit the
++ * vendor calls MFDE; asking for the whole block would drop the stream
++ * distributor and the bitplane engine along with it.
++ */
++#define V5R6_RESET			0xf80c
++#define V5R6_RESET_ALL			BIT(0)
++#define V5R6_RESET_CORE			BIT(1)
++#define V5R6_RESET_SCD			BIT(2)
++#define V5R6_RESET_BPD			BIT(3)
++
++#define V5R6_RST_STATE			0xf810
++#define V5R6_RST_STATE_ALL		BIT(0)
++#define V5R6_RST_STATE_CORE		BIT(1)
++#define V5R6_RST_STATE_SCD		BIT(2)
++#define V5R6_RST_STATE_BPD		BIT(3)
++#define V5R6_RST_STATE_IDLE		BIT(4)
++#define V5R6_RST_STATE_BPD_IDLE		BIT(5)
++#define V5R6_RST_STATE_SCD_IDLE		BIT(6)
++#define V5R6_RST_STATE_MFDE_IDLE	BIT(7)
++
++/*
++ * The stream distributor's own registers, inside the same window. The vendor
++ * build writes all four at every launch; the clock gate value 2 is this part's
++ * and 3 is the older one's.
++ */
++#define V5R6_SCD_AVS_FLAG		0xc000
++#define V5R6_SCD_EMAR_CFG		0xc004
++#define V5R6_SCD_EMAR_ENABLE		BIT(0)
++#define V5R6_SCD_VDH_SELRST		0xc008
++#define V5R6_SCD_CLOCK_GATE		0xc00c
++#define V5R6_SCD_GATE_VALUE		2
++
++/*
++ * The core's own SMMU. Zero in the control register keeps translation off and
++ * lets the message and reference addresses be programmed as physical ones; the
++ * firmware turns translation on by writing 0x00030008 there. The fault latches
++ * share the core's interrupt line, so they are cleared with it.
++ */
++#define V5R6_SMMU_SCR			0xf000
++#define V5R6_SMMU_SCR_ENABLE		0x00030008
++#define V5R6_SMMU_INTSTAT_S		0xf018
++#define V5R6_SMMU_INTCLR_S		0xf01c
++#define V5R6_SMMU_INTMASK		0xf020
++#define V5R6_SMMU_INTSTAT_NS		0xf028
++#define V5R6_SMMU_INTCLR_NS		0xf02c
++#define V5R6_SMMU_FAULT_BITS		GENMASK(2, 0)
++#define V5R6_SMMU_CB_TTBR		0xf20c
++#define V5R6_SMMU_ERR_RDADDR		0xf304
++#define V5R6_SMMU_ERR_WRADDR		0xf308
++
++#endif /* HISTB_VDEC_V5_REGS_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_tables_h264.h
+@@ -0,0 +1,340 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * CABAC probability-table initialisation image for the V5R6 core.
++ *
++ * The vendor build copies this block verbatim into the pool at probe time
++ * (InitHal -> Write_CabacTab -> memcpy of 5120 bytes from g_CabacMN), so it
++ * is carried here as data rather than recomputed. Extracted from the H.264
++ * assembly of the sibling revision: syntax/h264.S, symbol g_CabacMN,
++ * .size 5120.
++ */
++#ifndef HISTB_VDEC_V5_TABLES_H264_H
++#define HISTB_VDEC_V5_TABLES_H264_H
++
++#define HISTB_VDEC_V5_CABAC_MN_WORDS	1280
++
++static const u32 histb_vdec_v5_cabac_mn[HISTB_VDEC_V5_CABAC_MN_WORDS] = {
++	0x17211702, 0x15001240, 0x092b1d00, 0x000b0137,
++	0x00450029, 0x003f003f, 0x003f0000, 0x00000000,
++	0x14f10236, 0x034ae47f, 0xe968fa35, 0xff360733,
++	0x1f151f1f, 0x19320000, 0x00000000, 0x00000000,
++	0x0539f34e, 0xf541013e, 0x01090031, 0xdb760d29,
++	0x033ef753, 0x04560061, 0xf9480000, 0x00000000,
++	0x0143f34e, 0xf541013e, 0x1a43105a, 0x0968d27f,
++	0xec680000, 0x00000000, 0x00000000, 0x00000000,
++	0x0c31fc49, 0x1132fa56, 0xef5ffa3d, 0x092df943,
++	0xfb4afc4a, 0xfb50f948, 0x013a0000, 0x00000000,
++	0xfd45fa51, 0xf5600637, 0x0743fb56, 0x0258003a,
++	0xfd4cf65e, 0x05360445, 0xfd510058, 0x00000000,
++	0x16192200, 0x10001a22, 0x13162800, 0x000b0137,
++	0x00450029, 0x003f003f, 0x003f0000, 0x00000000,
++	0x14f10236, 0x034ae47f, 0xe968fa35, 0xff360733,
++	0x1f151f1f, 0x19320000, 0x00000000, 0x00000000,
++	0x0241fa47, 0xf34f0534, 0xfe090429, 0xe3760d29,
++	0x033ef753, 0x04560061, 0xf9480000, 0x00000000,
++	0xfc4cfa47, 0xf34f0534, 0x39022924, 0x1a45d37f,
++	0xf1650000, 0x00000000, 0x00000000, 0x00000000,
++	0x0932fd46, 0x0a360645, 0xf35a0034, 0x082bff42,
++	0xff4d0146, 0xfe56fb48, 0x003d0000, 0x00000000,
++	0xfe45fb52, 0xf660023b, 0x024bfd57, 0xfd640138,
++	0xfd4afa55, 0x003bfd51, 0xf956fb5f, 0x00000000,
++	0x1d101900, 0x0e001428, 0x140a1d00, 0x000b0137,
++	0x00450029, 0x003f003f, 0x003f0000, 0x00000000,
++	0x14f10236, 0x034ae47f, 0xe968fa35, 0xff360733,
++	0x1f151f1f, 0x19320000, 0x00000000, 0x00000000,
++	0x1a10fc55, 0xe8660539, 0xf633fd3e, 0xe5630d29,
++	0x033ef753, 0x04560061, 0xf9480000, 0x00000000,
++	0xfe4afc55, 0xe8660539, 0x3600252a, 0x0c61e07f,
++	0xea750000, 0x00000000, 0x00000000, 0x00000000,
++	0x0639ef49, 0x0e39fa5d, 0xf258fa2c, 0x04370337,
++	0xfc4ffe4b, 0xf461f932, 0x013c0000, 0x00000000,
++	0xf559f167, 0xeb741339, 0x143a0454, 0x0660013f,
++	0xfb55f36a, 0x053f064b, 0xfd5aff65, 0x00000000,
++	0x17211702, 0x15001240, 0x092b1d00, 0x002dfc4e,
++	0xfd600029, 0x003f003f, 0x003f0000, 0x00000000,
++	0x14f10236, 0x034ae47f, 0xe968fa35, 0xff360733,
++	0x0c280b33, 0x0e3b0000, 0x00000000, 0x00000000,
++	0x0539f34e, 0xf541013e, 0x01090031, 0xdb760d29,
++	0x033ef753, 0x04560061, 0xf9480000, 0x00000000,
++	0x0143f34e, 0xf541013e, 0x1a43105a, 0x0968d27f,
++	0xec680000, 0x00000000, 0x00000000, 0x00000000,
++	0x0c31fc49, 0x1132fa56, 0xef5ffa3d, 0x092df943,
++	0xfb4afc4a, 0xfb50f948, 0x013a0000, 0x00000000,
++	0xfd45fa51, 0xf5600637, 0x0743fb56, 0x0258003a,
++	0xfd4cf65e, 0x05360445, 0xfd510058, 0x00000000,
++	0x16192200, 0x10001a22, 0x13162800, 0x0d0f0733,
++	0x02500029, 0x003f003f, 0x003f0000, 0x00000000,
++	0x14f10236, 0x034ae47f, 0xe968fa35, 0xff360733,
++	0x19201531, 0x15360000, 0x00000000, 0x00000000,
++	0x0241fa47, 0xf34f0534, 0xfe090429, 0xe3760d29,
++	0x033ef753, 0x04560061, 0xf9480000, 0x00000000,
++	0xfc4cfa47, 0xf34f0534, 0x39022924, 0x1a45d37f,
++	0xf1650000, 0x00000000, 0x00000000, 0x00000000,
++	0x0932fd46, 0x0a360645, 0xf35a0034, 0x082bff42,
++	0xff4d0146, 0xfe56fb48, 0x003d0000, 0x00000000,
++	0xfe45fb52, 0xf660023b, 0x024bfd57, 0xfd640138,
++	0xfd4afa55, 0x003bfd51, 0xf956fb5f, 0x00000000,
++	0x1d101900, 0x0e001428, 0x140a1d00, 0x0722f758,
++	0xec7f0029, 0x003f003f, 0x003f0000, 0x00000000,
++	0x14f10236, 0x034ae47f, 0xe968fa35, 0xff360733,
++	0x15211332, 0x113d0000, 0x00000000, 0x00000000,
++	0x1a10fc55, 0xe8660539, 0xf633fd3e, 0xe5630d29,
++	0x033ef753, 0x04560061, 0xf9480000, 0x00000000,
++	0xfe4afc55, 0xe8660539, 0x3600252a, 0x0c61e07f,
++	0xea750000, 0x00000000, 0x00000000, 0x00000000,
++	0x0639ef49, 0x0e39fa5d, 0xf258fa2c, 0x04370337,
++	0xfc4ffe4b, 0xf461f932, 0x013c0000, 0x00000000,
++	0xf559f167, 0xeb741339, 0x143a0454, 0x0660013f,
++	0xfb55f36a, 0x053f064b, 0xfd5aff65, 0x00000000,
++	0xef7ff366, 0x0052f94a, 0xeb6be57f, 0xe17fe87f,
++	0xee5fe57f, 0xeb72e27f, 0x00000000, 0x00000000,
++	0xef7bf473, 0xf07af573, 0xfd47fa2a, 0xfb32fd36,
++	0xfe3e003a, 0x013ffe48, 0xff4af75b, 0x00000000,
++	0xf95df557, 0xfd4dfb47, 0xfc3ffc44, 0xf454f93e,
++	0xf941083d, 0x0538fe42, 0x0140003d, 0xfe4e0000,
++	0x18000f09, 0x08190d12, 0x0f090d13, 0x0a250c12,
++	0x061d1421, 0x0f1e042d, 0x013a003e, 0x073d0000,
++	0xfa5dfa54, 0xf84f0042, 0xff47003e, 0xfe3cfe3b,
++	0xfb4bfd3e, 0xfc3af742, 0xff4f0047, 0x03440000,
++	0x0f060613, 0x07100c0e, 0x120d0d0b, 0x0d0f0f10,
++	0x0c170d17, 0x0f140e1a, 0x0e2c1128, 0x112f0000,
++	0xf43ffe44, 0xf154f368, 0xfb43fb1b, 0xfd27fe2c,
++	0x002ef040, 0xf844f64e, 0xfa4df656, 0x00000000,
++	0x01320734, 0x0a23002c, 0x0b26012d, 0x002e052c,
++	0x1f110133, 0x07321c13, 0x10210e3e, 0x00000000,
++	0x0c260b2d, 0x0f270b2a, 0x0d2c102d, 0x0c290a31,
++	0x1e22122a, 0x0a371133, 0x112e0059, 0x00000000,
++	0x0a2cf93e, 0x0f240e28, 0x101b0c1d, 0x012c1424,
++	0x1220052a, 0x01300a3e, 0x112e0940, 0x00000000,
++	0x18111515, 0x19161f1b, 0x161d1323, 0x0e320a39,
++	0x073ffe4d, 0xfc52fd5e, 0x0945f46d, 0x00000000,
++	0xfd46f85d, 0xf65ae27f, 0xf45cf137, 0xf63cfa3e,
++	0xfc41f449, 0xf84cf950, 0xf758ef6e, 0x00000000,
++	0xf36cf164, 0xf365f35b, 0xf45ef658, 0xf054f656,
++	0xf953f357, 0xed5e0146, 0x0048fb4a, 0x123b0000,
++	0x1aed16ef, 0x1aef1ee7, 0x1cec21e9, 0x25e521e9,
++	0x28e426ef, 0x21f528f1, 0x29fa2601, 0x29110000,
++	0xf468f561, 0xf060f958, 0xf855f955, 0xf755f358,
++	0x0442fd4d, 0xfd4cfa4c, 0x0a3aff4c, 0xff530000,
++	0x24dd24de, 0x20e625e2, 0x2ce022ee, 0x22f128f1,
++	0x21f923fb, 0x21002602, 0x210d1723, 0x0d3a0000,
++	0xff4afa61, 0xf95bec7f, 0xf561ec54, 0xf54ffa49,
++	0xfc4af356, 0xf360f561, 0xed750000, 0x00000000,
++	0xf866f164, 0x005f0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x1efa1b03, 0x1a160000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0xf963f25f, 0x025f0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x1dfd1a00, 0x161e0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0xfc38fb52, 0xf94cea7d, 0xf84efb21, 0xfc30fe35,
++	0xfd3ef347, 0xf64ff456, 0xf35af261, 0x00000000,
++	0xfc4b0248, 0xf54bfd47, 0x0f2ef345, 0x003e0041,
++	0x1525f148, 0x09391036, 0x003e0c48, 0x00000000,
++	0x25f023fc, 0x26f826fd, 0x25032605, 0x2a002310,
++	0x27160e30, 0x1b25153c, 0x0c440261, 0x00000000,
++	0x004cfb4a, 0x0046f54b, 0x01440041, 0xf249033e,
++	0x043eff44, 0xf34b0b37, 0x05400c46, 0x00000000,
++	0x1ff923f1, 0x22fd2203, 0x24ff2205, 0x200b2305,
++	0x220c270b, 0x1e1d221a, 0x1d271342, 0x00000000,
++	0x00000000, 0x00000000, 0xfd4bff17, 0x0122012b,
++	0x0036fe37, 0x003d0140, 0x0044f75c, 0x00000000,
++	0xef78ec70, 0xee72f555, 0xf15cf259, 0xe647f151,
++	0xf2500044, 0xf246e838, 0xe944e832, 0xf54a0000,
++	0x17f31af3, 0x28f131f2, 0x2c032d06, 0x2c222136,
++	0x13520000, 0x00000000, 0x00000000, 0x00000000,
++	0xf26af361, 0xf15af45a, 0xee58f649, 0xf74ff256,
++	0xf649f646, 0xf645fb42, 0xf740fb3a, 0x023b0000,
++	0x15f618f5, 0x1cf81cff, 0x1d031d09, 0x23141d24,
++	0x0e430000, 0x00000000, 0x00000000, 0x00000000,
++	0xe57ee462, 0xe765e943, 0xe452ec5e, 0xf053ea6e,
++	0xeb5bee66, 0xf35de37f, 0x00000000, 0x00000000,
++	0xf95cfb59, 0xf960f36c, 0xfa4cfe2c, 0x002d0034,
++	0xfd40fe3b, 0xfc46fc4b, 0xf852ef66, 0x00000000,
++	0xfe55fa4e, 0xff4bf94d, 0x02360532, 0xfd440132,
++	0x062afc51, 0x013ffc46, 0x00430239, 0xfe4c0000,
++	0x0b1c0228, 0x032c0031, 0x002e022c, 0x0233002f,
++	0x0427023e, 0x062e0036, 0x0336023a, 0x043f0000,
++	0xf36af06a, 0xf657eb72, 0xee6ef262, 0xea6eeb6a,
++	0xee67eb6b, 0xe96ce670, 0xf660f45f, 0xfb5b0000,
++	0x0e0b0b0e, 0x090b120b, 0x150917fe, 0x20f120f1,
++	0x22eb27e9, 0x2adf29e1, 0x2ee426f4, 0x151d0000,
++	0xfd2eff41, 0xff39f75d, 0xf74d0318, 0x002a0030,
++	0x0037fa3b, 0xf947f453, 0xf557e277, 0x00000000,
++	0x0b230440, 0x013d0b23, 0x12190c18, 0x0d1d0d24,
++	0xf65df949, 0xfe490d2e, 0x0931f964, 0x00000000,
++	0x06330639, 0x07350634, 0x06370b2d, 0x0e240835,
++	0xff520737, 0xfd4e0f2e, 0x161fff54, 0x00000000,
++	0xf75dea5e, 0xfb560943, 0xfc50f655, 0xff46073c,
++	0x093a053d, 0x0c320f32, 0x12311136, 0x00000000,
++	0x2de835d3, 0x30e641d5, 0x2bed27f6, 0x1e09121a,
++	0x141b0039, 0xf252fb4b, 0xed61dd7d, 0x00000000,
++	0xfd4af75c, 0xf857e97e, 0x013afd1d, 0xff240126,
++	0x022bfa37, 0x003a0040, 0xfd4af65a, 0x00000000,
++	0x09350235, 0x0535fe3d, 0x00380038, 0xf33ffb3c,
++	0xff3e0439, 0xfa450439, 0x0e270433, 0x0d440000,
++	0x19071ef9, 0x1c031c04, 0x200022ff, 0x1e061e06,
++	0x20091f13, 0x1a1b1a1e, 0x25141c22, 0x11460000,
++	0x0a29072e, 0xff330731, 0x08340929, 0x062f0237,
++	0x0d290a2c, 0x06320535, 0x0d31043f, 0x06400000,
++	0x1b001c00, 0x1ffc1b06, 0x22081e0a, 0x18162113,
++	0x16201a1f, 0x15291a2c, 0x172f1041, 0x0e470000,
++	0x0536063c, 0x063b0645, 0x0046fc1d, 0x051f072a,
++	0x013bfe3a, 0xfd48fd51, 0xf5610000, 0x00000000,
++	0x0340013d, 0x093f0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x0143053b, 0x09430000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0xfe45fe3b, 0x06460000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x083c063f, 0x11410000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0xff300044, 0xfc45f858, 0x003a0805, 0x0a0e0e12,
++	0x0d1b0228, 0x003afd46, 0xfa4ff855, 0x00000000,
++	0x07321027, 0x052c0434, 0x0b30fb3c, 0xff3b003b,
++	0x1621052c, 0x0e2bff4e, 0x003c0945, 0x00000000,
++	0x101e1220, 0x1223161d, 0x181f1726, 0x122b1429,
++	0x0b3f093b, 0x0940ff5e, 0xfe59f76c, 0x00000000,
++	0x0a2c091f, 0x0c2b0335, 0x0e220a26, 0xfd340d28,
++	0x1120072c, 0x07260d32, 0x0a391a2b, 0x00000000,
++	0x15181714, 0x1a171b20, 0x1c171c18, 0x17281820,
++	0x1c1d172a, 0x13391635, 0x163d0b56, 0x00000000,
++	0x00000000, 0x00000000, 0xfa42f923, 0xf92af82d,
++	0xfb30f438, 0xfa3cfb3e, 0xf842f84c, 0x00000000,
++	0xfc4ff947, 0xfb45f746, 0xf842f644, 0xed49f445,
++	0xf046f143, 0xec3eed46, 0xf042ea41, 0xec3f0000,
++	0x09fe1af7, 0x21f727f9, 0x29fe2d03, 0x31092d1b,
++	0x243b0000, 0x00000000, 0x00000000, 0x00000000,
++	0xfb55fa51, 0xf64df951, 0xef50ee49, 0xfc4af653,
++	0xf747f743, 0xff3df842, 0xf242003b, 0x023b0000,
++	0x15f321f2, 0x27f92efe, 0x33023c06, 0x3d113722,
++	0x2a3e0000, 0x00000000, 0x00000000, 0x00000000,
++	0xd97fee5b, 0xef60e651, 0xdd62e866, 0xe961e577,
++	0xe863eb6e, 0xee66dc7f, 0x00000000, 0x00000000,
++	0x0050fb59, 0xf95efc5c, 0xe970f147, 0xf93d0035,
++	0xfb42f54d, 0xf750f754, 0xf657de7f, 0x00000000,
++	0xf367f35b, 0xf759f25c, 0xf84cf457, 0xe96ee869,
++	0xf64eec70, 0xef63b27f, 0xba7fce7f, 0xd27f0000,
++	0x042d0a1c, 0x0a1f21f5, 0x34d5120f, 0x1c0023ea,
++	0x26e72200, 0x27ee20f4, 0x66a20000, 0x38f10000,
++	0xeb7ee97c, 0xec6ee67e, 0xe77cef69, 0xe579e575,
++	0xef66e675, 0xe574df7a, 0xf65ff264, 0xf85f0000,
++	0x13fa12fa, 0x0e001af4, 0x1ff021e7, 0x21ea25e4,
++	0x27e22ae2, 0x2fd62ddc, 0x31de29ef, 0x20090000,
++	0x00270041, 0xf154dd7f, 0xeb65fd27, 0xfb35f93d,
++	0xf54bf14d, 0xef5be76b, 0xe76fe47a, 0x00000000,
++	0xfc42fb4e, 0xfc47f848, 0x023bff37, 0xf946fa4b,
++	0xf859de77, 0xfd4b2014, 0x1e16d47f, 0x00000000,
++	0x21fc1d0a, 0x25fb33e3, 0x27f734de, 0x45c643c1,
++	0x2cfb2007, 0x37e32001, 0x00001b24, 0x00000000,
++	0xef6fe472, 0xfa59fe50, 0xfc52f755, 0xf851ff48,
++	0x05400143, 0x09380045, 0x01450745, 0x00000000,
++	0x45b93fc1, 0x42c04db6, 0x36d934dd, 0x29f62400,
++	0x28ff1e0e, 0x1c1a1725, 0x0c370b41, 0x00000000,
++	0xfe49f468, 0xf75be17f, 0xf54cf62c, 0xf634f639,
++	0xf73af048, 0xf945fc45, 0xfb4af756, 0x00000000,
++	0x0036fb3d, 0x003aff3c, 0xfd3df843, 0xe754f24a,
++	0xfb410534, 0x0239003d, 0xf745f546, 0x12370000,
++	0x21e722e2, 0x24e426e4, 0x26e522ee, 0x23f022f2,
++	0x20f825fa, 0x23001e0a, 0x1c121a19, 0x1d290000,
++	0xf945fa43, 0xf04dfe40, 0x023dfa43, 0xfd400239,
++	0xfd41fd42, 0x003e0933, 0xff42fe47, 0xfe4b0000,
++	0x25df27dc, 0x28db26e2, 0x2edf2ae2, 0x28e831e3,
++	0x26f428f6, 0x26fd2efb, 0x1f141d1e, 0x192c0000,
++	0x03370738, 0x0737083d, 0x0242f722, 0x01200b1f,
++	0x0534fe37, 0xfe430049, 0xf8590000, 0x00000000,
++	0xfc47003a, 0x073d0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x004b0248, 0x084d0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0xff46f748, 0x0e3c0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x0c300b31, 0x1a2d0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0xfd350044, 0xf94af758, 0x03340704, 0x0a081108,
++	0x10130325, 0xff3dfb49, 0xff46fc4e, 0x00000000,
++	0x09291219, 0x0920052b, 0x092f002c, 0x0033022e,
++	0x1326fc42, 0x0f260c2a, 0x09220059, 0x00000000,
++	0x0e23121f, 0x1123151e, 0x112d142a, 0x122d1b1a,
++	0x10360742, 0x10380b49, 0x0a43f674, 0x00000000,
++	0x1025002f, 0x12230b25, 0x0c290a29, 0x02300c29,
++	0x0d29003b, 0x03321328, 0x03421232, 0x00000000,
++	0x16161716, 0x1b152114, 0x1a1c1e18, 0x1b22122a,
++	0x19271232, 0x0c461536, 0x0e470b53, 0x00000000,
++	0x00000000, 0x00000000, 0xfb470018, 0xff24fe2a,
++	0xfe34f739, 0xfa3ffc41, 0xfc43f952, 0x00000000,
++	0xfb55fa51, 0xf64df951, 0xef50ee49, 0xfc4af653,
++	0xf747f743, 0xff3df842, 0xf242003b, 0x023b0000,
++	0x11f620f3, 0x2af731fb, 0x35004003, 0x440a421b,
++	0x2f390000, 0x00000000, 0x00000000, 0x00000000,
++	0xfd51fd4c, 0xf948fa4e, 0xf448f244, 0xfd46fa4c,
++	0xfb42fb3e, 0x0039fc3d, 0xf73c0136, 0x023a0000,
++	0x11f620f3, 0x2af731fb, 0x35004003, 0x440a421b,
++	0x2f390000, 0x00000000, 0x00000000, 0x00000000,
++	0xdc7fef5b, 0xf25fe754, 0xe756f459, 0xef5be17f,
++	0xf24cee67, 0xf35adb7f, 0x00000000, 0x00000000,
++	0x0b50054c, 0x0254054e, 0xe873ea52, 0xf73e0035,
++	0x003bf255, 0xf359f35e, 0xf55ce37f, 0x00000000,
++	0xfc56f458, 0xfb52fd48, 0xfc43f848, 0xf059f745,
++	0xff3b0542, 0x0439fc47, 0xfe47023a, 0xff4a0000,
++	0x0427002a, 0x07220b1d, 0x081f0625, 0x072a0328,
++	0x08210d2b, 0x0d24042f, 0x0337023a, 0x063c0000,
++	0xea7fe77f, 0xe778e57f, 0xed72e975, 0xe776e675,
++	0xe871e476, 0xe178db7c, 0xf65ef166, 0xf6630000,
++	0x11f310f7, 0x11f41beb, 0x25e229d8, 0x2ad730d1,
++	0x27e02ed8, 0x34cd2ed7, 0x34d92bed, 0x200b0000,
++	0xfa37043d, 0xf253db7f, 0xeb64f239, 0xf443f547,
++	0xf64deb55, 0xf058e968, 0xf162db7f, 0x00000000,
++	0xfc2cff45, 0x003ef933, 0xfc2ffa2a, 0xfd29fa35,
++	0x084cf74e, 0xf5530934, 0x0043fb5a, 0x00000000,
++	0x082c0b2c, 0x0e2a0730, 0x04380434, 0x0d250931,
++	0x133a0a30, 0x0c2d0045, 0x1421083f, 0x00000000,
++	0xf36ace7f, 0xfb5c1139, 0xfb56f35e, 0xf45bfe4d,
++	0x0047ff49, 0x0440f951, 0x05400f39, 0x00000000,
++	0x3dc938d2, 0x3ece51bd, 0x2dec23fe, 0x1c0f2201,
++	0x27011e11, 0x1426122d, 0x0f36004f, 0x00000000,
++	0xfb4ff568, 0xf55be27f, 0xf652f830, 0xf83df842,
++	0xf946f24b, 0xf64ff753, 0xf45cee6c, 0x00000000,
++	0x0143f148, 0xfb4bf850, 0xeb53eb40, 0xf31fe740,
++	0xe35e094b, 0x113ff84a, 0xfb23fe1b, 0x0d5b0000,
++	0x23ee21e7, 0x1cfd180a, 0x1b0022f2, 0x34d427e8,
++	0x13111f19, 0x241d1821, 0x220f1e14, 0x16490000,
++	0x01430044, 0xf6430144, 0x004d0240, 0x0044fb4e,
++	0x0737053b, 0x02410e36, 0x0f2c053c, 0x02460000,
++	0x24f025f2, 0x25ef2001, 0x220f1d0f, 0x18192216,
++	0x1f102312, 0x1f1c2129, 0x241c1b2f, 0x153e0000,
++	0x0041fe4f, 0x0048fc5c, 0xfc4fea45, 0xf04bfe3a,
++	0x013af34e, 0xf753fc51, 0xf3630000, 0x00000000,
++	0x0341f945, 0x084d0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x1422131f, 0x1b2c0000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0xfe4cee56, 0x0c460000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x121f131a, 0x24180000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0xfa380344, 0xf847f362, 0xf351fa26, 0xf33efa3a,
++	0xfe3bf049, 0xf64cf356, 0xf753f657, 0x00000000,
++	0xf642033e, 0xfd44ec51, 0x001e0107, 0xfd17eb4a,
++	0x1042e97c, 0x11252cee, 0x32deea7f, 0x00000000,
++	0x13100f24, 0x0f24151c, 0x19151e14, 0x1f0c1b10,
++	0x182a005d, 0x0e380f39, 0x1a26e87f, 0x00000000,
++	0x0540f446, 0x0b370538, 0x00450241, 0xfa4a0536,
++	0x0736fa4c, 0xf552fe4d, 0xfe4d192a, 0x00000000,
++	0x18171b10, 0x181e1f1d, 0x1629162a, 0x103c0f34,
++	0x0e3c034e, 0xf07b1535, 0x1638193d, 0x00000000,
++	0x00000000, 0x00000000, 0xf747f925, 0xf82cf531,
++	0xf638f43b, 0xf83ff743, 0xfa44f64f, 0x00000000,
++	0xfd4ef84a, 0xf748f648, 0xee4bf447, 0xf53ffb46,
++	0xef4bf248, 0xf043f835, 0xf23bf734, 0xf5440000,
++	0x09fe1ef6, 0x1ffc21ff, 0x21071f0c, 0x25171f26,
++	0x14400000, 0x00000000, 0x00000000, 0x00000000,
++	0xfd4ef84a, 0xf748f648, 0xee4bf447, 0xf53ffb46,
++	0xef4bf248, 0xf043f835, 0xf23bf734, 0xf5440000,
++	0x09fe1ef6, 0x1ffc21ff, 0x21071f0c, 0x25171f26,
++	0x14400000, 0x00000000, 0x00000000, 0x00000000,
++
++};
++
++#endif /* HISTB_VDEC_V5_TABLES_H264_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vdec/histb_vdec_v5_tables_hevc.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * HEVC CABAC context table (928 bytes) for the V5R6 core of the
++ * Hi3798MV200H, taken from the vendor build's own firmware image.
++ *
++ * The decoder reads the table through picture-message word D25. For each of the
++ * 464 hardware CABAC contexts it holds the byte pair (m, n) of the
++ * initialisation process of ITU-T Rec. H.265 section 9.3.1.1 (m = 5 *
++ * slopeIdx - 45, n = 8 * offsetIdx - 16); the hardware derives the running
++ * (pStateIdx, valMps) from the slice QP itself. Two contexts pack into one word
++ * in little-endian byte order (m0, n0, m1, n1).
++ *
++ * The same table written for the older engine stores each 16-bit halfword the
++ * other way round; using that image here leaves every context initialised from
++ * swapped operands and the core decodes no CTB at all.
++ */
++#ifndef HISTB_VDEC_V5_TABLES_HEVC_H
++#define HISTB_VDEC_V5_TABLES_HEVC_H
++
++#include <linux/types.h>
++
++#define HISTB_VDEC_V5_CABAC_MN_HEVC_WORDS	232
++
++static const u32 histb_vdec_v5_cabac_mn_hevc[HISTB_VDEC_V5_CABAC_MN_HEVC_WORDS] = {
++	0x0f300038, 0xfb58fb48, 0x00400058, 0x00000000, 0x00000000, 0x00000a30, 0x00000000,
++	0xe2680a30, 0xfb40ec60, 0x00400a20, 0xfb58f168, 0x00400040, 0xfb48fb48, 0x0038fb40,
++	0x0528fb30, 0x00300030, 0xf160f160, 0xf658f650, 0x0038fb50, 0xf668f658, 0xf158fb50,
++	0xfb68f168, 0xf168f668, 0xf150e768, 0xe268f648, 0xf160f160, 0xf658f650, 0x0038fb50,
++	0xf668f658, 0xf158fb50, 0xfb68f168, 0xf168f668, 0xf150e768, 0xe268f648, 0x0548ec48,
++	0xfb58fb20, 0xec50fb50, 0xfb40fb38, 0x0030fb50, 0xfb48fb40, 0xe7400038, 0xec500018,
++	0xf148fb48, 0x0030f640, 0x0a08fb50, 0x0a200520, 0x1908fb50, 0x0f18f640, 0xf168f168,
++	0xf160f658, 0xec60f160, 0xf150f650, 0xf148f650, 0xfb58f658, 0x00380a08, 0xf148f658,
++	0xfb58f658, 0x00380a08, 0xf148f658, 0xfb58f658, 0x00380a08, 0xfb50f658, 0x0a20fb48,
++	0x00300a20, 0x0030fb30, 0x0038fb30, 0xfb48fb30, 0xfb30f168, 0xf168fb48, 0x00380000,
++	0xfb40fb40, 0x00000000, 0xf160e768, 0xec68f640, 0xe268e768, 0xd868d868, 0x00380038,
++	0xfb500530, 0x00000f20, 0x00000000, 0x0a380038, 0xfb48f148, 0x0040f660, 0x0a380f18,
++	0x00180f38, 0xfb480040, 0x00400040, 0x00300040, 0xf1480018, 0x00400528, 0xf1680038,
++	0x00400040, 0xfb48fb48, 0x0528f148, 0xf640ec48, 0x0528f148, 0xf160f658, 0xf160ec60,
++	0xe768ec68, 0xf168f658, 0xe760f160, 0xf168f160, 0xec68f168, 0xf150ec60, 0xf150f648,
++	0xf160f658, 0xf160ec60, 0xe768ec68, 0xf168f658, 0xe760f160, 0xf168f160, 0xec68f168,
++	0xf150ec60, 0xf150f648, 0xfb50f638, 0x0040e258, 0x0f100040, 0x05280f10, 0x00300040,
++	0x0a200528, 0xfb200a20, 0xfb300018, 0xf6380038, 0xfb38fb30, 0x0f000538, 0x05280520,
++	0x05280040, 0x0a20fb38, 0x00400048, 0x0038fb48, 0xf648fb48, 0xe268f648, 0x05200038,
++	0xfb500a28, 0x0038fb30, 0x05200040, 0xfb500a28, 0x0038fb30, 0x05200040, 0xfb500a28,
++	0x0038fb30, 0x05400040, 0xf6480038, 0xf148f648, 0xf148f638, 0x0528f638, 0x0a280028,
++	0x0028fb50, 0xfb500a28, 0xf6500000, 0xec60fb40, 0x00000000, 0x0040e768, 0xec68fb38,
++	0xe268e768, 0xd868d868, 0x00380038, 0x05380530, 0x00000f20, 0x00000000, 0x05f00038,
++	0xfb48f148, 0x0040f660, 0x0a380f18, 0xfb200f38, 0xfb480040, 0x00400040, 0x00300a28,
++	0xec500018, 0x00400528, 0xf1680038, 0x00400040, 0xfb48fb48, 0x0528f148, 0xf148ec48,
++	0x0528f148, 0xf160f658, 0xf160f650, 0xec60ec68, 0xf168f658, 0xe768f168, 0xf660f658,
++	0xf168f168, 0xf150e768, 0xec58f648, 0xf160f658, 0xf160f650, 0xec60ec68, 0xf168f658,
++	0xe768f168, 0xf660f658, 0xf168f168, 0xf150e768, 0xec58f648, 0xfb50f638, 0x0040e258,
++	0x0f100040, 0x05280528, 0x00300040, 0x0a200528, 0xfb200a20, 0xfb300018, 0xf6380038,
++	0xf640fb30, 0x14f00538, 0x05280520, 0x00300040, 0x0a200528, 0x00400540, 0x0038fb48,
++	0xf648fb48, 0xe268f648, 0x0520f650, 0xfb500a28, 0x0038fb30, 0x05200040, 0xfb500a28,
++	0x0038fb30, 0x05200040, 0xfb500a28, 0x0038fb30, 0x05400040, 0xfb400038, 0xf640fb40,
++	0xf640f638, 0x0528f638, 0x0a280028, 0x0028fb50, 0xfb500a28, 0x19f00000, 0xf6400528,
++	0x00000000,
++};
++
++#endif /* HISTB_VDEC_V5_TABLES_HEVC_H */

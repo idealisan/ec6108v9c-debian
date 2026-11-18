@@ -1,0 +1,38 @@
+From 8860cfcfd7d90afebec57e21de57fb484e3f9de3 Mon Sep 17 00:00:00 2001
+From: Yang Xiwen <forbidden405@outlook.com>
+Date: Wed, 5 Apr 2023 16:13:50 +0800
+Subject: [PATCH] dt-bindings: vendor-prefixes: add skyworth
+
+Skyworth Group Co., Ltd. was founded in 1988, mainly engaged in
+multimedia business (smart TV system, COOCAA system Internet value-added
+services, etc.), smart system technology business (home access system,
+smart manufacturing, automotive Electronic systems and other electronic
+products, etc.), smart electrical appliances business (smart air
+conditioners, smart refrigerators, smart washing machines, smart
+kitchens, etc.), modern service business (home appliance maintenance and
+repair, large logistics service industry, foreign trade, construction
+and development, financial leasing , Park property management, etc.) and
+other four major businesses, the group has two listed companies,
+Skyworth Group (HK00751) and Skyworth Digital (000810), several
+high-tech enterprises, with a national enterprise technology center, a
+national industrial design center, It is the first batch of
+demonstration units of "Made in China 2025", and has been among the top
+100 Chinese electronics companies for many years.
+
+Signed-off-by: Yang Xiwen <forbidden405@outlook.com>
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ Documentation/devicetree/bindings/vendor-prefixes.yaml | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -1587,6 +1587,8 @@ patternProperties:
+     description: SKOV A/S
+   "^skyworks,.*":
+     description: Skyworks Solutions, Inc.
++  "^skyworth,.*":
++    description: SKYWORTH Group Co., Ltd.
+   "^smartfiber,.*":
+     description: ShenZhen Smartfiber Technology Co, Ltd.
+   "^smartlabs,.*":

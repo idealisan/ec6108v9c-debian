@@ -1,0 +1,31 @@
+From 6fbfc52282f3a62e28d8d9cc733b29301c1c7c04 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 00:17:21 +0800
+Subject: [PATCH] media: platform: no bench hooks
+
+The glue block carries only Kconfig and Makefile lines; every one of
+them is in the submitted content.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/media/platform/hisilicon/Kconfig | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/drivers/media/platform/hisilicon/Kconfig
++++ b/drivers/media/platform/hisilicon/Kconfig
+@@ -11,6 +11,7 @@ config VIDEO_HISTB_JPGD
+ 	depends on V4L_MEM2MEM_DRIVERS
+ 	depends on VIDEO_DEV
+ 	select VIDEOBUF2_DMA_CONTIG
++	select VIDEOBUF2_VMALLOC
+ 	select V4L2_MEM2MEM_DEV
+ 	select V4L2_JPEG_HELPER
+ 	help
+@@ -30,6 +31,7 @@ config VIDEO_HISTB_JPGE
+ 	depends on V4L_MEM2MEM_DRIVERS
+ 	depends on VIDEO_DEV
+ 	select VIDEOBUF2_DMA_CONTIG
++	select VIDEOBUF2_VMALLOC
+ 	select V4L2_MEM2MEM_DEV
+ 	select V4L2_JPEG_HELPER
+ 	help

@@ -1,0 +1,3373 @@
+From f6723236207f05e4798f996a083169607574d3d2 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 3 Nov 2026 13:45:21 +0800
+Subject: [PATCH 2/2] media: platform: add the HiSTB VPSS video processing
+ driver
+
+The block sits between a decoder and an encoder or a display and has no
+mainline driver. Only tone mapping, temporal noise reduction, a second
+output port and a write-back capture channel have no V4L2 mem2mem shape,
+so they stay unimplemented. Add the driver as a mem2mem device: the
+probe path, the two queues, the register layer and the job path, the
+horizontal and vertical flips, the payload and timestamp of the frame
+actually written, the crop taken from the selection API and the scaler
+driven by the block's own phase tables. An interlaced field is bobbed
+into a frame through the pre-scaler's field filter while the capture
+rectangle is twice its height, and any other interlaced combination is
+refused with a warning instead of silently converting; the buffers a
+stopped queue still holds come back at stop_streaming.
+
+Beyond the flip-and-scale core the driver covers the 4:2:2 format family
+on both ports, the sharpening engine, a source-side crop, rotation
+through a two-image chain, packed 4:2:2 input and the block's
+motion-adaptive deinterlace mode; the vpss_v4_0 generation of
+hi3798mv200 runs its jobs through the chained-descriptor command path
+that generation uses.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/media/platform/hisilicon/Kconfig      |   17 +
+ drivers/media/platform/hisilicon/Makefile     |    1 +
+ .../platform/hisilicon/histb-vpss-regs.h      |  196 ++
+ .../platform/hisilicon/histb-vpss-v4-regs.h   |  231 ++
+ .../platform/hisilicon/histb-vpss-zme-coef.h  |  650 +++++
+ drivers/media/platform/hisilicon/histb-vpss.c | 2222 +++++++++++++++++
+ 6 files changed, 3317 insertions(+)
+ create mode 100644 drivers/media/platform/hisilicon/histb-vpss-regs.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vpss-v4-regs.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vpss-zme-coef.h
+ create mode 100644 drivers/media/platform/hisilicon/histb-vpss.c
+
+--- a/drivers/media/platform/hisilicon/Kconfig
++++ b/drivers/media/platform/hisilicon/Kconfig
+@@ -39,3 +39,20 @@ config VIDEO_HISTB_JPGE
+ 
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called histb-jpge.
++
++config VIDEO_HISTB_VPSS
++	tristate "HiSilicon HiSTB video processing subsystem driver"
++	depends on ARCH_HISI || COMPILE_TEST
++	depends on V4L_MEM2MEM_DRIVERS
++	depends on VIDEO_DEV
++	select VIDEOBUF2_DMA_CONTIG
++	select V4L2_MEM2MEM_DEV
++	help
++	  Support for the VPSS video processing block on HiSilicon Hi3798MV100
++	  set-top-box SoCs. The driver exposes it as a mem2mem device that turns
++	  a decoder frame into a linear one (undoing the 16x16 tile layout),
++	  optionally scaling it and de-interlacing it with the block's motion
++	  estimator.
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called histb-vpss.
+--- a/drivers/media/platform/hisilicon/Makefile
++++ b/drivers/media/platform/hisilicon/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+ obj-$(CONFIG_VIDEO_HISTB_JPGD) += histb-jpgd.o
+ obj-$(CONFIG_VIDEO_HISTB_JPGE) += histb-jpge.o
++obj-$(CONFIG_VIDEO_HISTB_VPSS) += histb-vpss.o
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vpss-regs.h
+@@ -0,0 +1,196 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * Register offsets and fields of the Hi3798MV100 VPSS register file.
++ *
++ * The block does not take field writes: a job is a register image in memory
++ * whose physical address is handed to the block through PNEXT and released by
++ * START, so every offset below is used on that image (and on the MMIO window,
++ * which the image mirrors).
++ */
++#ifndef __HISTB_VPSS_REGS_H
++#define __HISTB_VPSS_REGS_H
++
++#define VPSS_CTRL		0x000
++#define VPSS_CTRL_VHD_EN	BIT(1)
++#define VPSS_CTRL_UV_INVERT	BIT(5)
++#define VPSS_CTRL_IMG_PRO_MODE	GENMASK(7, 6)
++#define VPSS_CTRL_DEI_EN	BIT(9)
++#define VPSS_CTRL_PROT		GENMASK(13, 12)
++#define VPSS_CTRL_ROTATE_ANGLE	BIT(21)
++#define VPSS_CTRL_ROTATE_EN	BIT(22)
++#define VPSS_CTRL_PRE_VFIR_MODE	GENMASK(24, 23)
++#define VPSS_CTRL_PRE_VFIR_EN	BIT(25)
++#define VPSS_CTRL_VHD_LBA_EN	BIT(15)
++#define VPSS_CTRL_BFIELD_FIRST	BIT(29)
++#define VPSS_CTRL_BFIELD_MODE	BIT(30)
++#define VPSS_CTRL_BFIELD	BIT(31)
++
++#define VPSS_CTRL2		0x004
++#define VPSS_CTRL2_VHD_FORMAT	GENMASK(7, 4)
++#define VPSS_CTRL2_IN_FORMAT	GENMASK(20, 16)
++
++#define VPSS_IMGSIZE		0x008
++#define VPSS_IMGSIZE_WIDTH	GENMASK(11, 0)
++#define VPSS_IMGSIZE_HEIGHT	GENMASK(27, 16)
++
++#define VPSS_CUR_CTRL		0x00c
++#define VPSS_CUR_CTRL_HOR_OFFSET	GENMASK(17, 5)
++#define VPSS_CUR_CTRL_VER_OFFSET	GENMASK(30, 18)
++
++#define VPSS_CURYADDR		0x018
++#define VPSS_CURCADDR		0x01c
++#define VPSS_CURCRADDR		0x020
++
++#define VPSS_CURSTRIDE		0x024
++#define VPSS_CURSTRIDE_Y	GENMASK(15, 0)
++#define VPSS_CURSTRIDE_C	GENMASK(31, 16)
++
++/* The three field nodes DEI reads beside the current one. */
++#define VPSS_REF_CTRL		0x028
++#define VPSS_REFYADDR		0x034
++#define VPSS_REFCADDR		0x038
++#define VPSS_REFCRADDR		0x03c
++#define VPSS_REFSTRIDE		0x040
++#define VPSS_NXT1_CTRL		0x044
++#define VPSS_NXT1YADDR		0x050
++#define VPSS_NXT1CADDR		0x054
++#define VPSS_NXT1CRADDR		0x058
++#define VPSS_NXT1STRIDE		0x05c
++#define VPSS_NXT2_CTRL		0x060
++#define VPSS_NXT2YADDR		0x06c
++#define VPSS_NXT2CADDR		0x070
++#define VPSS_NXT2CRADDR		0x074
++#define VPSS_NXT2STRIDE		0x078
++#define VPSS_FIELDSTRIDE_Y	GENMASK(15, 0)
++#define VPSS_FIELDSTRIDE_C	GENMASK(31, 16)
++
++/* Motion history: the block reads one plane and writes the next. */
++#define VPSS_STRADDR		0x098
++#define VPSS_STWADDR		0x09c
++#define VPSS_STSTRIDE		0x0a0
++#define VPSS_STSTRIDE_VAL	GENMASK(19, 0)
++#define VPSS_DEI_ADDR		0x240
++
++#define VPSS_VHDCTRL		0x0a4
++#define VPSS_VHDCTRL_MIRROR	BIT(4)
++#define VPSS_VHDCTRL_FLIP	BIT(5)
++#define VPSS_VHDCTRL_UV_INVERT	BIT(8)
++
++#define VPSS_VHDSIZE		0x0a8
++#define VPSS_VHDSIZE_WIDTH	GENMASK(12, 0)
++#define VPSS_VHDSIZE_HEIGHT	GENMASK(28, 16)
++
++#define VPSS_VHDYADDR		0x0b4
++#define VPSS_VHDCADDR		0x0b8
++
++#define VPSS_VHDSTRIDE		0x0bc
++#define VPSS_VHDSTRIDE_Y	GENMASK(15, 0)
++#define VPSS_VHDSTRIDE_C	GENMASK(31, 16)
++
++#define VPSS_INCROP_POS		0x114
++#define VPSS_INCROP_SIZE	0x118
++#define VPSS_CROP_EN		BIT(31)
++
++#define VPSS_VHDLBA_VFPOS	0x288
++#define VPSS_VHDLBA_BK		0x290
++#define VPSS_VHDCROP_POS	0x124
++#define VPSS_VHDCROP_SIZE	0x128
++#define VPSS_VHDCROP_X		GENMASK(11, 0)
++#define VPSS_VHDCROP_Y		GENMASK(27, 16)
++#define VPSS_VHDCROP_WIDTH	GENMASK(11, 0)
++#define VPSS_VHDCROP_HEIGHT	GENMASK(27, 16)
++
++#define VPSS_VHD_HLOFFSET	0x164
++#define VPSS_VHD_HCOFFSET	0x168
++#define VPSS_VHD_HSP		0x160
++#define VPSS_VHD_VSP		0x16c
++#define VPSS_VHD_VSR		0x170
++#define VPSS_VHD_VOFFSET	0x174
++#define VPSS_VHD_ZMEORESO	0x178
++#define VPSS_VHD_ZMEIRESO	0x17c
++#define VPSS_VHD_ZME_LHADDR	0x210
++#define VPSS_VHD_ZME_LVADDR	0x214
++#define VPSS_VHD_ZME_CHADDR	0x218
++#define VPSS_VHD_ZME_CVADDR	0x21c
++
++/* The sharpen filters read their phase table 256 bytes into the scaler's. */
++#define VPSS_VHD_LTI_CTRL	0x180
++#define VPSS_LTI_CTRL_LHPASS_COEF4	GENMASK(7, 0)
++#define VPSS_LTI_CTRL_LMIXING_RATIO	GENMASK(15, 8)
++#define VPSS_LTI_CTRL_LGAIN_RATIO	GENMASK(27, 16)
++#define VPSS_LTI_CTRL_LTI_EN		BIT(31)
++#define VPSS_VHD_LHPASS_COEF	0x184
++#define VPSS_VHD_LTI_THD	0x188
++#define VPSS_LTI_THD_LOVER_SWING	GENMASK(9, 0)
++#define VPSS_LTI_THD_LUNDER_SWING	GENMASK(19, 10)
++#define VPSS_LTI_THD_LCORING_THD	GENMASK(31, 20)
++#define VPSS_VHD_LHFREQ_THD	0x18c
++#define VPSS_VHD_LGAIN_COEF	0x190
++#define VPSS_VHD_CTI_CTRL	0x194
++#define VPSS_CTI_CTRL_CMIXING_RATIO	GENMASK(15, 8)
++#define VPSS_CTI_CTRL_CGAIN_RATIO	GENMASK(27, 16)
++#define VPSS_CTI_CTRL_CTI_EN		BIT(31)
++#define VPSS_VHD_CHPASS_COEF	0x198
++#define VPSS_VHD_CTI_THD	0x19c
++#define VPSS_CTI_THD_COVER_SWING	GENMASK(9, 0)
++#define VPSS_CTI_THD_CUNDER_SWING	GENMASK(19, 10)
++#define VPSS_CTI_THD_CCORING_THD	GENMASK(31, 20)
++#define VPSS_MSC_H_MSSC		BIT(31)
++#define VPSS_MSC_H_CSSC		BIT(30)
++#define VPSS_MSC_H_LFIR		BIT(26)
++#define VPSS_MSC_H_CFIR		BIT(25)
++#define VPSS_MSC_H_RATIO		GENMASK(23, 0)
++#define VPSS_MSC_V_MSSC		BIT(31)
++#define VPSS_MSC_V_CSSC		BIT(30)
++#define VPSS_MSC_V_LFIR		BIT(24)
++#define VPSS_MSC_V_CFIR		BIT(23)
++#define VPSS_MSC_V_RATIO		GENMASK(15, 0)
++#define VPSS_ZME_IN_FMT		GENMASK(20, 19)	/* 0: 4:2:2, 1: 4:2:0 */
++#define VPSS_ZME_OUT_FMT	GENMASK(22, 21)
++#define VPSS_ZME_ORESO_W	GENMASK(11, 0)
++#define VPSS_ZME_ORESO_H	GENMASK(23, 12)
++#define VPSS_ZME_IRESO_W	GENMASK(11, 0)
++#define VPSS_ZME_IRESO_H	GENMASK(23, 12)
++
++#define VPSS_DIECTRL		0x1000
++#define VPSS_DIECTRL_LMODE	GENMASK(27, 26)
++#define VPSS_DIECTRL_CMODE	GENMASK(25, 24)
++
++#define VPSS_INTMASK		0x1fc
++#define VPSS_PNEXT		0x2fc
++#define VPSS_START		0x300
++#define VPSS_INTSTATE		0x304
++#define VPSS_INTSTATE_EOF	BIT(0)		/* raw_eof */
++#define VPSS_INTSTATE_TIMEOUT	BIT(1)		/* raw_timeout: the block's own limit */
++#define VPSS_INTSTATE_BUS_W	BIT(2)		/* write path rejected by the bus */
++#define VPSS_INTSTATE_DONE	BIT(3)		/* raw_eof_end */
++#define VPSS_INTSTATE_VHD_TUNL	BIT(4)		/* output tunnel overrun */
++#define VPSS_INTSTATE_STR_TUNL	BIT(6)		/* stride tunnel overrun */
++#define VPSS_INTSTATE_DCMP	BIT(7)		/* tile decompress error */
++#define VPSS_INTSTATE_BUS_R	BIT(10)		/* read path rejected by the bus */
++/* The vendor's U_VPSS_INTSTATE: everything but the two end-of-frame bits */
++#define VPSS_INTSTATE_ERRORS	(VPSS_INTSTATE_TIMEOUT | VPSS_INTSTATE_BUS_W | \
++				 VPSS_INTSTATE_VHD_TUNL | VPSS_INTSTATE_STR_TUNL | \
++				 VPSS_INTSTATE_DCMP | VPSS_INTSTATE_BUS_R)
++#define VPSS_INTCLR		0x308
++#define VPSS_MISCELLANEOUS	0x314
++#define VPSS_TIMEOUT		0x31c
++#define VPSS_VERSION		0x330		/* constant id word; 0 while the block
++						 * has no clock or does not decode
++						 */
++
++/* Register images are one contiguous block; the deepest field is at 0x5058. */
++#define VPSS_REG_IMAGE_SIZE	0x6000
++
++/* One phase table set per plane and axis: 256 bytes of scaler taps, then
++ * 256 bytes of sharpen taps.
++ */
++#define VPSS_COEF_BLOCK		512
++#define VPSS_COEF_BYTES		(4 * VPSS_COEF_BLOCK)
++
++/* Pre-scaler modes for turning one field into a frame. */
++#define VPSS_PREZME_DISABLE	0
++#define VPSS_PREZME_2X		1
++#define VPSS_PREZME_VFIELD	4
++
++#endif /* __HISTB_VPSS_REGS_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vpss-v4-regs.h
+@@ -0,0 +1,226 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * Offsets and fields of the vpss_v4_0 generation's control-plane block, the one
++ * the Hi3798MV200H carries.
++ *
++ * Three shapes differ from the Hi3798MV100 file this driver was written
++ * against. The constant id word moved from 0x330 to 0x340, and 0x330 there is
++ * the end-of-frame counter. The interrupt mask moved from 0x1fc to 0x324. And
++ * the geometry of a job is no longer a flat set of cells at the head of the
++ * image: the memory accessor takes it through one descriptor per stream
++ * channel, the picture being read at VPSS4_CF_CTRL and the picture this port
++ * writes at VPSS4_OUT0_CTRL. The image is still handed over through the same
++ * PNEXT/START pair.
++ *
++ * The word deltas below are the ones the vendor's own read- and write-channel
++ * accessors use, and the cell addresses are those accessors' anchors in the
++ * vendor's register descriptor table. The reset values that place this part
++ * in the mv310 lineage, rather than in the mv200 header, are the ones below.
++ */
++#ifndef __HISTB_VPSS_V4_REGS_H
++#define __HISTB_VPSS_V4_REGS_H
++#define VPSS4_CTRL		0x000
++#define VPSS4_CTRL_VHD0_EN	BIT(3)		/* the one output port this driver uses */
++#define VPSS4_CTRL3		0x008
++#define VPSS4_CTRL3_ZME_VHD0_EN	BIT(3)
++#define VPSS4_CTRL3_VHD0_CROP_EN BIT(17)
++/* Over-read sizes and the four filter-table pointers of the scaler. The vendor
++ * fills this word from the size the port produces, and the window answers zero
++ * for it even when the job image carries a size, so its readback is not
++ * evidence of what the block
++ * used. A job whose image leaves this cell at zero completes having written
++ * only the first sample of each plane, so the image carries the produced size\.
++ */
++#define VPSS4_ZMEORESO		0x18
++#define VPSS4_ZME_OH		GENMASK(28, 16)
++#define VPSS4_ZME_OW		GENMASK(12, 0)
++#define VPSS4_ZME_LHADDR	0x1c
++#define VPSS4_ZME_LVADDR	0x20
++#define VPSS4_ZME_CHADDR	0x24
++#define VPSS4_ZME_CVADDR	0x28
++/*
++ * Per-stream bypass bits, one for every channel the accessor could fetch or
++ * dump. The window answers 0 here after reset, the vendor's own layer has no
++ * caller that writes either word, and which stream is served is decided by each
++ * channel descriptor's enable bit -- so the job image leaves both at 0.
++ */
++#define VPSS4_RCH_BYPASS	0x010
++#define VPSS4_WCH_BYPASS	0x014
++/*
++ * The parameter regions of the sub-blocks are not inside the words the accessor
++ * fetches with the node itself: each of these cells holds the address of the
++ * same-named region of this very image, the way the vendor fills them for every
++ * node. A pass-through does not fault
++ * because of these cells, but a node with a null parameter pointer is not
++ * a shape the block is used to.
++ */
++#define VPSS4_TNR_ADDR		0x2c
++#define VPSS4_SNR_ADDR		0x34
++#define VPSS4_ZME_ADDR		0x3c
++#define VPSS4_DEI_ADDR		0x40
++#define VPSS4_HDR_ADDR		0x44
++#define VPSS4_TNR_PARA		0x3800		/* VPSS_TNR_CONTRL */
++#define VPSS4_SNR_PARA		0x2100		/* VPSS_DB_CTRL */
++#define VPSS4_ZME_PARA		0x2000		/* VPSS_VHD0_HSP */
++#define VPSS4_DEI_PARA		0x1000		/* VPSS_DIECTRL */
++
++/*
++ * The scaler's own cells, all inside the ZME parameter region. The ratio fields
++ * carry the vendor's precisions: 20 fractional bits horizontally, 12
++ * vertically, so 1:1 is 0x100000 and 0x1000.
++ */
++#define VPSS4_ZME_HSP		(VPSS4_ZME_PARA + 0x00)
++#define VPSS4_ZME_HCOFFSET	(VPSS4_ZME_PARA + 0x08)
++#define VPSS4_ZME_VSP		(VPSS4_ZME_PARA + 0x0c)
++#define VPSS4_ZME_VSR		(VPSS4_ZME_PARA + 0x10)
++#define VPSS4_ZME_H_RATIO	GENMASK(23, 0)
++#define VPSS4_ZME_HFIR_ORDER	BIT(24)
++#define VPSS4_ZME_H_CHFIR	BIT(25)
++#define VPSS4_ZME_H_LFIR	BIT(26)
++#define VPSS4_ZME_H_CHMID	BIT(28)
++#define VPSS4_ZME_H_LMID	BIT(29)
++#define VPSS4_ZME_H_CHMSC	BIT(30)
++#define VPSS4_ZME_H_LMSC	BIT(31)
++#define VPSS4_ZME_V_OUT_FMT	GENMASK(22, 21)	/* 1 = 4:2:0 semi, 0 = 4:2:2 */
++#define VPSS4_ZME_V_CHFIR	BIT(23)
++#define VPSS4_ZME_V_LFIR	BIT(24)
++#define VPSS4_ZME_V_CHMID	BIT(28)
++#define VPSS4_ZME_V_LMID	BIT(29)
++#define VPSS4_ZME_V_CHMSC	BIT(30)
++#define VPSS4_ZME_V_LMSC	BIT(31)
++#define VPSS4_ZME_V_RATIO	GENMASK(15, 0)
++#define VPSS4_ZME_HR_PREC	20
++#define VPSS4_ZME_VR_PREC	12
++/* The memory accessor's own request shaping, and the statistics sink. */
++#define VPSS4_CHN_CFG_CTRL	0x5000
++#define VPSS4_CHN_IMG_PRO_MODE	GENMASK(3, 2)
++/* The read channel of the picture being input. */
++#define VPSS4_CF_CTRL		0x5080
++#define VPSS4_CF_FORMAT		GENMASK(3, 0)
++#define VPSS4_CF_TYPE		GENMASK(7, 4)
++#define VPSS4_CF_ORDER		GENMASK(11, 8)
++#define VPSS4_CF_BITW		GENMASK(15, 12)
++#define VPSS4_CF_DCMP_MODE	GENMASK(19, 16)
++#define VPSS4_CF_UV_INVERT	BIT(20)
++#define VPSS4_CF_MIRROR		BIT(21)
++#define VPSS4_CF_FLIP		BIT(22)
++/*
++ * Which read the channel performs. The vendor's default for a whole frame is
++ * progressive, whose value is 1: 0 is the interlaced read, whose field and
++ * head tables this driver has no reason to fill.
++ */
++#define VPSS4_CF_LM_RMODE	GENMASK(25, 23)
++#define VPSS4_LM_PROGRESSIVE	1
++#define VPSS4_LM_INTERLACE	0
++#define VPSS4_CF_EN		BIT(31)
++/*
++ * b_bypass, h_bypass and d_bypass of the accessor's read descriptor. The
++ * vendor drives all three from a single bMmuBypass flag of its own, which is
++ * what a picture in plain coherent memory needs here.
++ */
++#define VPSS4_CF_TILE_BYPASS	(BIT(26) | BIT(27) | BIT(28))
++#define VPSS4_CF_SIZE		0x5088
++#define VPSS4_CF_SIZE_WIDTH	GENMASK(11, 0)
++#define VPSS4_CF_SIZE_HEIGHT	GENMASK(27, 16)
++#define VPSS4_CF_OFFSET		0x508c
++#define VPSS4_CF_OFFSET_HOR	GENMASK(11, 0)
++#define VPSS4_CF_OFFSET_VER	GENMASK(27, 16)
++#define VPSS4_CF_YADDR_H	0x5090
++#define VPSS4_CF_YADDR_L	0x5094
++#define VPSS4_CF_CADDR_H	0x5098
++#define VPSS4_CF_CADDR_L	0x509c
++#define VPSS4_CF_STRIDE		0x50c8
++#define VPSS4_CF_STRIDE_Y	GENMASK(15, 0)
++#define VPSS4_CF_STRIDE_C	GENMASK(31, 16)
++/* The write channel of port zero. */
++#define VPSS4_OUT0_CTRL		0x5800
++#define VPSS4_OUT0_FORMAT	GENMASK(3, 0)
++#define VPSS4_OUT0_TYPE		GENMASK(7, 4)
++#define VPSS4_OUT0_BITW		GENMASK(11, 8)
++#define VPSS4_OUT0_UV_INVERT	BIT(16)
++#define VPSS4_OUT0_MIRROR	BIT(17)
++#define VPSS4_OUT0_FLIP		BIT(18)
++#define VPSS4_OUT0_DITHER_EN	BIT(19)
++#define VPSS4_OUT0_LM_RMODE	GENMASK(25, 23)
++/* The vendor's frame layer sets both bypass bits of a channel from one
++ * flag, so a channel that talks to plain addresses carries the pair;
++ * leaving one out is not a "no change" value.
++ */
++#define VPSS4_OUT0_H_BYPASS	BIT(28)
++#define VPSS4_OUT0_D_BYPASS	BIT(29)
++#define VPSS4_OUT0_EN		BIT(31)
++#define VPSS4_OUT0_OFFSET	0x5804
++#define VPSS4_OUT0_YADDR_H	0x5808
++#define VPSS4_OUT0_YADDR_L	0x580c
++#define VPSS4_OUT0_CADDR_H	0x5810
++#define VPSS4_OUT0_CADDR_L	0x5814
++#define VPSS4_OUT0_STRIDE	0x5818
++#define VPSS4_OUT0_STRIDE_Y	GENMASK(15, 0)
++#define VPSS4_OUT0_STRIDE_C	GENMASK(31, 16)
++#define VPSS4_OUT0_SIZE		0x5830
++#define VPSS4_OUT0_SIZE_WIDTH	GENMASK(15, 0)
++#define VPSS4_OUT0_SIZE_HEIGHT	GENMASK(31, 16)
++/* Formats, as the accessor's own code lists them. */
++#define VPSS4_FMT_YUV420SP	0
++#define VPSS4_FMT_YUV422SP	1
++#define VPSS4_FMT_YUV420P	2
++#define VPSS4_FMT_YUV422P	3
++#define VPSS4_FMT_UYVY		7
++#define VPSS4_TYPE_LINEAR	0
++#define VPSS4_BITW_8		0
++#define VPSS4_NODEID		0x2f8
++#define VPSS4_PNEXT		0x2fc
++#define VPSS4_START_RUN		BIT(0)
++#define VPSS4_INTSTATE_EOF	BIT(0)		/* one node finished */
++#define VPSS4_INTSTATE_TIMEOUT	BIT(1)
++#define VPSS4_INTSTATE_BUS_W	BIT(2)
++#define VPSS4_INTSTATE_EOF_END	BIT(3)		/* the whole chain finished */
++#define VPSS4_INTSTATE_TUNL	BIT(4)
++#define VPSS4_INTSTATE_DCMP	BIT(5)
++#define VPSS4_INTSTATE_BUS_R	BIT(6)
++#define VPSS4_INTSTATE_ERRORS	(VPSS4_INTSTATE_TIMEOUT | VPSS4_INTSTATE_BUS_W | \
++				 VPSS4_INTSTATE_TUNL | VPSS4_INTSTATE_DCMP | \
++				 VPSS4_INTSTATE_BUS_R)
++#define VPSS4_INTCLR		0x308
++#define VPSS4_RAWINT		0x30c
++#define VPSS4_PFCNT		0x310
++/*
++ * The memory accessor's own request shaping. The window answers these
++ * at reset with 0x314 6466, 0x318 0, 0x344 0, 0x400 777f and 0x404 501 -- and
++ * 0x404's 501 is split_mode 1 with mid_enable set, which the vendor's own
++ * pre-run check demands.
++ */
++#define VPSS4_MACCFG		0x318
++#define VPSS4_BUS_CTRL		0x344
++#define VPSS4_MST_OUTSTANDING	0x400
++#define VPSS4_MST_CTRL		0x404
++#define VPSS4_MST_RCHN_PRIO0	0x410
++#define VPSS4_MST_WCHN_PRIO0	0x418
++/* Latches the block leaves when one of its three masters faults. */
++#define VPSS4_MST_ERR_CLR	0x440
++#define VPSS4_MST_DEBUG_CTRL	0x470
++#define VPSS4_MST_DEBUG_CLR	0x474
++#define VPSS4_MST_AXI_DET_EN	BIT(0)
++#define VPSS4_INTMASK		0x324		/* set bit = mask that source */
++#define VPSS4_VERSION		0x340	/* 0 in reset, 0x4000 once released */
++#define VPSS4_VERSION_RELEASED	0x4000
++#define VPSS4_MISCELLANEOUS	0x314
++#define VPSS4_TIMEOUT		0x31c
++/*
++ * Clock gating the block does for itself. The vendor asks for both as it
++ * enables the clock; the read-only half of the answer is the reset
++ * default at 0x400 (r 15, w 7, timer 119).
++ */
++#define VPSS4_LOWPOWER_CTRL	0x348
++#define VPSS4_LOWPOWER_CK_GT_EN	BIT(31)
++#define VPSS4_HARDGATE_CTRL	0x354
++#define VPSS4_HARDGATE_PPC_EN	BIT(1)
++#define VPSS4_HARDGATE_AXI_EN	BIT(0)
++#define VPSS4_SMMU_SCR		0xf000		/* bit 0: the block's own translation unit */
++/*
++ * One job image is the whole register file, sized the way the vendor's hardware
++ * layer sizes it: (sizeof(VPSS_REG_S) + 15) & ~15, whose last decoded member is
++ * the translation unit's eighth master debug word at 0xf530.
++ */
++#define VPSS4_REG_IMAGE_SIZE	0xf540
++#endif /* __HISTB_VPSS_V4_REGS_H */
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vpss-zme-coef.h
+@@ -0,0 +1,650 @@
++/* Generated from the vendor ZME phase tables. */
++#ifndef __HISTB_VPSS_ZME_COEF_H
++#define __HISTB_VPSS_ZME_COEF_H
++
++static const u32 histb_vpss_zme_lh_r0[51] = {
++	0x028fa804, 0xfea0a1d4, 0x00000004, 0x01afb803,
++	0xfe60d9d4, 0x00000005, 0x00efc802, 0xfe2111d2,
++	0x00000006, 0x002fd402, 0xfde151ce, 0x00000007,
++	0xff7fe401, 0xfda191c9, 0x00000008, 0xfeeff001,
++	0xfd61d1c2, 0x00000009, 0xfe5ff801, 0xfd2215bb,
++	0x0000000a, 0xfdd00800, 0xfce25db2, 0x0000000a,
++	0xfd601000, 0xfca2a1a9, 0x0000000b, 0xfcf01800,
++	0xfc72e99e, 0x0000000c, 0xfca02000, 0xfc433191,
++	0x0000000d, 0xfc602800, 0xfc237983, 0x0000000d,
++	0xfc202c00, 0xfbf3c176, 0x0000000e, 0xfbf03000,
++	0xfbe40967, 0x0000000e, 0xfbd03400, 0xfbc45158,
++	0x0000000e, 0xfbc03800, 0xfbc49547, 0x0000000e,
++	0xfbc03800, 0xfbc4d936, 0x0000000e,
++};
++static const u32 histb_vpss_zme_lv_r0[51] = {
++	0x004effde, 0x004e019f, 0x0009ffde, 0x0042ffe0,
++	0x005a019f, 0x0009ffdc, 0x0036ffe3, 0x0067019d,
++	0x0009ffda, 0x002bffe6, 0x0074019b, 0x0009ffd7,
++	0x0021ffe9, 0x00810196, 0x0009ffd6, 0x0018ffeb,
++	0x008f0191, 0x0009ffd4, 0x000effee, 0x009d018c,
++	0x0009ffd2, 0x0006fff0, 0x00ab0185, 0x0009ffd1,
++	0xfffefff2, 0x00b9017e, 0x0009ffd0, 0xfff7fff5,
++	0x00c70176, 0x0008ffcf, 0xfff0fff7, 0x00d5016d,
++	0x0008ffcf, 0xffebfff9, 0x00e40162, 0x0007ffcf,
++	0xffe5fffb, 0x00f20159, 0x0006ffcf, 0xffe0fffd,
++	0x0100014d, 0x0006ffd0, 0xffdcffff, 0x010d0142,
++	0x0004ffd2, 0xffd90000, 0x011b0135, 0x0003ffd4,
++	0xffd60002, 0x01280128, 0x0002ffd6,
++};
++static const u32 histb_vpss_zme_ch_r0[34] = {
++	0x014f0067, 0xffe30067, 0x014f005c, 0xffe50070,
++	0x014f0054, 0xffe40079, 0x014e004b, 0xffe40083,
++	0x014c0043, 0xffe4008d, 0x0149003b, 0xffe40098,
++	0x01460033, 0xffe500a2, 0x0143002b, 0xffe500ad,
++	0x013f0024, 0xffe600b7, 0x0139001e, 0xffe700c2,
++	0x01340017, 0xffe900cc, 0x012d0011, 0xffeb00d7,
++	0x0127000c, 0xffec00e1, 0x01200006, 0xffef00eb,
++	0x01180002, 0xfff200f4, 0x010ffffd, 0xfff600fe,
++	0x0107fff9, 0xfff90107,
++};
++static const u32 histb_vpss_zme_cv_r0[34] = {
++	0x014f0067, 0xffe30067, 0x014f005c, 0xffe50070,
++	0x014f0054, 0xffe40079, 0x014e004b, 0xffe40083,
++	0x014c0043, 0xffe4008d, 0x0149003b, 0xffe40098,
++	0x01460033, 0xffe500a2, 0x0143002b, 0xffe500ad,
++	0x013f0024, 0xffe600b7, 0x0139001e, 0xffe700c2,
++	0x01340017, 0xffe900cc, 0x012d0011, 0xffeb00d7,
++	0x0127000c, 0xffec00e1, 0x01200006, 0xffef00eb,
++	0x01180002, 0xfff200f4, 0x010ffffd, 0xfff600fe,
++	0x0107fff9, 0xfff90107,
++};
++static const u32 histb_vpss_zme_lh_r1[51] = {
++	0x00000000, 0x000001ff, 0x00000000, 0xff400fff,
++	0xffc039ff, 0x00000001, 0xfe901bfe, 0xff8071fd,
++	0x00000002, 0xfdf027fe, 0xff40b1f7, 0x00000003,
++	0xfd702ffd, 0xff00f5f0, 0x00000004, 0xfd0037fd,
++	0xfeb13de8, 0x000ffc05, 0xfca03bfd, 0xfe7189dd,
++	0x000ff807, 0xfc5043fc, 0xfe21d9d1, 0x000ff808,
++	0xfc1047fc, 0xfdd229c3, 0x000ffc09, 0xfbe04bfc,
++	0xfd9279b5, 0x000ff80a, 0xfbc04bfc, 0xfd42d1a5,
++	0x000ff80b, 0xfbb04bfc, 0xfd032594, 0x000ff40d,
++	0xfba04bfc, 0xfcc37982, 0x000ff80e, 0xfba04bfc,
++	0xfc83d170, 0x000ff40f, 0xfbb04bfc, 0xfc54255c,
++	0x000ff410, 0xfbd04bfc, 0xfc147949, 0x000ff410,
++	0xfbf047fd, 0xfbf4cd33, 0x000ff411,
++};
++static const u32 histb_vpss_zme_lv_r1[51] = {
++	0x00000000, 0x000001ff, 0x00000000, 0xfff40003,
++	0x000d01ff, 0x0000fffd, 0xffea0006, 0x001c01fb,
++	0x0000fff9, 0xffe00008, 0x002c01f6, 0x0001fff5,
++	0xffd8000a, 0x003d01ef, 0x0001fff1, 0xffd1000b,
++	0x004f01e6, 0x0002ffed, 0xffcb000c, 0x006201dc,
++	0x0003ffe8, 0xffc6000d, 0x007501d0, 0x0004ffe4,
++	0xffc2000e, 0x008901c3, 0x0005ffdf, 0xffbf000f,
++	0x009d01b5, 0x0006ffda, 0xffbd000f, 0x00b301a4,
++	0x0007ffd6, 0xffbc000f, 0x00c80194, 0x0007ffd2,
++	0xffbc000e, 0x00dd0182, 0x0009ffce, 0xffbc000e,
++	0x00f3016f, 0x000affca, 0xffbd000e, 0x0108015c,
++	0x000bffc6, 0xffbe000d, 0x011e0148, 0x000cffc3,
++	0xffc1000d, 0x01320132, 0x000dffc1,
++};
++static const u32 histb_vpss_zme_ch_r1[34] = {
++	0x01ff0000, 0x00000000, 0x01ffffed, 0xffff0015,
++	0x01fdffdb, 0xfffe002a, 0x01f8ffcd, 0xfffb0040,
++	0x01f3ffc0, 0xfff70056, 0x01ecffb6, 0xfff2006c,
++	0x01e4ffae, 0xffed0081, 0x01daffa7, 0xffe70098,
++	0x01cfffa2, 0xffe100ae, 0x01c3ff9f, 0xffda00c4,
++	0x01b6ff9e, 0xffd300d9, 0x01a8ff9e, 0xffcc00ee,
++	0x0199ff9e, 0xffc50104, 0x0188ffa1, 0xffbf0118,
++	0x0178ffa4, 0xffb8012c, 0x0166ffa8, 0xffb20140,
++	0x0153ffad, 0xffad0153,
++};
++static const u32 histb_vpss_zme_cv_r1[34] = {
++	0x01ff0000, 0x00000000, 0x01ffffed, 0xffff0015,
++	0x01fdffdb, 0xfffe002a, 0x01f8ffcd, 0xfffb0040,
++	0x01f3ffc0, 0xfff70056, 0x01ecffb6, 0xfff2006c,
++	0x01e4ffae, 0xffed0081, 0x01daffa7, 0xffe70098,
++	0x01cfffa2, 0xffe100ae, 0x01c3ff9f, 0xffda00c4,
++	0x01b6ff9e, 0xffd300d9, 0x01a8ff9e, 0xffcc00ee,
++	0x0199ff9e, 0xffc50104, 0x0188ffa1, 0xffbf0118,
++	0x0178ffa4, 0xffb8012c, 0x0166ffa8, 0xffb20140,
++	0x0153ffad, 0xffad0153,
++};
++static const u32 histb_vpss_zme_lh_r2[51] = {
++	0x091003f0, 0x000244fe, 0x000003f0, 0x08cffbf0,
++	0x00325cfd, 0x000003ef, 0x087feff1, 0x005274fd,
++	0x000003ee, 0x081fe7f2, 0x008288fc, 0x000003ee,
++	0x07bfdff3, 0x00b29cfc, 0x000003ed, 0x076fd7f3,
++	0x00f2b0fa, 0x000003ed, 0x070fd3f4, 0x0122c4fa,
++	0x000fffec, 0x06bfcbf5, 0x0152dcf7, 0x000fffec,
++	0x065fc7f6, 0x0192f0f5, 0x000fffeb, 0x060fc3f7,
++	0x01d300f3, 0x000ffbeb, 0x05afbbf8, 0x021314f2,
++	0x000ffbea, 0x055fb7f8, 0x025328ef, 0x000ffbea,
++	0x050fb7f9, 0x029338ec, 0x000ff7ea, 0x04bfb3f9,
++	0x02e348e9, 0x000ff7ea, 0x045faffa, 0x03235ce6,
++	0x000ff7ea, 0x041faffb, 0x03736ce2, 0x000fefea,
++	0x03cfaffb, 0x03c378de, 0x000fefeb,
++};
++static const u32 histb_vpss_zme_lv_r2[51] = {
++	0x0068ffe1, 0x0068016a, 0x0004ffe1, 0x005effe2,
++	0x0072016a, 0x0004ffe0, 0x0054ffe3, 0x007d0169,
++	0x0003ffe0, 0x004bffe4, 0x00880167, 0x0003ffdf,
++	0x0042ffe5, 0x00930164, 0x0003ffdf, 0x0039ffe7,
++	0x009e0161, 0x0002ffdf, 0x0031ffe8, 0x00a9015d,
++	0x0002ffdf, 0x0029ffea, 0x00b40158, 0x0001ffe0,
++	0x0021ffec, 0x00bf0153, 0x0000ffe1, 0x001affed,
++	0x00cb014d, 0xffffffe2, 0x0013ffef, 0x00d60147,
++	0xfffeffe3, 0x000dfff0, 0x00e10140, 0xfffdffe5,
++	0x0007fff2, 0x00ec0138, 0xfffcffe7, 0x0001fff3,
++	0x00f60131, 0xfffbffea, 0xfffcfff5, 0x01010127,
++	0xfffaffed, 0xfff8fff6, 0x010b011e, 0xfff9fff0,
++	0xfff4fff7, 0x01150115, 0xfff7fff4,
++};
++static const u32 histb_vpss_zme_ch_r2[34] = {
++	0x014f0067, 0xffe30067, 0x014f005c, 0xffe50070,
++	0x014f0054, 0xffe40079, 0x014e004b, 0xffe40083,
++	0x014c0043, 0xffe4008d, 0x0149003b, 0xffe40098,
++	0x01460033, 0xffe500a2, 0x0143002b, 0xffe500ad,
++	0x013f0024, 0xffe600b7, 0x0139001e, 0xffe700c2,
++	0x01340017, 0xffe900cc, 0x012d0011, 0xffeb00d7,
++	0x0127000c, 0xffec00e1, 0x01200006, 0xffef00eb,
++	0x01180002, 0xfff200f4, 0x010ffffd, 0xfff600fe,
++	0x0107fff9, 0xfff90107,
++};
++static const u32 histb_vpss_zme_cv_r2[34] = {
++	0x014f0067, 0xffe30067, 0x014f005c, 0xffe50070,
++	0x014f0054, 0xffe40079, 0x014e004b, 0xffe40083,
++	0x014c0043, 0xffe4008d, 0x0149003b, 0xffe40098,
++	0x01460033, 0xffe500a2, 0x0143002b, 0xffe500ad,
++	0x013f0024, 0xffe600b7, 0x0139001e, 0xffe700c2,
++	0x01340017, 0xffe900cc, 0x012d0011, 0xffeb00d7,
++	0x0127000c, 0xffec00e1, 0x01200006, 0xffef00eb,
++	0x01180002, 0xfff200f4, 0x010ffffd, 0xfff600fe,
++	0x0107fff9, 0xfff90107,
++};
++static const u32 histb_vpss_zme_lh_r3[51] = {
++	0x091003f0, 0x000244fe, 0x000003f0, 0x08cffbf0,
++	0x00325cfd, 0x000003ef, 0x087feff1, 0x005274fd,
++	0x000003ee, 0x081fe7f2, 0x008288fc, 0x000003ee,
++	0x07bfdff3, 0x00b29cfc, 0x000003ed, 0x076fd7f3,
++	0x00f2b0fa, 0x000003ed, 0x070fd3f4, 0x0122c4fa,
++	0x000fffec, 0x06bfcbf5, 0x0152dcf7, 0x000fffec,
++	0x065fc7f6, 0x0192f0f5, 0x000fffeb, 0x060fc3f7,
++	0x01d300f3, 0x000ffbeb, 0x05afbbf8, 0x021314f2,
++	0x000ffbea, 0x055fb7f8, 0x025328ef, 0x000ffbea,
++	0x050fb7f9, 0x029338ec, 0x000ff7ea, 0x04bfb3f9,
++	0x02e348e9, 0x000ff7ea, 0x045faffa, 0x03235ce6,
++	0x000ff7ea, 0x041faffb, 0x03736ce2, 0x000fefea,
++	0x03cfaffb, 0x03c378de, 0x000fefeb,
++};
++static const u32 histb_vpss_zme_lv_r3[51] = {
++	0x0082ffec, 0x00820129, 0xfffbffec, 0x007affeb,
++	0x008a012a, 0xfffaffed, 0x0073ffea, 0x00920129,
++	0xfff9ffef, 0x006cffea, 0x00990128, 0xfff9fff0,
++	0x0065ffe9, 0x00a10127, 0xfff8fff2, 0x005dffe9,
++	0x00a90126, 0xfff7fff4, 0x0057ffe8, 0x00b10124,
++	0xfff6fff6, 0x0050ffe8, 0x00b90121, 0xfff5fff9,
++	0x0049ffe8, 0x00c1011e, 0xfff4fffc, 0x0042ffe9,
++	0x00c8011b, 0xfff3ffff, 0x003cffe9, 0x00d00117,
++	0xfff20002, 0x0036ffe9, 0x00d70114, 0xfff10005,
++	0x0030ffea, 0x00de010f, 0xfff00009, 0x002affeb,
++	0x00e5010a, 0xffef000d, 0x0025ffeb, 0x00ec0105,
++	0xffee0011, 0x0020ffeb, 0x00f200ff, 0xffee0016,
++	0x001bffec, 0x00f900f9, 0xffec001b,
++};
++static const u32 histb_vpss_zme_ch_r3[34] = {
++	0x014f0067, 0xffe30067, 0x014f005c, 0xffe50070,
++	0x014f0054, 0xffe40079, 0x014e004b, 0xffe40083,
++	0x014c0043, 0xffe4008d, 0x0149003b, 0xffe40098,
++	0x01460033, 0xffe500a2, 0x0143002b, 0xffe500ad,
++	0x013f0024, 0xffe600b7, 0x0139001e, 0xffe700c2,
++	0x01340017, 0xffe900cc, 0x012d0011, 0xffeb00d7,
++	0x0127000c, 0xffec00e1, 0x01200006, 0xffef00eb,
++	0x01180002, 0xfff200f4, 0x010ffffd, 0xfff600fe,
++	0x0107fff9, 0xfff90107,
++};
++static const u32 histb_vpss_zme_cv_r3[34] = {
++	0x014f0067, 0xffe30067, 0x014f005c, 0xffe50070,
++	0x014f0054, 0xffe40079, 0x014e004b, 0xffe40083,
++	0x014c0043, 0xffe4008d, 0x0149003b, 0xffe40098,
++	0x01460033, 0xffe500a2, 0x0143002b, 0xffe500ad,
++	0x013f0024, 0xffe600b7, 0x0139001e, 0xffe700c2,
++	0x01340017, 0xffe900cc, 0x012d0011, 0xffeb00d7,
++	0x0127000c, 0xffec00e1, 0x01200006, 0xffef00eb,
++	0x01180002, 0xfff200f4, 0x010ffffd, 0xfff600fe,
++	0x0107fff9, 0xfff90107,
++};
++static const u32 histb_vpss_zme_lh_r4[51] = {
++	0x09004bee, 0x013240e2, 0x000ff3ef, 0x08b043ef,
++	0x015250e2, 0x000ff3ef, 0x087037ef, 0x018264e3,
++	0x000fefee, 0x08302fef, 0x01b274e2, 0x000fefee,
++	0x07e027ef, 0x01e284e1, 0x000fefef, 0x07a01bf0,
++	0x021294e1, 0x000febef, 0x076013f0, 0x0252a4e0,
++	0x000fe7ef, 0x07100bf0, 0x0282b4e0, 0x000fe7ef,
++	0x06d003f1, 0x02b2c4de, 0x000fe7ef, 0x068ffff1,
++	0x02f2d4dc, 0x000fe3f0, 0x064ff7f2, 0x0332e4da,
++	0x000fdff0, 0x060feff2, 0x0362f0d9, 0x000fdff1,
++	0x05bfebf2, 0x03a300d6, 0x000fdff2, 0x057fe7f3,
++	0x03e30cd4, 0x000fdbf2, 0x053fdff3, 0x042318d2,
++	0x000fdbf3, 0x04ffdbf4, 0x046324cf, 0x000fd7f4,
++	0x04afd7f4, 0x04a334cd, 0x000fd3f5,
++};
++static const u32 histb_vpss_zme_lv_r4[51] = {
++	0x00880010, 0x008800d9, 0xfff70010, 0x0084000d,
++	0x008d00d9, 0xfff70012, 0x0080000b, 0x009100d9,
++	0xfff60015, 0x007c0009, 0x009500d8, 0xfff60018,
++	0x00770007, 0x009900d8, 0xfff6001b, 0x00730005,
++	0x009d00d8, 0xfff5001e, 0x006f0003, 0x00a100d7,
++	0xfff50021, 0x006b0001, 0x00a500d6, 0xfff50024,
++	0x00660000, 0x00a900d5, 0xfff50027, 0x0062fffe,
++	0x00ad00d3, 0xfff5002b, 0x005efffd, 0x00b100d1,
++	0xfff5002e, 0x005afffc, 0x00b400cf, 0xfff50032,
++	0x0055fffb, 0x00b800ce, 0xfff50035, 0x0051fffa,
++	0x00bb00cb, 0xfff60039, 0x004dfff9, 0x00be00c9,
++	0xfff6003d, 0x0049fff8, 0x00c100c6, 0xfff70041,
++	0x0045fff7, 0x00c400c4, 0xfff70045,
++};
++static const u32 histb_vpss_zme_ch_r4[34] = {
++	0x01190078, 0xfff70078, 0x01190071, 0xfff7007f,
++	0x0118006a, 0xfff80086, 0x01170063, 0xfff9008d,
++	0x0115005c, 0xfffb0094, 0x01130055, 0xfffc009c,
++	0x0111004f, 0xfffe00a2, 0x010e0048, 0x000000aa,
++	0x010b0042, 0x000200b1, 0x0107003d, 0x000400b8,
++	0x01030038, 0x000600bf, 0x00ff0032, 0x000900c6,
++	0x00fb002c, 0x000c00cd, 0x00f60028, 0x000f00d3,
++	0x00f10022, 0x001300da, 0x00eb001f, 0x001600e0,
++	0x00e6001a, 0x001a00e6,
++};
++static const u32 histb_vpss_zme_cv_r4[34] = {
++	0x01190078, 0xfff70078, 0x01190071, 0xfff7007f,
++	0x0118006a, 0xfff80086, 0x01170063, 0xfff9008d,
++	0x0115005c, 0xfffb0094, 0x01130055, 0xfffc009c,
++	0x0111004f, 0xfffe00a2, 0x010e0048, 0x000000aa,
++	0x010b0042, 0x000200b1, 0x0107003d, 0x000400b8,
++	0x01030038, 0x000600bf, 0x00ff0032, 0x000900c6,
++	0x00fb002c, 0x000c00cd, 0x00f60028, 0x000f00d3,
++	0x00f10022, 0x001300da, 0x00eb001f, 0x001600e0,
++	0x00e6001a, 0x001a00e6,
++};
++static const u32 histb_vpss_zme_lh_r5[51] = {
++	0x09004bee, 0x013240e2, 0x000ff3ef, 0x08b043ef,
++	0x015250e2, 0x000ff3ef, 0x087037ef, 0x018264e3,
++	0x000fefee, 0x08302fef, 0x01b274e2, 0x000fefee,
++	0x07e027ef, 0x01e284e1, 0x000fefef, 0x07a01bf0,
++	0x021294e1, 0x000febef, 0x076013f0, 0x0252a4e0,
++	0x000fe7ef, 0x07100bf0, 0x0282b4e0, 0x000fe7ef,
++	0x06d003f1, 0x02b2c4de, 0x000fe7ef, 0x068ffff1,
++	0x02f2d4dc, 0x000fe3f0, 0x064ff7f2, 0x0332e4da,
++	0x000fdff0, 0x060feff2, 0x0362f0d9, 0x000fdff1,
++	0x05bfebf2, 0x03a300d6, 0x000fdff2, 0x057fe7f3,
++	0x03e30cd4, 0x000fdbf2, 0x053fdff3, 0x042318d2,
++	0x000fdbf3, 0x04ffdbf4, 0x046324cf, 0x000fd7f4,
++	0x04afd7f4, 0x04a334cd, 0x000fd3f5,
++};
++static const u32 histb_vpss_zme_lv_r5[51] = {
++	0x00880010, 0x008800d9, 0xfff70010, 0x0084000d,
++	0x008d00d9, 0xfff70012, 0x0080000b, 0x009100d9,
++	0xfff60015, 0x007c0009, 0x009500d8, 0xfff60018,
++	0x00770007, 0x009900d8, 0xfff6001b, 0x00730005,
++	0x009d00d8, 0xfff5001e, 0x006f0003, 0x00a100d7,
++	0xfff50021, 0x006b0001, 0x00a500d6, 0xfff50024,
++	0x00660000, 0x00a900d5, 0xfff50027, 0x0062fffe,
++	0x00ad00d3, 0xfff5002b, 0x005efffd, 0x00b100d1,
++	0xfff5002e, 0x005afffc, 0x00b400cf, 0xfff50032,
++	0x0055fffb, 0x00b800ce, 0xfff50035, 0x0051fffa,
++	0x00bb00cb, 0xfff60039, 0x004dfff9, 0x00be00c9,
++	0xfff6003d, 0x0049fff8, 0x00c100c6, 0xfff70041,
++	0x0045fff7, 0x00c400c4, 0xfff70045,
++};
++static const u32 histb_vpss_zme_ch_r5[34] = {
++	0x01190078, 0xfff70078, 0x01190071, 0xfff7007f,
++	0x0118006a, 0xfff80086, 0x01170063, 0xfff9008d,
++	0x0115005c, 0xfffb0094, 0x01130055, 0xfffc009c,
++	0x0111004f, 0xfffe00a2, 0x010e0048, 0x000000aa,
++	0x010b0042, 0x000200b1, 0x0107003d, 0x000400b8,
++	0x01030038, 0x000600bf, 0x00ff0032, 0x000900c6,
++	0x00fb002c, 0x000c00cd, 0x00f60028, 0x000f00d3,
++	0x00f10022, 0x001300da, 0x00eb001f, 0x001600e0,
++	0x00e6001a, 0x001a00e6,
++};
++static const u32 histb_vpss_zme_cv_r5[34] = {
++	0x01190078, 0xfff70078, 0x01190071, 0xfff7007f,
++	0x0118006a, 0xfff80086, 0x01170063, 0xfff9008d,
++	0x0115005c, 0xfffb0094, 0x01130055, 0xfffc009c,
++	0x0111004f, 0xfffe00a2, 0x010e0048, 0x000000aa,
++	0x010b0042, 0x000200b1, 0x0107003d, 0x000400b8,
++	0x01030038, 0x000600bf, 0x00ff0032, 0x000900c6,
++	0x00fb002c, 0x000c00cd, 0x00f60028, 0x000f00d3,
++	0x00f10022, 0x001300da, 0x00eb001f, 0x001600e0,
++	0x00e6001a, 0x001a00e6,
++};
++static const u32 histb_vpss_zme_lh_r6[51] = {
++	0x09004bee, 0x013240e2, 0x000ff3ef, 0x08b043ef,
++	0x015250e2, 0x000ff3ef, 0x087037ef, 0x018264e3,
++	0x000fefee, 0x08302fef, 0x01b274e2, 0x000fefee,
++	0x07e027ef, 0x01e284e1, 0x000fefef, 0x07a01bf0,
++	0x021294e1, 0x000febef, 0x076013f0, 0x0252a4e0,
++	0x000fe7ef, 0x07100bf0, 0x0282b4e0, 0x000fe7ef,
++	0x06d003f1, 0x02b2c4de, 0x000fe7ef, 0x068ffff1,
++	0x02f2d4dc, 0x000fe3f0, 0x064ff7f2, 0x0332e4da,
++	0x000fdff0, 0x060feff2, 0x0362f0d9, 0x000fdff1,
++	0x05bfebf2, 0x03a300d6, 0x000fdff2, 0x057fe7f3,
++	0x03e30cd4, 0x000fdbf2, 0x053fdff3, 0x042318d2,
++	0x000fdbf3, 0x04ffdbf4, 0x046324cf, 0x000fd7f4,
++	0x04afd7f4, 0x04a334cd, 0x000fd3f5,
++};
++static const u32 histb_vpss_zme_lv_r6[51] = {
++	0x00880010, 0x008800d9, 0xfff70010, 0x0084000d,
++	0x008d00d9, 0xfff70012, 0x0080000b, 0x009100d9,
++	0xfff60015, 0x007c0009, 0x009500d8, 0xfff60018,
++	0x00770007, 0x009900d8, 0xfff6001b, 0x00730005,
++	0x009d00d8, 0xfff5001e, 0x006f0003, 0x00a100d7,
++	0xfff50021, 0x006b0001, 0x00a500d6, 0xfff50024,
++	0x00660000, 0x00a900d5, 0xfff50027, 0x0062fffe,
++	0x00ad00d3, 0xfff5002b, 0x005efffd, 0x00b100d1,
++	0xfff5002e, 0x005afffc, 0x00b400cf, 0xfff50032,
++	0x0055fffb, 0x00b800ce, 0xfff50035, 0x0051fffa,
++	0x00bb00cb, 0xfff60039, 0x004dfff9, 0x00be00c9,
++	0xfff6003d, 0x0049fff8, 0x00c100c6, 0xfff70041,
++	0x0045fff7, 0x00c400c4, 0xfff70045,
++};
++static const u32 histb_vpss_zme_ch_r6[34] = {
++	0x01190078, 0xfff70078, 0x01190071, 0xfff7007f,
++	0x0118006a, 0xfff80086, 0x01170063, 0xfff9008d,
++	0x0115005c, 0xfffb0094, 0x01130055, 0xfffc009c,
++	0x0111004f, 0xfffe00a2, 0x010e0048, 0x000000aa,
++	0x010b0042, 0x000200b1, 0x0107003d, 0x000400b8,
++	0x01030038, 0x000600bf, 0x00ff0032, 0x000900c6,
++	0x00fb002c, 0x000c00cd, 0x00f60028, 0x000f00d3,
++	0x00f10022, 0x001300da, 0x00eb001f, 0x001600e0,
++	0x00e6001a, 0x001a00e6,
++};
++static const u32 histb_vpss_zme_cv_r6[34] = {
++	0x01190078, 0xfff70078, 0x01190071, 0xfff7007f,
++	0x0118006a, 0xfff80086, 0x01170063, 0xfff9008d,
++	0x0115005c, 0xfffb0094, 0x01130055, 0xfffc009c,
++	0x0111004f, 0xfffe00a2, 0x010e0048, 0x000000aa,
++	0x010b0042, 0x000200b1, 0x0107003d, 0x000400b8,
++	0x01030038, 0x000600bf, 0x00ff0032, 0x000900c6,
++	0x00fb002c, 0x000c00cd, 0x00f60028, 0x000f00d3,
++	0x00f10022, 0x001300da, 0x00eb001f, 0x001600e0,
++	0x00e6001a, 0x001a00e6,
++};
++static const u32 histb_vpss_dti_lh_r0[51] = {
++	0x028fa804, 0xfea0a1d4, 0x00000004, 0x01afb803,
++	0xfe60d9d4, 0x00000005, 0x00efc802, 0xfe2111d2,
++	0x00000006, 0x002fd402, 0xfde151ce, 0x00000007,
++	0xff7fe401, 0xfda191c9, 0x00000008, 0xfeeff001,
++	0xfd61d1c2, 0x00000009, 0xfe5ff801, 0xfd2215bb,
++	0x0000000a, 0xfdd00800, 0xfce25db2, 0x0000000a,
++	0xfd601000, 0xfca2a1a9, 0x0000000b, 0xfcf01800,
++	0xfc72e99e, 0x0000000c, 0xfca02000, 0xfc433191,
++	0x0000000d, 0xfc602800, 0xfc237983, 0x0000000d,
++	0xfc202c00, 0xfbf3c176, 0x0000000e, 0xfbf03000,
++	0xfbe40967, 0x0000000e, 0xfbd03400, 0xfbc45158,
++	0x0000000e, 0xfbc03800, 0xfbc49547, 0x0000000e,
++	0xfbc03800, 0xfbc4d936, 0x0000000e,
++};
++static const u32 histb_vpss_dti_lv_r0[17] = {
++	0x003201ce, 0x003f01c1, 0x004b01b5, 0x005801a8,
++	0x0065019b, 0x0072018e, 0x007e0182, 0x008b0175,
++	0x00980168, 0x00a5015b, 0x00b2014e, 0x00bf0141,
++	0x00cc0134, 0x00d90127, 0x00e6011a, 0x00f3010d,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_ch_r0[34] = {
++	0x014f0067, 0xffe30067, 0x014f005c, 0xffe50070,
++	0x014f0054, 0xffe40079, 0x014e004b, 0xffe40083,
++	0x014c0043, 0xffe4008d, 0x0149003b, 0xffe40098,
++	0x01460033, 0xffe500a2, 0x0143002b, 0xffe500ad,
++	0x013f0024, 0xffe600b7, 0x0139001e, 0xffe700c2,
++	0x01340017, 0xffe900cc, 0x012d0011, 0xffeb00d7,
++	0x0127000c, 0xffec00e1, 0x01200006, 0xffef00eb,
++	0x01180002, 0xfff200f4, 0x010ffffd, 0xfff600fe,
++	0x0107fff9, 0xfff90107,
++};
++static const u32 histb_vpss_dti_cv_r0[17] = {
++	0x0092016e, 0x00990167, 0x00a1015f, 0x00a80158,
++	0x00af0151, 0x00b6014a, 0x00bd0143, 0x00c4013c,
++	0x00cb0135, 0x00d2012e, 0x00d80128, 0x00df0121,
++	0x00e6011a, 0x00ec0114, 0x00f3010d, 0x00f90107,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_lh_r1[51] = {
++	0x00000000, 0x000001ff, 0x00000000, 0xff400fff,
++	0xffc039ff, 0x00000001, 0xfe901bfe, 0xff8071fd,
++	0x00000002, 0xfdf027fe, 0xff40b1f7, 0x00000003,
++	0xfd702ffd, 0xff00f5f0, 0x00000004, 0xfd0037fd,
++	0xfeb13de8, 0x000ffc05, 0xfca03bfd, 0xfe7189dd,
++	0x000ff807, 0xfc5043fc, 0xfe21d9d1, 0x000ff808,
++	0xfc1047fc, 0xfdd229c3, 0x000ffc09, 0xfbe04bfc,
++	0xfd9279b5, 0x000ff80a, 0xfbc04bfc, 0xfd42d1a5,
++	0x000ff80b, 0xfbb04bfc, 0xfd032594, 0x000ff40d,
++	0xfba04bfc, 0xfcc37982, 0x000ff80e, 0xfba04bfc,
++	0xfc83d170, 0x000ff40f, 0xfbb04bfc, 0xfc54255c,
++	0x000ff410, 0xfbd04bfc, 0xfc147949, 0x000ff410,
++	0xfbf047fd, 0xfbf4cd33, 0x000ff411,
++};
++static const u32 histb_vpss_dti_lv_r1[17] = {
++	0x003201ce, 0x003f01c1, 0x004b01b5, 0x005801a8,
++	0x0065019b, 0x0072018e, 0x007e0182, 0x008b0175,
++	0x00980168, 0x00a5015b, 0x00b2014e, 0x00bf0141,
++	0x00cc0134, 0x00d90127, 0x00e6011a, 0x00f3010d,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_ch_r1[34] = {
++	0x01ff0000, 0x00000000, 0x01ffffed, 0xffff0015,
++	0x01fdffdb, 0xfffe002a, 0x01f8ffcd, 0xfffb0040,
++	0x01f3ffc0, 0xfff70056, 0x01ecffb6, 0xfff2006c,
++	0x01e4ffae, 0xffed0081, 0x01daffa7, 0xffe70098,
++	0x01cfffa2, 0xffe100ae, 0x01c3ff9f, 0xffda00c4,
++	0x01b6ff9e, 0xffd300d9, 0x01a8ff9e, 0xffcc00ee,
++	0x0199ff9e, 0xffc50104, 0x0188ffa1, 0xffbf0118,
++	0x0178ffa4, 0xffb8012c, 0x0166ffa8, 0xffb20140,
++	0x0153ffad, 0xffad0153,
++};
++static const u32 histb_vpss_dti_cv_r1[17] = {
++	0x0092016e, 0x00990167, 0x00a1015f, 0x00a80158,
++	0x00af0151, 0x00b6014a, 0x00bd0143, 0x00c4013c,
++	0x00cb0135, 0x00d2012e, 0x00d80128, 0x00df0121,
++	0x00e6011a, 0x00ec0114, 0x00f3010d, 0x00f90107,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_lh_r2[51] = {
++	0x091003f0, 0x000244fe, 0x000003f0, 0x08cffbf0,
++	0x00325cfd, 0x000003ef, 0x087feff1, 0x005274fd,
++	0x000003ee, 0x081fe7f2, 0x008288fc, 0x000003ee,
++	0x07bfdff3, 0x00b29cfc, 0x000003ed, 0x076fd7f3,
++	0x00f2b0fa, 0x000003ed, 0x070fd3f4, 0x0122c4fa,
++	0x000fffec, 0x06bfcbf5, 0x0152dcf7, 0x000fffec,
++	0x065fc7f6, 0x0192f0f5, 0x000fffeb, 0x060fc3f7,
++	0x01d300f3, 0x000ffbeb, 0x05afbbf8, 0x021314f2,
++	0x000ffbea, 0x055fb7f8, 0x025328ef, 0x000ffbea,
++	0x050fb7f9, 0x029338ec, 0x000ff7ea, 0x04bfb3f9,
++	0x02e348e9, 0x000ff7ea, 0x045faffa, 0x03235ce6,
++	0x000ff7ea, 0x041faffb, 0x03736ce2, 0x000fefea,
++	0x03cfaffb, 0x03c378de, 0x000fefeb,
++};
++static const u32 histb_vpss_dti_lv_r2[17] = {
++	0x003201ce, 0x003f01c1, 0x004b01b5, 0x005801a8,
++	0x0065019b, 0x0072018e, 0x007e0182, 0x008b0175,
++	0x00980168, 0x00a5015b, 0x00b2014e, 0x00bf0141,
++	0x00cc0134, 0x00d90127, 0x00e6011a, 0x00f3010d,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_ch_r2[34] = {
++	0x014f0067, 0xffe30067, 0x014f005c, 0xffe50070,
++	0x014f0054, 0xffe40079, 0x014e004b, 0xffe40083,
++	0x014c0043, 0xffe4008d, 0x0149003b, 0xffe40098,
++	0x01460033, 0xffe500a2, 0x0143002b, 0xffe500ad,
++	0x013f0024, 0xffe600b7, 0x0139001e, 0xffe700c2,
++	0x01340017, 0xffe900cc, 0x012d0011, 0xffeb00d7,
++	0x0127000c, 0xffec00e1, 0x01200006, 0xffef00eb,
++	0x01180002, 0xfff200f4, 0x010ffffd, 0xfff600fe,
++	0x0107fff9, 0xfff90107,
++};
++static const u32 histb_vpss_dti_cv_r2[17] = {
++	0x0092016e, 0x00990167, 0x00a1015f, 0x00a80158,
++	0x00af0151, 0x00b6014a, 0x00bd0143, 0x00c4013c,
++	0x00cb0135, 0x00d2012e, 0x00d80128, 0x00df0121,
++	0x00e6011a, 0x00ec0114, 0x00f3010d, 0x00f90107,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_lh_r3[51] = {
++	0x091003f0, 0x000244fe, 0x000003f0, 0x08cffbf0,
++	0x00325cfd, 0x000003ef, 0x087feff1, 0x005274fd,
++	0x000003ee, 0x081fe7f2, 0x008288fc, 0x000003ee,
++	0x07bfdff3, 0x00b29cfc, 0x000003ed, 0x076fd7f3,
++	0x00f2b0fa, 0x000003ed, 0x070fd3f4, 0x0122c4fa,
++	0x000fffec, 0x06bfcbf5, 0x0152dcf7, 0x000fffec,
++	0x065fc7f6, 0x0192f0f5, 0x000fffeb, 0x060fc3f7,
++	0x01d300f3, 0x000ffbeb, 0x05afbbf8, 0x021314f2,
++	0x000ffbea, 0x055fb7f8, 0x025328ef, 0x000ffbea,
++	0x050fb7f9, 0x029338ec, 0x000ff7ea, 0x04bfb3f9,
++	0x02e348e9, 0x000ff7ea, 0x045faffa, 0x03235ce6,
++	0x000ff7ea, 0x041faffb, 0x03736ce2, 0x000fefea,
++	0x03cfaffb, 0x03c378de, 0x000fefeb,
++};
++static const u32 histb_vpss_dti_lv_r3[17] = {
++	0x003201ce, 0x003f01c1, 0x004b01b5, 0x005801a8,
++	0x0065019b, 0x0072018e, 0x007e0182, 0x008b0175,
++	0x00980168, 0x00a5015b, 0x00b2014e, 0x00bf0141,
++	0x00cc0134, 0x00d90127, 0x00e6011a, 0x00f3010d,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_ch_r3[34] = {
++	0x014f0067, 0xffe30067, 0x014f005c, 0xffe50070,
++	0x014f0054, 0xffe40079, 0x014e004b, 0xffe40083,
++	0x014c0043, 0xffe4008d, 0x0149003b, 0xffe40098,
++	0x01460033, 0xffe500a2, 0x0143002b, 0xffe500ad,
++	0x013f0024, 0xffe600b7, 0x0139001e, 0xffe700c2,
++	0x01340017, 0xffe900cc, 0x012d0011, 0xffeb00d7,
++	0x0127000c, 0xffec00e1, 0x01200006, 0xffef00eb,
++	0x01180002, 0xfff200f4, 0x010ffffd, 0xfff600fe,
++	0x0107fff9, 0xfff90107,
++};
++static const u32 histb_vpss_dti_cv_r3[17] = {
++	0x0092016e, 0x00990167, 0x00a1015f, 0x00a80158,
++	0x00af0151, 0x00b6014a, 0x00bd0143, 0x00c4013c,
++	0x00cb0135, 0x00d2012e, 0x00d80128, 0x00df0121,
++	0x00e6011a, 0x00ec0114, 0x00f3010d, 0x00f90107,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_lh_r4[51] = {
++	0x09004bee, 0x013240e2, 0x000ff3ef, 0x08b043ef,
++	0x015250e2, 0x000ff3ef, 0x087037ef, 0x018264e3,
++	0x000fefee, 0x08302fef, 0x01b274e2, 0x000fefee,
++	0x07e027ef, 0x01e284e1, 0x000fefef, 0x07a01bf0,
++	0x021294e1, 0x000febef, 0x076013f0, 0x0252a4e0,
++	0x000fe7ef, 0x07100bf0, 0x0282b4e0, 0x000fe7ef,
++	0x06d003f1, 0x02b2c4de, 0x000fe7ef, 0x068ffff1,
++	0x02f2d4dc, 0x000fe3f0, 0x064ff7f2, 0x0332e4da,
++	0x000fdff0, 0x060feff2, 0x0362f0d9, 0x000fdff1,
++	0x05bfebf2, 0x03a300d6, 0x000fdff2, 0x057fe7f3,
++	0x03e30cd4, 0x000fdbf2, 0x053fdff3, 0x042318d2,
++	0x000fdbf3, 0x04ffdbf4, 0x046324cf, 0x000fd7f4,
++	0x04afd7f4, 0x04a334cd, 0x000fd3f5,
++};
++static const u32 histb_vpss_dti_lv_r4[17] = {
++	0x003201ce, 0x003f01c1, 0x004b01b5, 0x005801a8,
++	0x0065019b, 0x0072018e, 0x007e0182, 0x008b0175,
++	0x00980168, 0x00a5015b, 0x00b2014e, 0x00bf0141,
++	0x00cc0134, 0x00d90127, 0x00e6011a, 0x00f3010d,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_ch_r4[34] = {
++	0x01190078, 0xfff70078, 0x01190071, 0xfff7007f,
++	0x0118006a, 0xfff80086, 0x01170063, 0xfff9008d,
++	0x0115005c, 0xfffb0094, 0x01130055, 0xfffc009c,
++	0x0111004f, 0xfffe00a2, 0x010e0048, 0x000000aa,
++	0x010b0042, 0x000200b1, 0x0107003d, 0x000400b8,
++	0x01030038, 0x000600bf, 0x00ff0032, 0x000900c6,
++	0x00fb002c, 0x000c00cd, 0x00f60028, 0x000f00d3,
++	0x00f10022, 0x001300da, 0x00eb001f, 0x001600e0,
++	0x00e6001a, 0x001a00e6,
++};
++static const u32 histb_vpss_dti_cv_r4[17] = {
++	0x0092016e, 0x00990167, 0x00a1015f, 0x00a80158,
++	0x00af0151, 0x00b6014a, 0x00bd0143, 0x00c4013c,
++	0x00cb0135, 0x00d2012e, 0x00d80128, 0x00df0121,
++	0x00e6011a, 0x00ec0114, 0x00f3010d, 0x00f90107,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_lh_r5[51] = {
++	0x09004bee, 0x013240e2, 0x000ff3ef, 0x08b043ef,
++	0x015250e2, 0x000ff3ef, 0x087037ef, 0x018264e3,
++	0x000fefee, 0x08302fef, 0x01b274e2, 0x000fefee,
++	0x07e027ef, 0x01e284e1, 0x000fefef, 0x07a01bf0,
++	0x021294e1, 0x000febef, 0x076013f0, 0x0252a4e0,
++	0x000fe7ef, 0x07100bf0, 0x0282b4e0, 0x000fe7ef,
++	0x06d003f1, 0x02b2c4de, 0x000fe7ef, 0x068ffff1,
++	0x02f2d4dc, 0x000fe3f0, 0x064ff7f2, 0x0332e4da,
++	0x000fdff0, 0x060feff2, 0x0362f0d9, 0x000fdff1,
++	0x05bfebf2, 0x03a300d6, 0x000fdff2, 0x057fe7f3,
++	0x03e30cd4, 0x000fdbf2, 0x053fdff3, 0x042318d2,
++	0x000fdbf3, 0x04ffdbf4, 0x046324cf, 0x000fd7f4,
++	0x04afd7f4, 0x04a334cd, 0x000fd3f5,
++};
++static const u32 histb_vpss_dti_lv_r5[17] = {
++	0x003201ce, 0x003f01c1, 0x004b01b5, 0x005801a8,
++	0x0065019b, 0x0072018e, 0x007e0182, 0x008b0175,
++	0x00980168, 0x00a5015b, 0x00b2014e, 0x00bf0141,
++	0x00cc0134, 0x00d90127, 0x00e6011a, 0x00f3010d,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_ch_r5[34] = {
++	0x01190078, 0xfff70078, 0x01190071, 0xfff7007f,
++	0x0118006a, 0xfff80086, 0x01170063, 0xfff9008d,
++	0x0115005c, 0xfffb0094, 0x01130055, 0xfffc009c,
++	0x0111004f, 0xfffe00a2, 0x010e0048, 0x000000aa,
++	0x010b0042, 0x000200b1, 0x0107003d, 0x000400b8,
++	0x01030038, 0x000600bf, 0x00ff0032, 0x000900c6,
++	0x00fb002c, 0x000c00cd, 0x00f60028, 0x000f00d3,
++	0x00f10022, 0x001300da, 0x00eb001f, 0x001600e0,
++	0x00e6001a, 0x001a00e6,
++};
++static const u32 histb_vpss_dti_cv_r5[17] = {
++	0x0092016e, 0x00990167, 0x00a1015f, 0x00a80158,
++	0x00af0151, 0x00b6014a, 0x00bd0143, 0x00c4013c,
++	0x00cb0135, 0x00d2012e, 0x00d80128, 0x00df0121,
++	0x00e6011a, 0x00ec0114, 0x00f3010d, 0x00f90107,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_lh_r6[51] = {
++	0x09004bee, 0x013240e2, 0x000ff3ef, 0x08b043ef,
++	0x015250e2, 0x000ff3ef, 0x087037ef, 0x018264e3,
++	0x000fefee, 0x08302fef, 0x01b274e2, 0x000fefee,
++	0x07e027ef, 0x01e284e1, 0x000fefef, 0x07a01bf0,
++	0x021294e1, 0x000febef, 0x076013f0, 0x0252a4e0,
++	0x000fe7ef, 0x07100bf0, 0x0282b4e0, 0x000fe7ef,
++	0x06d003f1, 0x02b2c4de, 0x000fe7ef, 0x068ffff1,
++	0x02f2d4dc, 0x000fe3f0, 0x064ff7f2, 0x0332e4da,
++	0x000fdff0, 0x060feff2, 0x0362f0d9, 0x000fdff1,
++	0x05bfebf2, 0x03a300d6, 0x000fdff2, 0x057fe7f3,
++	0x03e30cd4, 0x000fdbf2, 0x053fdff3, 0x042318d2,
++	0x000fdbf3, 0x04ffdbf4, 0x046324cf, 0x000fd7f4,
++	0x04afd7f4, 0x04a334cd, 0x000fd3f5,
++};
++static const u32 histb_vpss_dti_lv_r6[17] = {
++	0x003201ce, 0x003f01c1, 0x004b01b5, 0x005801a8,
++	0x0065019b, 0x0072018e, 0x007e0182, 0x008b0175,
++	0x00980168, 0x00a5015b, 0x00b2014e, 0x00bf0141,
++	0x00cc0134, 0x00d90127, 0x00e6011a, 0x00f3010d,
++	0x01000100,
++};
++static const u32 histb_vpss_dti_ch_r6[34] = {
++	0x01190078, 0xfff70078, 0x01190071, 0xfff7007f,
++	0x0118006a, 0xfff80086, 0x01170063, 0xfff9008d,
++	0x0115005c, 0xfffb0094, 0x01130055, 0xfffc009c,
++	0x0111004f, 0xfffe00a2, 0x010e0048, 0x000000aa,
++	0x010b0042, 0x000200b1, 0x0107003d, 0x000400b8,
++	0x01030038, 0x000600bf, 0x00ff0032, 0x000900c6,
++	0x00fb002c, 0x000c00cd, 0x00f60028, 0x000f00d3,
++	0x00f10022, 0x001300da, 0x00eb001f, 0x001600e0,
++	0x00e6001a, 0x001a00e6,
++};
++static const u32 histb_vpss_dti_cv_r6[17] = {
++	0x0092016e, 0x00990167, 0x00a1015f, 0x00a80158,
++	0x00af0151, 0x00b6014a, 0x00bd0143, 0x00c4013c,
++	0x00cb0135, 0x00d2012e, 0x00d80128, 0x00df0121,
++	0x00e6011a, 0x00ec0114, 0x00f3010d, 0x00f90107,
++	0x01000100,
++};
++
++#endif
+--- /dev/null
++++ b/drivers/media/platform/hisilicon/histb-vpss.c
+@@ -0,0 +1,2219 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * histb-vpss.c - HiSilicon HiSTB video processing subsystem, mem2mem form.
++ *
++ * The block sits between a decoder and an encoder or a display: it scales and
++ * de-interlaces frames and converts between the semi-planar 4:2:0 and 4:2:2
++ * layouts. Everything the block can do that has no V4L2 interface on a mem2mem
++ * device (tone mapping, temporal noise reduction, a second output port, a
++ * write-back capture channel) is deliberately not implemented: what this driver
++ * offers is the format conversion, the two-axis scaling implied by the OUTPUT
++ * and CAPTURE sizes, rotation, and the deinterlacing mode control.
++ */
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/reset.h>
++
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/v4l2-event.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-v4l2.h>
++
++#include "histb-vpss-regs.h"
++#include "histb-vpss-v4-regs.h"
++#include "histb-vpss-zme-coef.h"
++
++/* Rotation runs as one image per plane, chained. */
++#define HISTB_VPSS_IMAGES	2
++
++#define HISTB_VPSS_NAME		"histb-vpss"
++
++/*
++ * The block only needs its clock while a job is in flight, but a client that
++ * dequeues and requeues back-to-back would otherwise pay a reset per job.
++ */
++#define HISTB_VPSS_AUTOSUSPEND_MS	200
++
++#define VPSS_MIN_WIDTH		32
++#define VPSS_MIN_HEIGHT		32
++#define VPSS_MAX_WIDTH		1920
++#define VPSS_MAX_HEIGHT		1088
++#define VPSS_ALIGN		16
++
++/*
++ * Deinterlacing modes offered through V4L2_CID_DEINTERLACING_MODE.
++ * Bob turns one field into a frame by doubling it vertically; Weave states
++ * that no filtering happens, so its job is the plain conversion of a frame
++ * that already holds both fields. Motion-adaptive interpolation reads the
++ * field, the one before it and the two after it from a driver-owned ring, and
++ * a motion history the block keeps across jobs.
++ */
++#define VPSS_DEI_NONE		0
++#define VPSS_DEI_BOB		1
++#define VPSS_DEI_WEAVE		2
++#define VPSS_DEI_MAD		3
++
++/* The ring holds whole pictures: each one carries the two fields of its
++ * moment in the half they occupy, so the block can weave a field with its
++ * partner and compare whole pictures across time.
++ */
++#define VPSS_DEI_RING		4
++/* Motion history planes are fixed to the block's maximum picture (960 x 544
++ * bytes per plane on a 1920-wide frame), as the vendor's allocator does.
++ */
++#define VPSS_DEI_HIST_STRIDE	960
++#define VPSS_DEI_HIST_PLANE	(VPSS_DEI_HIST_STRIDE * 544)
++#define VPSS_DEI_HIST_PLANES	3
++
++struct histb_vpss_fmt {
++	u32	fourcc;
++	bool	nv21;
++	bool	fmt422;
++	bool	packed;
++};
++
++struct histb_vpss;
++struct histb_vpss_pass;
++
++/*
++ * What a generation owns: where the constant id word lives, how big one job
++ * image is, which state bits mean done and which mean fault, and the builder
++ * that fills the image. The v4 block also gates its own clocks on the way up.
++ */
++struct histb_vpss_variant {
++	u32	version;
++	u32	version_expect;	/* 0 = any answer but silence will do */
++	u32	image_size;
++	u32	done;
++	u32	errors;
++	u32	timeout;
++	const char *(*err_name)(u32 st);
++	bool	arm_detector;	/* the generation with an AXI transaction latch */
++	bool	status_from_raw;	/* wait on the unmasked status word, as
++					 * the vendor's own check does
++					 */
++	int	(*pass_run)(struct histb_vpss *vpss,
++			    const struct histb_vpss_pass *p);
++	void	(*power_up)(struct histb_vpss *vpss);
++	bool	deinterlacing;
++	bool	scaling;
++	bool	packed;
++};
++
++/*
++ * The v4 block will not run a chain until its clock-gating request and the
++ * hard gate of its post-processing clock are asked for, and it masks and clears
++ * its interrupts the same way on the way up. The vendor's layer does this
++ * against the window as it enables the clock, not against the job image, so
++ * it goes in the same place here.
++ */
++
++struct histb_vpss {
++	struct device		*dev;
++	const struct histb_vpss_variant *var;
++	void __iomem		*regs;
++	struct clk		*clk;
++	struct clk		*smmu_clk;	/* the generation that has one */
++	struct reset_control	*rst;
++	struct reset_control	*rst_smmu;	/* the generation with its own unit */
++	struct completion	done;
++	struct v4l2_device	v4l2_dev;
++	struct video_device	vdev;
++	struct v4l2_m2m_dev	*m2m_dev;
++	struct mutex		lock;	/* serialises jobs and format changes */
++	void			*shadow;	/* register images the block runs */
++	dma_addr_t		shadow_dma;
++	void			*coef;		/* scaler phase tables for one bucket */
++	dma_addr_t		coef_dma;
++	bool			busy;
++	u32			version;	/* VPSS_VERSION as first read */
++	bool			faulted;	/* reset failed; no job is attempted */
++	bool			removing;	/* device_run() refuses work */
++};
++
++struct histb_vpss_ctx {
++	struct v4l2_fh		fh;
++	struct histb_vpss	*vpss;
++	struct v4l2_pix_format	src_fmt;
++	struct v4l2_pix_format	dst_fmt;
++	struct v4l2_rect	crop;
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_ctrl	*dei_ctrl;
++	struct v4l2_ctrl	*hflip;
++	struct v4l2_ctrl	*vflip;
++	struct v4l2_ctrl	*sharpness;
++	struct v4l2_ctrl	*rotate;
++
++	/* Motion-adaptive deinterlacing keeps the fields the block reads
++	 * beside the current one, and the motion history it accumulates
++	 * between jobs. All of it is the driver's own memory: a client hands
++	 * the block one field per buffer and gets a frame back.
++	 */
++	void		*dei_fields;
++	dma_addr_t	dei_fields_dma;
++	size_t		dei_frame_bytes;
++	unsigned int	dei_count;
++	unsigned int	dei_hist_wr;
++	u64		dei_ts[VPSS_DEI_RING][2];
++	bool		dei_first_bottom;
++	bool		dei_last_bottom;
++	void		*dei_hist;
++	dma_addr_t	dei_hist_dma;
++};
++
++struct histb_vpss_job {
++	dma_addr_t	src;
++	dma_addr_t	dst;
++	unsigned int	width;
++	unsigned int	height;
++	unsigned int	out_width;
++	unsigned int	out_height;
++	unsigned int	src_stride;
++	unsigned int	dst_stride;
++	bool		in_422;
++	bool		out_422;
++	bool		in_packed;
++	unsigned int	in_fmt;
++	bool		invert_uv;
++	unsigned int	sharpness;
++	bool		hflip;
++	bool		vflip;
++	unsigned int	in_x;
++	unsigned int	in_y;
++	unsigned int	in_w;
++	unsigned int	in_h;
++	unsigned int	angle;
++};
++
++static const struct histb_vpss_fmt histb_vpss_out_fmts[] = {
++	{ V4L2_PIX_FMT_NV12, false, false, false },
++	{ V4L2_PIX_FMT_NV21, true, false, false },
++	{ V4L2_PIX_FMT_NV16, false, true, false },
++	{ V4L2_PIX_FMT_NV61, true, true, false },
++	{ V4L2_PIX_FMT_YUYV, false, true, true },
++	{ V4L2_PIX_FMT_UYVY, false, true, true },
++};
++
++static const struct histb_vpss_fmt histb_vpss_cap_fmts[] = {
++	{ V4L2_PIX_FMT_NV12, false, false, false },
++	{ V4L2_PIX_FMT_NV21, true, false, false },
++	{ V4L2_PIX_FMT_NV16, false, true, false },
++	{ V4L2_PIX_FMT_NV61, true, true, false },
++};
++
++static int histb_vpss_reset(struct histb_vpss *vpss);
++static int histb_vpss_kick(struct histb_vpss *vpss, dma_addr_t first);
++static void histb_vpss_reset_crop(struct histb_vpss_ctx *ctx);
++static void histb_vpss_dei_free(struct histb_vpss_ctx *ctx);
++
++static struct device *vpss_dev_of_ctx(const struct histb_vpss_ctx *ctx)
++{
++	return ctx->vpss->dev;
++}
++
++static struct histb_vpss_ctx *histb_vpss_ctx_of(struct file *file)
++{
++	return container_of(file->private_data, struct histb_vpss_ctx, fh);
++}
++
++static const struct histb_vpss_fmt *histb_vpss_find(const struct histb_vpss_fmt *t,
++						    unsigned int n, u32 fourcc)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i++)
++		if (t[i].fourcc == fourcc)
++			return &t[i];
++
++	return NULL;
++}
++
++static unsigned int histb_vpss_stride(unsigned int width, unsigned int bpl)
++{
++	return max(width, round_up(bpl, VPSS_ALIGN));
++}
++
++/*
++ * The input sampler's code for the source layout says:
++ * 0 is semi-planar 4:2:0, 2 semi-planar 4:2:2, and the packed pairs carry their
++ * own codes because the byte order inside a pair is part of the layout.
++ */
++static unsigned int histb_vpss_in_format(const struct histb_vpss_fmt *f)
++{
++	if (f->fourcc == V4L2_PIX_FMT_YUYV)
++		return 0xb;
++	if (f->fourcc == V4L2_PIX_FMT_UYVY)
++		return 0xd;
++	return f->fmt422 ? 2 : 0;
++}
++
++/*
++ * A client's bytesperline reaches the stride registers unchanged, and both of
++ * them are 16 bits wide (VPSS_CURSTRIDE_Y, VPSS_VHDSTRIDE_Y), so a request
++ * above that would be masked into a different geometry: the buffer gets sized
++ * by the requested stride while the block walks the truncated one. Rejecting
++ * the stride also keeps the sizeimage arithmetic below in range, since
++ * U16_MAX * VPSS_MAX_HEIGHT * 2 is nowhere near a 32-bit wrap.
++ */
++static int histb_vpss_fill_fmt(const struct histb_vpss_fmt *f,
++			       struct v4l2_pix_format *pix)
++{
++	unsigned int width = clamp_t(u32, ALIGN(pix->width, VPSS_ALIGN),
++				     VPSS_MIN_WIDTH, VPSS_MAX_WIDTH);
++	unsigned int height = clamp_t(u32, ALIGN(pix->height, VPSS_ALIGN),
++				      VPSS_MIN_HEIGHT, VPSS_MAX_HEIGHT);
++	unsigned int stride;
++
++	if (pix->bytesperline > U16_MAX)
++		return -EINVAL;
++
++	pix->width = width;
++	pix->height = height;
++	pix->pixelformat = f->fourcc;
++	pix->field = V4L2_FIELD_NONE;
++	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
++
++	/* A packed pair is two bytes per pixel and one plane, so the row is at
++	 * least 2 * width long and a client asking for less is asking for a
++	 * different geometry.
++	 */
++	if (f->packed && pix->bytesperline < 2 * width)
++		pix->bytesperline = 2 * width;
++
++	stride = histb_vpss_stride(width, pix->bytesperline);
++	pix->bytesperline = stride;
++	/* 4:2:2 keeps a full-height chroma plane beside the luma. */
++	if (f->packed)
++		pix->sizeimage = stride * height;
++	else if (f->fmt422)
++		pix->sizeimage = stride * height * 2;
++	else
++		pix->sizeimage = stride * height * 3 / 2;
++	return 0;
++}
++
++static int histb_vpss_querycap(struct file *file, void *priv,
++			       struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, HISTB_VPSS_NAME, sizeof(cap->driver));
++	strscpy(cap->card, HISTB_VPSS_NAME, sizeof(cap->card));
++	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
++		 HISTB_VPSS_NAME);
++	return 0;
++}
++
++static int histb_vpss_enum_fmt(struct file *file, void *priv,
++			       struct v4l2_fmtdesc *f)
++{
++	const struct histb_vpss_fmt *tab;
++	unsigned int n;
++
++	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++		tab = histb_vpss_out_fmts;
++		n = ARRAY_SIZE(histb_vpss_out_fmts);
++	} else {
++		tab = histb_vpss_cap_fmts;
++		n = ARRAY_SIZE(histb_vpss_cap_fmts);
++	}
++	if (f->index >= n)
++		return -EINVAL;
++
++	f->pixelformat = tab[f->index].fourcc;
++	return 0;
++}
++
++static int histb_vpss_g_fmt(struct file *file, void *priv,
++			    struct v4l2_format *f)
++{
++	struct histb_vpss_ctx *ctx = histb_vpss_ctx_of(file);
++
++	if (V4L2_TYPE_IS_OUTPUT(f->type))
++		f->fmt.pix = ctx->src_fmt;
++	else
++		f->fmt.pix = ctx->dst_fmt;
++	return 0;
++}
++
++static int histb_vpss_try_fmt(struct file *file, void *priv,
++			      struct v4l2_format *f)
++{
++	const struct histb_vpss_fmt *tab, *fmt;
++	unsigned int n;
++
++	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++		tab = histb_vpss_out_fmts;
++		n = ARRAY_SIZE(histb_vpss_out_fmts);
++	} else {
++		tab = histb_vpss_cap_fmts;
++		n = ARRAY_SIZE(histb_vpss_cap_fmts);
++	}
++
++	fmt = histb_vpss_find(tab, n, f->fmt.pix.pixelformat);
++	if (!fmt)
++		fmt = &tab[0];
++
++	return histb_vpss_fill_fmt(fmt, &f->fmt.pix);
++}
++
++static int histb_vpss_s_fmt(struct file *file, void *priv,
++			    struct v4l2_format *f)
++{
++	struct histb_vpss_ctx *ctx = histb_vpss_ctx_of(file);
++	struct vb2_queue *vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
++	int ret;
++
++	if (vb2_is_busy(vq))
++		return -EBUSY;
++
++	ret = histb_vpss_try_fmt(file, priv, f);
++	if (ret)
++		return ret;
++
++	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
++		const struct histb_vpss_fmt *src = histb_vpss_find(
++			histb_vpss_out_fmts, ARRAY_SIZE(histb_vpss_out_fmts),
++			f->fmt.pix.pixelformat);
++
++		if (src && src->packed && !ctx->vpss->var->packed) {
++			dev_warn_ratelimited(vpss_dev_of_ctx(ctx),
++					     "no packed source on this generation\n");
++			return -EINVAL;
++		}
++		ctx->src_fmt = f->fmt.pix;
++		histb_vpss_reset_crop(ctx);
++	} else {
++		/* The block converts between chroma orders but not between the
++		 * 4:2:0 and 4:2:2 families: mixing them leaves the job
++		 * unfinished, so a client has to stay in one family.
++		 */
++		const struct histb_vpss_fmt *src = histb_vpss_find(
++			histb_vpss_out_fmts, ARRAY_SIZE(histb_vpss_out_fmts),
++			ctx->src_fmt.pixelformat);
++		const struct histb_vpss_fmt *dst = histb_vpss_find(
++			histb_vpss_cap_fmts, ARRAY_SIZE(histb_vpss_cap_fmts),
++			f->fmt.pix.pixelformat);
++
++		if (!src || !dst || src->fmt422 != dst->fmt422)
++			return -EINVAL;
++		/*
++		 * With no scaler the port can only repeat the window it is
++		 * given. Refusing a size change here beats handing the client
++		 * back the input size and letting it find out from the pixels.
++		 */
++		if (!ctx->vpss->var->scaling &&
++		    (f->fmt.pix.width != ctx->src_fmt.width ||
++		     f->fmt.pix.height != ctx->src_fmt.height)) {
++			dev_warn_ratelimited(vpss_dev_of_ctx(ctx),
++					     "this generation scales nothing\n");
++			return -EINVAL;
++		}
++		ctx->dst_fmt = f->fmt.pix;
++	}
++	return 0;
++}
++
++static void histb_vpss_reset_crop(struct histb_vpss_ctx *ctx)
++{
++	ctx->crop.left = 0;
++	ctx->crop.top = 0;
++	ctx->crop.width = ctx->src_fmt.width;
++	ctx->crop.height = ctx->src_fmt.height;
++}
++
++static int histb_vpss_g_selection(struct file *file, void *priv,
++				  struct v4l2_selection *sel)
++{
++	struct histb_vpss_ctx *ctx = histb_vpss_ctx_of(file);
++
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		if (V4L2_TYPE_IS_CAPTURE(sel->type))
++			return -EINVAL;
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = ctx->src_fmt.width;
++		sel->r.height = ctx->src_fmt.height;
++		return 0;
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++		if (V4L2_TYPE_IS_CAPTURE(sel->type))
++			return -EINVAL;
++		sel->r = ctx->crop;
++		return 0;
++	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
++	case V4L2_SEL_TGT_COMPOSE:
++	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
++		if (!V4L2_TYPE_IS_CAPTURE(sel->type))
++			return -EINVAL;
++		/* The port only ever writes the whole CAPTURE frame. */
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = ctx->dst_fmt.width;
++		sel->r.height = ctx->dst_fmt.height;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++/*
++ * The rectangle is taken on the input side, the way the vendor's split nodes
++ * read a part of a frame: CUR_CTRL offsets the read inside the picture and
++ * IMGSIZE shrinks to the window. A VHDCROP window instead leaves the pipeline
++ * waiting for a completion that never arrives, so the destination stays whole.
++ *
++ * Offsets are on the block's own grid: rows and columns of 16 pixels.
++ */
++static int histb_vpss_s_selection(struct file *file, void *priv,
++				  struct v4l2_selection *sel)
++{
++	struct histb_vpss_ctx *ctx = histb_vpss_ctx_of(file);
++	struct v4l2_rect r = sel->r;
++
++	if (V4L2_TYPE_IS_CAPTURE(sel->type)) {
++		/* G_SELECTION reports COMPOSE as the whole CAPTURE frame, so
++		 * S_SELECTION accepts exactly that and nothing smaller: the port
++		 * has no working destination window.
++		 */
++		if (sel->target != V4L2_SEL_TGT_COMPOSE || r.left || r.top ||
++		    r.width != ctx->dst_fmt.width ||
++		    r.height != ctx->dst_fmt.height)
++			return -EINVAL;
++		sel->r = r;
++		return 0;
++	}
++	if (sel->target != V4L2_SEL_TGT_CROP)
++		return -EINVAL;
++
++	if (r.left % 16 || r.top % 16 || r.width % 16 || r.height % 16 ||
++	    !r.width || !r.height ||
++	    r.left + r.width > ctx->src_fmt.width ||
++	    r.top + r.height > ctx->src_fmt.height)
++		return -EINVAL;
++	ctx->crop = r;
++	sel->r = r;
++	return 0;
++}
++
++static int histb_vpss_qbuf_prepare(struct vb2_buffer *vb)
++{
++	struct histb_vpss_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct v4l2_pix_format *pix;
++	size_t need;
++
++	pix = V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) ? &ctx->src_fmt :
++							 &ctx->dst_fmt;
++	need = pix->sizeimage;
++	if (vb2_plane_size(vb, 0) < need) {
++		dev_dbg(ctx->vpss->dev, "plane %lu < %zu\n",
++			vb2_plane_size(vb, 0), need);
++		return -EINVAL;
++	}
++	vb2_set_plane_payload(vb, 0, V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) ?
++					  (unsigned long)need : 0);
++	return 0;
++}
++
++static void histb_vpss_qbuf_queue(struct vb2_buffer *vb)
++{
++	struct histb_vpss_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
++}
++
++static int histb_vpss_queue_setup(struct vb2_queue *vq, unsigned int *count,
++				  unsigned int *planes, unsigned int sizes[],
++				  struct device *alloc_devs[])
++{
++	struct histb_vpss_ctx *ctx = vb2_get_drv_priv(vq);
++	struct v4l2_pix_format *pix = V4L2_TYPE_IS_OUTPUT(vq->type) ?
++		&ctx->src_fmt : &ctx->dst_fmt;
++	size_t need = pix->sizeimage;
++
++	if (!need)
++		return -EINVAL;
++	if (*planes) {
++		if (sizes[0] < need)
++			return -EINVAL;
++		return 0;
++	}
++	*planes = 1;
++	sizes[0] = need;
++	if (!*count)
++		*count = 2;
++	return 0;
++}
++
++static void histb_vpss_stop_streaming(struct vb2_queue *vq)
++{
++	struct histb_vpss_ctx *ctx = vb2_get_drv_priv(vq);
++	struct vb2_v4l2_buffer *buf;
++
++	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
++		while ((buf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx)))
++			v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
++		/* A new stream starts with no fields and no motion history. */
++		histb_vpss_dei_free(ctx);
++	} else {
++		while ((buf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx)))
++			v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
++	}
++}
++
++static const struct vb2_ops histb_vpss_qops = {
++	.queue_setup = histb_vpss_queue_setup,
++	.buf_prepare = histb_vpss_qbuf_prepare,
++	.buf_queue = histb_vpss_qbuf_queue,
++	.stop_streaming = histb_vpss_stop_streaming,
++};
++
++/*
++ * One job: the block reads the OUTPUT plane, writes the CAPTURE plane, and the
++ * driver waits for the completion the interrupt releases.
++ */
++/*
++ * The scaler picks one of seven phase-table sets by the inverse of the zoom
++ * ratio, with the thresholds the vendor's PQ layer uses.
++ */
++static unsigned int histb_vpss_zme_bucket(unsigned int in, unsigned int out)
++{
++	unsigned int ratio = (in << 12) / out;
++	unsigned int t = (4096u * 4096u) / ratio;
++
++	if (t > 4096u)
++		return 0;
++	if (t == 4096u)
++		return 1;
++	if (t >= 3072u)
++		return 2;
++	if (t >= 2048u)
++		return 3;
++	if (t >= 1365u)
++		return 4;
++	if (t >= 1024u)
++		return 5;
++
++	return 6;
++}
++
++/* Four signed 8-bit taps in one word, lowest byte first; FIELD_PREP refuses
++ * negative constants, and the field keeps the low byte either way.
++ */
++static u32 histb_vpss_coef4(int c0, int c1, int c2, int c3)
++{
++	return ((u32)c0 & 0xff) | (((u32)c1 & 0xff) << 8) |
++	       (((u32)c2 & 0xff) << 16) | (((u32)c3 & 0xff) << 24);
++}
++
++static void histb_vpss_load_coef(struct histb_vpss *vpss, unsigned int b,
++				 bool sharpen, dma_addr_t addr[4])
++{
++	static const u32 *const lh[] = {
++		histb_vpss_zme_lh_r0, histb_vpss_zme_lh_r1, histb_vpss_zme_lh_r2,
++		histb_vpss_zme_lh_r3, histb_vpss_zme_lh_r4, histb_vpss_zme_lh_r5,
++		histb_vpss_zme_lh_r6,
++	};
++	static const u32 *const lv[] = {
++		histb_vpss_zme_lv_r0, histb_vpss_zme_lv_r1, histb_vpss_zme_lv_r2,
++		histb_vpss_zme_lv_r3, histb_vpss_zme_lv_r4, histb_vpss_zme_lv_r5,
++		histb_vpss_zme_lv_r6,
++	};
++	static const u32 *const ch[] = {
++		histb_vpss_zme_ch_r0, histb_vpss_zme_ch_r1, histb_vpss_zme_ch_r2,
++		histb_vpss_zme_ch_r3, histb_vpss_zme_ch_r4, histb_vpss_zme_ch_r5,
++		histb_vpss_zme_ch_r6,
++	};
++	static const u32 *const cv[] = {
++		histb_vpss_zme_cv_r0, histb_vpss_zme_cv_r1, histb_vpss_zme_cv_r2,
++		histb_vpss_zme_cv_r3, histb_vpss_zme_cv_r4, histb_vpss_zme_cv_r5,
++		histb_vpss_zme_cv_r6,
++	};
++	static const u32 *const dti_lh[] = {
++		histb_vpss_dti_lh_r0, histb_vpss_dti_lh_r1, histb_vpss_dti_lh_r2,
++		histb_vpss_dti_lh_r3, histb_vpss_dti_lh_r4, histb_vpss_dti_lh_r5,
++		histb_vpss_dti_lh_r6,
++	};
++	static const u32 *const dti_lv[] = {
++		histb_vpss_dti_lv_r0, histb_vpss_dti_lv_r1, histb_vpss_dti_lv_r2,
++		histb_vpss_dti_lv_r3, histb_vpss_dti_lv_r4, histb_vpss_dti_lv_r5,
++		histb_vpss_dti_lv_r6,
++	};
++	static const u32 *const dti_ch[] = {
++		histb_vpss_dti_ch_r0, histb_vpss_dti_ch_r1, histb_vpss_dti_ch_r2,
++		histb_vpss_dti_ch_r3, histb_vpss_dti_ch_r4, histb_vpss_dti_ch_r5,
++		histb_vpss_dti_ch_r6,
++	};
++	static const u32 *const dti_cv[] = {
++		histb_vpss_dti_cv_r0, histb_vpss_dti_cv_r1, histb_vpss_dti_cv_r2,
++		histb_vpss_dti_cv_r3, histb_vpss_dti_cv_r4, histb_vpss_dti_cv_r5,
++		histb_vpss_dti_cv_r6,
++	};
++	static const unsigned int words[4] = { 51, 51, 34, 34 };
++	static const unsigned int dti_words[4] = { 51, 17, 34, 17 };
++	static const u32 *const *const dti[] = { dti_lh, dti_lv, dti_ch, dti_cv };
++	const u32 *tab[4] = { lh[b], lv[b], ch[b], cv[b] };
++	unsigned int i;
++
++	for (i = 0; i < 4; i++) {
++		memcpy(vpss->coef + i * VPSS_COEF_BLOCK, tab[i], words[i] * 4);
++		if (sharpen)
++			memcpy(vpss->coef + i * VPSS_COEF_BLOCK + 256,
++			       dti[i][b], dti_words[i] * 4);
++		addr[i] = vpss->coef_dma + i * VPSS_COEF_BLOCK;
++	}
++}
++
++/*
++ * A frame is one or two passes of the same register image: one for a plain
++ * conversion, two for a rotation, whose luma and chroma planes the block
++ * transforms separately (img_pro_mode selects which one).
++ */
++struct histb_vpss_pass {
++	dma_addr_t	in;
++	dma_addr_t	out;
++	unsigned int	in_w;
++	unsigned int	in_h;
++	unsigned int	off_x;
++	unsigned int	off_y;
++	unsigned int	frame_h;
++	unsigned int	out_w;
++	unsigned int	out_h;
++	unsigned int	in_stride;
++	unsigned int	out_stride;
++	bool		in_422;
++	bool		out_422;
++	bool		in_packed;
++	unsigned int	in_fmt;
++	bool		invert_uv;
++	unsigned int	sharpness;
++	bool		hflip;
++	bool		vflip;
++};
++
++static int histb_vpss_v3_pass_run(struct histb_vpss *vpss,
++				 const struct histb_vpss_pass *p)
++{
++	u32 *s = vpss->shadow;
++	unsigned int src_c, dst_c, stride;
++
++	if (!s)
++		return -ENODEV;
++	if (upper_32_bits(p->in) || upper_32_bits(p->out))
++		return -ERANGE;
++
++	memset(s, 0, VPSS_REG_IMAGE_SIZE);
++	s[VPSS_MISCELLANEOUS / 4] = 0x03003244;
++	s[VPSS_INTMASK / 4] = 0xff;
++	s[VPSS_TIMEOUT / 4] = 0xffffffff;
++
++	s[VPSS_CTRL / 4] = VPSS_CTRL_VHD_EN |
++			  FIELD_PREP(VPSS_CTRL_PROT, 2);
++
++	/* 0 selects the 4:2:0 semi-planar family, 2 the 4:2:2 one and the packed
++	 * pairs their own codes; the port's format field counts 4:2:0 as 0 and
++	 * 4:2:2 as 1.
++	 */
++	s[VPSS_CTRL2 / 4] = FIELD_PREP(VPSS_CTRL2_IN_FORMAT, p->in_fmt) |
++			   FIELD_PREP(VPSS_CTRL2_VHD_FORMAT,
++				      p->out_422 ? 1 : 0);
++	s[VPSS_IMGSIZE / 4] = FIELD_PREP(VPSS_IMGSIZE_WIDTH, p->in_w - 1) |
++			     FIELD_PREP(VPSS_IMGSIZE_HEIGHT, p->in_h - 1);
++	/* The window is read by moving the picture's start, the way the vendor's
++	 * split nodes do it: the address and stride stay those of the whole
++	 * frame, IMGSIZE shrinks to the window, and CUR_CTRL says where inside
++	 * the frame the block begins reading.
++	 */
++	s[VPSS_CUR_CTRL / 4] =
++		FIELD_PREP(VPSS_CUR_CTRL_HOR_OFFSET, p->off_x) |
++		FIELD_PREP(VPSS_CUR_CTRL_VER_OFFSET, p->off_y);
++
++	/* A packed pair has no chroma plane of its own: the sampler takes the
++	 * bytes out of the luma rows, so both the chroma origin and its pitch
++	 * are left at zero.
++	 */
++	src_c = p->in_packed ? 0 :
++		lower_32_bits(p->in) + p->in_stride * p->frame_h;
++	s[VPSS_CURYADDR / 4] = lower_32_bits(p->in);
++	s[VPSS_CURCADDR / 4] = src_c;
++	stride = p->in_stride;	/* both layouts take the pitch in bytes */
++	s[VPSS_CURSTRIDE / 4] = FIELD_PREP(VPSS_CURSTRIDE_Y, stride) |
++				FIELD_PREP(VPSS_CURSTRIDE_C,
++					   p->in_packed ? 0 : stride);
++
++	s[VPSS_VHDCTRL / 4] = (p->invert_uv ? VPSS_VHDCTRL_UV_INVERT : 0) |
++			      (p->hflip ? VPSS_VHDCTRL_MIRROR : 0) |
++			      (p->vflip ? VPSS_VHDCTRL_FLIP : 0);
++	s[VPSS_VHDSIZE / 4] =
++		FIELD_PREP(VPSS_VHDSIZE_WIDTH, p->out_w - 1) |
++		FIELD_PREP(VPSS_VHDSIZE_HEIGHT, p->out_h - 1);
++	dst_c = lower_32_bits(p->out) + p->out_stride * p->out_h;
++	s[VPSS_VHDYADDR / 4] = lower_32_bits(p->out);
++	s[VPSS_VHDCADDR / 4] = dst_c;
++	s[VPSS_VHDSTRIDE / 4] = FIELD_PREP(VPSS_VHDSTRIDE_Y, p->out_stride) |
++				FIELD_PREP(VPSS_VHDSTRIDE_C, p->out_stride);
++
++	/* The sharpen filters sit in the scaler's datapath, so a unity ratio
++	 * still has to be programmed for them to see the frame.
++	 */
++	if (p->out_w != p->in_w || p->out_h != p->in_h || p->sharpness) {
++		dma_addr_t caddr[4];
++		unsigned int b = histb_vpss_zme_bucket(p->in_w, p->out_w);
++		unsigned int zme_in = p->in_422 ? 0 : 1;
++		unsigned int zme_out = p->out_422 ? 0 : 1;
++
++		histb_vpss_load_coef(vpss, b, p->sharpness != 0, caddr);
++		s[VPSS_VHD_ZME_LHADDR / 4] = lower_32_bits(caddr[0]);
++		s[VPSS_VHD_ZME_LVADDR / 4] = lower_32_bits(caddr[1]);
++		s[VPSS_VHD_ZME_CHADDR / 4] = lower_32_bits(caddr[2]);
++		s[VPSS_VHD_ZME_CVADDR / 4] = lower_32_bits(caddr[3]);
++		s[VPSS_VHD_ZMEIRESO / 4] =
++			FIELD_PREP(VPSS_ZME_IRESO_W, p->in_w - 1) |
++			FIELD_PREP(VPSS_ZME_IRESO_H, p->in_h - 1);
++		s[VPSS_VHD_ZMEORESO / 4] =
++			FIELD_PREP(VPSS_ZME_ORESO_W, p->out_w - 1) |
++			FIELD_PREP(VPSS_ZME_ORESO_H, p->out_h - 1);
++		s[VPSS_VHD_HSP / 4] =
++			VPSS_MSC_H_MSSC | VPSS_MSC_H_CSSC |
++			VPSS_MSC_H_LFIR | VPSS_MSC_H_CFIR |
++			FIELD_PREP(VPSS_MSC_H_RATIO,
++				   (p->in_w << 20) / p->out_w);
++		s[VPSS_VHD_VSR / 4] =
++			FIELD_PREP(VPSS_MSC_V_RATIO,
++				   (p->in_h << 12) / p->out_h);
++		s[VPSS_VHD_VSP / 4] =
++			VPSS_MSC_V_MSSC | VPSS_MSC_V_CSSC |
++			VPSS_MSC_V_LFIR | VPSS_MSC_V_CFIR |
++			FIELD_PREP(VPSS_ZME_IN_FMT, zme_in) |
++			FIELD_PREP(VPSS_ZME_OUT_FMT, zme_out);
++	}
++
++	/* Sharpen runs off the same phase table set, its taps 256 bytes in.
++	 * The gain follows the vendor PQ scale: 128 is nominal, and the
++	 * default luma and chroma ratios are 180 and 256.
++	 */
++	if (p->sharpness) {
++		unsigned int lgain = (180 * p->sharpness + 64) / 128;
++		unsigned int cgain = (256 * p->sharpness + 64) / 128;
++
++		s[VPSS_VHD_LTI_CTRL / 4] =
++			VPSS_LTI_CTRL_LTI_EN |
++			FIELD_PREP(VPSS_LTI_CTRL_LHPASS_COEF4, 0xff) |
++			FIELD_PREP(VPSS_LTI_CTRL_LMIXING_RATIO, 127) |
++			FIELD_PREP(VPSS_LTI_CTRL_LGAIN_RATIO, lgain);
++		s[VPSS_VHD_LHPASS_COEF / 4] = histb_vpss_coef4(-19, -8, -2, -1);
++		s[VPSS_VHD_LTI_THD / 4] =
++			FIELD_PREP(VPSS_LTI_THD_LOVER_SWING, 3) |
++			FIELD_PREP(VPSS_LTI_THD_LUNDER_SWING, 3) |
++			FIELD_PREP(VPSS_LTI_THD_LCORING_THD, 2);
++		s[VPSS_VHD_LHFREQ_THD / 4] =
++			FIELD_PREP(GENMASK(15, 0), 50) |
++			FIELD_PREP(GENMASK(31, 16), 51);
++		s[VPSS_VHD_LGAIN_COEF / 4] = histb_vpss_coef4(128, 128, 128, 0);
++		s[VPSS_VHD_CTI_CTRL / 4] =
++			VPSS_CTI_CTRL_CTI_EN |
++			FIELD_PREP(VPSS_CTI_CTRL_CMIXING_RATIO, 127) |
++			FIELD_PREP(VPSS_CTI_CTRL_CGAIN_RATIO, cgain);
++		s[VPSS_VHD_CHPASS_COEF / 4] = histb_vpss_coef4(-21, -21, -11, 0);
++		s[VPSS_VHD_CTI_THD / 4] =
++			FIELD_PREP(VPSS_CTI_THD_COVER_SWING, 4) |
++			FIELD_PREP(VPSS_CTI_THD_CUNDER_SWING, 4) |
++			FIELD_PREP(VPSS_CTI_THD_CCORING_THD, 4);
++	}
++
++	/* The port writes the whole CAPTURE frame: a VHDCROP window smaller than
++	 * the port never reports done, so a client that wants fewer pixels
++	 * crops the source instead.
++	 */
++	s[VPSS_VHDLBA_BK / 4] = FIELD_PREP(GENMASK(15, 8), 0x10) |
++				FIELD_PREP(GENMASK(23, 16), 0x80) |
++				FIELD_PREP(GENMASK(31, 24), 0x80);
++	s[VPSS_VHDCROP_SIZE / 4] =
++		VPSS_CROP_EN |
++		FIELD_PREP(VPSS_VHDCROP_WIDTH, p->out_w - 1) |
++		FIELD_PREP(VPSS_VHDCROP_HEIGHT, p->out_h - 1);
++
++	s[VPSS_PNEXT / 4] = 0;
++	s[VPSS_START / 4] = 1;
++	wmb();
++
++	return histb_vpss_kick(vpss, vpss->shadow_dma);
++}
++
++/*
++ * Rotation is a chain of two images, one per plane, exactly as the vendor's
++ * rotate node builds it: the whole frame goes in (address, stride, size), the
++ * rotated geometry comes out, and IMG_PRO_MODE picks luma in the first image
++ * and chroma in the second. The node writes nothing else, so no crop, no
++ * letterbox background, no scaler and no timeout are programmed here.
++ */
++static int histb_vpss_rotate_run(struct histb_vpss *vpss,
++				 const struct histb_vpss_pass *p,
++				 unsigned int angle)
++{
++	unsigned int i, src_c, dst_c;
++
++	if (!vpss->shadow)
++		return -ENODEV;
++	if (upper_32_bits(p->in) || upper_32_bits(p->out))
++		return -ERANGE;
++
++	for (i = 0; i < 2; i++) {
++		u32 *s = (u32 *)vpss->shadow +
++			 i * (VPSS_REG_IMAGE_SIZE / sizeof(u32));
++
++		memset(s, 0, VPSS_REG_IMAGE_SIZE);
++		s[VPSS_MISCELLANEOUS / 4] = 0x03003244;
++		s[VPSS_INTMASK / 4] = 0xff;
++		s[VPSS_PNEXT / 4] = i ? 0 :
++			lower_32_bits(vpss->shadow_dma + VPSS_REG_IMAGE_SIZE);
++		s[VPSS_START / 4] = 1;
++
++		s[VPSS_CTRL / 4] = VPSS_CTRL_VHD_EN |
++				   FIELD_PREP(VPSS_CTRL_PROT, 2) |
++				   VPSS_CTRL_ROTATE_EN |
++				   (angle == 270 ? VPSS_CTRL_ROTATE_ANGLE : 0) |
++				   FIELD_PREP(VPSS_CTRL_IMG_PRO_MODE, i + 1);
++		s[VPSS_CTRL2 / 4] = FIELD_PREP(VPSS_CTRL2_IN_FORMAT,
++					       p->in_422 ? 2 : 0) |
++				   FIELD_PREP(VPSS_CTRL2_VHD_FORMAT,
++					      p->out_422 ? 1 : 0);
++		s[VPSS_IMGSIZE / 4] = FIELD_PREP(VPSS_IMGSIZE_WIDTH, p->in_w - 1) |
++				     FIELD_PREP(VPSS_IMGSIZE_HEIGHT, p->in_h - 1);
++		src_c = lower_32_bits(p->in) + p->in_stride * p->frame_h;
++		s[VPSS_CURYADDR / 4] = lower_32_bits(p->in);
++		s[VPSS_CURCADDR / 4] = src_c;
++		s[VPSS_CURSTRIDE / 4] = FIELD_PREP(VPSS_CURSTRIDE_Y, p->in_stride) |
++					FIELD_PREP(VPSS_CURSTRIDE_C, p->in_stride);
++
++		s[VPSS_VHDCTRL / 4] = p->invert_uv ? VPSS_VHDCTRL_UV_INVERT : 0;
++		s[VPSS_VHDSIZE / 4] =
++			FIELD_PREP(VPSS_VHDSIZE_WIDTH, p->out_w - 1) |
++			FIELD_PREP(VPSS_VHDSIZE_HEIGHT, p->out_h - 1);
++		dst_c = lower_32_bits(p->out) + p->out_stride * p->out_h;
++		s[VPSS_VHDYADDR / 4] = lower_32_bits(p->out);
++		s[VPSS_VHDCADDR / 4] = dst_c;
++		s[VPSS_VHDSTRIDE / 4] = FIELD_PREP(VPSS_VHDSTRIDE_Y, p->out_stride) |
++					FIELD_PREP(VPSS_VHDSTRIDE_C, p->out_stride);
++	}
++	/* Both images have to be in memory before the block is given the head of
++	 * the chain.
++	 */
++	wmb();
++
++	return histb_vpss_kick(vpss, vpss->shadow_dma);
++}
++
++/*
++ * One job of the vpss_v4_0 block. The picture goes in through a channel
++ * descriptor of the memory accessor and out through the one belonging to port
++ * zero, so the geometry is not at the head of the image the way it is on the
++ * older block; both sizes are written as a last index, and the offsets are in
++ * pixels, exactly as the vendor's own channel accessors write them. Every
++ * channel nobody handed a buffer to is bypassed: the block waits for a stream
++ * it was pointed at, and the ones left live would read from, or write to,
++ * address zero.
++ */
++static int histb_vpss_v4_pass_run(struct histb_vpss *vpss,
++				  const struct histb_vpss_pass *p)
++{
++	u32 *s = vpss->shadow;
++	dma_addr_t in_c, out_c;
++	dma_addr_t caddr[4];
++	unsigned int in_fmt, out_fmt;
++
++	if (!s)
++		return -ENODEV;
++	if (upper_32_bits(p->in) || upper_32_bits(p->out))
++		return -ERANGE;
++
++	/*
++	 * A semi-planar pair is one code and the order inside the pair is a bit
++	 * of its own, so the formats this driver offers need no table: 4:2:0 is
++	 * 0 and 4:2:2 is 1, in both directions. s_fmt() is what keeps a packed
++	 * source and a size change away from this generation.
++	 */
++	in_fmt = p->in_422 ? VPSS4_FMT_YUV422SP : VPSS4_FMT_YUV420SP;
++	out_fmt = p->out_422 ? VPSS4_FMT_YUV422SP : VPSS4_FMT_YUV420SP;
++	in_c = p->in + (dma_addr_t)p->in_stride * p->frame_h;
++	out_c = p->out + (dma_addr_t)p->out_stride * p->out_h;
++
++	memset(s, 0, vpss->var->image_size);
++
++	s[VPSS4_CTRL / 4] = VPSS4_CTRL_VHD0_EN;
++	/* img_pro_mode is the rotation path's field, not the field mode: the
++	 * vendor's own check demands 0 whenever rotate_en is 0. The read mode
++	 * of a frame lives in the two channels' lm_rmode words above.
++	 */
++	s[VPSS4_CHN_CFG_CTRL / 4] = 0;
++	s[VPSS4_INTMASK / 4] = 0x7e;
++	s[VPSS4_TIMEOUT / 4] = 0xffffffff;
++
++	/* The four parameter regions live in this same image, so each pointer is
++	 * the image's address plus the region's offset in it.
++	 */
++	s[VPSS4_TNR_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS4_TNR_PARA);
++	s[VPSS4_SNR_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS4_SNR_PARA);
++	s[VPSS4_ZME_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS4_ZME_PARA);
++	s[VPSS4_DEI_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS4_DEI_PARA);
++
++	/* The filter bank this generation reaches for a 1:1 job blends across
++	 * edges instead of passing them through, so a job that changes neither
++	 * dimension leaves the scaler out. Everything else the port needs --
++	 * including the produced size -- the image still carries.
++	 */
++	if (p->in_w != p->out_w || p->in_h != p->out_h) {
++		histb_vpss_load_coef(vpss, histb_vpss_zme_bucket(p->in_w, p->out_w),
++				     false, caddr);
++		s[VPSS4_ZME_LHADDR / 4] = lower_32_bits(caddr[0]);
++		s[VPSS4_ZME_LVADDR / 4] = lower_32_bits(caddr[1]);
++		s[VPSS4_ZME_CHADDR / 4] = lower_32_bits(caddr[2]);
++		s[VPSS4_ZME_CVADDR / 4] = lower_32_bits(caddr[3]);
++
++		s[VPSS4_ZME_HSP / 4] = VPSS4_ZME_H_LMSC | VPSS4_ZME_H_CHMSC |
++				       VPSS4_ZME_H_LMID | VPSS4_ZME_H_CHMID |
++				       VPSS4_ZME_H_LFIR | VPSS4_ZME_H_CHFIR |
++				       FIELD_PREP(VPSS4_ZME_H_RATIO,
++						  (p->in_w << VPSS4_ZME_HR_PREC) /
++						  p->out_w);
++		s[VPSS4_ZME_VSP / 4] = VPSS4_ZME_V_LMSC | VPSS4_ZME_V_CHMSC |
++				       VPSS4_ZME_V_LMID | VPSS4_ZME_V_CHMID |
++				       VPSS4_ZME_V_LFIR | VPSS4_ZME_V_CHFIR |
++				       FIELD_PREP(VPSS4_ZME_V_OUT_FMT,
++						  p->out_422 ? 0 : 1);
++		s[VPSS4_ZME_VSR / 4] = FIELD_PREP(VPSS4_ZME_V_RATIO,
++						 (p->in_h << VPSS4_ZME_VR_PREC) /
++						 p->out_h);
++		s[VPSS4_CTRL3 / 4] = VPSS4_CTRL3_ZME_VHD0_EN;
++	}
++	/* The size this port produces: a node without it completes but writes
++	 * only the first sample of each plane.
++	 */
++	s[VPSS4_ZMEORESO / 4] = FIELD_PREP(VPSS4_ZME_OW, p->out_w - 1) |
++				FIELD_PREP(VPSS4_ZME_OH, p->out_h - 1);
++
++	/* The accessor's own request shaping comes from the image as well, so
++	 * the node carries what the window already answers with.
++	 */
++	s[VPSS4_MISCELLANEOUS / 4] = readl(vpss->regs + VPSS4_MISCELLANEOUS);
++	s[VPSS4_MACCFG / 4] = readl(vpss->regs + VPSS4_MACCFG);
++	s[VPSS4_BUS_CTRL / 4] = readl(vpss->regs + VPSS4_BUS_CTRL);
++	s[VPSS4_MST_OUTSTANDING / 4] =
++		readl(vpss->regs + VPSS4_MST_OUTSTANDING);
++	s[VPSS4_MST_CTRL / 4] = readl(vpss->regs + VPSS4_MST_CTRL);
++	s[VPSS4_MST_RCHN_PRIO0 / 4] = readl(vpss->regs + VPSS4_MST_RCHN_PRIO0);
++	s[VPSS4_MST_WCHN_PRIO0 / 4] = readl(vpss->regs + VPSS4_MST_WCHN_PRIO0);
++
++	s[VPSS4_CF_CTRL / 4] = FIELD_PREP(VPSS4_CF_FORMAT, in_fmt) |
++			       FIELD_PREP(VPSS4_CF_TYPE, VPSS4_TYPE_LINEAR) |
++			       FIELD_PREP(VPSS4_CF_BITW, VPSS4_BITW_8) |
++			       FIELD_PREP(VPSS4_CF_LM_RMODE,
++					  VPSS4_LM_PROGRESSIVE) |
++			       VPSS4_CF_TILE_BYPASS | VPSS4_CF_EN |
++			       (p->invert_uv ? VPSS4_CF_UV_INVERT : 0) |
++			       (p->hflip ? VPSS4_CF_MIRROR : 0) |
++			       (p->vflip ? VPSS4_CF_FLIP : 0);
++	s[VPSS4_CF_SIZE / 4] = FIELD_PREP(VPSS4_CF_SIZE_WIDTH, p->in_w - 1) |
++			       FIELD_PREP(VPSS4_CF_SIZE_HEIGHT, p->in_h - 1);
++	s[VPSS4_CF_OFFSET / 4] = FIELD_PREP(VPSS4_CF_OFFSET_HOR, p->off_x) |
++				 FIELD_PREP(VPSS4_CF_OFFSET_VER, p->off_y);
++	s[VPSS4_CF_YADDR_H / 4] = upper_32_bits(p->in);
++	s[VPSS4_CF_YADDR_L / 4] = lower_32_bits(p->in);
++	s[VPSS4_CF_CADDR_H / 4] = upper_32_bits(in_c);
++	s[VPSS4_CF_CADDR_L / 4] = lower_32_bits(in_c);
++	s[VPSS4_CF_STRIDE / 4] = FIELD_PREP(VPSS4_CF_STRIDE_Y, p->in_stride) |
++				 FIELD_PREP(VPSS4_CF_STRIDE_C, p->in_stride);
++
++	s[VPSS4_OUT0_CTRL / 4] = FIELD_PREP(VPSS4_OUT0_FORMAT, out_fmt) |
++				 FIELD_PREP(VPSS4_OUT0_TYPE, VPSS4_TYPE_LINEAR) |
++				 FIELD_PREP(VPSS4_OUT0_BITW, VPSS4_BITW_8) |
++				 VPSS4_OUT0_DITHER_EN | VPSS4_OUT0_H_BYPASS |
++				 VPSS4_OUT0_D_BYPASS |
++				 FIELD_PREP(VPSS4_OUT0_LM_RMODE,
++					  VPSS4_LM_PROGRESSIVE) |
++				 VPSS4_OUT0_EN |
++				 (p->invert_uv ? VPSS4_OUT0_UV_INVERT : 0) |
++				 (p->hflip ? VPSS4_OUT0_MIRROR : 0) |
++				 (p->vflip ? VPSS4_OUT0_FLIP : 0);
++	s[VPSS4_OUT0_YADDR_H / 4] = upper_32_bits(p->out);
++	s[VPSS4_OUT0_YADDR_L / 4] = lower_32_bits(p->out);
++	s[VPSS4_OUT0_CADDR_H / 4] = upper_32_bits(out_c);
++	s[VPSS4_OUT0_CADDR_L / 4] = lower_32_bits(out_c);
++	s[VPSS4_OUT0_STRIDE / 4] = FIELD_PREP(VPSS4_OUT0_STRIDE_Y, p->out_stride) |
++				   FIELD_PREP(VPSS4_OUT0_STRIDE_C, p->out_stride);
++	s[VPSS4_OUT0_SIZE / 4] = FIELD_PREP(VPSS4_OUT0_SIZE_WIDTH, p->out_w - 1) |
++				 FIELD_PREP(VPSS4_OUT0_SIZE_HEIGHT, p->out_h - 1);
++
++	s[VPSS4_PNEXT / 4] = 0;
++	/* The vendor's node fill never touches the node's own start word -- the
++	 * only writer is VPSS_Sys_SetStart(pstVpss, 0, 1) against the window --
++	 * so the image leaves it at 0.
++	 */
++	wmb();
++
++	return histb_vpss_kick(vpss, vpss->shadow_dma);
++}
++
++/* Name the failure the block reported, for the job-failed log line. */
++static const char *histb_vpss_v3_err_name(u32 st)
++{
++	if (st & VPSS_INTSTATE_TIMEOUT)
++		return "block timeout";
++	if (st & VPSS_INTSTATE_BUS_R)
++		return "bus read error";
++	if (st & VPSS_INTSTATE_BUS_W)
++		return "bus write error";
++	if (st & VPSS_INTSTATE_DCMP)
++		return "tile decompress error";
++	if (st & VPSS_INTSTATE_VHD_TUNL)
++		return "output tunnel overrun";
++	return "stride tunnel overrun";
++}
++
++static const char *histb_vpss_v4_err_name(u32 st)
++{
++	if (st & VPSS4_INTSTATE_TIMEOUT)
++		return "block timeout";
++	if (st & VPSS4_INTSTATE_BUS_R)
++		return "bus read error";
++	if (st & VPSS4_INTSTATE_BUS_W)
++		return "bus write error";
++	if (st & VPSS4_INTSTATE_DCMP)
++		return "tile decompress error";
++	return "tunnel overrun";
++}
++
++static void histb_vpss_v4_power_up(struct histb_vpss *vpss)
++{
++	writel(0x7e, vpss->regs + VPSS4_INTMASK);
++	writel(0x7e, vpss->regs + VPSS4_INTCLR);
++	writel(0xffffffff, vpss->regs + VPSS4_TIMEOUT);
++	writel(BIT(0), vpss->regs + VPSS4_SMMU_SCR);
++	/* The vendor's power-up path also asks for the clock gates here; with
++	 * hard_gate_clk_ppc_en set the block ignores the first chain it is
++	 * handed after a bring-up, so both cells stay at their reset value of 0.
++	 */
++	writel(0, vpss->regs + VPSS4_HARDGATE_CTRL);
++	writel(0, vpss->regs + VPSS4_LOWPOWER_CTRL);
++}
++
++static const struct histb_vpss_variant histb_vpss_v3 = {
++	.version = VPSS_VERSION,
++	.image_size = VPSS_REG_IMAGE_SIZE,
++	.done = VPSS_INTSTATE_EOF | VPSS_INTSTATE_DONE,
++	.errors = VPSS_INTSTATE_ERRORS,
++	.timeout = VPSS_INTSTATE_TIMEOUT,
++	.err_name = histb_vpss_v3_err_name,
++	.pass_run = histb_vpss_v3_pass_run,
++	.deinterlacing = true,
++	.scaling = true,
++	.packed = true,
++};
++
++static const struct histb_vpss_variant histb_vpss_v4 = {
++	.version = VPSS4_VERSION,
++	.version_expect = VPSS4_VERSION_RELEASED,
++	.image_size = VPSS4_REG_IMAGE_SIZE,
++	.done = VPSS4_INTSTATE_EOF | VPSS4_INTSTATE_EOF_END,
++	.errors = VPSS4_INTSTATE_ERRORS,
++	.timeout = VPSS4_INTSTATE_TIMEOUT,
++	.err_name = histb_vpss_v4_err_name,
++	.arm_detector = true,
++	.status_from_raw = true,
++	.pass_run = histb_vpss_v4_pass_run,
++	.power_up = histb_vpss_v4_power_up,
++};
++
++/* Hand the chain head to the block and wait for the completion it releases. */
++static int histb_vpss_kick(struct histb_vpss *vpss, dma_addr_t first)
++{
++	unsigned int attempt, attempts = vpss->var->status_from_raw ? 2 : 1;
++	unsigned long deadline;
++	u32 st, acted;
++
++	/* This generation ignores the first chain it is handed after the block has
++	 * been brought up: that attempt leaves no raw status and no transaction
++	 * counted, and the same image completes once the block has been cleared
++	 * and reset again. An attempt that moved
++	 * nothing therefore gets re-armed and started once more; anything that
++	 * reached the bus is reported as it stands, so no buffer is ever written
++	 * twice by one job.
++	 */
++	for (attempt = 1; ; attempt++) {
++		/*
++		 * The state bits are latched: a completion left over from the
++		 * previous job would end this one before the block had even
++		 * started.
++		 */
++		writel(0xffffffff, vpss->regs + VPSS_INTCLR);
++		if (vpss->var->arm_detector) {
++			writel(VPSS4_MST_AXI_DET_EN,
++			       vpss->regs + VPSS4_MST_DEBUG_CLR);
++			writel(VPSS4_MST_AXI_DET_EN,
++			       vpss->regs + VPSS4_MST_DEBUG_CTRL);
++		}
++		writel(lower_32_bits(first), vpss->regs + VPSS_PNEXT);
++		writel(1, vpss->regs + VPSS_START);
++
++		deadline = jiffies + msecs_to_jiffies(1000);
++		do {
++			st = readl(vpss->regs + (vpss->var->status_from_raw ?
++						 VPSS4_RAWINT : VPSS_INTSTATE));
++			/* A single-image chain may report either the node or the
++			 * chain end; either means the frame is written.
++			 */
++			if (st & vpss->var->done) {
++				writel(st, vpss->regs + VPSS_INTCLR);
++				return 0;
++			}
++			/*
++			 * A block that has said "no" does not change its mind by
++			 * waiting, so report it now instead of spending the timeout
++			 * on a poll. Only its own timeout word maps to ETIMEDOUT;
++			 * the rest are faults.
++			 */
++			if (st & vpss->var->errors) {
++				writel(st, vpss->regs + VPSS_INTCLR);
++				dev_err(vpss->dev, "job failed: status %#x (%s)\n",
++					st, vpss->var->err_name(st));
++				if (st & vpss->var->timeout)
++					return -ETIMEDOUT;
++				return -EIO;
++			}
++			usleep_range(200, 400);
++		} while (time_before(jiffies, deadline));
++
++		acted = st;
++		if (vpss->var->arm_detector)
++			acted |= readl(vpss->regs + VPSS4_PFCNT);
++		if (acted || attempt == attempts)
++			break;
++		/* Nothing reached the bus, so starting over cannot duplicate work
++		 * the block already did.
++		 */
++		writel(0xffffffff, vpss->regs + VPSS_INTCLR);
++		if (histb_vpss_reset(vpss))
++			return -EIO;
++		dev_info(vpss->dev,
++			 "chain %llx left no trace, re-arming the block\n",
++			 (unsigned long long)first);
++	}
++
++	dev_warn(vpss->dev, "job timed out, status %#x\n", st);
++	writel(0xffffffff, vpss->regs + VPSS_INTCLR);
++	if (histb_vpss_reset(vpss))
++		return -EIO;
++	return -ETIMEDOUT;
++}
++
++static void histb_vpss_pass_fill(struct histb_vpss_pass *p,
++				 const struct histb_vpss_job *job)
++{
++	p->in = job->src;
++	p->out = job->dst;
++	p->in_w = job->in_w;
++	p->in_h = job->in_h;
++	p->off_x = job->in_x;
++	p->off_y = job->in_y;
++	p->frame_h = job->height;
++	p->out_w = job->out_width;
++	p->out_h = job->out_height;
++	p->in_stride = job->src_stride;
++	p->out_stride = job->dst_stride;
++	p->in_422 = job->in_422;
++	p->in_packed = job->in_packed;
++	p->in_fmt = job->in_fmt;
++	p->sharpness = job->sharpness;
++	p->out_422 = job->out_422;
++	p->invert_uv = job->invert_uv;
++	p->hflip = job->hflip;
++	p->vflip = job->vflip;
++}
++
++static int histb_vpss_run(struct histb_vpss *vpss,
++			  const struct histb_vpss_job *job)
++{
++	struct histb_vpss_pass p = { 0 };
++
++	histb_vpss_pass_fill(&p, job);
++	return vpss->var->pass_run(vpss, &p);
++}
++
++/*
++ * The block's interpolation parameters are one register image of their own,
++ * taken from the vendor's PQ defaults for this chip: the motion
++ * adaptation window first, then the film-mode detector's thresholds. Each
++ * word is written whole, so the comment names the fields it carries.
++ */
++static const struct {
++	unsigned int	off;
++	u32		val;
++} histb_vpss_dei_defaults[] = {
++	{ 0x1004, 0x00000092 },	/* rec-mode, IIR, motion smooth, mf-max */
++	{ 0x1008, 0xfec00200 },	/* ver_min_inten, dir_inten_ver */
++	{ 0x100c, 0x00000002 },	/* range_scale */
++	{ 0x1010, 0x0008021e },	/* check1 gain, range gain, max range */
++	{ 0x1014, 0x0008021e },	/* check2 gain, range gain, max range */
++	{ 0x1018, 0x1b201828 },	/* direction multipliers 0..3 */
++	{ 0x101c, 0x0b0c0f12 },	/* direction multipliers 4..7 */
++	{ 0x1020, 0x06070809 },	/* direction multipliers 8..11 */
++	{ 0x1024, 0x00030505 },	/* direction multipliers 12..14 */
++	{ 0x1034, 0x87766556 },	/* interpolation scale ratios 1..8 */
++	{ 0x1038, 0x08888888 },	/* interpolation scale ratios 9..15 */
++	{ 0x103c, 0x13880420 },	/* strength/dir thresholds, bc gain */
++	{ 0x1040, 0x00000000 },	/* jitter and field-motion coring */
++	{ 0x1044, 0x083eff00 },	/* field motion gain, slope, thresholds */
++	{ 0x1048, 0xffd09010 },	/* motion-difference thresholds 0..3 */
++	{ 0x104c, 0x4020ffff },	/* IIR range and thresholds 4..5 */
++	{ 0x1050, 0x20000081 },	/* motion IIR curve slopes and ratio 0 */
++	{ 0x1054, 0x40404030 },	/* motion IIR curve ratios 1..4 */
++	{ 0x1058, 0x000d0011 },	/* history mode, rec-mode steps */
++	{ 0x105c, 0x01000000 },	/* median filter */
++	{ 0x1060, 0xa00a0fff },	/* comb-check limits */
++	{ 0x1064, 0x00001e40 },	/* comb-check thresholds */
++	{ 0x1068, 0xffff4808 },	/* frame-motion smooth thresholds 0..3 */
++	{ 0x106c, 0x4000ffff },	/* frame-motion smooth range 4..5 */
++	{ 0x1070, 0x00000008 },	/* frame-motion smooth slopes, ratio 0 */
++	{ 0x1074, 0x40404040 },	/* frame-motion smooth ratios 1..4 */
++	{ 0x1078, 0xffff4808 },	/* frame/field blend thresholds 0..3 */
++	{ 0x107c, 0x4000ffff },	/* frame/field blend range 4..5 */
++	{ 0x1080, 0x00000008 },	/* frame/field blend slopes, ratio 0 */
++	{ 0x1084, 0x40404040 },	/* frame/field blend ratios 1..4 */
++	{ 0x1088, 0x00800080 },	/* motion-adjust gains */
++	{ 0x108c, 0x00100010 },	/* global-motion thresholds 0..1 */
++	{ 0x1090, 0x00100010 },	/* global-motion thresholds 2..3 */
++	{ 0x1094, 0x40402004 },	/* chroma combing removal */
++	{ 0x1098, 0x040118c0 },	/* chroma combing thresholds */
++	{ 0x1144, 0x00201008 },	/* film-mode histogram thresholds 0..2 */
++	{ 0x1148, 0x00143214 },	/* motion coring: block, pixel, window */
++	{ 0x1150, 0x02000006 },	/* edge smoothing, motion-to-rec shift */
++	{ 0x1154, 0x00001e00 },	/* moving-block and still-block thresholds */
++	{ 0x1158, 0x00000000 },	/* monitoring start and threshold */
++	{ 0x115c, 0x00402008 },	/* static-detection thresholds */
++	{ 0x1160, 0x0010105a },	/* per-pixel coring: block, pixel, window */
++	{ 0x1164, 0x00000010 },	/* per-pixel horizontal threshold */
++	{ 0x1168, 0x80402010 },	/* per-pixel vertical thresholds 0..3 */
++	{ 0x116c, 0x20100804 },	/* pixel-difference thresholds 0..3 */
++	{ 0x1170, 0x00200f14 },	/* edge/texture thresholds */
++	{ 0x1174, 0x00000020 },	/* texture alpha, texture coring */
++	{ 0x1178, 0x00000000 },	/* texture thresholds 0..3 */
++	{ 0x117c, 0x00000000 },	/* detection region start and end */
++};
++
++static void histb_vpss_dei_free(struct histb_vpss_ctx *ctx)
++{
++	if (ctx->dei_fields)
++		dma_free_coherent(ctx->vpss->dev,
++				  ctx->dei_frame_bytes * VPSS_DEI_RING,
++				  ctx->dei_fields, ctx->dei_fields_dma);
++	if (ctx->dei_hist)
++		dma_free_coherent(ctx->vpss->dev,
++				  VPSS_DEI_HIST_PLANE * VPSS_DEI_HIST_PLANES,
++				  ctx->dei_hist, ctx->dei_hist_dma);
++	ctx->dei_fields = NULL;
++	ctx->dei_hist = NULL;
++	ctx->dei_frame_bytes = 0;
++	ctx->dei_count = 0;
++	ctx->dei_hist_wr = 0;
++}
++
++static int histb_vpss_dei_alloc(struct histb_vpss_ctx *ctx, size_t frame_bytes)
++{
++	struct histb_vpss *vpss = ctx->vpss;
++	u32 *hist;
++	unsigned int i;
++
++	if (ctx->dei_frame_bytes == frame_bytes && ctx->dei_hist)
++		return 0;
++	histb_vpss_dei_free(ctx);
++
++	ctx->dei_fields = dma_alloc_coherent(vpss->dev,
++					     frame_bytes * VPSS_DEI_RING,
++					     &ctx->dei_fields_dma, GFP_KERNEL);
++	if (!ctx->dei_fields)
++		return -ENOMEM;
++	ctx->dei_hist = dma_alloc_coherent(vpss->dev,
++					   VPSS_DEI_HIST_PLANE *
++					   VPSS_DEI_HIST_PLANES,
++					   &ctx->dei_hist_dma, GFP_KERNEL);
++	if (!ctx->dei_hist) {
++		histb_vpss_dei_free(ctx);
++		return -ENOMEM;
++	}
++	/* The vendor hands the block a history of "no motion" words. */
++	hist = ctx->dei_hist;
++	for (i = 0; i < VPSS_DEI_HIST_PLANE * VPSS_DEI_HIST_PLANES / 4; i++)
++		hist[i] = 0x007f007f;
++	ctx->dei_frame_bytes = frame_bytes;
++	ctx->dei_count = 0;
++	ctx->dei_hist_wr = 0;
++	return 0;
++}
++
++/*
++ * A ring slot is one picture of its moment: the field that just arrived goes
++ * into the half it occupies, and the other half holds the field that came
++ * with it. That is the layout the block is given - it is handed the picture
++ * (one line past its start for the bottom field) and reads every other line.
++ */
++static void histb_vpss_dei_store(struct histb_vpss_ctx *ctx, const void *src,
++				 unsigned int stride, unsigned int h,
++				 unsigned int field, bool bottom, u64 ts)
++{
++	unsigned int half = bottom;
++	unsigned int slot = (field / 2) % VPSS_DEI_RING;
++	u8 *pic = ctx->dei_fields + (size_t)slot * ctx->dei_frame_bytes;
++	u8 *y = pic + (size_t)half * stride;
++	u8 *c = pic + (size_t)stride * 2 * h + (size_t)half * stride;
++	const u8 *row = src;
++	unsigned int i;
++
++	for (i = 0; i < h; i++)
++		memcpy(y + (size_t)2 * i * stride, row + (size_t)i * stride,
++		       stride);
++	row += (size_t)stride * h;
++	for (i = 0; i < h / 2; i++)
++		memcpy(c + (size_t)2 * i * stride, row + (size_t)i * stride,
++		       stride);
++	ctx->dei_ts[slot][half] = ts;
++}
++
++static dma_addr_t histb_vpss_dei_field(struct histb_vpss_ctx *ctx,
++				       unsigned int field, bool bottom,
++				       unsigned int stride)
++{
++	unsigned int slot = (field / 2) % VPSS_DEI_RING;
++
++	return ctx->dei_fields_dma + (size_t)slot * ctx->dei_frame_bytes +
++	       (bottom ? stride : 0);
++}
++
++/*
++ * One motion-adaptive job. A job reads the field it produces, the one before
++ * it and the two after it out of the ring, so its picture is three fields
++ * behind the buffer that triggered it, and its timestamp says so; the delay
++ * is what makes sure every picture a job reads is complete. Until the output
++ * field has a neighbour on both sides the block has nothing to interpolate
++ * against, so that frame leaves as the doubled copy bob already produces.
++ */
++static int histb_vpss_dei_run(struct histb_vpss *vpss,
++			      struct histb_vpss_ctx *ctx,
++			      const struct histb_vpss_job *job,
++			      const void *src, u64 ts, bool bottom,
++			      u64 *out_ts)
++{
++	unsigned int h = job->height;
++	size_t frame = (size_t)job->src_stride * 3 * h;
++	dma_addr_t f[VPSS_DEI_RING];
++	dma_addr_t hist_w, hist_r;
++	unsigned int n, k, i;
++	bool cur_bottom;
++	u32 *s = vpss->shadow;
++	int ret;
++
++	ret = histb_vpss_dei_alloc(ctx, frame);
++	if (ret)
++		return ret;
++
++	n = ctx->dei_count;
++	/*
++	 * The block pairs a field with the one before it, so a stream whose
++	 * fields do not alternate has no pairing to give it; start the ring
++	 * over instead of pairing the current field with a stale picture.
++	 */
++	if (n && bottom == ctx->dei_last_bottom) {
++		dev_warn_ratelimited(vpss->dev,
++				     "fields do not alternate, starting over\n");
++		ctx->dei_count = 0;
++		n = 0;
++	}
++	ctx->dei_last_bottom = bottom;
++	if (!n)
++		ctx->dei_first_bottom = bottom;
++	histb_vpss_dei_store(ctx, src, job->src_stride, h, n, bottom, ts);
++	ctx->dei_count++;
++
++	if (ctx->dei_count <= 4) {
++		*out_ts = ts;
++		return histb_vpss_run(vpss, job);
++	}
++
++	k = n - 3;
++	cur_bottom = ctx->dei_first_bottom ^ (k & 1);
++	for (i = 0; i < VPSS_DEI_RING; i++) {
++		unsigned int field = k - 1 + i;
++
++		f[i] = histb_vpss_dei_field(ctx, field,
++					    ctx->dei_first_bottom ^
++					    (field & 1),
++					    job->src_stride);
++	}
++	*out_ts = ctx->dei_ts[(k / 2) % VPSS_DEI_RING][cur_bottom];
++
++	if (!s)
++		return -ENODEV;
++	if (upper_32_bits(f[0]) || upper_32_bits(f[3]))
++		return -ERANGE;
++
++	memset(s, 0, VPSS_REG_IMAGE_SIZE);
++	s[VPSS_MISCELLANEOUS / 4] = 0x03003244;
++	s[VPSS_INTMASK / 4] = 0xff;
++	s[VPSS_TIMEOUT / 4] = 0xffffffff;
++
++	/* Field input: the block reads one half of each frame-sized picture,
++	 * which half the field it produces is, and which half the stream
++	 * starts with.
++	 */
++	s[VPSS_CTRL / 4] = VPSS_CTRL_VHD_EN |
++			  FIELD_PREP(VPSS_CTRL_PROT, 2) |
++			  VPSS_CTRL_DEI_EN | VPSS_CTRL_BFIELD |
++			  (ctx->dei_first_bottom ? VPSS_CTRL_BFIELD_FIRST : 0) |
++			  (cur_bottom ? VPSS_CTRL_BFIELD_MODE : 0);
++	s[VPSS_CTRL2 / 4] = FIELD_PREP(VPSS_CTRL2_IN_FORMAT, 0) |
++			   FIELD_PREP(VPSS_CTRL2_VHD_FORMAT, 0);
++	s[VPSS_IMGSIZE / 4] = FIELD_PREP(VPSS_IMGSIZE_WIDTH, job->in_w - 1) |
++			     FIELD_PREP(VPSS_IMGSIZE_HEIGHT, 2 * h - 1);
++
++	s[VPSS_CURYADDR / 4] = lower_32_bits(f[1]);
++	s[VPSS_CURCADDR / 4] = lower_32_bits(f[1] +
++					     (size_t)job->src_stride * 2 * h);
++	s[VPSS_CURSTRIDE / 4] =
++		FIELD_PREP(VPSS_CURSTRIDE_Y, job->src_stride) |
++		FIELD_PREP(VPSS_CURSTRIDE_C, job->src_stride);
++	s[VPSS_REFYADDR / 4] = lower_32_bits(f[0]);
++	s[VPSS_REFCADDR / 4] = lower_32_bits(f[0] +
++					     (size_t)job->src_stride * 2 * h);
++	s[VPSS_REFSTRIDE / 4] =
++		FIELD_PREP(VPSS_FIELDSTRIDE_Y, job->src_stride) |
++		FIELD_PREP(VPSS_FIELDSTRIDE_C, job->src_stride);
++	s[VPSS_NXT1YADDR / 4] = lower_32_bits(f[2]);
++	s[VPSS_NXT1CADDR / 4] = lower_32_bits(f[2] +
++					      (size_t)job->src_stride * 2 * h);
++	s[VPSS_NXT1STRIDE / 4] =
++		FIELD_PREP(VPSS_FIELDSTRIDE_Y, job->src_stride) |
++		FIELD_PREP(VPSS_FIELDSTRIDE_C, job->src_stride);
++	s[VPSS_NXT2YADDR / 4] = lower_32_bits(f[3]);
++	s[VPSS_NXT2CADDR / 4] = lower_32_bits(f[3] +
++					      (size_t)job->src_stride * 2 * h);
++	s[VPSS_NXT2STRIDE / 4] =
++		FIELD_PREP(VPSS_FIELDSTRIDE_Y, job->src_stride) |
++		FIELD_PREP(VPSS_FIELDSTRIDE_C, job->src_stride);
++
++	hist_w = ctx->dei_hist_dma + ctx->dei_hist_wr * VPSS_DEI_HIST_PLANE;
++	hist_r = ctx->dei_hist_dma +
++		 ((ctx->dei_hist_wr + 2) % VPSS_DEI_HIST_PLANES) *
++		 VPSS_DEI_HIST_PLANE;
++	s[VPSS_STWADDR / 4] = lower_32_bits(hist_w);
++	s[VPSS_STRADDR / 4] = lower_32_bits(hist_r);
++	s[VPSS_STSTRIDE / 4] =
++		FIELD_PREP(VPSS_STSTRIDE_VAL, VPSS_DEI_HIST_STRIDE);
++	/* The parameter block starts at the control word itself
++	 * (VPSS_REG_SIZE_CALC(VPSS_CTRL, VPSS_DIECTRL) - 4 in the vendor
++	 * header), which is inside this register image.
++	 */
++	s[VPSS_DEI_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS_DIECTRL);
++	s[VPSS_DIECTRL / 4] = FIELD_PREP(VPSS_DIECTRL_LMODE, 1) |
++			     FIELD_PREP(VPSS_DIECTRL_CMODE, 1);
++	for (i = 0; i < ARRAY_SIZE(histb_vpss_dei_defaults); i++)
++		s[histb_vpss_dei_defaults[i].off / 4] =
++			histb_vpss_dei_defaults[i].val;
++
++	s[VPSS_VHDCTRL / 4] = job->invert_uv ? VPSS_VHDCTRL_UV_INVERT : 0;
++	s[VPSS_VHDSIZE / 4] = FIELD_PREP(VPSS_VHDSIZE_WIDTH, job->out_width - 1) |
++			     FIELD_PREP(VPSS_VHDSIZE_HEIGHT, 2 * h - 1);
++	s[VPSS_VHDYADDR / 4] = lower_32_bits(job->dst);
++	s[VPSS_VHDCADDR / 4] = lower_32_bits(job->dst +
++					     (size_t)job->dst_stride * 2 * h);
++	s[VPSS_VHDSTRIDE / 4] = FIELD_PREP(VPSS_VHDSTRIDE_Y, job->dst_stride) |
++			       FIELD_PREP(VPSS_VHDSTRIDE_C, job->dst_stride);
++
++	s[VPSS_VHDLBA_BK / 4] = FIELD_PREP(GENMASK(15, 8), 0x10) |
++				FIELD_PREP(GENMASK(23, 16), 0x80) |
++				FIELD_PREP(GENMASK(31, 24), 0x80);
++	s[VPSS_VHDCROP_SIZE / 4] =
++		VPSS_CROP_EN |
++		FIELD_PREP(VPSS_VHDCROP_WIDTH, job->out_width - 1) |
++		FIELD_PREP(VPSS_VHDCROP_HEIGHT, 2 * h - 1);
++
++	s[VPSS_PNEXT / 4] = 0;
++	s[VPSS_START / 4] = 1;
++	/* The image has to be in memory before the block is handed its head. */
++	wmb();
++
++	ret = histb_vpss_kick(vpss, vpss->shadow_dma);
++	if (!ret)
++		ctx->dei_hist_wr = (ctx->dei_hist_wr + 2) % VPSS_DEI_HIST_PLANES;
++	return ret;
++}
++
++static void histb_vpss_device_run(void *priv)
++{
++	struct histb_vpss_ctx *ctx = priv;
++	struct histb_vpss *vpss = ctx->vpss;
++	struct vb2_v4l2_buffer *src, *dst;
++	struct histb_vpss_job job = { 0 };
++	unsigned int dei_mode = VPSS_DEI_NONE;
++	int ret = -EINVAL;
++	bool powered = false;
++	u64 out_ts = 0;
++
++	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
++	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	if (!src || !dst)
++		goto finish;
++	out_ts = src->vb2_buf.timestamp;
++
++	if (vpss->faulted) {
++		ret = -EIO;
++		goto finish;
++	}
++
++	/*
++	 * v4l2_m2m_suspend() waits for the current context only, so a job can
++	 * still be scheduled while remove() runs; refuse it rather than touch a
++	 * block whose clock is on its way out.
++	 */
++	if (READ_ONCE(vpss->removing)) {
++		ret = -ENODEV;
++		goto finish;
++	}
++
++	/*
++	 * Nothing here reaches the block before this: the job description is
++	 * built in the shadow image, and the reset on the way back up is what
++	 * makes the registers meaningful again.
++	 */
++	ret = pm_runtime_resume_and_get(vpss->dev);
++	if (ret) {
++		dev_warn_ratelimited(vpss->dev, "cannot clock the block: %d\n",
++				     ret);
++		goto finish;
++	}
++	powered = true;
++
++	job.src = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
++	job.dst = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
++	job.width = ctx->src_fmt.width;
++	job.height = ctx->src_fmt.height;
++	job.out_width = ctx->dst_fmt.width;
++	job.out_height = ctx->dst_fmt.height;
++	job.src_stride = ctx->src_fmt.bytesperline;
++	job.dst_stride = ctx->dst_fmt.bytesperline;
++	job.sharpness = ctx->sharpness ? ctx->sharpness->val : 0;
++	{
++		const struct histb_vpss_fmt *src_fmt =
++			histb_vpss_find(histb_vpss_out_fmts,
++					ARRAY_SIZE(histb_vpss_out_fmts),
++					ctx->src_fmt.pixelformat);
++		const struct histb_vpss_fmt *dst_fmt =
++			histb_vpss_find(histb_vpss_cap_fmts,
++					ARRAY_SIZE(histb_vpss_cap_fmts),
++					ctx->dst_fmt.pixelformat);
++
++		job.in_422 = src_fmt->fmt422;
++		job.in_packed = src_fmt->packed;
++		job.in_fmt = histb_vpss_in_format(src_fmt);
++		job.out_422 = dst_fmt->fmt422;
++		job.invert_uv = src_fmt->nv21 != dst_fmt->nv21;
++		/*
++		 * A packed pair reaches the sampler in the opposite order to the
++		 * semi-planar one: with exact luma a YUYV/UYVY frame comes out
++		 * with U and V exchanged, and the output inversion is the pair
++		 * swap the rest of the path already uses.
++		 */
++		if (src_fmt->packed)
++			job.invert_uv = !job.invert_uv;
++	}
++	dei_mode = ctx->dei_ctrl ? ctx->dei_ctrl->val : VPSS_DEI_NONE;
++	job.in_x = ctx->crop.left;
++	job.in_y = ctx->crop.top;
++	job.in_w = ctx->crop.width;
++	job.in_h = ctx->crop.height;
++	/* The offset semantics are known for the planar layouts; in a packed
++	 * row a start offset moves the pair boundary as well, so a windowed
++	 * packed frame is refused.
++	 */
++	if (job.in_packed && (job.in_x || job.in_y)) {
++		dev_warn_ratelimited(vpss->dev,
++				     "packed input cannot be windowed\n");
++		ret = -EINVAL;
++		goto finish;
++	}
++	/* Bob doubles one field vertically through the scaler, so it only
++	 * exists when the buffer is a field and the CAPTURE rectangle is twice
++	 * its height; asking for it any other way is a mistake worth a warning
++	 * rather than a silent plain conversion. A source window would shrink
++	 * the field it doubles, so a cropped bob is refused too.
++	 */
++	if (dei_mode == VPSS_DEI_BOB &&
++	    (ctx->dst_fmt.height != job.height * 2 ||
++	     job.in_x || job.in_y ||
++	     job.in_w != job.width || job.in_h != job.height ||
++	     (src->field != V4L2_FIELD_TOP &&
++	      src->field != V4L2_FIELD_BOTTOM))) {
++		dev_warn_ratelimited(vpss->dev,
++				     "bob needs a field and twice its height\n");
++		ret = -EINVAL;
++		goto finish;
++	}
++	job.hflip = ctx->hflip && ctx->hflip->val;
++	job.vflip = ctx->vflip && ctx->vflip->val;
++	job.angle = ctx->rotate ? ctx->rotate->val : 0;
++
++	if (dei_mode == VPSS_DEI_MAD) {
++		const void *vaddr = vb2_plane_vaddr(&src->vb2_buf, 0);
++
++		/*
++		 * The interpolation path reads 4:2:0 fields only, from memory
++		 * the driver can copy, and it owns the whole conversion: no
++		 * window, scaler, sharpen, flip or turn rides on top of it.
++		 */
++		if (job.in_422 || job.out_422 || job.in_packed ||
++		    job.in_x || job.in_y ||
++		    job.in_w != job.width || job.in_h != job.height ||
++		    job.out_width != job.width ||
++		    job.out_height != job.height * 2 ||
++		    job.sharpness || job.hflip || job.vflip || job.angle ||
++		    !vaddr ||
++		    (src->field != V4L2_FIELD_TOP &&
++		     src->field != V4L2_FIELD_BOTTOM)) {
++			dev_warn_ratelimited(vpss->dev,
++					     "motion-adaptive wants one 4:2:0 field and nothing "
++					     "else\n");
++			ret = -EINVAL;
++			goto finish;
++		}
++		ret = histb_vpss_dei_run(vpss, ctx, &job, vaddr,
++					 src->vb2_buf.timestamp,
++					 src->field == V4L2_FIELD_BOTTOM,
++					 &out_ts);
++	} else if (job.angle == 180) {
++		/* Half a turn is the port's mirror plus flip. Both are order
++		 * reversals on independent axes, so they commute and a client's
++		 * flip cancels the matching one here rather than being dropped.
++		 */
++		job.hflip = !job.hflip;
++		job.vflip = !job.vflip;
++		ret = histb_vpss_run(vpss, &job);
++	} else if (job.angle) {
++		struct histb_vpss_pass p = { 0 };
++
++		histb_vpss_pass_fill(&p, &job);
++		/* Quarter turns go through the block's rotate chain, which
++		 * programs no crop, no scaler and no sharpening; a job asking for
++		 * those alongside rotation is refused rather than quietly
++		 * delivered without them. The port's mirror and flip do not
++		 * compose with this chain either: an address-encoded frame showed
++		 * the flip leaving the map untouched and the mirror moving the read
++		 * window off the frame, and a 4:2:2 quarter turn writes only the
++		 * first half of the chroma plane. Swapping the chroma order is inert
++		 * here too (an NV12 request came back byte-identical to the NV21
++		 * one), so all of it is refused.
++		 */
++		if (job.in_x || job.in_y || job.sharpness || job.hflip ||
++		    job.vflip || job.invert_uv || job.in_422 || job.out_422 ||
++		    job.in_w != job.out_height || job.in_h != job.out_width) {
++			dev_warn_ratelimited(vpss->dev,
++					     "rotation wants swapped 4:2:0 sizes and nothing "
++					     "else\n");
++			ret = -EINVAL;
++			goto finish;
++		}
++		ret = histb_vpss_rotate_run(vpss, &p, job.angle);
++	} else {
++		ret = histb_vpss_run(vpss, &job);
++	}
++	if (ret)
++		dev_warn_ratelimited(vpss->dev, "job failed: %d\n", ret);
++
++finish:
++	if (powered)
++		pm_runtime_put_autosuspend(vpss->dev);
++	if (src) {
++		src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++		v4l2_m2m_buf_done(src, ret ? VB2_BUF_STATE_ERROR :
++						 VB2_BUF_STATE_DONE);
++	}
++	if (dst) {
++		dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++		if (!ret) {
++			vb2_set_plane_payload(&dst->vb2_buf, 0,
++					      ctx->dst_fmt.sizeimage);
++			if (src)
++				dst->vb2_buf.timestamp = out_ts;
++		}
++		v4l2_m2m_buf_done(dst, ret ? VB2_BUF_STATE_ERROR :
++						 VB2_BUF_STATE_DONE);
++	}
++	v4l2_m2m_job_finish(vpss->m2m_dev, ctx->fh.m2m_ctx);
++}
++
++static const struct v4l2_m2m_ops histb_vpss_m2m_ops = {
++	.device_run = histb_vpss_device_run,
++};
++
++static int histb_vpss_queue_init(void *priv, struct vb2_queue *src_vq,
++				 struct vb2_queue *dst_vq)
++{
++	struct histb_vpss_ctx *ctx = priv;
++	int ret;
++
++	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	src_vq->drv_priv = ctx;
++	src_vq->ops = &histb_vpss_qops;
++	src_vq->mem_ops = &vb2_dma_contig_memops;
++	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	src_vq->lock = &ctx->vpss->lock;
++	src_vq->dev = ctx->vpss->dev;
++	ret = vb2_queue_init(src_vq);
++	if (ret)
++		return ret;
++
++	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	dst_vq->drv_priv = ctx;
++	dst_vq->ops = &histb_vpss_qops;
++	dst_vq->mem_ops = &vb2_dma_contig_memops;
++	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	dst_vq->lock = &ctx->vpss->lock;
++	dst_vq->dev = ctx->vpss->dev;
++
++	return vb2_queue_init(dst_vq);
++}
++
++static const char *const histb_vpss_dei_menu[] = {
++	"Off", "Bob", "Weave", "Motion adaptive", NULL,
++};
++
++static int histb_vpss_ctrls_create(struct histb_vpss_ctx *ctx)
++{
++	struct v4l2_ctrl_handler *hdl = &ctx->ctrl_handler;
++
++	v4l2_ctrl_handler_init(hdl, 5);
++	ctx->hflip = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_HFLIP, 0, 1, 1, 0);
++	ctx->vflip = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_VFLIP, 0, 1, 1, 0);
++	if (ctx->vpss->var->scaling) {
++		ctx->sharpness = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_SHARPNESS,
++						   0, 255, 1, 0);
++		ctx->rotate = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_ROTATE, 0,
++						270, 90, 0);
++	}
++	if (ctx->vpss->var->deinterlacing)
++		ctx->dei_ctrl = v4l2_ctrl_new_std_menu_items(hdl, NULL,
++							     V4L2_CID_DEINTERLACING_MODE,
++							     VPSS_DEI_MAD, 0,
++							     VPSS_DEI_NONE,
++							     histb_vpss_dei_menu);
++	if (hdl->error)
++		return hdl->error;
++
++	ctx->fh.ctrl_handler = hdl;
++	return 0;
++}
++
++static int histb_vpss_open(struct file *file)
++{
++	struct histb_vpss *vpss = video_drvdata(file);
++	struct histb_vpss_ctx *ctx;
++	int ret;
++
++	ctx = kzalloc_obj(*ctx);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->vpss = vpss;
++	v4l2_fh_init(&ctx->fh, &vpss->vdev);
++	file->private_data = &ctx->fh;
++
++	ctx->src_fmt.width = 320;
++	ctx->src_fmt.height = 240;
++	/* The defaults carry no client bytesperline, so the stride bound
++	 * above cannot trip here.
++	 */
++	histb_vpss_fill_fmt(&histb_vpss_out_fmts[0], &ctx->src_fmt);
++	ctx->dst_fmt = ctx->src_fmt;
++	histb_vpss_fill_fmt(&histb_vpss_cap_fmts[0], &ctx->dst_fmt);
++	histb_vpss_reset_crop(ctx);
++
++	ret = histb_vpss_ctrls_create(ctx);
++	if (ret) {
++		v4l2_fh_exit(&ctx->fh);
++		kfree(ctx);
++		return ret;
++	}
++
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(vpss->m2m_dev, ctx,
++					    histb_vpss_queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		v4l2_ctrl_handler_free(&ctx->ctrl_handler);
++		v4l2_fh_exit(&ctx->fh);
++		kfree(ctx);
++		return ret;
++	}
++	v4l2_fh_add(&ctx->fh, file);
++	return 0;
++}
++
++static int histb_vpss_release(struct file *file)
++{
++	struct histb_vpss_ctx *ctx = container_of(file->private_data,
++						  typeof(*ctx), fh);
++
++	mutex_lock(&ctx->vpss->lock);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
++	v4l2_fh_del(&ctx->fh, file);
++	v4l2_fh_exit(&ctx->fh);
++	histb_vpss_dei_free(ctx);
++	mutex_unlock(&ctx->vpss->lock);
++	kfree(ctx);
++	return 0;
++}
++
++static const struct v4l2_file_operations histb_vpss_fops = {
++	.owner = THIS_MODULE,
++	.open = histb_vpss_open,
++	.release = histb_vpss_release,
++	.poll = v4l2_m2m_fop_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = v4l2_m2m_fop_mmap,
++};
++
++static const struct v4l2_ioctl_ops histb_vpss_ioctl_ops = {
++	.vidioc_querycap = histb_vpss_querycap,
++	.vidioc_enum_fmt_vid_cap = histb_vpss_enum_fmt,
++	.vidioc_enum_fmt_vid_out = histb_vpss_enum_fmt,
++	.vidioc_g_fmt_vid_cap = histb_vpss_g_fmt,
++	.vidioc_g_fmt_vid_out = histb_vpss_g_fmt,
++	.vidioc_try_fmt_vid_cap = histb_vpss_try_fmt,
++	.vidioc_try_fmt_vid_out = histb_vpss_try_fmt,
++	.vidioc_s_fmt_vid_cap = histb_vpss_s_fmt,
++	.vidioc_s_fmt_vid_out = histb_vpss_s_fmt,
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++	.vidioc_g_selection = histb_vpss_g_selection,
++	.vidioc_s_selection = histb_vpss_s_selection,
++};
++
++static const struct video_device histb_vpss_videodev = {
++	.name = HISTB_VPSS_NAME,
++	.vfl_dir = VFL_DIR_M2M,
++	.fops = &histb_vpss_fops,
++	.ioctl_ops = &histb_vpss_ioctl_ops,
++	.minor = -1,
++	.release = video_device_release_empty,
++	.device_caps = V4L2_CAP_VIDEO_M2M | V4L2_CAP_STREAMING,
++};
++
++/*
++ * The block has no reset-done bit (VPSS_START only says that a job is running),
++ * so the completion check is that its constant version word answers again: a
++ * window that no longer decodes reads 0, and a reset that the CRG refused leaves
++ * the block unclocked. A failed reset is latched rather than retried blind --
++ * every later job would otherwise burn the whole 200 ms timeout on a block that
++ * cannot answer, and the application would only see ETIMEDOUT.
++ */
++static int histb_vpss_reset(struct histb_vpss *vpss)
++{
++	unsigned long deadline;
++	int ret;
++
++	ret = reset_control_assert(vpss->rst);
++	if (ret)
++		goto faulted;
++	udelay(1);
++	ret = reset_control_deassert(vpss->rst);
++	if (ret)
++		goto faulted;
++
++	if (!vpss->version)	/* first reset: nothing to compare against yet */
++		return 0;
++
++	deadline = jiffies + msecs_to_jiffies(20);
++	do {
++		if (readl(vpss->regs + vpss->var->version) == vpss->version)
++			return 0;
++		usleep_range(200, 400);
++	} while (time_before(jiffies, deadline));
++
++	ret = -EIO;
++faulted:
++	dev_err(vpss->dev, "reset failed (%d); VPSS stays unusable\n", ret);
++	vpss->faulted = true;
++	return ret;
++}
++
++static int histb_vpss_runtime_suspend(struct device *dev)
++{
++	struct histb_vpss *vpss = dev_get_drvdata(dev);
++
++	if (vpss->rst_smmu)
++		reset_control_assert(vpss->rst_smmu);
++	if (vpss->smmu_clk)
++		clk_disable_unprepare(vpss->smmu_clk);
++	clk_disable_unprepare(vpss->clk);
++	return 0;
++}
++
++static int histb_vpss_runtime_resume(struct device *dev)
++{
++	struct histb_vpss *vpss = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_prepare_enable(vpss->clk);
++	if (ret)
++		return ret;
++	/* The accessor's own transactions cross this block's translation unit
++	 * even while that unit is bypassed, so it needs its clock too: with the
++	 * clock off every fetch the job makes is answered with a bus error.
++	 */
++	if (vpss->smmu_clk) {
++		ret = clk_prepare_enable(vpss->smmu_clk);
++		if (ret) {
++			clk_disable_unprepare(vpss->clk);
++			return ret;
++		}
++	}
++	/* The unit has to be let out of reset only once its clock runs, the same
++	 * order the block's own reset below needs.
++	 */
++	if (vpss->rst_smmu) {
++		ret = reset_control_deassert(vpss->rst_smmu);
++		if (ret) {
++			if (vpss->smmu_clk)
++				clk_disable_unprepare(vpss->smmu_clk);
++			clk_disable_unprepare(vpss->clk);
++			return ret;
++		}
++	}
++	/*
++	 * Coming back means the block lost its clock, so start from a known
++	 * state instead of trusting registers that are now whatever the power
++	 * domain left. The job itself re-programs everything it needs.
++	 */
++	ret = histb_vpss_reset(vpss);
++	if (ret)
++		return ret;
++	if (vpss->var->power_up)
++		vpss->var->power_up(vpss);
++	return 0;
++}
++
++static const struct dev_pm_ops histb_vpss_pm_ops = {
++	RUNTIME_PM_OPS(histb_vpss_runtime_suspend, histb_vpss_runtime_resume,
++		       NULL)
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				pm_runtime_force_resume)
++};
++
++static void histb_vpss_v4l2_release(struct v4l2_device *v4l2_dev)
++{
++	struct histb_vpss *vpss = container_of(v4l2_dev, struct histb_vpss, v4l2_dev);
++
++	v4l2_device_unregister(v4l2_dev);
++	if (vpss->m2m_dev)
++		v4l2_m2m_release(vpss->m2m_dev);
++	kfree(vpss);
++}
++
++static void histb_vpss_v4l2_put(void *data)
++{
++	struct histb_vpss *vpss = data;
++
++	v4l2_device_put(&vpss->v4l2_dev);
++}
++
++static int histb_vpss_probe(struct platform_device *pdev)
++{
++	struct histb_vpss *vpss;
++	int ret;
++
++	vpss = kzalloc_obj(*vpss);
++	if (!vpss)
++		return -ENOMEM;
++
++	ret = v4l2_device_register(&pdev->dev, &vpss->v4l2_dev);
++	if (ret) {
++		kfree(vpss);
++		return ret;
++	}
++	vpss->v4l2_dev.release = histb_vpss_v4l2_release;
++	ret = devm_add_action_or_reset(&pdev->dev, histb_vpss_v4l2_put, vpss);
++	if (ret)
++		return ret;
++
++	vpss->dev = &pdev->dev;
++	vpss->var = of_device_get_match_data(&pdev->dev);
++	if (!vpss->var)
++		return dev_err_probe(&pdev->dev, -ENODEV, "no generation data\n");
++	mutex_init(&vpss->lock);
++	init_completion(&vpss->done);
++
++	vpss->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(vpss->regs))
++		return PTR_ERR(vpss->regs);
++
++	vpss->clk = devm_clk_get(&pdev->dev, "vpss");
++	if (IS_ERR(vpss->clk))
++		return dev_err_probe(&pdev->dev, PTR_ERR(vpss->clk),
++				     "no vpss clock\n");
++	vpss->smmu_clk = devm_clk_get_optional(&pdev->dev, "vpss-smmu");
++	if (IS_ERR(vpss->smmu_clk))
++		return dev_err_probe(&pdev->dev, PTR_ERR(vpss->smmu_clk),
++				     "no vpss-smmu clock\n");
++	vpss->rst = devm_reset_control_get_exclusive(&pdev->dev, "vpss");
++	if (IS_ERR(vpss->rst))
++		return dev_err_probe(&pdev->dev, PTR_ERR(vpss->rst),
++				     "no vpss reset\n");
++	/* The translation unit beside the block has its own reset line, and it
++	 * answers in reset until that line is released.
++	 */
++	vpss->rst_smmu = devm_reset_control_get_optional_exclusive(&pdev->dev,
++							   "vpss-smmu");
++	if (IS_ERR(vpss->rst_smmu))
++		return dev_err_probe(&pdev->dev, PTR_ERR(vpss->rst_smmu),
++				     "no vpss-smmu reset\n");
++
++	vpss->shadow = dma_alloc_coherent(&pdev->dev,
++					  vpss->var->image_size * HISTB_VPSS_IMAGES,
++					  &vpss->shadow_dma, GFP_KERNEL);
++	if (!vpss->shadow)
++		return -ENOMEM;
++	vpss->coef = dma_alloc_coherent(&pdev->dev, VPSS_COEF_BYTES,
++					&vpss->coef_dma, GFP_KERNEL);
++	if (!vpss->coef) {
++		ret = -ENOMEM;
++		goto err_shadow;
++	}
++
++	/* The PM callbacks reach the device through drvdata, so publish it
++	 * before the first runtime resume.
++	 */
++	platform_set_drvdata(pdev, vpss);
++
++	pm_runtime_enable(&pdev->dev);
++	pm_runtime_set_autosuspend_delay(&pdev->dev,
++					 HISTB_VPSS_AUTOSUSPEND_MS);
++	pm_runtime_use_autosuspend(&pdev->dev);
++
++	ret = pm_runtime_resume_and_get(&pdev->dev);
++	if (ret) {
++		dev_err_probe(&pdev->dev, ret, "cannot bring the block up\n");
++		goto err_pm_disable;
++	}
++	/* Remember what the block answers with, so a later reset can tell
++	 * "back up" from "the window stopped decoding".
++	 */
++	vpss->version = readl(vpss->regs + vpss->var->version);
++	if (!vpss->version ||
++	    (vpss->var->version_expect && vpss->version != vpss->var->version_expect)) {
++		dev_err(&pdev->dev, "block does not answer as expected (id word reads %#010x, "
++			"wanted %#010x)\n",
++			vpss->version, vpss->var->version_expect);
++		ret = -ENODEV;
++		goto err_pm;
++	}
++
++	vpss->m2m_dev = v4l2_m2m_init(&histb_vpss_m2m_ops);
++	if (IS_ERR(vpss->m2m_dev)) {
++		ret = PTR_ERR(vpss->m2m_dev);
++		vpss->m2m_dev = NULL;
++		goto err_pm;
++	}
++
++	vpss->vdev = histb_vpss_videodev;
++	vpss->vdev.v4l2_dev = &vpss->v4l2_dev;
++	vpss->vdev.lock = &vpss->lock;
++	video_set_drvdata(&vpss->vdev, vpss);
++
++	ret = video_register_device(&vpss->vdev, VFL_TYPE_VIDEO, -1);
++	if (ret) {
++		dev_err(&pdev->dev, "cannot register video device\n");
++		goto err_pm;
++	}
++
++	dev_info(&pdev->dev, "video processor, %d x %d max\n",
++		 VPSS_MAX_WIDTH, VPSS_MAX_HEIGHT);
++	pm_runtime_put_autosuspend(&pdev->dev);
++	return 0;
++
++err_pm:
++	pm_runtime_put_sync(&pdev->dev);
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++err_pm_disable:
++	pm_runtime_disable(&pdev->dev);
++	dma_free_coherent(vpss->dev, VPSS_COEF_BYTES, vpss->coef,
++			  vpss->coef_dma);
++err_shadow:
++	dma_free_coherent(vpss->dev, vpss->var->image_size * HISTB_VPSS_IMAGES,
++			  vpss->shadow, vpss->shadow_dma);
++	return ret;
++}
++
++static void histb_vpss_remove(struct platform_device *pdev)
++{
++	struct histb_vpss *vpss = platform_get_drvdata(pdev);
++
++	/*
++	 * v4l2_m2m_release() is only a kfree() in this tree, so nothing else here
++	 * waits for a running job; pause the queue and let it finish first, or
++	 * the shadow image freed below is still a DMA target for that job.
++	 * This block reports through a polled status word, so there is no
++	 * interrupt to mask.
++	 */
++	mutex_lock(&vpss->lock);
++	WRITE_ONCE(vpss->removing, true);
++	v4l2_m2m_suspend(vpss->m2m_dev);
++	video_unregister_device(&vpss->vdev);
++	mutex_unlock(&vpss->lock);
++	/* Probe already dropped its own runtime reference, so force the idle
++	 * state instead of putting one that is not held.
++	 */
++	pm_runtime_suspend(&pdev->dev);
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++	dma_free_coherent(vpss->dev, vpss->var->image_size * HISTB_VPSS_IMAGES,
++			  vpss->shadow, vpss->shadow_dma);
++	dma_free_coherent(vpss->dev, VPSS_COEF_BYTES, vpss->coef,
++			  vpss->coef_dma);
++}
++
++static const struct of_device_id histb_vpss_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-vpss", .data = &histb_vpss_v3 },
++	{ .compatible = "hisilicon,hi3798mv200-vpss", .data = &histb_vpss_v4 },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, histb_vpss_of_match);
++
++static struct platform_driver histb_vpss_driver = {
++	.probe = histb_vpss_probe,
++	.remove = histb_vpss_remove,
++	.driver = {
++		.name = HISTB_VPSS_NAME,
++		.pm = pm_ptr(&histb_vpss_pm_ops),
++		.of_match_table = histb_vpss_of_match,
++	},
++};
++module_platform_driver(histb_vpss_driver);
++
++MODULE_DESCRIPTION("HiSilicon HiSTB video processing subsystem driver");
++MODULE_LICENSE("Dual MIT/GPL");

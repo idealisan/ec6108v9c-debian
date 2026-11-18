@@ -1,0 +1,31 @@
+From a0e2e516d6d7d24ad610a40d900169de8ed3e256 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 16:52:23 +0800
+Subject: [PATCH 3/3] MAINTAINERS: add the HiSilicon STB regulator entry
+
+The PMOC voltage regulator driver has no maintainer entry. The driver is
+a DT-binding driver of this platform, reviewed under linux-kernel.
+
+Register the driver with its binding.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ MAINTAINERS | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -12196,6 +12196,13 @@ S:	Maintained
+ F:	Documentation/devicetree/bindings/mfd/hisilicon,hi6421-spmi-pmic.yaml
+ F:	drivers/mfd/hi6421-spmi-pmic.c
+ 
++HISILICON STB VOLTAGE REGULATOR DRIVER
++M:	David Yang <mmyangfl@gmail.com>
++L:	linux-kernel@vger.kernel.org
++S:	Maintained
++F:	Documentation/devicetree/bindings/regulator/hisilicon,hi3798cv200-regulator.yaml
++F:	drivers/regulator/histb-regulator.c
++
+ HISILICON TRUE RANDOM NUMBER GENERATOR V2 SUPPORT
+ M:	Weili Qian <qianweili@huawei.com>
+ S:	Maintained

@@ -1,0 +1,55 @@
+From 474ff8e2e6e335451e6f78a4e480e1b1de39e0bb Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sun, 25 Oct 2026 07:00:33 +0800
+Subject: [PATCH 2/2] dmaengine: pl08x: take the channel count from the device
+ tree
+
+The channel count is baked into the vendor_data entry a part matches,
+and that says what the IP can have, not what an integrator wired up. The
+plain PL080 entry claims eight channels; the Hi3798MV100 instance has
+four, so the driver registers channels that are not there and a transfer
+queued on one of them never starts. With the count left at eight chan0
+through chan3 complete their transfers while chan4, chan5 and chan7
+never do.
+
+Read dma-channels, which dma-common.yaml already defines for a
+controller node, and use it when it is smaller than what the part
+claims. A node that asks for more than the IP has is reported and left
+at the IP number, because the extra channels would be the same dead
+weight they were before.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/dma/amba-pl08x.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+--- a/drivers/dma/amba-pl08x.c
++++ b/drivers/dma/amba-pl08x.c
+@@ -2698,6 +2698,7 @@ static int pl08x_probe(struct amba_devic
+ 	struct device_node *np = adev->dev.of_node;
+ 	struct reset_control *rst;
+ 	u32 tsfr_size;
++	u32 channels;
+ 	int ret = 0;
+ 	int i;
+ 
+@@ -2763,6 +2764,19 @@ static int pl08x_probe(struct amba_devic
+ 		vd->dualmaster = !!(val & BIT(9));
+ 	}
+ 
++	/*
++	 * The part number says how many channels the IP can have, not how many
++	 * this integrator wired up; shrink the count when the node says so.
++	 */
++	if (!of_property_read_u32(np, "dma-channels", &channels) && channels) {
++		if (channels > vd->channels)
++			dev_warn(&adev->dev,
++				 "node says %u channels, IP has %u: using %u\n",
++				 channels, vd->channels, vd->channels);
++		else
++			vd->channels = channels;
++	}
++
+ 	/* Initialize memcpy engine */
+ 	dma_cap_set(DMA_MEMCPY, pl08x->memcpy.cap_mask);
+ 	pl08x->memcpy.dev = &adev->dev;

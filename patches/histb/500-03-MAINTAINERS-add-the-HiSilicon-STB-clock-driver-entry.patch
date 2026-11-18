@@ -1,0 +1,33 @@
+From 51b4109e5dfab268ebefcbacac7b4e2968b1f367 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 16:52:23 +0800
+Subject: [PATCH 3/3] MAINTAINERS: add the HiSilicon STB clock driver entry
+
+The Hi3798MV100 CRG clock driver has no maintainer entry. The driver is
+a DT-binding driver reviewed under linux-clk.
+
+Register the driver with its binding and clock headers.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ MAINTAINERS | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -12202,6 +12202,15 @@ S:	Maintained
+ F:	Documentation/devicetree/bindings/mfd/hisilicon,hi6421-spmi-pmic.yaml
+ F:	drivers/mfd/hi6421-spmi-pmic.c
+ 
++HISILICON STB CLOCK DRIVER
++M:	David Yang <mmyangfl@gmail.com>
++L:	linux-clk@vger.kernel.org
++L:	linux-arm-kernel@lists.infradead.org
++S:	Maintained
++F:	Documentation/devicetree/bindings/clock/hisilicon,hisi-crg.yaml
++F:	drivers/clk/hisilicon/crg-hi3798mv100.c
++F:	include/dt-bindings/clock/hisilicon,hi3798mv100-*.h
++
+ HISILICON STB VOLTAGE REGULATOR DRIVER
+ M:	David Yang <mmyangfl@gmail.com>
+ L:	linux-kernel@vger.kernel.org

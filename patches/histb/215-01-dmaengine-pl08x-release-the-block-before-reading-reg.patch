@@ -1,0 +1,94 @@
+From 8be8bfe426cab9fe115c47f73ecc676f40c1ecd0 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sun, 25 Oct 2026 07:00:33 +0800
+Subject: [PATCH 1/2] dmaengine: pl08x: release the block before reading
+ registers
+
+A bootloader that leaves an unused peripheral in reset has to be
+answered by the driver itself: the AMBA bus deasserts a PrimeCell's
+reset only around the hardware ID read, and a node that carries
+arm,primecell-periphid never reaches amba_read_periphid(). The block
+then stays in reset for the whole life of the device, and while it is
+held there nothing in its window decodes -- not even the feature
+register -- so every transfer times out without a single interrupt.
+
+With the block left in reset a 16 KiB copy fails on all four channels
+and the terminal-count interrupt never fires; releasing the reset
+through the CRG word first makes the block answer again. Take the
+optional reset at probe and deassert it before the first readl(). The
+binding already allows resets on this node.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/dma/amba-pl08x.c | 25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+--- a/drivers/dma/amba-pl08x.c
++++ b/drivers/dma/amba-pl08x.c
+@@ -75,6 +75,7 @@
+ #include <linux/of.h>
+ #include <linux/of_dma.h>
+ #include <linux/pm_runtime.h>
++#include <linux/reset.h>
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/amba/pl080.h>
+@@ -863,7 +864,8 @@ static void pl08x_phy_alloc_and_start(st
+ 
+ 	ch = pl08x_get_phy_channel(pl08x, plchan);
+ 	if (!ch) {
+-		dev_dbg(&pl08x->adev->dev, "no physical channel available for xfer on %s\n", plchan->name);
++		dev_dbg(&pl08x->adev->dev, "no physical channel available for xfer "
++			"on %s\n", plchan->name);
+ 		plchan->state = PL08X_CHAN_WAITING;
+ 		plchan->waiting_at = jiffies;
+ 		return;
+@@ -1455,7 +1457,8 @@ static int pl08x_fill_llis_for_desc(stru
+ 
+ 		if (total_bytes != dsg->len) {
+ 			dev_err(&pl08x->adev->dev,
+-				"%s size of encoded lli:s don't match total txd, transferred 0x%08zx from size 0x%08zx\n",
++				"%s size of encoded lli:s don't match total txd, transferred "
++				"0x%08zx from size 0x%08zx\n",
+ 				__func__, total_bytes, dsg->len);
+ 			return 0;
+ 		}
+@@ -2693,6 +2696,7 @@ static int pl08x_probe(struct amba_devic
+ 	struct pl08x_driver_data *pl08x;
+ 	struct vendor_data *vd = id->data;
+ 	struct device_node *np = adev->dev.of_node;
++	struct reset_control *rst;
+ 	u32 tsfr_size;
+ 	int ret = 0;
+ 	int i;
+@@ -2723,6 +2727,20 @@ static int pl08x_probe(struct amba_devic
+ 		goto out_no_ioremap;
+ 	}
+ 
++	/*
++	 * Nothing below, not even the feature register, is readable while the
++	 * block is held in reset, and bootloaders increasingly leave unused
++	 * peripherals in reset for Linux to release.
++	 */
++	rst = devm_reset_control_get_optional_exclusive(&adev->dev, NULL);
++	if (IS_ERR(rst)) {
++		ret = PTR_ERR(rst);
++		goto out_no_ioremap;
++	}
++	ret = reset_control_deassert(rst);
++	if (ret)
++		goto out_no_ioremap;
++
+ 	if (vd->ftdmac020) {
+ 		u32 val;
+ 
+@@ -2895,7 +2913,8 @@ static int pl08x_probe(struct amba_devic
+ 
+ 			val = readl(ch->reg_config);
+ 			if (val & (PL080N_CONFIG_ITPROT | PL080N_CONFIG_SECPROT)) {
+-				dev_info(&adev->dev, "physical channel %d reserved for secure access only\n", i);
++				dev_info(&adev->dev, "physical channel %d reserved for secure "
++					 "access only\n", i);
+ 				ch->locked = true;
+ 			}
+ 		}

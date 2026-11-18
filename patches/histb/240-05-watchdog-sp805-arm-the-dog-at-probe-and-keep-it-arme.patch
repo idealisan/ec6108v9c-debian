@@ -1,0 +1,98 @@
+From 1ad3c57819f949e15b983276e31a1232e05d9017 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 3 Nov 2026 14:31:01 +0800
+Subject: [PATCH 5/5] watchdog: sp805: arm the dog at probe and keep it armed
+
+Early boot failures happen before userspace opens /dev/watchdog, so a
+dog that is only armed from userspace is not there when it is needed.
+
+The counter only advances while the block is unlocked and INT_ENABLE is
+set, WDTINTCLR re-times a running counter, and with
+CONFIG_WATCHDOG_OPEN_TIMEOUT=0 the core never stops feeding, so a
+probe-armed dog bites exactly when the kernel can no longer run its
+keepalive work -- an honest panic is already covered by panic= and the
+restart handler. The clock provider can still be deferred at probe, but
+a DT clock-frequency is enough to arm without it.
+
+Arm at probe, register at subsys_initcall -- the earliest level at which
+the AMBA bus devices created at arch_initcall exist -- fall back to the
+DT rate when the provider defers, and force nowayout so the arming
+cannot be taken back.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/watchdog/sp805_wdt.c | 48 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 46 insertions(+), 2 deletions(-)
+
+--- a/drivers/watchdog/sp805_wdt.c
++++ b/drivers/watchdog/sp805_wdt.c
+@@ -296,8 +296,18 @@ sp805_wdt_probe(struct amba_device *adev
+ 	device_property_read_u64(&adev->dev, "clock-frequency", &rate);
+ 
+ 	wdt->clk = devm_clk_get_optional(&adev->dev, NULL);
+-	if (IS_ERR(wdt->clk))
++	/*
++	 * A deferred clock provider must not delay the arming: this driver
++	 * pre-arms the watchdog at probe so early boot failures still reset
++	 * the board, and hisi_femac probes right after it. With a DT
++	 * clock-frequency we can arm without the provider.
++	 */
++	if (IS_ERR(wdt->clk) && PTR_ERR(wdt->clk) == -EPROBE_DEFER && rate) {
++		dev_warn(&adev->dev, "clock provider deferred, using DT rate\n");
++		wdt->clk = NULL;
++	} else if (IS_ERR(wdt->clk)) {
+ 		return dev_err_probe(&adev->dev, PTR_ERR(wdt->clk), "Clock not found\n");
++	}
+ 
+ 	wdt->rate = clk_get_rate(wdt->clk);
+ 	if (!wdt->rate)
+@@ -341,6 +351,29 @@ sp805_wdt_probe(struct amba_device *adev
+ 		set_bit(WDOG_HW_RUNNING, &wdt->wdd.status);
+ 	}
+ 
++	/*
++	 * Arm at probe and keep it armed. Two properties of this
++	 * integration, both measured on the board, decide what that has to
++	 * look like: the counter only advances while the block is unlocked
++	 * (writing WDTLOCK freezes WDTVALUE where it stands), and it only
++	 * advances with INT_ENABLE set. wdt_config() is ordered for that,
++	 * and its INTCLR write re-times a running counter, which is what
++	 * the framework keepalive feeds on.
++	 *
++	 * With CONFIG_WATCHDOG_OPEN_TIMEOUT=0 the framework never stops
++	 * feeding (open_deadline is KTIME_MAX), so a probe-armed dog bites
++	 * only when the kernel itself can no longer run its keepalive work.
++	 * That is the case the arming is for: an honest panic is already
++	 * covered by panic= plus the restart handler, and recovery of a
++	 * locked-up kernel is not. The arming is only worth keeping if
++	 * userspace cannot disarm it, so nowayout is forced here.
++	 */
++	if (wdt_config(&wdt->wdd, false))
++		dev_warn(&adev->dev, "cannot pre-arm watchdog\n");
++	else
++		set_bit(WDOG_HW_RUNNING, &wdt->wdd.status);
++	watchdog_set_nowayout(&wdt->wdd, true);
++
+ 	watchdog_stop_on_reboot(&wdt->wdd);
+ 	ret = watchdog_register_device(&wdt->wdd);
+ 	if (ret)
+@@ -412,7 +445,18 @@ static struct amba_driver sp805_wdt_driv
+ 	.remove = sp805_wdt_remove,
+ };
+ 
+-module_amba_driver(sp805_wdt_driver);
++/*
++ * Register at subsys_initcall, not device_initcall: the watchdog has to be
++ * armed before the peripheral drivers that first exposed the early boot
++ * failures can probe, and those register at the default initcall level.
++ * The amba devices are created by of_platform_populate at arch_initcall,
++ * so subsys is the earliest safe level.
++ */
++static int __init sp805_wdt_early_init(void)
++{
++	return amba_driver_register(&sp805_wdt_driver);
++}
++subsys_initcall(sp805_wdt_early_init);
+ 
+ MODULE_AUTHOR("Viresh Kumar <vireshk@kernel.org>");
+ MODULE_DESCRIPTION("ARM SP805 Watchdog Driver");

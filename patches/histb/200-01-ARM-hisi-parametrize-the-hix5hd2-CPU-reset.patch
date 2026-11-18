@@ -1,0 +1,49 @@
+From 224ebb52a3e7425e4af4b75abd0369b48f83bd29 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Mon, 5 Oct 2026 04:22:54 +0800
+Subject: [PATCH 1/4] ARM: hisi: parametrize the hix5hd2 CPU reset
+
+The hix5hd2 hotplug path hardcodes the CPU1 arm reset of CRG20
+(CRG20_CPU1_RESET, bit 17). Name it by core number instead,
+
+CRG20_ARM_SRST(i) = BIT(i + 16), so the same CRG20 layout can drive the
+reset of the other cores too; for the single core hix5hd2 has this is no
+functional change.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ arch/arm/mach-hisi/hotplug.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+--- a/arch/arm/mach-hisi/hotplug.c
++++ b/arch/arm/mach-hisi/hotplug.c
+@@ -54,7 +54,7 @@
+ #define CPU0_SRST_REQ_EN		(1 << 0)
+ 
+ #define HIX5HD2_PERI_CRG20		0x50
+-#define CRG20_CPU1_RESET		(1 << 17)
++#define CRG20_ARM_SRST(i)		BIT((i) + 16)
+ 
+ #define HIX5HD2_PERI_PMC0		0x1000
+ #define PMC0_CPU1_WAIT_MTCOMS_ACK	(1 << 8)
+@@ -203,7 +203,7 @@ void hix5hd2_set_cpu(int cpu, bool enabl
+ 		writel_relaxed(val, ctrl_base + HIX5HD2_PERI_PMC0);
+ 		/* unreset */
+ 		val = readl_relaxed(ctrl_base + HIX5HD2_PERI_CRG20);
+-		val &= ~CRG20_CPU1_RESET;
++		val &= ~CRG20_ARM_SRST(cpu);
+ 		writel_relaxed(val, ctrl_base + HIX5HD2_PERI_CRG20);
+ 	} else {
+ 		/* power down cpu1 */
+@@ -211,10 +211,9 @@ void hix5hd2_set_cpu(int cpu, bool enabl
+ 		val |= PMC0_CPU1_PMC_ENABLE | PMC0_CPU1_POWERDOWN;
+ 		val &= ~PMC0_CPU1_WAIT_MTCOMS_ACK;
+ 		writel_relaxed(val, ctrl_base + HIX5HD2_PERI_PMC0);
+-
+ 		/* reset */
+ 		val = readl_relaxed(ctrl_base + HIX5HD2_PERI_CRG20);
+-		val |= CRG20_CPU1_RESET;
++		val |= CRG20_ARM_SRST(cpu);
+ 		writel_relaxed(val, ctrl_base + HIX5HD2_PERI_CRG20);
+ 	}
+ }

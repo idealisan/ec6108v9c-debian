@@ -1,0 +1,49 @@
+From b461f38765308ed3f4bfc1c7b256c6deb1b666b2 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 00:17:21 +0800
+Subject: [PATCH] MAINTAINERS: entries for the bench-only files
+
+The bench files this series keeps out of the submitted tree are not
+listed here on purpose.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ MAINTAINERS | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -8359,7 +8359,7 @@ M:	David Yang <mmyangfl@gmail.com>
+ L:	dri-devel@lists.freedesktop.org
+ S:	Supported
+ F:	Documentation/devicetree/bindings/display/bridge/hisilicon,hi3798mv100-hdmi.yaml
+-F:	Documentation/devicetree/bindings/display/hisilicon/hisilicon,hi3716cv200-vdp.yaml
++F:	Documentation/devicetree/bindings/display/hisilicon/hisilicon,hi3798mv100-vdp.yaml
+ F:	drivers/gpu/drm/bridge/hi3798mv100-hdmi.c
+ F:	drivers/gpu/drm/bridge/sii9134.c
+ F:	drivers/gpu/drm/bridge/sii9134.h
+@@ -12043,14 +12043,12 @@ F:	drivers/net/dsa/hirschmann/*
+ F:	include/linux/platform_data/hirschmann-hellcreek.h
+ F:	net/dsa/tag_hellcreek.c
+ 
+-HISILICON AIAO AUDIO DRIVERS
++HISILICON AIAO AUDIO I2S PORTS
+ M:	David Yang <mmyangfl@gmail.com>
+ L:	linux-sound@vger.kernel.org
+ S:	Supported
+-F:	Documentation/devicetree/bindings/sound/hisilicon,hi3716cv200-adac.yaml
+ F:	Documentation/devicetree/bindings/sound/hisilicon,hi3798mv100-aiao-card.yaml
+ F:	Documentation/devicetree/bindings/sound/hisilicon,hi3798mv100-aiao-i2s.yaml
+-F:	sound/soc/hisilicon/histb-adac.c
+ F:	sound/soc/hisilicon/histb-aiao-card.c
+ F:	sound/soc/hisilicon/histb-aiao-i2s.c
+ 
+@@ -12238,7 +12236,7 @@ M:	David Yang <mmyangfl@gmail.com>
+ L:	linux-media@vger.kernel.org
+ L:	linux-arm-kernel@lists.infradead.org
+ S:	Maintained
+-F:	Documentation/devicetree/bindings/media/hisilicon,hi3716cv200-vdec.yaml
++F:	Documentation/devicetree/bindings/media/hisilicon,hi3798mv100-vdec.yaml
+ F:	drivers/media/platform/hisilicon/histb-vdec/
+ 
+ HISILICON STB VOLTAGE REGULATOR DRIVER

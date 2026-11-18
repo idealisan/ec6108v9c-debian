@@ -1,0 +1,44 @@
+From d93ca86a49478a7b0e06a1e2bb6091c5db7f72f0 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 4 Nov 2026 19:41:05 +0800
+Subject: [PATCH] hwrng: histb - use device messages
+
+pr_*() prints without saying which device the message came from. Print
+with dev_*() instead and adjust error messages.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+---
+ drivers/char/hw_random/histb-rng.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+--- a/drivers/char/hw_random/histb-rng.c
++++ b/drivers/char/hw_random/histb-rng.c
+@@ -22,6 +22,7 @@
+ 
+ struct histb_rng_priv {
+ 	struct hwrng rng;
++	struct device *dev;
+ 	void __iomem *base;
+ };
+ 
+@@ -71,8 +72,9 @@ static int histb_rng_read(struct hwrng *
+ 			if (!wait)
+ 				return i;
+ 			if (histb_rng_wait(base)) {
+-				pr_err("failed to generate random number, generated %d\n",
+-				       i);
++				dev_err(priv->dev,
++					"RNG timeout, generated %d of %zu bytes\n",
++					i, max);
+ 				return i ? i : -ETIMEDOUT;
+ 			}
+ 		}
+@@ -142,6 +144,7 @@ static int histb_rng_probe(struct platfo
+ 	}
+ 
+ 	priv->base = base;
++	priv->dev = dev;
+ 	priv->rng.name = pdev->name;
+ 	priv->rng.read = histb_rng_read;
+ 	ret = devm_hwrng_register(dev, &priv->rng);

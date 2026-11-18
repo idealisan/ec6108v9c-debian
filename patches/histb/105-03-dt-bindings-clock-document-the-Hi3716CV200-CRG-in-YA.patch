@@ -1,0 +1,24 @@
+From 09a83d6282c78d44da93120b0af84ceba2b74f95 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 21 Oct 2026 15:55:16 +0800
+Subject: [PATCH 3/4] dt-bindings: clock: document the Hi3716CV200 CRG in YAML
+
+The Hi3716CV200 core CRG needs its compatible in the schema and its
+clock ids published. Add the compatible to hisilicon,hisi-crg.yaml; the
+id header comes with the driver block.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ Documentation/devicetree/bindings/clock/hisilicon,hisi-crg.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/Documentation/devicetree/bindings/clock/hisilicon,hisi-crg.yaml
++++ b/Documentation/devicetree/bindings/clock/hisilicon,hisi-crg.yaml
+@@ -26,6 +26,7 @@ properties:
+       - items:
+           - enum:
+               - hisilicon,hi3516cv300-crg
++              - hisilicon,hi3716cv200-crg
+               - hisilicon,hi3798cv200-crg
+               - hisilicon,hi3798mv100-crg
+           - const: syscon

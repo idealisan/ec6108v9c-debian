@@ -1,0 +1,63 @@
+From 431fde04a7039222d6235c2b7a9d01447a772404 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 06:41:30 +0800
+Subject: [PATCH 4/4] phy: hisilicon: inno-usb2: clock the ports this instance
+ registers
+
+The setup word sits in each port's own register 0x06, but
+hisi_inno_phy_setup() strobed port 0 alone: an instance whose node
+describes both ports left the second one without its phy clock. The port
+array is sized to the IP maximum (INNO_PHY_PORT_NUM), so strobing past
+the ports the node described would just as well write a port the
+integrator never wired.
+
+Keep the count of the ports probe registers and strobe exactly those.
+Every in-tree user (hi3798cv200) and every HiSTB board wired so far
+describes one port per instance, so what reaches the bus for them is the
+same single write as before.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/phy/hisilicon/phy-hisi-inno-usb2.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+--- a/drivers/phy/hisilicon/phy-hisi-inno-usb2.c
++++ b/drivers/phy/hisilicon/phy-hisi-inno-usb2.c
+@@ -54,6 +54,7 @@ struct hisi_inno_phy_priv {
+ 	struct clk *ref_clk;
+ 	struct reset_control *por_rst;
+ 	unsigned int type;
++	unsigned int num_ports;
+ 	struct hisi_inno_phy_port ports[INNO_PHY_PORT_NUM];
+ };
+ 
+@@ -88,6 +89,8 @@ static void hisi_inno_phy_write_reg(stru
+ 
+ static void hisi_inno_phy_setup(struct hisi_inno_phy_priv *priv)
+ {
++	int i;
++
+ 	/*
+ 	 * Hi3798MV200 has no test port: the window base is the first register
+ 	 * of the port's own register file, so strobing a test word there is a
+@@ -97,8 +100,9 @@ static void hisi_inno_phy_setup(struct h
+ 	if (priv->type == PHY_TYPE_2)
+ 		return;
+ 
+-	/* The phy clk is controlled by the port0 register 0x06. */
+-	hisi_inno_phy_write_reg(priv, 0, 0x06, PHY_CLK_ENABLE);
++	/* The phy clk is controlled by the port register 0x06. */
++	for (i = 0; i < priv->num_ports; i++)
++		hisi_inno_phy_write_reg(priv, i, 0x06, PHY_CLK_ENABLE);
+ 	msleep(PHY_CLK_STABLE_TIME);
+ }
+ 
+@@ -197,6 +201,8 @@ static int hisi_inno_phy_probe(struct pl
+ 		}
+ 	}
+ 
++	priv->num_ports = i;
++
+ 	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
+ 	return PTR_ERR_OR_ZERO(provider);
+ }

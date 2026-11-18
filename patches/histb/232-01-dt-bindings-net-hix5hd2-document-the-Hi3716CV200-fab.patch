@@ -1,0 +1,31 @@
+From 1e4cba90ba93b2259b78ebd40e57d81a92ab1723 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Sun, 15 Nov 2026 01:15:47 +0800
+Subject: [PATCH 1/2] dt-bindings: net: hix5hd2: document the Hi3716CV200
+ fabric windows
+
+The Hi3716CV200 switch fabric sits in front of both MACs and needs two
+optional windows: the CRF acknowledge threshold register the vendor
+writes
+first on every bring-up, and the PERI_CRG51 bits that select the GSF
+clock
+source and pulse the fabric port and MAC resets. Document both; other
+SoCs
+wired to this driver describe neither and are unaffected.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../devicetree/bindings/net/hisilicon-hix5hd2-gmac.txt    | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/Documentation/devicetree/bindings/net/hisilicon-hix5hd2-gmac.txt
++++ b/Documentation/devicetree/bindings/net/hisilicon-hix5hd2-gmac.txt
+@@ -13,6 +13,8 @@ Required properties:
+ - reg: specifies base physical address(s) and size of the device registers.
+   The first region is the MAC register base and size.
+   The second region is external interface control register.
++  The third region is the fabric CRF acknowledge threshold register
++  (Hi3716CV200 only, optional): without it the driver skips that write.
+ - interrupts: should contain the MAC interrupt.
+ - #address-cells: must be <1>.
+ - #size-cells: must be <0>.

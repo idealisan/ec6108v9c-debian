@@ -1,0 +1,305 @@
+From ec974749711dc566af8f8c5a382e812d9ac32711 Mon Sep 17 00:00:00 2001
+From: Yang Xiwen <forbidden405@outlook.com>
+Date: Fri, 16 Feb 2024 06:37:50 +0800
+Subject: [PATCH 1/3] dt-bindings: net: convert the hisilicon FEMAC bindings to
+ YAML
+
+The FEMAC MAC and its integrated MDIO bus were only described by text
+bindings.
+
+Convert both to YAML schemas. Per the TRM the MDIO node gains its
+optional clock cell, the MAC gains the MDIO subnode, the ahb clock, phy
+clock and reset, and the old text bindings are dropped now that the
+schemas cover the block.
+
+The compatible carries the legacy Hi3516 single-string form alongside
+the Hi3798MV200 single string, the MAC clocks range over one to three
+entries, and the cells the older parts do not carry are required only
+under the Hi3798MV200 compatible.
+
+Signed-off-by: Yang Xiwen <forbidden405@outlook.com>
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../net/hisilicon,hisi-femac-mdio.yaml        |  46 ++++++
+ .../bindings/net/hisilicon,hisi-femac.yaml    | 152 ++++++++++++++++++
+ .../bindings/net/hisilicon-femac-mdio.txt     |  22 ---
+ .../bindings/net/hisilicon-femac.txt          |  41 -----
+ 4 files changed, 198 insertions(+), 63 deletions(-)
+ create mode 100644 Documentation/devicetree/bindings/net/hisilicon,hisi-femac-mdio.yaml
+ create mode 100644 Documentation/devicetree/bindings/net/hisilicon,hisi-femac.yaml
+ delete mode 100644 Documentation/devicetree/bindings/net/hisilicon-femac-mdio.txt
+ delete mode 100644 Documentation/devicetree/bindings/net/hisilicon-femac.txt
+
+--- /dev/null
++++ b/Documentation/devicetree/bindings/net/hisilicon,hisi-femac.yaml
+@@ -0,0 +1,152 @@
++# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/net/hisilicon,hisi-femac.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Hisilicon Fast Ethernet MAC controller
++
++maintainers:
++  - Yang Xiwen <forbidden405@foxmail.com>
++
++allOf:
++  - $ref: ethernet-controller.yaml#
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: hisilicon,hi3798mv200-femac
++    then:
++      required:
++        - clock-names
++        - phy-connection-type
++        - phy-handle
++      properties:
++        clocks:
++          minItems: 3
++
++description: |
++  The FEMAC core has one register window for the MAC itself and a second one
++  for the global MAC control. hi3798mv200 wires three clocks to it and names
++  them, and its MDIO bus is a child node the MAC driver populates. Earlier
++  members of the family (hisi-femac-v1/-v2, hi3516cv300) name no clocks at all
++  and keep the MDIO bus in a sibling node, which the bus driver binds to
++  directly; their clock cell stays unnamed there because the block has a single
++  clock.
++
++properties:
++  compatible:
++    oneOf:
++      - const: hisilicon,hi3798mv200-femac
++      - enum:
++          - hisilicon,hisi-femac-v1
++          - hisilicon,hisi-femac-v2
++          - hisilicon,hi3516cv300-femac
++
++  reg:
++    items:
++      - description: The first region is the MAC core register base and size.
++      - description: The second region is the global MAC control register.
++
++  ranges:
++    maxItems: 1
++
++  '#address-cells':
++    const: 1
++
++  '#size-cells':
++    const: 1
++
++  interrupts:
++    maxItems: 1
++
++  clocks:
++    minItems: 1
++    maxItems: 3
++
++  clock-names:
++    minItems: 1
++    items:
++      - const: mac
++      - const: macif
++      - const: phy
++
++  resets:
++    maxItems: 2
++
++  reset-names:
++    items:
++      - const: mac
++      - const: phy
++
++  hisilicon,phy-reset-delays-us:
++    items:
++      - description: The 1st cell is reset pre-delay in micro seconds.
++      - description: The 2nd cell is reset pulse in micro seconds.
++      - description: The 3rd cell is reset post-delay in micro seconds.
++
++patternProperties:
++  '^mdio@[0-9a-f]+$':
++    $ref: hisilicon,hisi-femac-mdio.yaml#
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - clocks
++  - resets
++  - hisilicon,phy-reset-delays-us
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++
++    ethernet@9c30000 {
++        compatible = "hisilicon,hi3798mv200-femac";
++        reg = <0x9c30000 0x1000>, <0x9c31300 0x200>;
++        ranges = <0x0 0x9c30000 0x10000>;
++        #address-cells = <1>;
++        #size-cells = <1>;
++        interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>;
++        clocks = <&clk_femac>,
++                 <&clk_femacif>,
++                 <&clk_fephy>;
++        clock-names = "mac", "macif", "phy";
++        resets = <&crg 0xd0 3>, <&crg 0x388 4>;
++        reset-names = "mac", "phy";
++        phy-handle = <&fephy>;
++        phy-connection-type = "mii";
++        // To be filled by bootloader
++        mac-address = [00 00 00 00 00 00];
++        hisilicon,phy-reset-delays-us = <10000 10000 500000>;
++        status = "okay";
++
++        mdio@1100 {
++            compatible = "hisilicon,hisi-femac-mdio";
++            reg = <0x1100 0x20>;
++            #address-cells = <1>;
++            #size-cells = <0>;
++            status = "okay";
++
++            ethernet-phy@1 {
++                reg = <1>;
++            };
++        };
++    };
++
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++
++    ethernet@9840000 {
++        compatible = "hisilicon,hisi-femac-v2";
++        reg = <0x9840000 0x1000>, <0x9841300 0x200>;
++        interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>;
++        clocks = <&crg 12>;
++        resets = <&crg 0xcc 4>, <&crg 0x120 4>;
++        reset-names = "mac", "phy";
++        phy-handle = <&phy1>;
++        phy-mode = "mii";
++        hisilicon,phy-reset-delays-us = <10000 10000 20000>;
++    };
+--- /dev/null
++++ b/Documentation/devicetree/bindings/net/hisilicon,hisi-femac-mdio.yaml
+@@ -0,0 +1,46 @@
++# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/net/hisilicon,hisi-femac-mdio.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: HiSilicon FEMAC MDIO bus
++
++maintainers:
++  - Yang Xiwen <forbidden405@formail.com>
++
++allOf:
++  - $ref: mdio.yaml#
++
++properties:
++  compatible:
++    const: hisilicon,hisi-femac-mdio
++
++  reg:
++    maxItems: 1
++
++  clocks:
++    maxItems: 1
++    description: |
++      The PHY-side clock the bus runs off. hi3798mv200 supplies it through the
++      MAC node ("phy" of that node's clock-names) and leaves this cell out;
++      hi3798mv100 keeps it here, unnamed.
++
++required:
++  - compatible
++  - reg
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    mdio@10091100 {
++        compatible = "hisilicon,hisi-femac-mdio";
++        reg = <0x10091100 0x20>;
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        phy@1 {
++            reg = <1>;
++        };
++    };
+--- a/Documentation/devicetree/bindings/net/hisilicon-femac.txt
++++ /dev/null
+@@ -1,41 +0,0 @@
+-Hisilicon Fast Ethernet MAC controller
+-
+-Required properties:
+-- compatible: should contain one of the following version strings:
+-	* "hisilicon,hisi-femac-v1"
+-	* "hisilicon,hisi-femac-v2"
+-	and the soc string "hisilicon,hi3516cv300-femac".
+-- reg: specifies base physical address(s) and size of the device registers.
+-  The first region is the MAC core register base and size.
+-  The second region is the global MAC control register.
+-- interrupts: should contain the MAC interrupt.
+-- clocks: A phandle to the MAC main clock.
+-- resets: should contain the phandle to the MAC reset signal(required) and
+-	the PHY reset signal(optional).
+-- reset-names: should contain the reset signal name "mac"(required)
+-	and "phy"(optional).
+-- phy-mode: see ethernet.txt [1].
+-- phy-handle: see ethernet.txt [1].
+-- hisilicon,phy-reset-delays-us: triplet of delays if PHY reset signal given.
+-	The 1st cell is reset pre-delay in micro seconds.
+-	The 2nd cell is reset pulse in micro seconds.
+-	The 3rd cell is reset post-delay in micro seconds.
+-
+-The MAC address will be determined using the optional properties
+-defined in ethernet.txt[1].
+-
+-[1] Documentation/devicetree/bindings/net/ethernet.txt
+-
+-Example:
+-	hisi_femac: ethernet@10090000 {
+-		compatible = "hisilicon,hi3516cv300-femac","hisilicon,hisi-femac-v2";
+-		reg = <0x10090000 0x1000>,<0x10091300 0x200>;
+-		interrupts = <12>;
+-		clocks = <&crg HI3518EV200_ETH_CLK>;
+-		resets = <&crg 0xec 0>,<&crg 0xec 3>;
+-		reset-names = "mac","phy";
+-		mac-address = [00 00 00 00 00 00];
+-		phy-mode = "mii";
+-		phy-handle = <&phy0>;
+-		hisilicon,phy-reset-delays-us = <10000 20000 20000>;
+-	};
+--- a/Documentation/devicetree/bindings/net/hisilicon-femac-mdio.txt
++++ /dev/null
+@@ -1,22 +0,0 @@
+-Hisilicon Fast Ethernet MDIO Controller interface
+-
+-Required properties:
+-- compatible: should be "hisilicon,hisi-femac-mdio".
+-- reg: address and length of the register set for the device.
+-- clocks: A phandle to the reference clock for this device.
+-
+-- PHY subnode: inherits from phy binding [1]
+-[1] Documentation/devicetree/bindings/net/phy.txt
+-
+-Example:
+-mdio: mdio@10091100 {
+-	compatible = "hisilicon,hisi-femac-mdio";
+-	reg = <0x10091100 0x10>;
+-	clocks = <&crg HI3516CV300_MDIO_CLK>;
+-	#address-cells = <1>;
+-	#size-cells = <0>;
+-
+-	phy0: phy@1 {
+-		reg = <1>;
+-	};
+-};

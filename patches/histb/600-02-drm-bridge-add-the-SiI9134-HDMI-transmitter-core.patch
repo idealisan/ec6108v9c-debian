@@ -1,0 +1,2483 @@
+From 63b736d96430b8c7ea514b1bc9fdaa5744c74d0b Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 27 Oct 2026 20:06:07 +0800
+Subject: [PATCH 2/2] drm/bridge: add the SiI9134 HDMI transmitter core
+
+The mv100 board reaches its panel through a SiI9134 transmitter. Add the
+bridge core and the mv100 glue, programming the AUDP mode the link
+needs.
+
+A failed component bind tears the codec device down again, and the
+bridge carries the negotiated colour format to the encoder through
+DRM_BRIDGE_OP_HDMI instead of forwarding a fixed RGB-to-YCbCr conversion
+with a hand-written AVI infoframe.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/gpu/drm/bridge/Kconfig            |   15 +
+ drivers/gpu/drm/bridge/Makefile           |    2 +
+ drivers/gpu/drm/bridge/hi3798mv100-hdmi.c |  621 ++++++++
+ drivers/gpu/drm/bridge/sii9134.c          | 1643 +++++++++++++++++++++
+ drivers/gpu/drm/bridge/sii9134.h          |  150 ++
+ 5 files changed, 2431 insertions(+)
+ create mode 100644 drivers/gpu/drm/bridge/hi3798mv100-hdmi.c
+ create mode 100644 drivers/gpu/drm/bridge/sii9134.c
+ create mode 100644 drivers/gpu/drm/bridge/sii9134.h
+
+--- /dev/null
++++ b/drivers/gpu/drm/bridge/sii9134.c
+@@ -0,0 +1,1643 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright (c) 2023 David Yang
++ *
++ * Silicon Image SiI9134 HDMI 1.4 transmitter core.
++ *
++ * Register interface: three banks of byte registers on a 4-byte MMIO stride
++ * (see sii9134.h). The bank flattening is not covered by the SiI9134 datasheet,
++ * so the register sequences here follow what an integrator's HDMI block
++ * expects. The TMDS PHY window and where the DVI encoder sits are per
++ * integration and come in through struct sii9134_phy_ops.
++ *
++ * Not implemented:
++ *
++ * - HDCP. The transmitter takes its authentication key from an on-chip
++ *   key store, which is left blank on these boards, and the driver has
++ *   no interface to install keys.
++ * - CEC. The CEC controller is a fourth bank at offset 0x800, byte
++ *   registers on the same 4-byte stride; wiring it to the CEC framework
++ *   would be a separate driver.
++ * - SPD and Gamut Metadata packets.
++ * - Deep colour and pixel replication: the link runs 8 bits per channel.
++ */
++
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++#include <sound/hdmi-codec.h>
++
++#include <drm/drm_atomic_state_helper.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_edid.h>
++#include <drm/drm_print.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/display/drm_hdmi_state_helper.h>
++
++#include <linux/hdmi.h>
++
++#include "sii9134.h"
++
++/*
++ * Bank 0 (I2C slave 0x72 in the original design; wrapper regmap .map, MMIO
++ * offset 0x0000): TPI / system / timing / interrupts / master DDC.
++ */
++#define TX_VENDOR_ID_ADDR	0x0	/* reg 0x00, 16-bit, Silicon Image = 0x0001 */
++#define TX_DEVICE_ID_ADDR	0x8	/* reg 0x02, 16-bit, SiI9134 = 0x9134 */
++#define TX_DEVICE_REV_ADDR	0x10	/* reg 0x04 */
++#define TX_SWRST_ADDR		0x14	/* reg 0x05 */
++#define BIT_TX_SW_RST			0x01
++#define BIT_TX_FIFO_RST			0x02
++#define TX_SYS_CTRL1_ADDR	0x20	/* reg 0x08 */
++#define BIT_TX_PD			0x01	/* 1 = powered up */
++#define BIT_TX_CLOCK_RISING_EDGE	0x02
++#define BIT_BSEL24BITS			0x04	/* 24-bit input bus */
++#define TX_STAT_ADDR		0x24	/* reg 0x09 */
++#define BIT_HDMI_MODE			0x01	/* TMDS clock stable */
++#define BIT_HPD_PIN			0x02
++#define BIT_RSEN			0x04
++#define DATA_CTRL_ADDR		0x34	/* reg 0x0d */
++#define BIT_AUD_MUTE			0x02
++#define BIT_VID_BLANK			0x04
++
++#define DE_HSTART_ADDR		0xc8	/* reg 0x32 */
++#define DE_CNTRL_ADDR		0xcc	/* reg 0x33 */
++#define BIT_DE_ENABLED			0x40
++#define DE_CNTRL_HSTART_MSB		0x03
++#define DE_CNTRL_SYNC_POL		0x30	/* 1 = negative sync */
++#define DE_VSTART_ADDR		0xd0	/* reg 0x34 */
++#define DE_HRES_ADDR		0xd8	/* reg 0x36, 16-bit */
++#define DE_VRES_ADDR		0xe0	/* reg 0x38, 16-bit */
++/*
++ * read-only counters, only valid while IDCK plus H/VSYNC reach the TX; in the
++ * sync-derived mode below 0x3a/0x3c double as the programmed totals, so treat
++ * reads with care
++ */
++#define MEAS_HRES_ADDR		0xe8	/* reg 0x3a, H_RES[12:0], 13-bit */
++#define MEAS_VRES_ADDR		0xf0	/* reg 0x3c, V_RES[10:0], 11-bit */
++
++/*
++ * Sync-derived video timing: the DE generator stays off and the TX derives the
++ * active window from H/V sync and these counters.
++ */
++#define TX656_ADJ_MODE_ADDR	0xf8	/* reg 0x3e, low bits only */
++#define TX656_HTOT_ADDR		0xe8	/* reg 0x3a, 16-bit, htotal */
++#define TX656_VTOT_ADDR		0xf0	/* reg 0x3c, 16-bit, vtotal */
++#define TX656_HBIT2HSYNC_ADDR	0x100	/* reg 0x40, 16-bit, h front porch */
++#define TX656_FIELD2_ADDR	0x108	/* reg 0x42, 16-bit, field-2 offset */
++#define TX656_HLENGTH_ADDR	0x110	/* reg 0x44, 16-bit, hsync width */
++#define TX656_VBIT_ADDR		0x118	/* reg 0x46, v front porch */
++#define TX656_VLENGTH_ADDR	0x11c	/* reg 0x47, vsync width */
++
++#define TX_VID_IN_MODE_ADDR	0x1a4	/* reg 0x69, input bus width/mux */
++#define TX_VID_MODE_ADDR		0x128	/* reg 0x4a */
++#define TX_VID_MODE_ALL_MUX		0x3f	/* demux/csc/range/dither */
++#define TX_VID_MODE_DITHER		0x20	/* reg 0x4a bit5 */
++#define TX_VID_ACEN_ADDR		0x124	/* reg 0x49 */
++#define TX_VID_ACEN_DWN_SAMPLE		0x01	/* 4:4:4 -> 4:2:2 chroma down sampler */
++#define TX_VID_ACEN_RGB2YCBCR		0x04	/* RGB -> YCbCr colour-space converter */
++#define TX_VID_ACEN_CLIP_CS		0x10	/* 1 = link carries YCbCr */
++#define TX_VID_CTRL_ADDR		0x120	/* reg 0x48 */
++#define TX_VID_CTRL_ICLK		0x03
++#define TX_VID_CTRL_CSCSEL		0x10	/* BT.709 vs BT.601 */
++#define TX_VID_DITHER_ADDR		0x13c	/* reg 0x4f, dither block */
++#define TX_VID_DITHER_24BIT		0x0e	/* D_RC_EN | D_GC_EN | D_BC_EN */
++
++#define HDMI_INT1_ADDR		0x1c4	/* reg 0x71, status, write 1 to clear */
++#define HDMI_INT_STATE_ADDR	0x1c0	/* reg 0x70, summary state, write 1 to clear */
++#define BIT_INT_HOT_PLUG		0x40
++#define BIT_INT_RSEN			0x20
++#define HDMI_INT_MASK_ADDR	0x1d8	/* reg 0x76 */
++#define INT_CNTRL_ADDR		0x1ec	/* reg 0x7b */
++#define INT_CONTROL			0x02	/* push-pull, active high */
++
++/* master DDC (used for EDID when no ddc-i2c-bus is wired up) */
++#define MDDC_SLAVE_ADDR_REG	0x3b4	/* reg 0xed */
++#define MDDC_SEGMENT_ADDR	0x3b8	/* reg 0xee */
++#define MDDC_STATUS_ADDR		0x3c8	/* reg 0xf2 */
++#define MDDC_COMMAND_ADDR	0x3cc	/* reg 0xf3 */
++#define MDDC_FIFO_ADDR		0x3d0	/* reg 0xf4 */
++#define MDDC_FIFO_CNT_ADDR	0x3d4	/* reg 0xf5 */
++#define MDDC_DELAY_CNT		0x3d8	/* reg 0xf6 */
++#define BIT_MDDC_ST_I2C_LOW		0x40
++#define BIT_MDDC_ST_NO_ACK		0x20
++#define BIT_MDDC_ST_IN_PROGR		0x10
++#define BIT_MDDC_ST_FIFO_FULL		0x08
++/* SCL = oscclk / (delay * 35): 0x14 = 100 kHz, 0x1a = 75 kHz */
++#define MDDC_DELAY_75KHZ		0x1a
++#define MDDC_FIFO_DEPTH			16
++#define MASTER_CMD_CLEAR_FIFO		0x09
++#define MASTER_CMD_ABORT		0x0f
++#define MASTER_CMD_CLOCK		0x0a
++#define MASTER_CMD_SEQ_RD		0x02
++#define MASTER_CMD_ENH_RD		0x04
++#define DDC_EDID_ADDR			0xA0
++#define DDC_SEGMENT_ADDR		0x30
++
++/*
++ * Bank 1 (I2C slave 0x7a in the original design; wrapper regmap .map1, MMIO
++ * offset 0x0400): audio, ACR and infoframe packet memory.
++ */
++#define DIAG_PD_ADDR		0xf4	/* reg 0x3d, all three bits default 1 */
++#define BIT_PDIDCK			0x04	/* 1 = IDCK input not blocked */
++#define BIT_PDOSC			0x02	/* 1 = ring oscillator on */
++#define BIT_PDTOT			0x01	/* 1 = nothing powered down */
++
++#define ACR_CTRL_ADDR		0x4	/* reg 0x01 */
++#define ACR_CTRL_N_CTS_ENABLE		0x02
++#define ACR_CTRL_INTERNAL_MCLK		0x04
++#define FREQ_SVAL_ADDR		0x8	/* reg 0x02, MCLK index */
++#define N_SVAL_ADDR		0xc	/* reg 0x03, N value, 24-bit */
++
++#define AUD_MODE_ADDR		0x50	/* reg 0x14 */
++#define BIT_AUDIO_EN			0x01
++#define BIT_SPDIF_SELECT		0x02
++#define BIT_DSD_SELECT			0x08
++#define SD_0				0x10	/* enable I2S SD0 */
++#define SD_0_3_EN			0xF0	/* enable I2S SD0-3 */
++#define I2S_IN_CTRL_ADDR		0x74	/* reg 0x1d */
++#define I2S_SCK_RISING			0x40
++#define I2S_COMPRESSED			0x10
++#define I2S_HBR_ON			0x80
++#define I2S_CHST0_ADDR		0x78	/* reg 0x1e */
++#define I2S_CHST1_ADDR		0x7c	/* reg 0x1f */
++#define I2S_CHST2_ADDR		0x80	/* reg 0x20 */
++#define I2S_CHST4_ADDR		0x84	/* reg 0x21, CHST[31:24]: Fs */
++#define I2S_CHST5_ADDR		0x88	/* reg 0x22, CHST[39:32]: Fs/len */
++#define SAMPLE_RATE_CONVERSION	0x8c	/* reg 0x23 */
++#define I2S_IN_LEN		0x90	/* reg 0x24 */
++#define AUDP_TXCTRL_ADDR		0xbc	/* reg 0x2f */
++#define BIT_TXHDMI_MODE			0x01
++#define BIT_LAYOUT1			0x02	/* layout 1: >2 channels */
++#define AUDP_PACKET_MODE	GENMASK(5, 3)	/* vendor table: 100/101/110 */
++#define AUDP_PACKET_24BIT	FIELD_PREP(AUDP_PACKET_MODE, 4)
++#define TEST_TX_ADDR		0xf0	/* reg 0x3c */
++#define BIT_DVI_ENC_BYPASS		0x08
++#define INF_CTRL1		0xf8	/* reg 0x3e, 16-bit */
++#define BIT_AVI_REPEAT			0x01
++#define BIT_AVI_ENABLE			0x02
++#define BIT_SPD_REPEAT			0x04
++#define BIT_SPD_ENABLE			0x08
++#define BIT_AUD_REPEAT			0x10
++#define BIT_AUD_ENABLE			0x20
++#define BIT_VSDB_REPEAT			0x40	/* MPEG slot, see below */
++#define BIT_VSDB_ENABLE			0x80
++#define INF_CTRL2		0xfc	/* reg 0x3f */
++#define BIT_CP_REPEAT			0x04
++#define BIT_CP_ENABLE			0x08
++
++/* control packet (GCP) interface: write 0x01 to mute, 0x10 to unmute */
++#define CP_IF_ADDR		0x37c	/* reg 0xdf */
++#define BIT_CP_AVI_MUTE_SET		0x01
++#define BIT_CP_AVI_MUTE_CLEAR		0x10
++
++/*
++ * Infoframe packet memory: type, version, length, checksum, payload. The
++ * HDMI-VSDB vendor packet goes into the MPEG packet slot.
++ */
++#define AVI_IF_ADDR		0x100	/* reg 0x40 */
++#define AUD_IF_ADDR		0x200	/* reg 0x80 */
++#define VSDB_IF_ADDR		0x280	/* reg 0xa0 */
++#define IFRAME_POLL_MAX			60
++
++/*
++ * TMDS clock window. 165MHz is not this IP's ceiling -- that figure is the
++ * single-link limit of HDMI 1.0/1.1. The PHY output swing is selected from the
++ * TMDS clock and has a band of its own above 165MHz, and pixel clocks up to
++ * 297MHz are supported. 4K@50/60 would need 594MHz and is out of range.
++ */
++#define SII9134_MIN_TMDSCLOCK		(25 * 1000)
++#define SII9134_MAX_TMDSCLOCK		(297 * 1000)
++/* DVI is the HDMI 1.0-era single link: no TMDS clock above 165MHz */
++#define SII9134_MAX_DVI_CLOCK		(165 * 1000)
++
++#define SII9134_MAX_AUDIO_CHANNELS	8
++
++static inline struct sii9134 *
++bridge_to_sii9134(struct drm_bridge *bridge)
++{
++	return container_of(bridge, struct sii9134, bridge);
++}
++
++/* ------------------------------------------------------------------ */
++/* Low-level helpers                                                    */
++/* ------------------------------------------------------------------ */
++
++static int sii9134_modify(struct sii9134 *sii, struct regmap *map,
++			  unsigned int reg, unsigned int mask,
++			  unsigned int val)
++{
++	unsigned int tmp;
++	int ret;
++
++	ret = regmap_read(map, reg, &tmp);
++	if (ret)
++		return ret;
++
++	tmp &= ~mask;
++	tmp |= val;
++
++	return regmap_write(map, reg, tmp);
++}
++
++static int sii9134_write_word(struct sii9134 *sii, struct regmap *map,
++			      unsigned int reg, unsigned int val)
++{
++	int ret;
++
++	ret = regmap_write(map, reg, val & 0xff);
++	if (ret)
++		return ret;
++
++	return regmap_write(map, reg + 4, (val >> 8) & 0xff);
++}
++
++static int sii9134_read_word(struct sii9134 *sii, struct regmap *map,
++			     unsigned int reg, unsigned int *val)
++{
++	unsigned int lo, hi;
++	int ret;
++
++	ret = regmap_read(map, reg, &lo);
++	if (ret)
++		return ret;
++
++	ret = regmap_read(map, reg + 4, &hi);
++	if (ret)
++		return ret;
++
++	*val = (lo & 0xff) | ((hi & 0xff) << 8);
++
++	return 0;
++}
++
++static int sii9134_write_block(struct sii9134 *sii, struct regmap *map,
++			       unsigned int reg, const u8 *buf, size_t len)
++{
++	int ret = 0;
++	size_t i;
++
++	for (i = 0; i < len && !ret; i++)
++		ret = regmap_write(map, reg + 4 * i, buf[i]);
++
++	return ret;
++}
++
++
++/* ------------------------------------------------------------------ */
++/* Infoframes                                                           */
++/* ------------------------------------------------------------------ */
++
++static int sii9134_wait_buff_ready(struct sii9134 *sii, u16 ctrl_bits)
++{
++	u16 rpt_mask = (ctrl_bits >> 1) & ctrl_bits;
++	u16 en_mask = (ctrl_bits << 1) & ctrl_bits;
++	unsigned int regval;
++	int i, ret;
++
++	ret = regmap_read(sii->map1, INF_CTRL1, &regval);
++	if (ret)
++		return ret;
++
++	if (regval & ctrl_bits) {
++		if (regval & rpt_mask)
++			sii9134_modify(sii, sii->map1, INF_CTRL1,
++				       rpt_mask, 0);
++
++		for (i = 0; i < IFRAME_POLL_MAX; i++) {
++			if (regmap_read(sii->map1, INF_CTRL1, &regval))
++				return -EIO;
++			if (!(regval & en_mask))
++				break;
++			mdelay(1);
++		}
++		if (i == IFRAME_POLL_MAX) {
++			/*
++			 * The repeat bit can stay set even though the buffer is
++			 * free; force it through instead of failing the
++			 * modeset.
++			 */
++			dev_warn(sii->dev,
++				 "infoframe repeat bit stuck, forcing buffer ready\n");
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Write an infoframe into the hardware packet memory and enable its
++ * transmission. @data holds the packed infoframe as produced by
++ * hdmi_*_infoframe_pack(): type, version, length, checksum, payload.
++ */
++static int sii9134_send_infoframe(struct sii9134 *sii, unsigned int dest,
++				  u16 ctrl_bits, const u8 *data, u8 length)
++{
++	int ret;
++
++	ret = sii9134_wait_buff_ready(sii, ctrl_bits);
++	if (ret) {
++		dev_err(sii->dev, "infoframe buffer not ready\n");
++		return ret;
++	}
++
++	ret = sii9134_write_block(sii, sii->map1, dest, data, length + 4);
++	if (ret)
++		return ret;
++
++	return sii9134_modify(sii, sii->map1, INF_CTRL1, ctrl_bits,
++			      ctrl_bits);
++}
++
++/*
++ * Tell the sink that valid AV data is being sent: a GCP with AVMUTE cleared,
++ * repeated. A receiver stays black -- clock, sync and DE window all correct --
++ * as long as it was last told AVMUTE, which is a state a restarted pipeline can
++ * be left in.
++ */
++static void sii9134_clear_avmute(struct sii9134 *sii)
++{
++	unsigned int val;
++	int i;
++
++	/* stop the repeating GCP before changing the payload */
++	sii9134_modify(sii, sii->map1, INF_CTRL2,
++		       BIT_CP_ENABLE | BIT_CP_REPEAT, 0);
++	for (i = 0; i < 64; i++) {
++		if (regmap_read(sii->map1, INF_CTRL2, &val))
++			return;
++		if (!(val & BIT_CP_ENABLE))
++			break;
++		usleep_range(1000, 2000);
++	}
++
++	regmap_write(sii->map1, CP_IF_ADDR, BIT_CP_AVI_MUTE_CLEAR);
++	sii9134_modify(sii, sii->map1, INF_CTRL2,
++		       BIT_CP_ENABLE | BIT_CP_REPEAT,
++		       BIT_CP_ENABLE | BIT_CP_REPEAT);
++}
++
++static int sii9134_disable_infoframe(struct sii9134 *sii, u16 ctrl_bits)
++{
++	return sii9134_modify(sii, sii->map1, INF_CTRL1, ctrl_bits, 0);
++}
++
++/*
++ * The 4K formats have no CEA-861 VIC that a sink can act on, so the link has to
++ * say "this is one of the extended 4K formats" in the HDMI-VSDB vendor
++ * infoframe. The 4K_VIC ids below are 1 = 3840x2160@30, 2 = @25, 3 = @24, 4 =
++ * 4096x2160@24. CEA-861 folds each format's 1000/1001 variant into the same id,
++ * and hdmi_vendor_infoframe_pack() emits the packet -- OUI 00:0C:03, video
++ * format code 1 (extended resolutions) and the id -- into the MPEG packet slot.
++ */
++static u8 sii9134_hdmi_4k_vic(u8 cea_vic)
++{
++	switch (cea_vic) {
++	case 95:
++		return 1;
++	case 94:
++		return 2;
++	case 93:
++		return 3;
++	case 111:
++		return 4;
++	default:
++		return 0;
++	}
++}
++
++static void sii9134_send_vsdb(struct sii9134 *sii, u8 hdmi_vic)
++{
++	struct hdmi_vendor_infoframe frame;
++	u8 buf[HDMI_MAX_INFOFRAME_SIZE];
++	int ret;
++
++	if (!hdmi_vic) {
++		sii9134_disable_infoframe(sii,
++					  BIT_VSDB_ENABLE | BIT_VSDB_REPEAT);
++		return;
++	}
++
++	hdmi_vendor_infoframe_init(&frame);
++	frame.vic = hdmi_vic;
++
++	ret = hdmi_vendor_infoframe_pack(&frame, buf, sizeof(buf));
++	if (ret < 0) {
++		dev_err(sii->dev, "failed to pack vendor infoframe: %d\n", ret);
++		return;
++	}
++
++	ret = sii9134_send_infoframe(sii, VSDB_IF_ADDR,
++				     BIT_VSDB_ENABLE | BIT_VSDB_REPEAT,
++				     buf, ret - 4);
++	if (ret)
++		dev_err(sii->dev, "failed to send vendor infoframe\n");
++}
++
++/*
++ * "Encoded Audio Sampling Frequency" table from the SiI9134 datasheet. 4K
++ * formats use their own table: the N value is divided into the CTS of the TMDS
++ * clock, and 297MHz is a different column of the CTA table than 74.25MHz or
++ * 148.5MHz. sii9134_hdmi_4k_vic() picks between the two.
++ */
++static u32 sii9134_audio_n_value(u8 fs_code, bool fourk)
++{
++	static const u32 n_val[] = {
++		6272,	/* 0: 44.1kHz */
++		0,
++		6144,	/* 2: 48kHz */
++		4096,	/* 3: 32kHz */
++		0, 0, 0, 0,
++		12544,	/* 8: 88.2kHz */
++		0,
++		12288,	/* a: 96kHz */
++		0,
++		25088,	/* c: 176.4kHz */
++		0,
++		24576,	/* e: 192kHz */
++	};
++	static const u32 n_val_4k[] = {
++		4704,	/* 0: 44.1kHz */
++		0,
++		5120,	/* 2: 48kHz */
++		3072,	/* 3: 32kHz */
++		0, 0, 0, 0,
++		9408,	/* 8: 88.2kHz */
++		0,
++		10240,	/* a: 96kHz */
++		0,
++		18816,	/* c: 176.4kHz */
++		0,
++		20480,	/* e: 192kHz */
++	};
++
++	return fourk ? n_val_4k[fs_code] : n_val[fs_code];
++}
++
++static void sii9134_write_n_value(struct sii9134 *sii, u8 fs_code, bool fourk)
++{
++	unsigned int n_val = sii9134_audio_n_value(fs_code, fourk);
++
++	regmap_write(sii->map1, N_SVAL_ADDR + 0, n_val & 0xff);
++	regmap_write(sii->map1, N_SVAL_ADDR + 4, (n_val >> 8) & 0xff);
++	regmap_write(sii->map1, N_SVAL_ADDR + 8, (n_val >> 16) & 0xff);
++}
++
++/* ------------------------------------------------------------------ */
++/* EDID over the hardware master DDC                                    */
++/* ------------------------------------------------------------------ */
++
++static int sii9134_ddc_fifo_read(struct sii9134 *sii, u8 len, u8 *buf)
++{
++	unsigned int count, val;
++	int retry, i = 0;
++
++	for (retry = 20 + len; i < len && retry; retry--) {
++		regmap_read(sii->map, MDDC_FIFO_CNT_ADDR, &count);
++		if (!count) {
++			usleep_range(1000, 2000);
++			continue;
++		}
++		if (regmap_read(sii->map, MDDC_FIFO_ADDR, &val))
++			return -EIO;
++		buf[i++] = val;
++	}
++
++	return i == len ? 0 : -EIO;
++}
++
++static int sii9134_ddc_wait_done(struct sii9134 *sii, unsigned int want)
++{
++	unsigned int status, count;
++	int i;
++
++	for (i = 0; i < want + 5; i++) {
++		usleep_range(1000, 2000);
++		regmap_read(sii->map, MDDC_STATUS_ADDR, &status);
++		if (status & BIT_MDDC_ST_NO_ACK)
++			return -EIO;
++		if (status & BIT_MDDC_ST_IN_PROGR)
++			continue;
++		regmap_read(sii->map, MDDC_FIFO_CNT_ADDR, &count);
++		if (count == want)
++			return 0;
++	}
++
++	return -ETIMEDOUT;
++}
++
++/*
++ * One master-DDC read transaction. len must fit the hardware FIFO: the
++ * engine only drops IN_PROGR once every requested byte is *in* the FIFO,
++ * so a request larger than MDDC_FIFO_DEPTH parks with STATUS =
++ * IN_PROGR|FIFO_FULL (0x18) and FIFO_CNT stuck at 16. EDID is read in
++ * 16-byte chunks for exactly this reason.
++ */
++static int sii9134_ddc_read(struct sii9134 *sii, u8 segment, u8 offset,
++			    u8 *buf, unsigned int len)
++{
++	u8 header[7] = {
++		DDC_EDID_ADDR,
++		segment,
++		offset,
++		len,
++		0,			/* byte count MSB */
++		0,			/* dummy */
++		/* enhanced (segmented) read only when a segment is set */
++		segment ? MASTER_CMD_ENH_RD : MASTER_CMD_SEQ_RD,
++	};
++	unsigned int status, count, cmd;
++	int ret;
++
++	/* abort anything pending and clear the DDC FIFO */
++	regmap_write(sii->map, MDDC_COMMAND_ADDR, MASTER_CMD_CLEAR_FIFO);
++
++	/* one burst starting at 0xED programs addr/segment/offset/count/cmd */
++	ret = sii9134_write_block(sii, sii->map, MDDC_SLAVE_ADDR_REG, header,
++				  sizeof(header));
++	if (ret)
++		return ret;
++
++	ret = sii9134_ddc_wait_done(sii, len);
++	if (ret) {
++		regmap_read(sii->map, MDDC_STATUS_ADDR, &status);
++		regmap_read(sii->map, MDDC_FIFO_CNT_ADDR, &count);
++		regmap_read(sii->map, MDDC_COMMAND_ADDR, &cmd);
++		dev_warn(sii->dev,
++			 "mddc seg%u off0x%02x len%u timeout: status=%02x%s%s cnt=%u cmd=%02x\n",
++			 segment, offset, len, status,
++			 status & BIT_MDDC_ST_I2C_LOW ? " BUS_LOW" : "",
++			 status & BIT_MDDC_ST_FIFO_FULL ? " FIFO_FULL" : "",
++			 count, cmd);
++		regmap_write(sii->map, MDDC_COMMAND_ADDR, MASTER_CMD_ABORT);
++		regmap_write(sii->map, MDDC_COMMAND_ADDR, MASTER_CMD_CLOCK);
++		return ret;
++	}
++
++	return sii9134_ddc_fifo_read(sii, len, buf);
++}
++
++/*
++ * The master DDC engine is a reduced I2C master: it only performs the
++ * transaction shape the DRM DDC reader uses -- the optional segment pointer
++ * write (0x30), the in-segment offset write (0x50), then one read from 0x50.
++ * Exposing it as an i2c_adapter, like inno-hdmi.c and rk3066_hdmi.c do for
++ * their own DDC hardware, is what lets the EDID come from drm_edid_read_ddc();
++ * the bus then lives and dies with this device instead of depending on whether
++ * a DT-referenced master happened to have probed before we did.
++ */
++static int sii9134_ddc_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
++			    int num)
++{
++	struct sii9134 *sii = i2c_get_adapdata(adap);
++	struct i2c_msg *read = NULL;
++	unsigned int segment = 0, offset = 0, done;
++	int i, ret = 0;
++
++	for (i = 0; i < num; i++) {
++		if (msgs[i].flags & I2C_M_RD) {
++			if (read || i != num - 1)
++				return -EOPNOTSUPP;
++			read = &msgs[i];
++			continue;
++		}
++
++		if (read || msgs[i].len != 1)
++			return -EOPNOTSUPP;
++
++		if (msgs[i].addr == DDC_SEGMENT_ADDR)
++			segment = msgs[i].buf[0];
++		else if (msgs[i].addr == DDC_EDID_ADDR >> 1)
++			offset = msgs[i].buf[0];
++		else
++			return -EOPNOTSUPP;
++	}
++
++	if (!read)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&sii->lock);
++
++	/* SCL = oscclk / (delay * 35); 75 kHz */
++	regmap_write(sii->map, MDDC_DELAY_CNT, MDDC_DELAY_75KHZ);
++
++	for (done = 0; done < read->len; ) {
++		/* one transaction is capped by the engine's FIFO depth */
++		unsigned int len = min_t(unsigned int, read->len - done,
++					 MDDC_FIFO_DEPTH);
++
++		ret = sii9134_ddc_read(sii, segment, offset + done,
++				       read->buf + done, len);
++		if (ret)
++			break;
++
++		done += len;
++	}
++
++	/* leave the segment register as found */
++	regmap_write(sii->map, MDDC_SEGMENT_ADDR, 0);
++
++	mutex_unlock(&sii->lock);
++
++	if (ret)
++		return ret;
++
++	return num;
++}
++
++static u32 sii9134_ddc_func(struct i2c_adapter *adap)
++{
++	return I2C_FUNC_I2C;
++}
++
++static const struct i2c_algorithm sii9134_ddc_algorithm = {
++	.master_xfer	= sii9134_ddc_xfer,
++	.functionality	= sii9134_ddc_func,
++};
++
++static int sii9134_ddc_adapter_add(struct sii9134 *sii)
++{
++	struct i2c_adapter *adap;
++	int ret;
++
++	adap = devm_kzalloc_obj(sii->dev, *adap);
++	if (!adap)
++		return -ENOMEM;
++
++	adap->owner = THIS_MODULE;
++	adap->dev.parent = sii->dev;
++	/* lets a connector node point ddc-i2c-bus back at this device */
++	adap->dev.of_node = sii->dev->of_node;
++	adap->algo = &sii9134_ddc_algorithm;
++	strscpy(adap->name, "sii9134 DDC", sizeof(adap->name));
++	i2c_set_adapdata(adap, sii);
++
++	ret = devm_i2c_add_adapter(sii->dev, adap);
++	if (ret)
++		return ret;
++
++	sii->ddc = adap;
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* HPD / detect                                                         */
++/* ------------------------------------------------------------------ */
++
++static enum drm_connector_status sii9134_detect_status(struct sii9134 *sii)
++{
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(sii->map, TX_STAT_ADDR, &val);
++	if (ret)
++		return connector_status_unknown;
++
++	if (val & BIT_HPD_PIN)
++		return connector_status_connected;
++
++	return connector_status_disconnected;
++}
++
++/* ------------------------------------------------------------------ */
++/* drm_bridge_funcs                                                     */
++/* ------------------------------------------------------------------ */
++
++static int sii9134_bridge_attach(struct drm_bridge *bridge,
++				 struct drm_encoder *encoder,
++				 enum drm_bridge_attach_flags flags)
++{
++	if (!(flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR)) {
++		pr_err_once("sii9134: DRM_BRIDGE_ATTACH_NO_CONNECTOR is required\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static enum drm_mode_status
++sii9134_bridge_mode_valid(struct drm_bridge *bridge,
++			  const struct drm_display_info *info,
++			  const struct drm_display_mode *mode)
++{
++	unsigned int max_clock = info->is_hdmi ? SII9134_MAX_TMDSCLOCK :
++						  SII9134_MAX_DVI_CLOCK;
++
++	if (mode->clock < SII9134_MIN_TMDSCLOCK ||
++	    mode->clock > max_clock)
++		return MODE_CLOCK_RANGE;
++
++	return MODE_OK;
++}
++
++static void sii9134_enable_video_output(struct sii9134 *sii, bool enable)
++{
++	unsigned int val;
++
++	regmap_read(sii->map, DATA_CTRL_ADDR, &val);
++	if (enable)
++		regmap_write(sii->map, DATA_CTRL_ADDR,
++			     val & ~BIT_VID_BLANK);
++	else
++		regmap_write(sii->map, DATA_CTRL_ADDR,
++			     val | BIT_VID_BLANK);
++}
++
++
++static void sii9134_hw_init(struct sii9134 *sii)
++{
++	/* Basic bring-up; clocks and resets are handled by the wrapper. */
++	/*
++	 * SiI-PR-0039-F p.123 Table 17: PDTOT#=0 powers down the whole chip,
++	 * PDIDCK#=0 blocks all IDCK-based logic. With any of the four
++	 * power-down bits asserted only part of the register file accepts
++	 * writes (Table 18, and the infoframe EN bits on p.51 additionally
++	 * require a live IDCK). Only bits 3:0 are ours to touch; bit 3 reads 1
++	 * at reset and is left as found.
++	 */
++	sii9134_modify(sii, sii->map1, DIAG_PD_ADDR,
++		       BIT_PDIDCK | BIT_PDOSC | BIT_PDTOT,
++		       BIT_PDIDCK | BIT_PDOSC | BIT_PDTOT);
++
++	/*
++	 * Disable the INT output: it is level and stays asserted while the sink
++	 * holds HPD, so an interrupt-driven connector would storm. The DRM core
++	 * polls the detect callback instead.
++	 */
++	regmap_write(sii->map, INT_CNTRL_ADDR, 0x00);
++
++	/* master DDC bus timing */
++	regmap_write(sii->map, MDDC_DELAY_CNT, MDDC_DELAY_75KHZ);
++
++	/*
++	 * The encoder sits either in the SiI controller or in the PHY; the glue
++	 * says which, because clearing TEST_TX.DVI_ENC_BYPASS in the wrong
++	 * place takes the link down.
++	 */
++	if (sii->phy->dvi_enc_in_ctrl)
++		sii9134_modify(sii, sii->map1, TEST_TX_ADDR,
++			       BIT_DVI_ENC_BYPASS, 0);
++
++	/* 24-bit input bus, power up */
++	sii9134_modify(sii, sii->map, TX_SYS_CTRL1_ADDR,
++		       BIT_TX_PD | BIT_BSEL24BITS,
++		       BIT_TX_PD | BIT_BSEL24BITS);
++
++	/* internal MCLK generator + N/CTS packet generation */
++	regmap_write(sii->map1, ACR_CTRL_ADDR,
++		     ACR_CTRL_N_CTS_ENABLE | ACR_CTRL_INTERNAL_MCLK);
++	regmap_write(sii->map1, FREQ_SVAL_ADDR, 0x01);
++	/* default N for 48kHz; recomputed on audio hw_params */
++	regmap_write(sii->map1, N_SVAL_ADDR + 0, 6144 & 0xff);
++	regmap_write(sii->map1, N_SVAL_ADDR + 4, (6144 >> 8) & 0xff);
++	regmap_write(sii->map1, N_SVAL_ADDR + 8, (6144 >> 16) & 0xff);
++
++	/* audio/video output: keep blanked and muted until enabled */
++	regmap_update_bits(sii->map, DATA_CTRL_ADDR,
++			   BIT_VID_BLANK | BIT_AUD_MUTE,
++			   BIT_VID_BLANK | BIT_AUD_MUTE);
++
++	/*
++	 * enable the HPD interrupt only: RSEN and the audio error sources
++	 * re-latch continuously while no TMDS input clock is running
++	 */
++	regmap_update_bits(sii->map, HDMI_INT_MASK_ADDR,
++			   BIT_INT_HOT_PLUG, BIT_INT_HOT_PLUG);
++	/* write 1 to clear everything latched while we were coming up */
++	regmap_write(sii->map, HDMI_INT1_ADDR, 0xff);
++}
++
++static void
++sii9134_bridge_atomic_enable(struct drm_bridge *bridge,
++			     struct drm_atomic_commit *state)
++{
++	struct sii9134 *sii = bridge_to_sii9134(bridge);
++	struct drm_connector *connector;
++	struct drm_connector_state *conn_state;
++	struct drm_crtc_state *crtc_state;
++	const struct drm_display_mode *mode;
++	u8 hdmi_vic;
++	unsigned int val;
++	bool hdmi_sink, interlaced;
++	int i;
++	int ret;
++
++	connector = drm_atomic_get_new_connector_for_encoder(state,
++							     bridge->encoder);
++	if (WARN_ON(!connector))
++		return;
++
++	conn_state = drm_atomic_get_new_connector_state(state, connector);
++	if (WARN_ON(!conn_state))
++		return;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, conn_state->crtc);
++	if (WARN_ON(!crtc_state))
++		return;
++
++	mode = &crtc_state->adjusted_mode;
++	hdmi_vic = sii9134_hdmi_4k_vic(drm_match_cea_mode(mode));
++
++	dev_dbg(sii->dev, "enable: enter %dx%d format %s\n",
++		mode->hdisplay, mode->vdisplay,
++		drm_hdmi_connector_get_output_format_name(
++			conn_state->hdmi.output_format));
++
++	mutex_lock(&sii->lock);
++
++	/* cache for the hdmi-codec ELD / plug-status callbacks */
++	sii->connector = connector;
++
++	/*
++	 * What the sink's EDID says it is: a DVI panel gets no HDMI-only
++	 * packets and no YCbCr on the link. The DVI recipe is
++	 * AUDP_TXCTRL.hdmi_mode cleared, the AVI and audio infoframes off, and
++	 * the link output forced to RGB444.
++	 */
++	hdmi_sink = connector->display_info.is_hdmi;
++	sii->hdmi_sink = hdmi_sink;
++	/*
++	 * The colour-format negotiation the connector ran picked the link
++	 * format (the "color format" property is the userspace knob); on a DVI
++	 * sink the core forces RGB regardless.  Every format this part carries
++	 * goes out as the transmitter's bypass: the channel hands over RGB or
++	 * YCbCr 4:4:4 (see the video-input comment below) and none of the
++	 * converter, the down-sampler or the CLIP_CS_ID declaration belongs to
++	 * either path.
++	 */
++
++	/*
++	 * The TMDS clock class decides the audio N value (4K formats use their
++	 * own table), and the mode may change while a stream is up, so record
++	 * it here for whichever side comes asking last.
++	 */
++	sii->video_4k = hdmi_vic != 0;
++
++	/*
++	 * Reset first, program everything afterwards: the soft reset puts the
++	 * TPI register file back to its reset defaults (TX_SYS_CTRL1 reads 0x00
++	 * after the pulse), so a DE generator enable written before it is
++	 * wiped -- with DE off the TX waits for an input DE the DHD HDMI bus
++	 * never sends, and no picture reaches the sink.
++	 */
++
++	/*
++	 * wait for the input pixel clock before resetting (50 ms timeout, reset
++	 * anyway)
++	 */
++	for (i = 0; i < 50; i++) {
++		regmap_read(sii->map, TX_STAT_ADDR, &val);
++		if (val & BIT_HDMI_MODE)
++			break;
++		usleep_range(1000, 2000);
++	}
++
++	/* software reset of the TMDS/AV state machines */
++	regmap_write(sii->map, TX_SWRST_ADDR,
++		     BIT_TX_SW_RST | BIT_TX_FIFO_RST);
++	usleep_range(1000, 2000);
++	regmap_write(sii->map, TX_SWRST_ADDR, 0);
++	usleep_range(1000, 2000);
++
++	/*
++	 * The soft reset clears TX_SYS_CTRL1 to its powered-down default; wake
++	 * the TX again. The TMDS PLL and the HPD/TPI status bits live behind
++	 * this power switch.
++	 */
++	sii9134_modify(sii, sii->map, TX_SYS_CTRL1_ADDR,
++		       BIT_TX_PD | BIT_BSEL24BITS,
++		       BIT_TX_PD | BIT_BSEL24BITS);
++
++	/*
++	 * Which clock edge carries the pixel bus. The bit resets to 1, and
++	 * Hi3716CV200's own transmitter runs with it clear: measured there while
++	 * it was displaying, TX_SYS_CTRL1 = 0x35 against this driver's 0x37. A
++	 * mismatched sample edge is invisible to every other status bit -- the
++	 * TMDS PLL locks, the channel counts frames, video is unblanked -- and
++	 * still leaves the sink with blank data, so the edge belongs to the PHY
++	 * contract the glue supplies rather than something this core can infer.
++	 */
++	if (sii->phy->edge_falling)
++		sii9134_modify(sii, sii->map, TX_SYS_CTRL1_ADDR,
++			       BIT_TX_CLOCK_RISING_EDGE, 0);
++
++	/*
++	 * HDMI mode on the link; a DVI sink stays in the encoder's DVI mode.
++	 * The same register's [5:3] is the packet mode: the SDK's table says
++	 * 0b100 = 24 bits, which is what
++	 * SI_SetDeepColor() writes for the non-deep-colour case, and a
++	 * displaying Hi3716CV200 carries it (0x21). The reset value 0 is not
++	 * one of the encodings, so it is programmed here rather than left to
++	 * whatever the boot set.
++	 */
++	sii9134_modify(sii, sii->map1, AUDP_TXCTRL_ADDR,
++		       BIT_TXHDMI_MODE | AUDP_PACKET_MODE,
++		       (hdmi_sink ? BIT_TXHDMI_MODE : 0) | AUDP_PACKET_24BIT);
++
++	/*
++	 * Video input: the display channel hands the transmitter either RGB or
++	 * YCbCr 4:4:4 -- the negotiated output format decides which (the VDP
++	 * driver picks the DHD data type and its GP0 CSC stage from the same
++	 * connector state).  Either way the link carries exactly what the pins
++	 * carry: the converter, the down-sampler and the CLIP_CS_ID
++	 * declaration all stay clear.  (The link used to run YCbCr 4:2:2 out
++	 * of the transmitter's own converter; the colour-format negotiation
++	 * made the straight-through shape reachable, and the vendor's own
++	 * displaying pipeline runs the same bypass -- the boot-state
++	 * groundtruth carries TX_VID_MODE 0x20, dither only, at a channel
++	 * whose hdmi_mode is 0.)
++	 *
++	 * The demux/422to444/CSC bits of TX_VID_MODE belong to the opposite
++	 * (YCbCr in, RGB out) direction and must stay clear: with DeMux set the
++	 * chroma collapses to one value and red and blue both read back as
++	 * green.
++	 */
++	/*
++	 * Input bus width: the VDP's HDMI bus carries 12 bits per channel, so
++	 * VID_IN_MODE[2:1] is programmed for a 12-bit input. The soft reset
++	 * above clears the field back to its default, and with the wrong width
++	 * the sink keeps sync but no pixel data arrives.
++	 *
++	 * Bits [7:6] of the same register are the wide-bus code (00 = 24 bits,
++	 * 01 = 30, 10 = 36) and stay 00: only the deep-colour path writes them
++	 * non-zero, so the link runs 8 bits per channel end to end.
++	 */
++	regmap_update_bits(sii->map, TX_VID_IN_MODE_ADDR, 0x06, 0x06);
++
++	/*
++	 * With dithering on, the dither block is programmed to 0x0e
++	 * (D_RC_EN | D_GC_EN | D_BC_EN) for the 24-bit case. The formats that
++	 * leave the block and its enable alone are the analog SD pixel-repeat
++	 * ones, which need a 27MHz row clock this link does not generate, so
++	 * every mode accepted here is in the 0x0e class.
++	 *
++	 * The address used to be 0x158 ("reg 0x56"), which is not the dither
++	 * block: the vendor's register header says TX_VID_DITHER is reg 0x4f,
++	 * and a displaying Hi3716CV200 carries 0x0e at 0x4f and 0 at 0x56.
++	 */
++	regmap_write(sii->map, TX_VID_MODE_ADDR, TX_VID_MODE_DITHER);
++	regmap_write(sii->map, TX_VID_DITHER_ADDR, TX_VID_DITHER_24BIT);
++
++	/*
++	 * The converter, the down-sampler and the CLIP_CS_ID declaration stay
++	 * clear on every path: a DVI sink gets the channel's RGB straight onto
++	 * the link, and on an HDMI sink the format the negotiation picked is
++	 * already what the pins carry, so there is nothing left to convert.
++	 */
++	sii9134_modify(sii, sii->map, TX_VID_ACEN_ADDR,
++		       TX_VID_ACEN_RGB2YCBCR | TX_VID_ACEN_DWN_SAMPLE |
++		       TX_VID_ACEN_CLIP_CS, 0);
++
++	/*
++	 * Video timing: the DHD HDMI bus carries no DE signal, so the DE
++	 * generator stays off (0x72:0x33 keeps its reset default) and the
++	 * sync-derived window is programmed instead.
++	 */
++	/*
++	 * IADJUST bit2:0 keep their reset values (DE_ADJ#=1, datasheet p.14):
++	 * use a read-modify-write here.
++	 */
++	sii9134_modify(sii, sii->map, TX656_ADJ_MODE_ADDR, 0, 0);
++	/*
++	 * In interlaced modes the transmitter counts fields, so the vertical
++	 * totals are halved (for 1080i that is vtotal 562 and v front porch 2),
++	 * and FIELD2_HSYNC_OFFSET shifts the second field by half a line (1100
++	 * of a 2200 pixel line).
++	 */
++	interlaced = mode->flags & DRM_MODE_FLAG_INTERLACE;
++	sii9134_write_word(sii, sii->map, TX656_HTOT_ADDR, mode->htotal);
++	sii9134_write_word(sii, sii->map, TX656_VTOT_ADDR,
++			   interlaced ? mode->vtotal / 2 : mode->vtotal);
++	sii9134_write_word(sii, sii->map, TX656_HBIT2HSYNC_ADDR,
++			   mode->hsync_start - mode->hdisplay);
++	sii9134_write_word(sii, sii->map, TX656_FIELD2_ADDR,
++			   interlaced ? mode->htotal / 2 : 0);
++	sii9134_write_word(sii, sii->map, TX656_HLENGTH_ADDR,
++			   mode->hsync_end - mode->hsync_start);
++	if (interlaced)
++		regmap_write(sii->map, TX656_VBIT_ADDR,
++			     (mode->vsync_start - mode->vdisplay) / 2);
++	else
++		regmap_write(sii->map, TX656_VBIT_ADDR,
++			     mode->vsync_start - mode->vdisplay);
++	regmap_write(sii->map, TX656_VLENGTH_ADDR,
++		     mode->vsync_end - mode->vsync_start);
++
++	{
++		unsigned int c1, st, de, vim;
++
++		regmap_read(sii->map, TX_SYS_CTRL1_ADDR, &c1);
++		regmap_read(sii->map, TX_STAT_ADDR, &st);
++		regmap_read(sii->map, DE_CNTRL_ADDR, &de);
++		regmap_read(sii->map, TX_VID_IN_MODE_ADDR, &vim);
++		dev_dbg(sii->dev,
++			"enable: after-config ctrl1=%02x stat=%02x de=%02x vim=%02x\n",
++			c1, st, de, vim);
++	}
++
++	/*
++	 * set the PHY output swing for this TMDS clock rate, then enable the
++	 * PHY output (TMDS on)
++	 */
++	sii->phy->swing(sii, mode->clock);
++	sii->phy->power(sii, true);
++
++	/*
++	 * Packets are only accepted once TMDS is stable: wait for the TMDS
++	 * clock PLL to lock before writing the AVI infoframe.
++	 */
++	for (i = 0; i < 100; i++) {
++		regmap_read(sii->map, TX_STAT_ADDR, &val);
++		if (val & BIT_HDMI_MODE)
++			break;
++		mdelay(1);
++	}
++	if (i == 100) {
++		unsigned int hres, vres;
++
++		sii9134_read_word(sii, sii->map, MEAS_HRES_ADDR, &hres);
++		sii9134_read_word(sii, sii->map, MEAS_VRES_ADDR, &vres);
++		/* nonzero counters prove IDCK and H/VSYNC reach the encoder */
++		dev_warn(sii->dev,
++			 "TMDS clock not stable (stat=%02x hres=%u vres=%u), sending AVI "
++			 "infoframe anyway\n",
++			 val, hres & 0x1fff, vres & 0x7ff);
++	}
++
++	/*
++	 * Infoframes: the connector's HDMI machinery generated the AVI from
++	 * the negotiated output format (its declaration matches what the link
++	 * carries by construction), and update_infoframes() pushes it through
++	 * the bridge's write callback below.  The HDMI-VSDB vendor packet the
++	 * 4K formats need still goes out from here: the TPI's vendor slot on
++	 * this part is written with the register sequence in
++	 * sii9134_send_vsdb(), not with the generic vendor infoframe path.
++	 *
++	 * A DVI panel gets no HDMI-only packets.
++	 */
++	if (hdmi_sink) {
++		ret = drm_atomic_helper_connector_hdmi_update_infoframes(
++			connector, state);
++		if (ret)
++			dev_err(sii->dev, "failed to update infoframes: %d\n",
++				ret);
++
++		sii9134_send_vsdb(sii, hdmi_vic);
++	} else {
++		sii9134_disable_infoframe(sii, BIT_AVI_ENABLE | BIT_AVI_REPEAT);
++		sii9134_disable_infoframe(sii, BIT_VSDB_ENABLE | BIT_VSDB_REPEAT);
++	}
++
++	/* re-derive the audio N value for this mode's TMDS clock class */
++	if (sii->audio_fs_code >= 0)
++		sii9134_write_n_value(sii, sii->audio_fs_code, sii->video_4k);
++
++	/* unblank video */
++	sii9134_enable_video_output(sii, true);
++
++	/* release the sink from any AVMUTE left over from before */
++	sii9134_clear_avmute(sii);
++
++
++	mutex_unlock(&sii->lock);
++}
++
++static void
++sii9134_bridge_atomic_disable(struct drm_bridge *bridge,
++			      struct drm_atomic_commit *state)
++{
++	struct sii9134 *sii = bridge_to_sii9134(bridge);
++
++	mutex_lock(&sii->lock);
++
++	/*
++	 * The cached connector is only valid while the pipeline is up: the DRM
++	 * core frees it when the device goes away, which happens on an
++	 * aggregate unbind without this device ever disappearing.
++	 */
++	sii->connector = NULL;
++
++	sii9134_enable_video_output(sii, false);
++
++	/* mute audio and blank video */
++	regmap_update_bits(sii->map, DATA_CTRL_ADDR,
++			   BIT_VID_BLANK | BIT_AUD_MUTE,
++			   BIT_VID_BLANK | BIT_AUD_MUTE);
++
++	/* disable infoframes */
++	sii9134_disable_infoframe(sii, BIT_AVI_ENABLE | BIT_AVI_REPEAT);
++	sii9134_disable_infoframe(sii, BIT_AUD_ENABLE | BIT_AUD_REPEAT);
++	sii9134_disable_infoframe(sii, BIT_VSDB_ENABLE | BIT_VSDB_REPEAT);
++
++	/* TMDS off */
++	sii->phy->power(sii, false);
++
++	mutex_unlock(&sii->lock);
++}
++
++static enum drm_connector_status
++sii9134_bridge_detect(struct drm_bridge *bridge,
++		      struct drm_connector *connector)
++{
++	struct sii9134 *sii = bridge_to_sii9134(bridge);
++	enum drm_connector_status status;
++
++	status = sii9134_detect_status(sii);
++	/* also the visible trace of the connector poll work */
++	dev_dbg(sii->dev, "detect: %s\n",
++		status == connector_status_connected ? "connected" :
++						       "disconnected");
++
++	return status;
++}
++
++static const struct drm_edid *
++sii9134_bridge_edid_read(struct drm_bridge *bridge,
++			 struct drm_connector *connector)
++{
++	struct sii9134 *sii = bridge_to_sii9134(bridge);
++
++	/*
++	 * Reading through the core, rather than pulling bytes into our own
++	 * buffer, is what lets drm.edid_firmware and the connector's debugfs
++	 * edid_override stand in for the DDC read, and gives us the core's
++	 * per-block validation and retry.
++	 */
++	return drm_edid_read_ddc(connector, sii->ddc);
++}
++
++/*
++ * Infoframe plumbing for the connector's HDMI machinery.  The AVI is packed
++ * by the core from the negotiated output format and arrives with the CTA
++ * header on; this hardware's packet buffers take the payload without it, the
++ * same four bytes the hand-rolled path used to shave off.  The HDMI vendor
++ * callbacks are required by the bridge connector but this part's 4K VSDB is
++ * written with its own register sequence from atomic_enable, so they are
++ * graceful no-ops: the core only calls them when it generated a vendor frame
++ * itself, and nothing the sink needs is in them on this transmitter.
++ */
++static int sii9134_bridge_hdmi_clear_avi_infoframe(struct drm_bridge *bridge)
++{
++	struct sii9134 *sii = bridge_to_sii9134(bridge);
++
++	if (!sii->hdmi_sink)
++		return 0;
++
++	return sii9134_disable_infoframe(sii, BIT_AVI_ENABLE | BIT_AVI_REPEAT);
++}
++
++static int sii9134_bridge_hdmi_write_avi_infoframe(struct drm_bridge *bridge,
++						   const u8 *buffer, size_t len)
++{
++	struct sii9134 *sii = bridge_to_sii9134(bridge);
++
++	if (!sii->hdmi_sink || len < 4)
++		return 0;
++
++	return sii9134_send_infoframe(sii, AVI_IF_ADDR,
++				      BIT_AVI_ENABLE | BIT_AVI_REPEAT,
++				      buffer, len - 4);
++}
++
++static int sii9134_bridge_hdmi_clear_hdmi_infoframe(struct drm_bridge *bridge)
++{
++	return 0;
++}
++
++static int sii9134_bridge_hdmi_write_hdmi_infoframe(struct drm_bridge *bridge,
++						    const u8 *buffer, size_t len)
++{
++	return 0;
++}
++
++const struct drm_bridge_funcs sii9134_bridge_funcs = {
++	.attach			= sii9134_bridge_attach,
++	.mode_valid		= sii9134_bridge_mode_valid,
++	.atomic_enable		= sii9134_bridge_atomic_enable,
++	.atomic_disable		= sii9134_bridge_atomic_disable,
++	.detect			= sii9134_bridge_detect,
++	.edid_read		= sii9134_bridge_edid_read,
++	.hdmi_clear_avi_infoframe = sii9134_bridge_hdmi_clear_avi_infoframe,
++	.hdmi_write_avi_infoframe = sii9134_bridge_hdmi_write_avi_infoframe,
++	.hdmi_clear_hdmi_infoframe = sii9134_bridge_hdmi_clear_hdmi_infoframe,
++	.hdmi_write_hdmi_infoframe = sii9134_bridge_hdmi_write_hdmi_infoframe,
++	.atomic_duplicate_state	= drm_atomic_helper_bridge_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_bridge_destroy_state,
++	.atomic_create_state	= drm_atomic_helper_bridge_create_state,
++};
++
++/* ------------------------------------------------------------------ */
++/* Audio: hdmi-audio-codec platform device                              */
++/* ------------------------------------------------------------------ */
++
++/*
++ * I2S wiring between the AIAO block and the HDMI TX IP is fixed in the
++ * SoC (AIAO I2S TX SD0..3 -> HDMI I2S SD0..3, plus WS/SCK/MCLK).
++ * The registers of that path are:
++ *   0x7A:0x14 AUD_MODE   - enable SD0 (stereo) or SD0..3 (multichannel)
++ *   0x7A:0x1D I2S_IN_CTRL- 0x40: sample on rising SCK edge
++ *   0x7A:0x24 I2S_IN_LEN - input sample length code
++ *   0x7A:0x21..22 CHST   - channel status Fs / length
++ *   0x7A:0x01..05 ACR    - N value + N/CTS packet generation
++ */
++static int sii9134_audio_fs_code(unsigned int rate)
++{
++	switch (rate) {
++	case 32000:
++		return 0x03;
++	case 44100:
++		return 0x00;
++	case 48000:
++		return 0x02;
++	case 88200:
++		return 0x08;
++	case 96000:
++		return 0x0a;
++	case 176400:
++		return 0x0c;
++	case 192000:
++		return 0x0e;
++	default:
++		return -EINVAL;
++	}
++}
++
++/* input sample length code */
++static u8 sii9134_audio_len_code(unsigned int sample_width)
++{
++	switch (sample_width) {
++	case 16:
++		return 0x02;
++	case 18:
++		return 0x04;
++	case 20:
++		return 0x0a;
++	case 22:
++		return 0x05;
++	case 24:
++		return 0x0b;
++	default:
++		return 0x02;
++	}
++}
++
++static int sii9134_audio_startup(struct device *dev, void *data)
++{
++	struct sii9134 *sii = data;
++
++	mutex_lock(&sii->lock);
++
++	/* flush the audio FIFO */
++	regmap_write(sii->map, TX_SWRST_ADDR, BIT_TX_FIFO_RST);
++	regmap_write(sii->map, TX_SWRST_ADDR, 0);
++
++	/* N/CTS packet generation on */
++	sii9134_modify(sii, sii->map1, ACR_CTRL_ADDR,
++		       ACR_CTRL_N_CTS_ENABLE | ACR_CTRL_INTERNAL_MCLK,
++		       ACR_CTRL_N_CTS_ENABLE | ACR_CTRL_INTERNAL_MCLK);
++
++	mutex_unlock(&sii->lock);
++
++	return 0;
++}
++
++static void sii9134_audio_shutdown(struct device *dev, void *data)
++{
++	struct sii9134 *sii = data;
++
++	mutex_lock(&sii->lock);
++
++	/* mute audio output */
++	sii9134_modify(sii, sii->map, DATA_CTRL_ADDR, BIT_AUD_MUTE,
++		       BIT_AUD_MUTE);
++
++	/* disable I2S input */
++	sii9134_modify(sii, sii->map1, AUD_MODE_ADDR, BIT_AUDIO_EN, 0);
++	sii9134_disable_infoframe(sii, BIT_AUD_ENABLE | BIT_AUD_REPEAT);
++
++	/* flush the audio FIFO */
++	regmap_write(sii->map, TX_SWRST_ADDR, BIT_TX_FIFO_RST);
++	regmap_write(sii->map, TX_SWRST_ADDR, 0);
++
++	mutex_unlock(&sii->lock);
++}
++
++static int sii9134_audio_hw_params(struct device *dev, void *data,
++				   struct hdmi_codec_daifmt *fmt,
++				   struct hdmi_codec_params *hparms)
++{
++	struct sii9134 *sii = data;
++	struct hdmi_audio_infoframe frame;
++	u8 buf[14];
++	u8 len_code;
++	u8 ctrl_bits;
++	unsigned int val;
++	int fs_code;
++	int ret;
++
++	fs_code = sii9134_audio_fs_code(hparms->sample_rate);
++	if (fs_code < 0) {
++		dev_err(dev, "unsupported sample rate %d\n",
++			hparms->sample_rate);
++		return fs_code;
++	}
++
++	if (hparms->channels < 1 ||
++	    hparms->channels > SII9134_MAX_AUDIO_CHANNELS) {
++		dev_err(dev, "unsupported channel count %d\n",
++			hparms->channels);
++		return -EINVAL;
++	}
++
++	if (fmt->fmt != HDMI_I2S) {
++		dev_err(dev, "unsupported DAI format %d\n", fmt->fmt);
++		return -EINVAL;
++	}
++
++	len_code = sii9134_audio_len_code(hparms->sample_width);
++
++	mutex_lock(&sii->lock);
++
++	/*
++	 * A DVI sink has no audio on the link: stay muted and announce no audio
++	 * packet.
++	 */
++	if (!sii->hdmi_sink) {
++		ret = 0;
++		goto out;
++	}
++
++	/* N value for the current Fs and the video format on the link */
++	sii->audio_fs_code = fs_code;
++	sii9134_write_n_value(sii, fs_code, sii->video_4k);
++
++	/* channel status: PCM, Fs + length */
++	regmap_write(sii->map1, I2S_CHST0_ADDR, 0x00);
++	regmap_write(sii->map1, I2S_CHST1_ADDR, 0x00);
++	regmap_write(sii->map1, I2S_CHST2_ADDR, 0x00);
++	regmap_write(sii->map1, I2S_CHST4_ADDR, fs_code);
++	regmap_write(sii->map1, I2S_CHST5_ADDR,
++		     len_code | ((fs_code & 0x0f) << 4));
++
++	/* I2S input: sample on rising SCK, uncompressed */
++	regmap_write(sii->map1, I2S_IN_CTRL_ADDR, I2S_SCK_RISING);
++	regmap_write(sii->map1, I2S_IN_LEN, len_code);
++
++	/* I2S input mapping: SD0 only for stereo, SD0..3 for >2 ch */
++	ctrl_bits = BIT_AUDIO_EN;
++	regmap_read(sii->map1, AUD_MODE_ADDR, &val);
++	val &= ~(BIT_SPDIF_SELECT | BIT_DSD_SELECT | SD_0_3_EN);
++	if (hparms->channels > 2) {
++		val |= SD_0_3_EN;
++		ctrl_bits |= BIT_LAYOUT1;
++	} else {
++		val |= SD_0;
++	}
++	regmap_write(sii->map1, AUD_MODE_ADDR, val);
++	regmap_update_bits(sii->map1, AUDP_TXCTRL_ADDR, BIT_LAYOUT1,
++			   ctrl_bits & BIT_LAYOUT1);
++
++	usleep_range(1000, 2000);
++
++	/*
++	 * Audio infoframe: start from the frame hdmi-codec already filled in
++	 * (hparms->cea carries the channel allocation etc., cf. sii902x.c) and
++	 * only adjust what the hardware needs.
++	 */
++	frame = hparms->cea;
++
++	ret = hdmi_audio_infoframe_pack(&frame, buf, sizeof(buf));
++	if (ret < 0) {
++		dev_err(dev, "failed to pack audio infoframe: %d\n", ret);
++		goto out;
++	}
++
++	ret = sii9134_send_infoframe(sii, AUD_IF_ADDR,
++				     BIT_AUD_ENABLE | BIT_AUD_REPEAT,
++				     buf, ret - 4);
++	if (ret) {
++		dev_err(dev, "failed to send audio infoframe\n");
++		goto out;
++	}
++
++	/* unmute */
++	sii9134_modify(sii, sii->map1, AUD_MODE_ADDR, BIT_AUDIO_EN,
++		       BIT_AUDIO_EN);
++	sii9134_modify(sii, sii->map, DATA_CTRL_ADDR, BIT_AUD_MUTE, 0);
++
++out:
++	mutex_unlock(&sii->lock);
++	return ret;
++}
++
++static int sii9134_audio_mute(struct device *dev, void *data, bool mute,
++			      int direction)
++{
++	struct sii9134 *sii = data;
++
++	mutex_lock(&sii->lock);
++	sii9134_modify(sii, sii->map, DATA_CTRL_ADDR, BIT_AUD_MUTE,
++		       mute ? BIT_AUD_MUTE : 0);
++	mutex_unlock(&sii->lock);
++
++	return 0;
++}
++
++static int sii9134_audio_get_eld(struct device *dev, void *data,
++				 u8 *buf, size_t len)
++{
++	struct sii9134 *sii = data;
++	struct drm_connector *connector;
++
++	/*
++	 * The display/DRM-master side creates the connector via
++	 * drm_bridge_connector_init(); we cache it while the pipeline is
++	 * enabled and copy the ELD the DRM core computed from the EDID. A
++	 * zeroed buffer means "no ELD available", which the ASoC side treats as
++	 * "sink unknown" and keeps the audio path functional.
++	 */
++	mutex_lock(&sii->lock);
++	connector = sii->connector;
++	mutex_unlock(&sii->lock);
++
++	memset(buf, 0, len);
++	if (connector && connector->eld[0]) {
++		len = min(len, sizeof(connector->eld));
++		memcpy(buf, connector->eld, len);
++	}
++
++	return 0;
++}
++
++static int sii9134_audio_hook_plugged_cb(struct device *dev, void *data,
++					 hdmi_codec_plugged_cb fn,
++					 struct device *codec_dev)
++{
++	struct sii9134 *sii = data;
++	bool plugged;
++
++	mutex_lock(&sii->lock);
++	sii->plugged_cb = fn;
++	sii->codec_dev = codec_dev;
++	plugged = sii->connector &&
++		  sii->connector->status == connector_status_connected;
++	mutex_unlock(&sii->lock);
++
++	/* report the current status, like dw-hdmi does */
++	if (fn)
++		fn(codec_dev, plugged);
++
++	return 0;
++}
++
++static const struct hdmi_codec_ops sii9134_audio_codec_ops = {
++	.audio_startup		= sii9134_audio_startup,
++	.hw_params		= sii9134_audio_hw_params,
++	.audio_shutdown		= sii9134_audio_shutdown,
++	.mute_stream		= sii9134_audio_mute,
++	.get_eld		= sii9134_audio_get_eld,
++	.hook_plugged_cb	= sii9134_audio_hook_plugged_cb,
++};
++
++static int sii9134_audio_codec_init(struct sii9134 *sii, struct device *dev)
++{
++	struct hdmi_codec_pdata codec_data = {
++		.ops = &sii9134_audio_codec_ops,
++		.i2s = 1,
++		.spdif = 0,
++		.max_i2s_channels = SII9134_MAX_AUDIO_CHANNELS,
++		.no_capture_mute = 1,
++		.data = sii,
++	};
++
++	if (!of_property_present(dev->of_node, "#sound-dai-cells")) {
++		dev_dbg(dev, "no #sound-dai-cells, audio disabled\n");
++		return 0;
++	}
++
++	sii->audio_pdev = platform_device_register_data(dev,
++							HDMI_CODEC_DRV_NAME,
++							PLATFORM_DEVID_AUTO,
++							&codec_data,
++							sizeof(codec_data));
++	if (IS_ERR(sii->audio_pdev))
++		return PTR_ERR(sii->audio_pdev);
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Probe / remove                                                       */
++/* ------------------------------------------------------------------ */
++
++int sii9134_probe(struct sii9134 *sii9134, int irq)
++{
++	struct device *dev = sii9134->dev;
++	int ret;
++
++	if (IS_ERR_OR_NULL(sii9134->map) || IS_ERR_OR_NULL(sii9134->map1) ||
++	    IS_ERR_OR_NULL(sii9134->map_phy) || !sii9134->phy)
++		return -EINVAL;
++
++	mutex_init(&sii9134->lock);
++	sii9134->irq = irq;
++	sii9134->audio_fs_code = -1;
++	sii9134->hdmi_sink = true;
++
++	/* the transmitter's own DDC master, exposed as an I2C bus */
++	ret = sii9134_ddc_adapter_add(sii9134);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to add DDC adapter\n");
++		return ret;
++	}
++
++	/*
++	 * The PHY is configured while the controller is still held in reset,
++	 * and the controller's own bring-up only starts once it is released.
++	 */
++	if (sii9134->reset_hold)
++		sii9134->reset_hold(sii9134);
++	sii9134->phy->init(sii9134);
++	if (sii9134->reset_release)
++		sii9134->reset_release(sii9134);
++	sii9134_hw_init(sii9134);
++
++	sii9134->bridge.of_node = dev->of_node;
++	/*
++	 * DRM_BRIDGE_OP_HDMI turns the connector the master builds into an
++	 * HDMI connector: the "color format" property becomes the userspace
++	 * knob for RGB vs YCbCr, the core validates the request against the
++	 * sink's EDID and this bitmask, and the AVI infoframe is generated to
++	 * match the negotiation.  The transmitter's bypass carries RGB and
++	 * YCbCr 4:4:4 alike; 4:2:2 and 4:2:0 are not advertised because this
++	 * generation has neither a DHD 4:2:2 producer nor an HDMI 2.0 4:2:0
++	 * path.
++	 */
++	sii9134->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID |
++			      DRM_BRIDGE_OP_HDMI;
++	sii9134->bridge.supported_formats =
++		BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444) |
++		BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444);
++	sii9134->bridge.vendor = "SII";
++	sii9134->bridge.product = "SiI9134";
++	/*
++	 * drm_bridge_connector_init() rejects chains whose last bridge has no
++	 * connector type
++	 */
++	sii9134->bridge.type = DRM_MODE_CONNECTOR_HDMIA;
++	/*
++	 * drm_bridge_connector_init() drops every interlaced mode unless each
++	 * bridge in the chain declares the capability, and the TPI does count
++	 * fields itself (see the FIELD2_HSYNC_OFFSET write).
++	 */
++	sii9134->bridge.interlace_allowed = true;
++
++	ret = sii9134_audio_codec_init(sii9134, dev);
++	if (ret) {
++		dev_err_probe(dev, ret,
++			      "failed to register audio codec\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++/*
++ * The bridge becomes visible to DRM when the aggregate that owns the pipeline
++ * binds, and disappears with it: while the master is bound the bridge may be
++ * attached to, and while it is not, nothing may reach it. Registering from
++ * probe instead would keep a bridge that no DRM device owns on the global list
++ * for the whole lifetime of the platform device.
++ */
++void sii9134_bridge_add(struct sii9134 *sii9134)
++{
++	drm_bridge_add(&sii9134->bridge);
++}
++
++void sii9134_bridge_remove(struct sii9134 *sii9134)
++{
++	drm_bridge_remove(&sii9134->bridge);
++}
++
++void sii9134_remove(struct sii9134 *sii9134)
++{
++	/*
++	 * sii9134_bridge_remove() has already run from the component unbind,
++	 * and the DDC adapter goes with devm; the audio codec pdev must go away
++	 * first so no audio callback can reach us while the bridge is being
++	 * torn down.
++	 */
++	if (sii9134->audio_pdev)
++		platform_device_unregister(sii9134->audio_pdev);
++
++	sii9134->phy->power(sii9134, false);
++}
+--- /dev/null
++++ b/drivers/gpu/drm/bridge/sii9134.h
+@@ -0,0 +1,150 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (c) 2023 David Yang
++ *
++ * Silicon Image SiI9134 HDMI 1.4 transmitter core.
++ */
++
++#ifndef __SII9134_H__
++#define __SII9134_H__
++
++#include <linux/mutex.h>
++
++#include <drm/drm_bridge.h>
++#include <sound/hdmi-codec.h>
++
++struct sii9134;
++struct device;
++struct drm_bridge;
++struct drm_bridge_funcs;
++
++extern const struct drm_bridge_funcs sii9134_bridge_funcs;
++struct drm_connector;
++struct i2c_adapter;
++struct platform_device;
++struct regmap;
++
++/**
++ * struct sii9134_phy_ops - PHY programming supplied by the SoC glue
++ *
++ * The TMDS PHY is not part of the SiI9134 register set this core drives: the
++ * integrations it is used in wire a separate 32-bit register window to it,
++ * whose bring-up values and swing table are per SoC and appear in no SiI
++ * datasheet.
++ *
++ * @init:	program the PHY once, before the first mode set
++ * @power:	TMDS output on (@true) or off (@false)
++ * @swing:	select the output drive strength for a TMDS clock in kHz
++ * @dvi_enc_in_ctrl:	the DVI/TMDS encoder lives in the SiI controller rather
++ *			than in the PHY, so the core has to clear
++ *			TEST_TX.DVI_ENC_BYPASS. Measured on hi3798mv100, where the
++ *			link only comes up with it cleared; hi3716cv200 needs the
++ *			opposite, its SDK has no writer of TEST_TX at all and the
++ *			part runs with the bit set. For another part: check its HDMI
++ *			Tx chapter for which side owns TEST_TX.
++ * @edge_falling:	sample the incoming pixel bus on the falling clock edge,
++ *			i.e. leave TX_SYS_CTRL1.clock_rising_edge clear. The bit
++ *			resets to 1, so a bring-up that never touches it samples on
++ *			the rising edge.
++ */
++struct sii9134_phy_ops {
++	void (*init)(struct sii9134 *sii);
++	void (*power)(struct sii9134 *sii, bool on);
++	void (*swing)(struct sii9134 *sii, unsigned int tmds_khz);
++	bool dvi_enc_in_ctrl;
++	bool edge_falling;
++};
++
++/**
++ * struct sii9134 - SiI9134 HDMI transmitter core
++ *
++ * The SoC glue (hi3798mv100-hdmi.c) owns the MMIO region and the clocks/resets.
++ * Register access goes through three regmaps, all 8-bit registers on a 4-byte
++ * stride:
++ *
++ *  - @map:   bank 0, I2C slave 0x72 in the original Silicon Image design
++ *            (TPI / system / timing / interrupt / master-DDC registers),
++ *            MMIO offset 0x0000..0x03ff
++ *  - @map1:  bank 1, I2C slave 0x7a (audio / ACR / infoframe packet
++ *            memory), MMIO offset 0x0400..0x07ff
++ *  - @map_phy: the integrated TMDS PHY window, 32-bit registers,
++ *            programmed by the glue through @phy
++ *
++ * Connector convention: this driver does NOT create a drm_connector; the
++ * downstream (display, DRM master) side creates one with
++ * drm_bridge_connector_init(). The bridge implements DRM_BRIDGE_OP_DETECT /
++ * DRM_BRIDGE_OP_EDID; DRM_BRIDGE_OP_HPD is left off because the INT output
++ * cannot be made to deassert while a sink holds HPD, so the DRM core polls
++ * detect instead (see the SoC glue).
++ */
++struct sii9134 {
++	struct device *dev;
++
++	struct regmap *map;
++	struct regmap *map1;
++	struct regmap *map_phy;
++
++	struct drm_bridge bridge;
++
++	/* the transmitter's own master DDC, registered as an I2C bus */
++	struct i2c_adapter *ddc;
++
++	int irq;
++
++	/*
++	 * Wrapper-provided CRG reset halves. They are taken in a split order:
++	 * assert both, release the PHY, configure the PHY, and only then
++	 * release the controller. Configuring the PHY while the controller is
++	 * still held is what makes the difference between a link that comes up
++	 * and one that stays dead. Both are optional.
++	 */
++	void (*reset_hold)(struct sii9134 *sii);
++	void (*reset_release)(struct sii9134 *sii);
++
++	/* Required: the PHY programming of this integration. */
++	const struct sii9134_phy_ops *phy;
++
++	/*
++	 * Single lock serialising every read-modify-write on shared registers
++	 * (modeset, audio, infoframe, HPD): separate locks per callback lose
++	 * updates on INF_CTRL1 / DATA_CTRL_ADDR.
++	 */
++	struct mutex lock;
++
++	/*
++	 * hdmi-codec state. @connector is borrowed from the downstream bridge
++	 * connector (created by the DRM master) and cached while the pipeline
++	 * is enabled; it is used to export the ELD to ALSA.
++	 */
++	struct drm_connector *connector;
++	hdmi_codec_plugged_cb plugged_cb;
++	struct device *codec_dev;
++
++	/*
++	 * Video state the audio side has to respect: the ACR N value is not a
++	 * function of the sample rate alone -- 4K formats use a table of their
++	 * own -- so a mode change has to recompute it while the stream stays up.
++	 * @audio_fs_code is the SiI Fs code of the last configured stream, or -1
++	 * before the first one; both fields are written and read under @lock.
++	 */
++	bool video_4k;
++	int audio_fs_code;
++
++	/*
++	 * Whether the sink the last modeset saw is HDMI (@true) or a plain DVI
++	 * panel (@false); DVI has no audio channel and no infoframe reader, so
++	 * the audio side has to know. Until the first modeset this is true,
++	 * because a stream opened before the display came up should not be
++	 * silently dropped.
++	 */
++	bool hdmi_sink;
++
++	struct platform_device *audio_pdev;
++};
++
++int sii9134_probe(struct sii9134 *sii9134, int irq);
++void sii9134_remove(struct sii9134 *sii9134);
++void sii9134_bridge_add(struct sii9134 *sii9134);
++void sii9134_bridge_remove(struct sii9134 *sii9134);
++
++#endif
+--- /dev/null
++++ b/drivers/gpu/drm/bridge/hi3798mv100-hdmi.c
+@@ -0,0 +1,620 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright (c) 2023 David Yang
++ */
++
++#include <linux/clk.h>
++#include <linux/component.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "sii9134.h"
++
++struct hi3798mv100_hdmi_map {
++	void __iomem *base;
++	unsigned int max_offset;
++};
++
++struct hi3798mv100_hdmi_priv {
++	void __iomem *base;
++
++	struct clk *clk_ctrl;
++	struct reset_control *rst;
++	struct reset_control *rst_sii9134;
++	struct clk *clk_phy;
++	struct reset_control *rst_phy;
++
++	struct hi3798mv100_hdmi_map map0;
++	struct hi3798mv100_hdmi_map map1;
++	struct hi3798mv100_hdmi_map map_phy;
++
++	struct sii9134 sii9134;
++};
++
++/*
++ * One config per bank: regmap debugfs is keyed on device+name. Register numbers
++ * are byte offsets into the window (SiI9134 register N sits at base + 4 * N);
++ * the custom bus below performs the access width the wrapper actually decodes.
++ */
++static const struct regmap_config hi3798mv100_hdmi_bank0_regmap_config = {
++	.reg_bits = 32,
++	.val_bits = 8,
++	.name = "bank0",
++	.max_register = 0x3fc,
++	.cache_type = REGCACHE_NONE,
++};
++
++static const struct regmap_config hi3798mv100_hdmi_bank1_regmap_config = {
++	.reg_bits = 32,
++	.val_bits = 8,
++	.name = "bank1",
++	.max_register = 0x3fc,
++	.cache_type = REGCACHE_NONE,
++};
++
++/* on-chip "Taiyan" TMDS PHY (hi3798mv100): 32-bit regs at base + 0x1800 */
++static const struct regmap_config hi3798mv100_hdmi_phy_regmap_config = {
++	.reg_bits = 32,
++	.val_bits = 32,
++	.name = "phy",
++	.max_register = 0x38,
++	.cache_type = REGCACHE_NONE,
++};
++
++/*
++ * The TX wrapper only answers full-width accesses: byte strobes are ignored, so
++ * an 8-bit value needs a 32-bit read of the word and a 32-bit write whose low
++ * byte carries the register value. regmap-mmio cannot express that -- it
++ * demands reg_stride >= 4 for 32-bit values, and the core then rejects every
++ * register number that is not a multiple of the stride.
++ */
++static int hi3798mv100_hdmi_regmap_read(void *context, const void *reg, size_t reg_len,
++				  void *val, size_t val_len)
++{
++	struct hi3798mv100_hdmi_map *map = context;
++	unsigned int offset = get_unaligned_le32(reg);
++	u32 word;
++
++	if (reg_len != 4 || (val_len != 1 && val_len != 4))
++		return -EIO;
++
++	if (offset > map->max_offset) {
++		pr_warn_once("hi3798mv100-hdmi: read out of window: off=%#x len=%zu\n",
++			     offset, val_len);
++		return -EINVAL;
++	}
++
++	word = readl(map->base + offset);
++	if (val_len == 1)
++		*(u8 *)val = word & 0xff;
++	else
++		put_unaligned_le32(word, val);
++
++	return 0;
++}
++
++static int hi3798mv100_hdmi_regmap_write(void *context, const void *data, size_t count)
++{
++	struct hi3798mv100_hdmi_map *map = context;
++	const u8 *buf = data;
++	unsigned int offset = get_unaligned_le32(buf);
++	size_t val_len = count - 4;
++	u32 word;
++
++	if (count < 5 || val_len > 4)
++		return -EIO;
++
++	if (offset > map->max_offset) {
++		pr_warn_once("hi3798mv100-hdmi: write out of window: off=%#x len=%zu\n",
++			     offset, val_len);
++		return -EINVAL;
++	}
++
++	word = val_len == 4 ? get_unaligned_le32(buf + 4) : buf[4];
++	writel(word, map->base + offset);
++
++	return 0;
++}
++
++static const struct regmap_bus hi3798mv100_hdmi_regmap_bus = {
++	.read = hi3798mv100_hdmi_regmap_read,
++	.write = hi3798mv100_hdmi_regmap_write,
++	.reg_format_endian_default = REGMAP_ENDIAN_NATIVE,
++	.val_format_endian_default = REGMAP_ENDIAN_NATIVE,
++};
++
++/*
++ * Take the transmitter through a reset of our own instead of trusting the state
++ * it was handed over in, and do it in a split order: hold controller and PHY,
++ * release the PHY so the bridge core can configure it, and only then release
++ * the controller with 10 ms of settling for the TMDS PLL. A narrow
++ * assert/deassert pair with nothing in between does not reset anything, so the
++ * delays are part of the contract.
++ *
++ * Both halves are clocked before this runs: the gates of PERI_CRG67[5:0] and
++ * PERI_CRG68[0] are the clocks "ctrl" and "phy", enabled from
++ * hi3798mv100_hdmi_runtime_resume(), because a reset request only reaches a
++ * block while it is clocked. Whether the block answers afterwards is visible in
++ * the register dump that follows in sii9134_probe(): an unclocked or still-held
++ * transmitter reads back zero.
++ */
++static void hi3798mv100_hdmi_reset_hold(struct sii9134 *sii)
++{
++	struct hi3798mv100_hdmi_priv *priv =
++		container_of(sii, struct hi3798mv100_hdmi_priv, sii9134);
++
++	reset_control_assert(priv->rst_phy);
++	reset_control_assert(priv->rst_sii9134);
++	reset_control_assert(priv->rst);
++	usleep_range(1000, 1200);
++
++	reset_control_deassert(priv->rst_phy);
++	usleep_range(1000, 1200);
++}
++
++static void hi3798mv100_hdmi_reset_release(struct sii9134 *sii)
++{
++	struct hi3798mv100_hdmi_priv *priv =
++		container_of(sii, struct hi3798mv100_hdmi_priv, sii9134);
++
++	reset_control_deassert(priv->rst_sii9134);
++	reset_control_deassert(priv->rst);
++	/*
++	 * releasing the controller reset waits 10 ms for the TMDS PLL to lock
++	 */
++	usleep_range(10000, 12000);
++}
++
++/* PHY ("Taiyan" PHY of hi3798mv100: 32-bit registers at base + 0x1800) */
++#define PHY_OE_ADDR		0x0	/* reg 0x00 */
++#define RG_TX_RSTB		0x01
++#define PHY_PWD_ADDR		0x4	/* reg 0x01 */
++#define RG_TX_EN		0x01
++#define PHY_AUD_ADDR		0x8	/* reg 0x02 */
++#define PHY_PLL1_ADDR		0xc	/* reg 0x03 */
++#define PHY_PLL2_ADDR		0x10	/* reg 0x04 */
++#define PHY_DRV_ADDR		0x14	/* reg 0x05 */
++#define PHY_CLK_ADDR		0x18	/* reg 0x06 */
++
++static int hi3798mv100_hdmi_phy_write(struct sii9134 *sii, unsigned int reg, u32 val)
++{
++	return regmap_write(sii->map_phy, reg, val);
++}
++
++static int hi3798mv100_hdmi_phy_read(struct sii9134 *sii, unsigned int reg, u32 *val)
++{
++	return regmap_read(sii->map_phy, reg, val);
++}
++
++static int hi3798mv100_hdmi_phy_update(struct sii9134 *sii, unsigned int reg,
++			      u32 mask, u32 val)
++{
++	unsigned int tmp;
++	int ret;
++
++	ret = hi3798mv100_hdmi_phy_read(sii, reg, &tmp);
++	if (ret)
++		return ret;
++
++	tmp &= ~mask;
++	tmp |= val;
++
++	return hi3798mv100_hdmi_phy_write(sii, reg, tmp);
++}
++
++/* ------------------------------------------------------------------ */
++/* PHY                                                                  */
++/* ------------------------------------------------------------------ */
++
++static void hi3798mv100_hdmi_phy_init(struct sii9134 *sii)
++{
++	/*
++	 * PHY bring-up sequence for the integrated ("Taiyan") PHY; these values
++	 * are per SoC family and are not in the SiI9134 datasheet.
++	 */
++	hi3798mv100_hdmi_phy_write(sii, PHY_OE_ADDR, 0x00);
++	/*
++	 * audio clock select: the I2S path uses a fixed source, so 0x02 is
++	 * always right.
++	 */
++	hi3798mv100_hdmi_phy_write(sii, PHY_AUD_ADDR, 0x02);
++	hi3798mv100_hdmi_phy_write(sii, PHY_PLL1_ADDR, 0x02);
++	hi3798mv100_hdmi_phy_write(sii, PHY_PLL2_ADDR, 0x09);
++	hi3798mv100_hdmi_phy_write(sii, PHY_DRV_ADDR, 0x01);
++	hi3798mv100_hdmi_phy_write(sii, PHY_CLK_ADDR, 0x00);
++	/* power up last, improves PLL stability */
++	hi3798mv100_hdmi_phy_write(sii, PHY_PWD_ADDR, RG_TX_EN);
++}
++
++static void hi3798mv100_hdmi_phy_power(struct sii9134 *sii, bool on)
++{
++	if (on)
++		hi3798mv100_hdmi_phy_update(sii, PHY_OE_ADDR, RG_TX_RSTB, RG_TX_RSTB);
++	else
++		hi3798mv100_hdmi_phy_update(sii, PHY_OE_ADDR, RG_TX_RSTB, 0);
++}
++
++/*
++ * Output swing / PLL drive strength depends on the TMDS clock rate:
++ * <= 27MHz -> 0x00, <= 165MHz -> 0x01, above that -> 0x03.
++ * @tmds_khz is the TMDS clock in kHz (equal to the pixel clock at
++ * 8 bits per channel).
++ */
++static void hi3798mv100_hdmi_phy_swing(struct sii9134 *sii, unsigned int tmds_khz)
++{
++	unsigned int mhz = tmds_khz / 1000;
++	unsigned int val;
++
++	hi3798mv100_hdmi_phy_read(sii, PHY_PLL1_ADDR, &val);
++	val &= ~0x03;
++
++	if (mhz <= 27)
++		val |= 0x00;
++	else if (mhz <= 165)
++		val |= 0x01;
++	else
++		val |= 0x03;
++
++	hi3798mv100_hdmi_phy_write(sii, PHY_PLL1_ADDR, val);
++}
++
++static const struct sii9134_phy_ops hi3798mv100_hdmi_phy_ops = {
++	.init = hi3798mv100_hdmi_phy_init,
++	.power = hi3798mv100_hdmi_phy_power,
++	.swing = hi3798mv100_hdmi_phy_swing,
++	.dvi_enc_in_ctrl = true,
++};
++
++/*
++ * Hi3716CV200 PHY.
++ *
++ * Same register file at base + 0x1800, word-strided like the bank windows, but
++ * the bit assignment and the whole bring-up belong to a different generation:
++ * the vendor keeps them in two #if branches of the same functions in
++ * its PHY driver, and the branch for this part writes ten
++ * registers the mv100 branch never touches -- including the PLL control and the
++ * bias generator -- and then resets the PLL by asserting power-down. Reusing the
++ * mv100 values here is what makes the transmitter measure its own input timing
++ * (hres/vres nonzero) while the TMDS clock never locks.
++ *
++ * The mv100 names above describe this part's numbering differently, so these
++ * macros are indexed by the vendor's own register number and named after the
++ * comment the vendor puts next to it.
++ */
++#define CV200_PHY_PLL_CTRL	(0x02 * 4)	/* deep colour in bits 1..0 */
++#define CV200_PHY_OE		(0x05 * 4)	/* oe bit 5, power-down bit 4 */
++#define CV200_PHY_CTRL2		(0x06 * 4)	/* rising time in bits 7..6 */
++#define CV200_PHY_CTRL3		(0x07 * 4)
++#define CV200_PHY_CTRL4		(0x08 * 4)
++#define CV200_PHY_CTRL5		(0x09 * 4)
++#define CV200_PHY_BIAS1		(0x0a * 4)
++#define CV200_PHY_BIAS2		(0x0b * 4)
++#define CV200_PHY_ENC_BYPASS	(0x0d * 4)
++#define CV200_PHY_TERM_EN	(0x0e * 4)
++
++#define CV200_RG_OE		BIT(5)
++#define CV200_RG_PWR_UP	BIT(4)
++
++static void hi3716cv200_hdmi_phy_init(struct sii9134 *sii)
++{
++	/*
++	 * Register 0x09 depends on the die revision, read from bits 15..8 of a
++	 * SoC-ID word: the EC part (tag 0x41) has the 19 m PHY and takes 0x00,
++	 * the original (tag 0x40) takes 0x1a, and an unknown tag falls back to
++	 * the original. This part measures tag 0x40, so its PHY gets 0x1a.
++	 */
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_CTRL2, 0x89);
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_TERM_EN, 0x00);
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_CTRL3, 0x81);
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_CTRL5, 0x1a);
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_BIAS1, 0x07);
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_BIAS2, 0x51);
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_PLL_CTRL, 0x24);
++	/*
++	 * oe stays off at bring-up (bit 5 clear in 0x12); bit 4 is the power-up
++	 * that the reset below takes away again on purpose.
++	 */
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_OE, 0x12);
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_CTRL4, 0x40);
++	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_ENC_BYPASS, 0x00);
++
++	/* "after cfg phy ok, we need reset phy pll" (vendor PHY driver) */
++	hi3798mv100_hdmi_phy_update(sii, CV200_PHY_OE, CV200_RG_PWR_UP, 0);
++	mdelay(1);
++}
++
++static void hi3716cv200_hdmi_phy_power(struct sii9134 *sii, bool on)
++{
++	/*
++	 * The PHY's power-up is bit 4 and its output enable bit 5 of one word
++	 * per the vendor PHY driver, so releasing the reset has to come
++	 * first: enabling the output while the PLL is still powered down is the
++	 * one order this part does not accept.
++	 */
++	if (on) {
++		hi3798mv100_hdmi_phy_update(sii, CV200_PHY_OE, CV200_RG_PWR_UP,
++					    CV200_RG_PWR_UP);
++		hi3798mv100_hdmi_phy_update(sii, CV200_PHY_OE, CV200_RG_OE,
++					    CV200_RG_OE);
++	} else {
++		hi3798mv100_hdmi_phy_update(sii, CV200_PHY_OE, CV200_RG_OE, 0);
++		hi3798mv100_hdmi_phy_update(sii, CV200_PHY_OE, CV200_RG_PWR_UP, 0);
++	}
++}
++
++/*
++ * The swing/divider helper for this PHY generation is empty: the vendor PHY
++ * driver has no body in the cv200 branch (the drive strength is fixed by the
++ * bias registers set at bring-up), and the rate-dependent code below it belongs
++ * to the mv100 "taiyan" PHY. Writing the mv100 PLL1 bits here would touch a
++ * register the vendor leaves alone.
++ */
++static void hi3716cv200_hdmi_phy_swing(struct sii9134 *sii, unsigned int tmds_khz)
++{
++}
++
++static const struct sii9134_phy_ops hi3716cv200_hdmi_phy_ops = {
++	.init = hi3716cv200_hdmi_phy_init,
++	.power = hi3716cv200_hdmi_phy_power,
++	.swing = hi3716cv200_hdmi_phy_swing,
++	.edge_falling = true,
++	/*
++	 * No .dvi_enc_in_ctrl here: this part owns the encoder on the PHY side, so
++	 * TEST_TX.DVI_ENC_BYPASS has to stay as reset left it. The vendor SDK never
++	 * writes TEST_TX on cv200 -- SI_TX_CTRL_DVIEncoder(), the only writer of that
++	 * bit, compiles its body for the mv100 family only, and InitTestCtrlReg()
++	 * returns before its #if 0 block -- and its live page-1 TEST_TX reads 0x08
++	 * (BIT_DVI_ENC_BYPASS) while it displays. Measured on the board: with the bit
++	 * cleared, as copying the mv100 flag did, the sink saw nothing but the
++	 * transmitter's own timing; setting it back by hand changed every frame the
++	 * capture card produced in that window.
++	 */
++};
++
++static int hi3798mv100_hdmi_runtime_suspend(struct device *dev)
++{
++	struct hi3798mv100_hdmi_priv *priv = dev_get_drvdata(dev);
++
++	clk_disable_unprepare(priv->clk_phy);
++	clk_disable_unprepare(priv->clk_ctrl);
++
++	return 0;
++}
++
++static int hi3798mv100_hdmi_runtime_resume(struct device *dev)
++{
++	struct hi3798mv100_hdmi_priv *priv = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_prepare_enable(priv->clk_ctrl);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(priv->clk_phy);
++	if (ret) {
++		clk_disable_unprepare(priv->clk_ctrl);
++		return ret;
++	}
++
++	return 0;
++}
++
++static const struct dev_pm_ops hi3798mv100_hdmi_pm_ops = {
++	RUNTIME_PM_OPS(hi3798mv100_hdmi_runtime_suspend,
++		       hi3798mv100_hdmi_runtime_resume, NULL)
++};
++
++static void hi3798mv100_hdmi_pm_cleanup(void *data)
++{
++	struct device *dev = data;
++	struct hi3798mv100_hdmi_priv *priv = dev_get_drvdata(dev);
++
++	pm_runtime_disable(dev);
++	pm_runtime_put_noidle(dev);	/* balance the always-on reference */
++	clk_disable_unprepare(priv->clk_phy);
++	clk_disable_unprepare(priv->clk_ctrl);
++}
++
++/*
++ * Binding to the aggregate is what publishes the bridge: the master's .bind()
++ * runs component_bind_all() before it looks for its downstream bridge through
++ * the device tree, so the bridge is on the global list exactly while some DRM
++ * device can attach to it. Unbinding takes it away again after the master has
++ * stopped using it.
++ */
++static int hi3798mv100_hdmi_component_bind(struct device *comp,
++					struct device *master,
++					void *master_data)
++{
++	struct hi3798mv100_hdmi_priv *priv = dev_get_drvdata(comp);
++
++	sii9134_bridge_add(&priv->sii9134);
++	return 0;
++}
++
++static void hi3798mv100_hdmi_component_unbind(struct device *comp,
++					   struct device *master,
++					   void *master_data)
++{
++	struct hi3798mv100_hdmi_priv *priv = dev_get_drvdata(comp);
++
++	sii9134_bridge_remove(&priv->sii9134);
++}
++
++static const struct component_ops hi3798mv100_hdmi_component_ops = {
++	.bind	= hi3798mv100_hdmi_component_bind,
++	.unbind	= hi3798mv100_hdmi_component_unbind,
++};
++
++static int hi3798mv100_hdmi_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct hi3798mv100_hdmi_priv *priv;
++	int irq;
++	int ret;
++
++	/* acquire resources */
++	priv = devm_drm_bridge_alloc(dev, struct hi3798mv100_hdmi_priv,
++				     sii9134.bridge, &sii9134_bridge_funcs);
++	if (IS_ERR(priv))
++		return PTR_ERR(priv);
++
++	priv->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(priv->base))
++		return PTR_ERR(priv->base);
++
++	/*
++	 * "ctrl" is the PERI_CRG67[5:0] gate group and "phy" PERI_CRG68[0];
++	 * both have to be running before the resets below shift, so none of
++	 * these is optional. The resets are CRG67[9] (transmitter core),
++	 * CRG67[8] (its bus) and CRG68[4] (PHY).
++	 */
++	priv->clk_ctrl = devm_clk_get(dev, "ctrl");
++	if (IS_ERR(priv->clk_ctrl))
++		return dev_err_probe(dev, PTR_ERR(priv->clk_ctrl),
++				     "no ctrl clock\n");
++
++	priv->rst = devm_reset_control_get(dev, "base");
++	if (IS_ERR(priv->rst))
++		return dev_err_probe(dev, PTR_ERR(priv->rst), "no base reset\n");
++
++	priv->rst_sii9134 = devm_reset_control_get(dev, "bus");
++	if (IS_ERR(priv->rst_sii9134))
++		return dev_err_probe(dev, PTR_ERR(priv->rst_sii9134),
++				     "no bus reset\n");
++
++	priv->clk_phy = devm_clk_get(dev, "phy");
++	if (IS_ERR(priv->clk_phy))
++		return dev_err_probe(dev, PTR_ERR(priv->clk_phy),
++				     "no phy clock\n");
++
++	priv->rst_phy = devm_reset_control_get(dev, "phy");
++	if (IS_ERR(priv->rst_phy))
++		return dev_err_probe(dev, PTR_ERR(priv->rst_phy),
++				     "no phy reset\n");
++
++	/*
++	 * The SiI9134 INT output is level and storms while a sink holds HPD, so
++	 * the driver polls instead of using interrupts.
++	 */
++	irq = -1;
++
++	platform_set_drvdata(pdev, priv);
++	dev_set_drvdata(dev, priv);
++
++	/* bring up device */
++	ret = hi3798mv100_hdmi_runtime_resume(dev);
++	if (ret)
++		return ret;
++
++	/*
++	 * Keep the device powered for its whole probe/remove lifetime: the
++	 * connector poll work, EDID reads and the codec DAI callbacks all reach
++	 * these registers without holding a runtime PM reference of their own.
++	 * hi3798mv100_hdmi_runtime_resume() is therefore called directly from
++	 * probe below; neither idle gating nor pm_runtime_force_suspend() at
++	 * system sleep is in place yet.
++	 */
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++	pm_runtime_get(dev);
++	ret = devm_add_action_or_reset(dev, hi3798mv100_hdmi_pm_cleanup, dev);
++	if (ret)
++		return ret;
++
++	priv->map0.base = priv->base;
++	priv->map0.max_offset = 0x3fc;
++	priv->map1.base = priv->base + 0x400;
++	priv->map1.max_offset = 0x3fc;
++	priv->map_phy.base = priv->base + 0x1800;
++	priv->map_phy.max_offset = 0x38;
++
++	priv->sii9134.map = devm_regmap_init(dev, &hi3798mv100_hdmi_regmap_bus,
++					     &priv->map0,
++					     &hi3798mv100_hdmi_bank0_regmap_config);
++	if (IS_ERR(priv->sii9134.map))
++		return PTR_ERR(priv->sii9134.map);
++
++	priv->sii9134.map1 = devm_regmap_init(dev, &hi3798mv100_hdmi_regmap_bus,
++					      &priv->map1,
++					      &hi3798mv100_hdmi_bank1_regmap_config);
++	if (IS_ERR(priv->sii9134.map1))
++		return PTR_ERR(priv->sii9134.map1);
++
++	priv->sii9134.map_phy = devm_regmap_init(dev, &hi3798mv100_hdmi_regmap_bus,
++						 &priv->map_phy,
++						 &hi3798mv100_hdmi_phy_regmap_config);
++	if (IS_ERR(priv->sii9134.map_phy))
++		return PTR_ERR(priv->sii9134.map_phy);
++
++	priv->sii9134.dev = dev;
++	priv->sii9134.reset_hold = hi3798mv100_hdmi_reset_hold;
++	priv->sii9134.reset_release = hi3798mv100_hdmi_reset_release;
++	/*
++	 * The PHY is the only part whose programming differs between the two
++	 * supported parts; the SiI9134 controller side is shared.
++	 */
++	if (of_device_is_compatible(dev->of_node, "hisilicon,hi3716cv200-hdmi"))
++		priv->sii9134.phy = &hi3716cv200_hdmi_phy_ops;
++	else
++		priv->sii9134.phy = &hi3798mv100_hdmi_phy_ops;
++	ret = sii9134_probe(&priv->sii9134, irq);
++	if (ret)
++		return ret;
++
++	ret = component_add(dev, &hi3798mv100_hdmi_component_ops);
++	/* Only remove() unregisters the audio codec pdev. */
++	if (ret)
++		sii9134_remove(&priv->sii9134);
++
++	return ret;
++}
++
++static void hi3798mv100_hdmi_remove(struct platform_device *pdev)
++{
++	struct hi3798mv100_hdmi_priv *priv = platform_get_drvdata(pdev);
++
++	/*
++	 * component_del() first: it brings the DRM device that attached this
++	 * bridge down. Then the bridge core goes, and the devm action
++	 * (hi3798mv100_hdmi_pm_cleanup) releases the always-on clocks, runtime
++	 * PM and the devm-managed bridge behind it.
++	 */
++	component_del(&pdev->dev, &hi3798mv100_hdmi_component_ops);
++	sii9134_remove(&priv->sii9134);
++}
++
++static const struct of_device_id hi3798mv100_hdmi_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-hdmi", },
++	{ .compatible = "hisilicon,hi3716cv200-hdmi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hi3798mv100_hdmi_of_match);
++
++static struct platform_driver hi3798mv100_hdmi_driver = {
++	.probe = hi3798mv100_hdmi_probe,
++	.remove = hi3798mv100_hdmi_remove,
++	.driver = {
++		.name = "hi3798mv100-hdmi",
++		.of_match_table = hi3798mv100_hdmi_of_match,
++		.pm = pm_ptr(&hi3798mv100_hdmi_pm_ops),
++	},
++};
++
++module_platform_driver(hi3798mv100_hdmi_driver);
++
++MODULE_DESCRIPTION("SiI9134 HDMI 1.4 transmitter for Hi3798MV100");
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("David Yang <mmyangfl@gmail.com>");
+--- a/drivers/gpu/drm/bridge/Kconfig
++++ b/drivers/gpu/drm/bridge/Kconfig
+@@ -328,6 +328,21 @@ config DRM_SII902X
+ 	help
+ 	  Silicon Image sii902x bridge chip driver.
+ 
++config DRM_SII9134
++	tristate "Silicon Image SiI9134 HDMI 1.4 transmitter"
++	depends on OF
++	select DRM_KMS_HELPER
++	select REGMAP
++	select SND_SOC_HDMI_CODEC if SND_SOC
++	help
++	  Say Y or M here if you want to use the HDMI 1.4 transmitter built
++	  around a Silicon Image SiI9134 core, as integrated on the HiSilicon
++	  Hi3798MV100 (the same core also serves the Hi3716CV200, Hi3716DV100,
++	  Hi3716MV410, Hi3716MV420 and Hi3796MV100). It covers the controller
++	  registers plus,
++	  on the parts that have one, the on-chip TMDS PHY and its HDMI audio
++	  codec DAI.
++
+ config DRM_SII9234
+ 	tristate "Silicon Image SII9234 HDMI/MHL bridge"
+ 	depends on OF
+--- a/drivers/gpu/drm/bridge/Makefile
++++ b/drivers/gpu/drm/bridge/Makefile
+@@ -28,6 +28,8 @@ obj-$(CONFIG_DRM_PARADE_PS8640) += parad
+ obj-$(CONFIG_DRM_SAMSUNG_DSIM) += samsung-dsim.o
+ obj-$(CONFIG_DRM_SIL_SII8620) += sil-sii8620.o
+ obj-$(CONFIG_DRM_SII902X) += sii902x.o
++obj-$(CONFIG_DRM_SII9134) += sii9134-hdmi.o
++sii9134-hdmi-y := sii9134.o hi3798mv100-hdmi.o
+ obj-$(CONFIG_DRM_SII9234) += sii9234.o
+ obj-$(CONFIG_DRM_SIMPLE_BRIDGE) += simple-bridge.o
+ obj-$(CONFIG_DRM_SOLOMON_SSD2825) += ssd2825.o

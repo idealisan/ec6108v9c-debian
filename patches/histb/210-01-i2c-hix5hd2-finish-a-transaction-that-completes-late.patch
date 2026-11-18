@@ -1,0 +1,57 @@
+From f60f799a79bcb5b9d3e49132b4317728700c4e65 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Fri, 23 Oct 2026 14:36:44 +0800
+Subject: [PATCH] i2c: hix5hd2: finish a transaction that completes late
+
+On a Hi3716CV200 the interrupt path never finishes a transfer inside the
+adapter timeout: the completion expires after 100 jiffies -- 1 s at
+HZ=100 -- while the handler still reports I2C_OVER_INTR (SR bit 0) about
+30 ms later, ten times in a row, so the client gets -ETIMEDOUT for a
+transaction that in fact completed.
+
+The late delivery has two candidates: a functional clock running far
+below the rate the divider was computed from, or a genuinely late event.
+
+The driver need not choose between them: wait in 10 ms slices against a
+fixed 2 s deadline instead of one blocking wait at adap->timeout, so a
+late but real completion returns the transaction's own ACK/NACK rather
+than -ETIMEDOUT. The timeout path and its error handling are unchanged.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/i2c/busses/i2c-hix5hd2.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+--- a/drivers/i2c/busses/i2c-hix5hd2.c
++++ b/drivers/i2c/busses/i2c-hix5hd2.c
+@@ -327,8 +327,28 @@ static int hix5hd2_i2c_xfer_msg(struct h
+ 	reinit_completion(&priv->msg_complete);
+ 	hix5hd2_i2c_message_start(priv, stop);
+ 
+-	time_left = wait_for_completion_timeout(&priv->msg_complete,
+-						priv->adap.timeout);
++	/*
++	 * The event does arrive, only later than the driver is willing to
++	 * wait: on a Hi3716CV200 the handler reported I2C_OVER_INTR (SR bit 0)
++	 * about 30 ms after a 100-jiffies wait -- 1 s at HZ=100 -- had given
++	 * up, ten times in a row.  Why the delivery is late is not settled
++	 * yet; until it is, wait in slices against a fixed 2 s deadline so a
++	 * late but real completion returns the transaction's own ACK/NACK
++	 * rather than -ETIMEDOUT.
++	 */
++	{
++		unsigned long deadline = jiffies + msecs_to_jiffies(2000);
++		unsigned int slice = 0;
++
++		time_left = 0;
++		while (slice < 200 && time_after(deadline, jiffies)) {
++			time_left = wait_for_completion_timeout(&priv->msg_complete,
++								msecs_to_jiffies(10));
++			if (time_left)
++				break;
++			slice++;
++		}
++	}
+ 	if (time_left == 0) {
+ 		priv->state = HIX5I2C_STAT_RW_ERR;
+ 		priv->err = -ETIMEDOUT;

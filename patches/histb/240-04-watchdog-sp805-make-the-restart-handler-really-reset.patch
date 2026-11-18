@@ -1,0 +1,74 @@
+From c79059362f7dce38b883537039cfc5de6e39b939 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Thu, 22 Oct 2026 04:07:36 +0800
+Subject: [PATCH 4/5] watchdog: sp805: make the restart handler really reset
+ the board
+
+The restart handler armed the counter with WDTLOAD = 0, which on some
+integrations never expires, so reboot ends with the system halted, and
+by the time the core calls the handler watchdog_stop_reboot() has
+already run wdt_disable(), whose clk_disable_unprepare() cleared the
+clock gate the counter needs.
+
+A board whose DT gives neither a clock-frequency nor a clock rate has
+nothing to divide, so the fallback is the short load this block's reset
+path documents; a pending interrupt must be cleared before arming so the
+timeout starts from a known state.
+
+Re-enable the clock, clear the interrupt, arm a short timeout and wait
+for the reset to assert.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/watchdog/sp805_wdt.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+--- a/drivers/watchdog/sp805_wdt.c
++++ b/drivers/watchdog/sp805_wdt.c
+@@ -17,6 +17,7 @@
+ #include <linux/amba/bus.h>
+ #include <linux/bitops.h>
+ #include <linux/clk.h>
++#include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/ioport.h>
+ #include <linux/kernel.h>
+@@ -145,15 +146,37 @@ static int
+ wdt_restart(struct watchdog_device *wdd, unsigned long mode, void *cmd)
+ {
+ 	struct sp805_wdt *wdt = watchdog_get_drvdata(wdd);
++	/*
++	 * Two things this handler needs:
++	 *
++	 * A non-zero load.  With WDTLOAD = 0 the counter never expires, so
++	 * "reboot" ends in "Reboot failed -- System halted".  Arm ~100 ms;
++	 * the reset then follows at the second expiry, roughly 200 ms later.
++	 * A board whose DT gives neither a clock-frequency nor a clock rate has
++	 * nothing to divide, so fall back to the load the vendor's own reset
++	 * path arms this block with (WDTLOAD = 0x100, seen on Hi3798MV200H).
++	 *
++	 * The clock put back.  watchdog_stop_reboot() runs ->stop() on the way
++	 * down and wdt_disable() ends in clk_disable_unprepare(), so the writes
++	 * below would otherwise go to a block with no clock.
++	 */
++	u32 load = wdt->rate ? DIV_ROUND_UP_ULL(wdt->rate, 10) : 0x100;
++
++	/* For reset, we start the WDT clock and leave it running. */
++	clk_prepare_enable(wdt->clk);
+ 
+ 	writel_relaxed(UNLOCK, wdt->base + WDTLOCK);
+ 	writel_relaxed(0, wdt->base + WDTCONTROL);
+-	writel_relaxed(0, wdt->base + WDTLOAD);
++	writel_relaxed(INT_MASK, wdt->base + WDTINTCLR);
++	writel_relaxed(load, wdt->base + WDTLOAD);
+ 	writel_relaxed(INT_ENABLE | RESET_ENABLE, wdt->base + WDTCONTROL);
+ 
+ 	/* Flush posted writes. */
+ 	readl_relaxed(wdt->base + WDTLOCK);
+ 
++	/* Wait for the reset to assert... */
++	mdelay(300);
++
+ 	return 0;
+ }
+ 

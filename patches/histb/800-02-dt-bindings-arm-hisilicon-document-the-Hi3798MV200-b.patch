@@ -1,0 +1,35 @@
+From 549bcda9d13ad3694d3d0f35a1a76f5be7ae97f8 Mon Sep 17 00:00:00 2001
+From: Yang Xiwen <forbidden405@outlook.com>
+Date: Wed, 5 Apr 2023 16:03:56 +0800
+Subject: [PATCH 2/2] dt-bindings: arm: hisilicon: document the Hi3798MV200
+ boards
+
+The two Hi3798MV200 boards added for arm64 are not in the schema. Both
+carry their own compatible, one per vendor. List them next to the
+existing Hi3798 boards.
+
+Signed-off-by: Yang Xiwen <forbidden405@outlook.com>
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../devicetree/bindings/arm/hisilicon/hisilicon.yaml   | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+--- a/Documentation/devicetree/bindings/arm/hisilicon/hisilicon.yaml
++++ b/Documentation/devicetree/bindings/arm/hisilicon/hisilicon.yaml
+@@ -35,6 +35,16 @@ properties:
+           - const: hisilicon,hi3798mv100-ec6108v9c
+           - const: hisilicon,hi3798mv100
+ 
++      - description: Hi3798MV200 based boards.
++        items:
++          - const: skyworth,hc2910-2aghd05
++          - const: hisilicon,hi3798mv200
++
++      - description: Hi3798mv200h based boards.
++        items:
++          - const: skyworth,hi3798mv200h-stb
++          - const: hisilicon,hi3798mv200
++
+       - description: Hi4511 Board
+         items:
+           - const: hisilicon,hi3620-hi4511
