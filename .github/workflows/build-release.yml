@@ -128,6 +128,12 @@ jobs:
     needs: [build-kernel, build-rootfs]
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    # extra_cmdline must reach the packaging scripts too: the p2 runtime env
+    # bootargs (make-community-flash-package.sh -> KERNEL_CMDLINE_NO_MEM) is
+    # what hiboot actually boots with, NOT the DTB /chosen/bootargs. Without
+    # this, params like cma=160M only land in the DTB and are ignored.
+    env:
+      EXTRA_CMDLINE: ${{ inputs.extra_cmdline }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
