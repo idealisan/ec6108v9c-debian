@@ -126,7 +126,7 @@ if [ "$ROOTFS_VARIANT" = desktop ] && [ -f "$DRIDIR/lima_dri.so" ]; then
 import struct, sys
 path = sys.argv[1]
 d = bytearray(open(path, 'rb').read())
-assert d[:5] == b'\x7fELF' and d[4] == 1 and d[5] == 1, 'not ELF32 LE'
+assert d[:4] == b'\x7fELF' and d[4] == 1 and d[5] == 1, 'not ELF32 LE'
 e_shoff, = struct.unpack_from('<I', d, 0x20)
 e_shentsize, e_shnum, e_shstrndx = struct.unpack_from('<HHH', d, 0x2e)
 secs = [struct.unpack_from('<IIIIIIIIII', d, e_shoff + i * e_shentsize)
