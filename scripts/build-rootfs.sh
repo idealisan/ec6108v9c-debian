@@ -98,36 +98,27 @@ sudo DEBIAN_FRONTEND=noninteractive chroot "$ROOT" \
 sudo chroot "$ROOT" apt-get clean
 
 # ---- Mesa kmsro shim: make libgbm/glamor render card0 with the Mali-450 ----
-# The on-SoC display engine registers as DRM driver "histb-vdp", but Debian
-# bookworm's lima_dri.so has no kmsro entry for that name, so Xorg's glamor
-# fails ("couldn't get display device") and XFCE falls back to CPU swrast.
-# libgbm picks the DRI driver by the kernel DRM name: it opens
-# <dri-dir>/histb_vdp_dri.so and dlsym()s __driDriverGetExtensions_histb_vdp.
-# Ship such a file as a byte-identical copy of lima_dri.so with the single
-# kmsro slot "sun4i_drm" (same 9-char length, same Mali render path) renamed
-# to "histb_vdp". The original lima_dri.so stays untouched, so the real lima
-# render node (/dev/dri/renderD128) keeps working. This lets the display card
-# (card0) be rendered by the very same Mali-450 GPU via lima's kmsro path.
+# The on-SoC display engine registers as DRM driver "histb-vdp" and has no
+# render node, so libgbm/glamor need a DRI driver named histb-vdp_dri.so whose
+# kmsro slot renders through lima's renderD128. Debian bookworm's lima_dri.so
+# has kmsro slots for other display drivers (e.g. sun4i_drm) but not ours.
+# Rename one kmsro slot with objcopy. Do NOT byte-patch the string in place:
+# .gnu.hash (bloom/buckets/chains) is keyed by the old symbol name, so dlsym()
+# will NOT find an in-place-renamed symbol (verified on real HW 2026-11-19).
+# objcopy rebuilds the hash tables correctly. The original lima_dri.so stays
+# untouched, so the real lima render node keeps working.
 DRIDIR="$ROOT/usr/lib/arm-linux-gnueabihf/dri"
 if [ -f "$DRIDIR/lima_dri.so" ]; then
-  echo "== install histb-vdp kmsro shim (lima) =="
-  # libgbm derives the dri filename from the DRM driver name "histb-vdp"
-  # (hyphen), so the shim MUST be named histb-vdp_dri.so (hyphen). A previous
-  # build used histb_vdp_dri.so (underscore) and libgbm never found it.
-  sudo cp "$DRIDIR/lima_dri.so" "$DRIDIR/histb-vdp_dri.so"
-  sudo python3 - "$DRIDIR/histb-vdp_dri.so" <<'PY'
-import sys
-path = sys.argv[1]
-data = bytearray(open(path, 'rb').read())
-# sun4i_drm and histb_vdp are both 9 bytes: in-place, ELF-safe. This renames
-# the kmsro extension symbol to the name libgbm derives from "histb-vdp".
-assert data.count(b'sun4i_drm') == 1, "unexpected sun4i_drm count"
-i = data.find(b'sun4i_drm')
-data[i:i+9] = b'histb_vdp'
-assert bytes(data).count(b'__driDriverGetExtensions_histb_vdp') == 1
-open(path, 'wb').write(data)
-print("kmsro shim ready:", path)
-PY
+  echo "== install histb-vdp kmsro shim (lima, objcopy) =="
+  # File name uses the DRM driver name with a hyphen; the kmsro symbol uses
+  # an underscore. Both spellings were tested on HW; this combination works.
+  sudo objcopy --redefine-sym \
+    __driDriverGetExtensions_sun4i_drm=__driDriverGetExtensions_histb_vdp \
+    "$DRIDIR/lima_dri.so" "$DRIDIR/histb-vdp_dri.so"
+  sudo objdump -T "$DRIDIR/histb-vdp_dri.so" \
+    | grep -q '__driDriverGetExtensions_histb_vdp' || {
+      echo "ERROR: kmsro shim symbol missing" >&2; exit 1; }
+  echo "  kmsro shim ready"
 fi
 
 echo "== configure system =="
