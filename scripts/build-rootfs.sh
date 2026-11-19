@@ -102,23 +102,93 @@ sudo chroot "$ROOT" apt-get clean
 # render node, so libgbm/glamor need a DRI driver named histb-vdp_dri.so whose
 # kmsro slot renders through lima's renderD128. Debian bookworm's lima_dri.so
 # has kmsro slots for other display drivers (e.g. sun4i_drm) but not ours.
-# Rename one kmsro slot with objcopy. Do NOT byte-patch the string in place:
-# .gnu.hash (bloom/buckets/chains) is keyed by the old symbol name, so dlsym()
-# will NOT find an in-place-renamed symbol (verified on real HW 2026-11-19).
-# objcopy rebuilds the hash tables correctly. The original lima_dri.so stays
-# untouched, so the real lima render node keeps working.
+# Rename one kmsro slot to "histb_vdp". A plain in-place string patch is NOT
+# enough: .gnu.hash (bloom/buckets/chains) is keyed by the old symbol name, so
+# dlsym() won't find the renamed symbol (verified on real HW 2026-11-19).
+# Rebuild .gnu.hash after the rename; no binutils cross-tool needed. The
+# original lima_dri.so stays untouched, so renderD128 keeps working.
 DRIDIR="$ROOT/usr/lib/arm-linux-gnueabihf/dri"
 if [ -f "$DRIDIR/lima_dri.so" ]; then
-  echo "== install histb-vdp kmsro shim (lima, objcopy) =="
-  # File name uses the DRM driver name with a hyphen; the kmsro symbol uses
-  # an underscore. Both spellings were tested on HW; this combination works.
-  sudo objcopy --redefine-sym \
-    __driDriverGetExtensions_sun4i_drm=__driDriverGetExtensions_histb_vdp \
-    "$DRIDIR/lima_dri.so" "$DRIDIR/histb-vdp_dri.so"
-  sudo objdump -T "$DRIDIR/histb-vdp_dri.so" \
-    | grep -q '__driDriverGetExtensions_histb_vdp' || {
-      echo "ERROR: kmsro shim symbol missing" >&2; exit 1; }
-  echo "  kmsro shim ready"
+  echo "== install histb-vdp kmsro shim (lima, rebuild .gnu.hash) =="
+  sudo cp "$DRIDIR/lima_dri.so" "$DRIDIR/histb-vdp_dri.so"
+  sudo python3 - "$DRIDIR/histb-vdp_dri.so" <<'PY'
+import struct, sys
+path = sys.argv[1]
+d = bytearray(open(path, 'rb').read())
+assert d[:5] == b'\x7fELF' and d[4] == 1 and d[5] == 1, 'not ELF32 LE'
+e_shoff, = struct.unpack_from('<I', d, 0x20)
+e_shentsize, e_shnum, e_shstrndx = struct.unpack_from('<HHH', d, 0x2e)
+secs = [struct.unpack_from('<IIIIIIIIII', d, e_shoff + i * e_shentsize)
+        for i in range(e_shnum)]
+shstr = secs[e_shstrndx]
+def secname(s):
+    b = d[shstr[4] + s[0]:shstr[4] + shstr[5]]
+    return b[:b.index(0)].decode()
+by = {secname(s): s for s in secs}
+gh, ds, st = by['.gnu.hash'], by['.dynsym'], by['.dynstr']
+gh_off, ds_off, st_off = gh[4], ds[4], st[4]
+nb, sx, mw, sh = struct.unpack_from('<IIII', d, gh_off)
+nsyms = ds[5] // 16
+# sun4i_drm and histb_vdp are both 9 bytes: in-place rename in .dynstr.
+seg = d[st_off:st_off + st[5]]
+assert seg.count(b'sun4i_drm') == 1, 'unexpected sun4i_drm count'
+pos = st_off + seg.index(b'sun4i_drm')
+d[pos:pos + 9] = b'histb_vdp'
+def name(i):
+    n, = struct.unpack_from('<I', d, ds_off + i * 16)
+    b = d[st_off + n:]
+    return b[:b.index(0)]
+def hsh(n):
+    h = 5381
+    for c in n:
+        h = ((h << 5) + h + c) & 0xffffffff
+    return h
+names, hashes = [], []
+for i in range(nsyms):
+    names.append(name(i))
+    hashes.append(hsh(names[-1]))
+bloom = [0] * mw
+for i in range(sx, nsyms):
+    h = hashes[i]
+    w = (h // 32) & (mw - 1)
+    bloom[w] |= (1 << (h % 32)) | (1 << ((h >> sh) % 32))
+groups = [[] for _ in range(nb)]
+for i in range(sx, nsyms):
+    groups[hashes[i] % nb].append(i)
+buckets, chain = [0] * nb, [0] * (nsyms - sx)
+for b, items in enumerate(groups):
+    if not items:
+        continue
+    buckets[b] = items[0]
+    for k, i in enumerate(items):
+        v = hashes[i] & ~1
+        if k == len(items) - 1:
+            v |= 1
+        chain[i - sx] = v
+struct.pack_into('<IIII', d, gh_off, nb, sx, mw, sh)
+struct.pack_into('<%dI' % mw, d, gh_off + 16, *[b & 0xffffffff for b in bloom])
+struct.pack_into('<%dI' % nb, d, gh_off + 16 + mw * 4, *buckets)
+struct.pack_into('<%dI' % len(chain), d, gh_off + 16 + mw * 4 + nb * 4, *chain)
+# Verify dlsym() would find the renamed symbol (bloom -> bucket -> chain).
+target = b'__driDriverGetExtensions_histb_vdp'
+h = hsh(target)
+word = struct.unpack_from('<I', d, gh_off + 16 + ((h // 32) & (mw - 1)) * 4)[0]
+assert (word >> (h % 32)) & 1 and (word >> ((h >> sh) % 32)) & 1, 'bloom miss'
+b = struct.unpack_from('<I', d, gh_off + 16 + mw * 4 + (h % nb) * 4)[0]
+assert b != 0, 'bucket miss'
+found = False
+while True:
+    if names[b] == target:
+        found = True
+        break
+    c = struct.unpack_from('<I', d, gh_off + 16 + mw * 4 + nb * 4 + (b - sx) * 4)[0]
+    if c & 1:
+        break
+    b = c
+assert found, 'symbol lookup failed'
+open(path, 'wb').write(d)
+print('kmsro shim ready:', path)
+PY
 fi
 
 echo "== configure system =="
