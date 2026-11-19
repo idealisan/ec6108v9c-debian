@@ -112,6 +112,12 @@ jobs:
   build-rootfs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    # Two rootfs variants are built in parallel and published in ONE release:
+    #   desktop = XFCE + Mesa/kmsro + GPU services (original image)
+    #   server  = no X/GPU/desktop; SSH/telnet/WiFi/CLI only (headless server)
+    strategy:
+      matrix:
+        variant: [desktop, server]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -120,15 +126,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            debootstrap qemu-user-static binfmt-support python3 binutils
+            debootstrap qemu-user-static binfmt-support python3
 
-      - name: Build Debian rootfs (SSH + telnet + WiFi firmware + tools)
+      - name: Build Debian rootfs (${{ matrix.variant }})
+        env:
+          ROOTFS_VARIANT: ${{ matrix.variant }}
         run: bash scripts/build-rootfs.sh
 
       - name: Upload rootfs artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rootfs-dist
+          name: rootfs-dist-${{ matrix.variant }}
           path: dist/
           if-no-files-found: error
           retention-days: 5
@@ -159,28 +167,45 @@ jobs:
           name: kernel-dist
           path: dist/
 
-      - name: Download rootfs artifact
+      - name: Download desktop rootfs artifact
         uses: actions/download-artifact@v4
         with:
-          name: rootfs-dist
+          name: rootfs-dist-desktop
           path: dist/
 
-      - name: Build community-format U-disk flash package (legacy fallback)
+      - name: Download server rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-dist-server
+          path: dist/
+
+      - name: Build community-format U-disk flash packages (legacy fallback)
         run: |
           STAMP=$(date -u +%Y%m%dT%H%M%SZ)
           echo "STAMP=$STAMP" >> "$GITHUB_ENV"
-          STAMP="$STAMP" bash scripts/make-community-flash-package.sh
+          STAMP="$STAMP" FLAVOR=desktop IMG_SIZE_MB=900 \
+            WORK=build/community-package-desktop \
+            OUT="dist/mv100-mdmo1g-debian-usb-flash-desktop-$STAMP.zip" \
+            ROOTFS_TAR=dist/debian-rootfs-armhf-bookworm-desktop.tar.gz \
+            bash scripts/make-community-flash-package.sh
+          STAMP="$STAMP" FLAVOR=server IMG_SIZE_MB=600 \
+            WORK=build/community-package-server \
+            OUT="dist/mv100-mdmo1g-debian-usb-flash-server-$STAMP.zip" \
+            ROOTFS_TAR=dist/debian-rootfs-armhf-bookworm-server.tar.gz \
+            bash scripts/make-community-flash-package.sh
 
-      - name: Build recovery-flasher mainline U-disk package (recommended)
-        # Reuses the mainline kernel/rootfs images built above, but swaps the
-        # FLASHER PROGRAM: top-level bootargs.bin becomes a recovery entry
-        # (fatload recovery.img; bootm) driven by the patched STOCK recovery
-        # 3.10 kernel + our terminal-style flasher (HDMI progress log), which
-        # writes p2/p5/p6/p8 by ABSOLUTE LBA from flash.manifest. This is the
-        # method already verified on real hardware; no kernel/rootfs rebuild.
-        # clang/lld above compile only the 15KB ARM flasher ELF, not a toolchain
-        # cross-build, so this adds seconds, not minutes, to the package job.
-        run: STAMP="$STAMP" bash scripts/make-recovery-flash-package.sh
+      - name: Build recovery-flasher U-disk packages (recommended)
+        # Same flasher program for both variants; only the rootfs payload
+        # differs. p1 is never written; writes are absolute LBA from the
+        # generated flash.manifest (HDMI terminal log verified on real HW).
+        run: |
+          for v in desktop server; do
+            STAMP="$STAMP" FLAVOR="$v" \
+              PKG="build/community-package-$v/pkg" \
+              STAGE="build/recovery-mainline-package-$v" \
+              OUT="dist/mv100-mdmo1g-mainline-recovery-flash-$v-$STAMP.zip" \
+              bash scripts/make-recovery-flash-package.sh
+          done
 
       - name: Archive reference materials
         # Opt-in only: these snapshots are multi-GB and would show up as
@@ -211,20 +236,26 @@ jobs:
               * board DTS: bootargs/memory@0/mmc0 alias/ramoops pinned
               * rtl8xxxu (RTL8188FU USB WiFi, 0bda:f179) built in
               * ext4/f2fs/btrfs/xfs/squashfs/overlay/exfat/ntfs3/fuse built in
-          - rootfs: Debian 12 bookworm armhf (debootstrap)
-              * SSH enabled (root / ec6108v9c - CHANGE IT), telnet on 23
+          - rootfs: Debian 12 bookworm armhf (debootstrap), TWO variants:
+              * desktop: XFCE + Mesa lima/kmsro + GPU services (original image)
+              * server:  no X/GPU/desktop packages; SSH/telnet/WiFi/CLI only
+              * both: SSH (root / ec6108v9c - CHANGE IT), telnet on 23
               * DHCP on eth0 and wlx8421f1edf583, wpasupplicant + firmware-realtek
               * lm-sensors, fbset, kbd, console-setup, full CLI toolset
 
-          Assets:
-          - mv100-mdmo1g-mainline-recovery-flash-$STAMP.zip  ** RECOMMENDED **
-            recovery-flasher package: patched stock recovery kernel + terminal
-            flasher (HDMI progress log), absolute-LBA flash.manifest.
-          - mv100-mdmo1g-debian-usb-flash-$STAMP.zip   legacy community-format
-            package (hiboot mmc-write script), kept as a known-good fallback.
+          Assets (pick ONE variant - both flash the same kernel; rootfs differs):
+          - mv100-mdmo1g-mainline-recovery-flash-desktop-$STAMP.zip  ** RECOMMENDED **
+            recovery-flasher + DESKTOP rootfs (XFCE, 4K30 verified on real HW).
+          - mv100-mdmo1g-mainline-recovery-flash-server-$STAMP.zip   ** RECOMMENDED **
+            recovery-flasher + SERVER rootfs (headless, no desktop/GPU services).
+          - mv100-mdmo1g-debian-usb-flash-desktop-$STAMP.zip   legacy community-format
+            desktop package (hiboot mmc-write script), known-good fallback.
+          - mv100-mdmo1g-debian-usb-flash-server-$STAMP.zip    legacy community-format
+            server package, known-good fallback.
           - hi_kernel.bin        uImage = zImage + DTB, load 0x2000000 -> p6 (LBA 0x7000)
           - modules.tar.gz       kernel modules (/lib/modules)
-          - debian-rootfs-armhf-bookworm.tar.gz  plain rootfs tarball (not for flashing)
+          - debian-rootfs-armhf-bookworm-desktop.tar.gz  plain desktop rootfs (not for flashing)
+          - debian-rootfs-armhf-bookworm-server.tar.gz   plain server rootfs (not for flashing)
           - patches/kernel/*     kernel patches applied during the build
           - SHA256SUMS.txt
 
@@ -237,7 +268,7 @@ jobs:
              -> patched stock recovery kernel lights HDMI and runs the terminal
              flasher: a scrolling "<number> <TEXT>" log, then writes p2/p5/p6/p8
              by absolute LBA. Stops at "6 DONE NO REBOOT".
-          4. Power off, remove stick, boot normally -> mainline 6.x from p6.
+          4. Power off, remove stick, boot normally -> Linux 7.4 from p6.
              First boot: resize2fs grows p8, SSH/telnet come up on DHCP.
 
           BOOT DISPLAY (best effort, NOT verified on real HW): the kernel carries
@@ -258,7 +289,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "build-$STAMP" \
-            --title "$STAMP · debian12-armhf + histb-7.4 + recovery-flasher USB" \
+            --title "$STAMP · debian12-armhf + histb-7.4 + desktop+server USB" \
             --notes-file RELEASE_NOTES.md \
             dist/*
 
@@ -270,6 +301,9 @@ jobs:
     needs: [build-rootfs]
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    strategy:
+      matrix:
+        variant: [desktop, server]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -284,22 +318,22 @@ jobs:
       - name: Download rootfs artifact
         uses: actions/download-artifact@v4
         with:
-          name: rootfs-dist
+          name: rootfs-dist-${{ matrix.variant }}
           path: dist/
 
-      - name: Boot under QEMU and verify SSH
+      - name: Boot under QEMU and verify SSH (${{ matrix.variant }})
         # Same script as the local test (scripts/qemu-local-test.sh): the
         # rootfs is booted directly as an initramfs, so no disk image and no
         # initrd from the Debian kernel package are needed.
         run: |
-          ROOTFS_TAR=dist/debian-rootfs-armhf-bookworm.tar.gz \
-          WORK=build/qemu/local \
-          CONSOLE_LOG=build/qemu/local-console.log \
+          ROOTFS_TAR=dist/debian-rootfs-armhf-bookworm-${{ matrix.variant }}.tar.gz \
+          WORK=build/qemu/local-${{ matrix.variant }} \
+          CONSOLE_LOG=build/qemu/local-${{ matrix.variant }}-console.log \
             bash scripts/qemu-local-test.sh
 
       - name: Upload QEMU console log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qemu-console-log
-          path: build/qemu/local-console.log
+          name: qemu-console-log-${{ matrix.variant }}
+          path: build/qemu/local-${{ matrix.variant }}-console.log

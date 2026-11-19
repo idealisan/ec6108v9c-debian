@@ -67,21 +67,30 @@ CI 每次 fetch 干净基线，不受这些本地状态影响。
   - `extra_cmdline`：追加内核参数（如 `cma=160M`；会同时进 DTB 和 p2 runtime env，**不只是 DTB**）
   - `archive_refs`：是否归档约 2GB 的第三方快照，默认 `false`
   - `fb_*`：仅 simplefb 路径使用的 framebuffer 参数
-- 并行 job：`build-kernel`（quilt + defconfig + 硬断言）与 `build-rootfs`（debootstrap）各自产出 artifact；
-  `package` 汇总后生成两个刷机包；`qemu-boot-test` 复用 rootfs 验证能启动且 SSH 可达。
+- 并行 job：`build-kernel`（quilt + defconfig + 硬断言）与 `build-rootfs`（debootstrap，desktop/server 两个变体）
+  各自产出 artifact；`package` 汇总后生成四个刷机包（桌面/服务器 × recovery/community）；
+  `qemu-boot-test` 对两个变体分别验证能启动且 SSH 可达。
 - 制品以 CI release 为准；本地只做只读分析和轻量校验（不本地出包、不直接写真机）。
 
 ## 产物
 
 | 文件 | 说明 |
 |---|---|
-| `mv100-mdmo1g-mainline-recovery-flash-*.zip` | **推荐**：recovery-flasher 包，打补丁的 stock recovery 3.10 内核 + 终端 flasher（HDMI 进度日志），按绝对 LBA 写 p2/p5/p6/p8 |
-| `mv100-mdmo1g-debian-usb-flash-*.zip` | 社区格式包（hiboot mmc-write 脚本），known-good fallback |
+| `mv100-mdmo1g-mainline-recovery-flash-desktop-*.zip` | **推荐（桌面版）**：recovery-flasher 包 + XFCE 桌面 rootfs；已真机验证 1920x1080/4K30 |
+| `mv100-mdmo1g-mainline-recovery-flash-server-*.zip` | **推荐（服务器版）**：同一刷机程序 + **无桌面** rootfs（只有 SSH/telnet/WiFi/CLI），适合长期当 server 用 |
+| `mv100-mdmo1g-debian-usb-flash-{desktop,server}-*.zip` | 社区格式 legacy fallback（hiboot mmc-write 脚本），两个变体各一个 |
 | `hi_kernel.bin` | uImage = zImage + DTB，加载 `0x2000000`，写入 p6（LBA `0x7000`） |
 | `modules.tar.gz` | 内核模块 `/lib/modules` |
-| `debian-rootfs-armhf-bookworm.tar.gz` | 纯 rootfs tarball（参考用，不直接刷） |
+| `debian-rootfs-armhf-bookworm-{desktop,server}.tar.gz` | 两种变体的纯 rootfs tarball（参考用，不直接刷） |
 | `patches/kernel/*` / `SHA256SUMS.txt` | 构建时使用的补丁与校验和 |
 | `references-*.tar.gz` / `snapshot-*.tar.gz` | 可选资料快照，仅在 `archive_refs=true` 时生成 |
+
+每次发布同时产出 **desktop** 和 **server** 两个变体，刷机流程相同，只是 rootfs 不同：
+
+- **desktop**：XFCE + Mesa lima/kmsro + GPU 服务；可进桌面，默认软件渲染，
+  4K30 已真机验证；GPU 模式在浏览器负载下会 lima job timeout，不建议日常使用。
+- **server**：不装 X/Mesa/XFCE，不启用 GPU/桌面服务；开机进 TTY，SSH/telnet 可用，
+  适合长期当服务器。内核与刷机包其余部分与 desktop 版一致。
 
 ## 刷机方式
 

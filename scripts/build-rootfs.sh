@@ -12,6 +12,13 @@ ROOT=${ROOT:-build/rootfs}
 DIST=${DIST:-dist}
 TARGET_HOST=${TARGET_HOST:-ec6108v9c}
 ROOT_PASSWD=${ROOT_PASSWD:-ec6108v9c}
+# desktop = XFCE + Mesa/kmsro + GPU services (default, keeps old behaviour)
+# server  = no X/GPU/desktop packages; SSH/telnet/WiFi/CLI only
+ROOTFS_VARIANT=${ROOTFS_VARIANT:-desktop}
+case "$ROOTFS_VARIANT" in
+  desktop|server) ;;
+  *) echo "ERROR: ROOTFS_VARIANT must be desktop or server" >&2; exit 1 ;;
+esac
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT_DIR"
@@ -91,11 +98,15 @@ sudo DEBIAN_FRONTEND=noninteractive chroot "$ROOT" /debootstrap/debootstrap --se
 # debootstrap's foreign stage, but with a complete dpkg DB + base-passwd it is
 # fine here. policy-rc.d (above) still prevents daemons from actually starting
 # inside the chroot.
-echo "== apt-get install GPU desktop (XFCE + Mesa lima + X) =="
-sudo chroot "$ROOT" apt-get update
-sudo DEBIAN_FRONTEND=noninteractive chroot "$ROOT" \
-    apt-get install -y --no-install-recommends "${DESKTOP_PACKAGES[@]}"
-sudo chroot "$ROOT" apt-get clean
+if [ "$ROOTFS_VARIANT" = desktop ]; then
+  echo "== apt-get install GPU desktop (XFCE + Mesa lima + X) =="
+  sudo chroot "$ROOT" apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive chroot "$ROOT" \
+      apt-get install -y --no-install-recommends "${DESKTOP_PACKAGES[@]}"
+  sudo chroot "$ROOT" apt-get clean
+else
+  echo "== server variant: skip X/Mesa/XFCE packages =="
+fi
 
 # ---- Mesa kmsro shim: make libgbm/glamor render card0 with the Mali-450 ----
 # The on-SoC display engine registers as DRM driver "histb-vdp" and has no
@@ -108,7 +119,7 @@ sudo chroot "$ROOT" apt-get clean
 # Rebuild .gnu.hash after the rename; no binutils cross-tool needed. The
 # original lima_dri.so stays untouched, so renderD128 keeps working.
 DRIDIR="$ROOT/usr/lib/arm-linux-gnueabihf/dri"
-if [ -f "$DRIDIR/lima_dri.so" ]; then
+if [ "$ROOTFS_VARIANT" = desktop ] && [ -f "$DRIDIR/lima_dri.so" ]; then
   echo "== install histb-vdp kmsro shim (lima, rebuild .gnu.hash) =="
   sudo cp "$DRIDIR/lima_dri.so" "$DRIDIR/histb-vdp_dri.so"
   sudo python3 - "$DRIDIR/histb-vdp_dri.so" <<'PY'
@@ -310,16 +321,13 @@ UNIT_EOF
 sudo ln -sf /etc/systemd/system/ec6108-dns-init.service \
     "$ROOT/etc/systemd/system/multi-user.target.wants/ec6108-dns-init.service"
 
-# ---- GPU (Mali-450 / mainline lima) --------------------------------------
-# lima is built as a MODULE (=m), never built-in: probing it reads GPU
-# registers and, built-in, could stall the boot critical path (a built-in
-# lima probe previously turned into an unknown-block(0,0) boot panic). Load it
-# only AFTER userspace/network/SSH are up via a time-bounded, non-fatal unit.
-# Enabled by default so the GPU is usable right after flashing; because the
-# module probe is off the boot path and wrapped in timeouts + exit 0, even a
-# stuck probe cannot affect mounting root or reaching SSH. If it ever needs to
-# be parked for debugging, disable online: systemctl disable ec6108-gpu.
-sudo tee "$ROOT/etc/systemd/system/ec6108-gpu.service" >/dev/null <<'UNIT_EOF'
+if [ "$ROOTFS_VARIANT" = desktop ]; then
+  # ---- GPU (Mali-450 / mainline lima) ------------------------------------
+  # lima is built as a MODULE (=m), never built-in: probing it reads GPU
+  # registers and, built-in, could stall the boot critical path. Load it only
+  # AFTER userspace/network/SSH are up via a time-bounded, non-fatal unit.
+  # A stuck probe cannot affect mounting root or reaching SSH.
+  sudo tee "$ROOT/etc/systemd/system/ec6108-gpu.service" >/dev/null <<'UNIT_EOF'
 [Unit]
 Description=Load lima (Mali-450) DRM driver after userspace is ready
 After=systemd-networkd.service ssh.service
@@ -334,9 +342,12 @@ TimeoutStartSec=30
 [Install]
 WantedBy=multi-user.target
 UNIT_EOF
-# Enable the unit (see comment above): safe because it starts only after SSH.
-sudo ln -sf /etc/systemd/system/ec6108-gpu.service \
-    "$ROOT/etc/systemd/system/multi-user.target.wants/ec6108-gpu.service"
+  # Enable the unit (see comment above): safe because it starts only after SSH.
+  sudo ln -sf /etc/systemd/system/ec6108-gpu.service \
+      "$ROOT/etc/systemd/system/multi-user.target.wants/ec6108-gpu.service"
+else
+  echo "== server variant: skip GPU/lima autoload service =="
+fi
 
 # ---- time: no hardware RTC, so use Debian's file-backed software clock ----
 # The mainline kernel has CONFIG_RTC_CLASS off and the DTB carries no rtc
@@ -449,6 +460,7 @@ EC6108V9C / Hi3798MV100 - Debian $SUITE armhf
 serial console: ttyAMA0 115200, login root
 EOF
 
+if [ "$ROOTFS_VARIANT" = desktop ]; then
 # ---- GPU-accelerated X desktop (docs/055) ---------------------------------
 # X server uses the modesetting DDX with DRI3/PRIME: drm-histb (KMS display)
 # owns /dev/dri/card0, lima (render node) renders via kmsro, and the desktop
@@ -540,6 +552,9 @@ sudo tee "$ROOT/root/.xinitrc" >/dev/null <<'XINIT_EOF'
 exec startxfce4
 XINIT_EOF
 sudo chmod 755 "$ROOT/root/.xinitrc"
+else
+  echo "== server variant: skip X config / XFCE autostart / gpu-mode =="
+fi
 
 echo "== device helper scripts =="
 sudo cp -a "$ROOT_DIR/rootfs/usr/local/bin/." "$ROOT/usr/local/bin/"
@@ -566,5 +581,7 @@ echo "  payload now: $(du -sh "$ROOT" | cut -f1)"
 cleanup
 trap - EXIT
 
-sudo tar --numeric-owner -czf "$DIST/debian-rootfs-$ARCH-$SUITE.tar.gz" -C "$ROOT" .
-ls -l "$DIST/debian-rootfs-$ARCH-$SUITE.tar.gz"
+ROOTFS_TAR_NAME="debian-rootfs-$ARCH-$SUITE-$ROOTFS_VARIANT.tar.gz"
+sudo tar --numeric-owner -czf "$DIST/$ROOTFS_TAR_NAME" -C "$ROOT" .
+ls -l "$DIST/$ROOTFS_TAR_NAME"
+echo "rootfs variant: $ROOTFS_VARIANT -> $DIST/$ROOTFS_TAR_NAME"

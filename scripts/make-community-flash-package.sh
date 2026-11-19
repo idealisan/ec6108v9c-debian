@@ -59,7 +59,9 @@ if [ -f "$ROOT_DIR/configs/partition-layout.env" ]; then
   set +a
 fi
 
-WORK=build/community-package
+WORK=${WORK:-build/community-package}
+# Variant label is only informational (printed in the package README).
+FLAVOR=${FLAVOR:-desktop}
 rm -rf "$WORK"
 mkdir -p "$WORK/root" "$WORK/pkg/mv100" "$DIST"
 
@@ -264,6 +266,7 @@ SAFETY
 If the box ever fails to boot, re-flash the community Ubuntu package with
 the same short-pads method - that path is proven to work.
 EOF
+printf '\nROOTFS VARIANT: %s\n' "$FLAVOR" >> "$WORK/pkg/README.txt"
 
 ( cd "$WORK/pkg" && sha256sum bootargs.bin mv100/* > SHA256SUMS.txt )
 ( cd "$WORK/pkg" && zip -q -r "$ROOT_DIR/$OUT" . )

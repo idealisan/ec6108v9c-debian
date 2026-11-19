@@ -71,6 +71,9 @@
 | 052 | `052-mainline-kernel-vendor-driver-plan.md` — 方向调整：6.3 + backport 海思私有显示驱动 |
 | 055 | `055-histb-drm-backport-plan.md` — 把 histb DRM KMS backport 到 6.3（含结论修正） |
 | 056 | `056-7.4-driver-bringup-plan.md` — 7.4 内核硬件驱动移植与验证计划 |
+| 057 | `057-ssh-only-verify-checklist.md` — 无串口环境下的 SSH-only 验证清单 |
+| 058 | `058-7.4-first-hw-verify.md` — 7.4 首次真机验证（启动/GPU/4K/浏览器） |
+| 059 | `059-h264-decode-test.md` — H.264 硬解实测（当前包无 V4L2 M2M 设备） |
 
 ## 维护约定
 

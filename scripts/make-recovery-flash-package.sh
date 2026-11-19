@@ -33,6 +33,7 @@ STAMP=${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}
 PKG=${PKG:-build/community-package/pkg}
 STAGE=${STAGE:-build/recovery-mainline-package}
 OUT=${OUT:-$DIST/mv100-mdmo1g-mainline-recovery-flash-$STAMP.zip}
+FLAVOR=${FLAVOR:-desktop}
 
 echo "[1/6] 检查前置主线镜像 (来自 make-community-flash-package.sh)"
 for f in bootargs.bin logo.img hi_kernel.bin debian-root.ext4; do
@@ -118,6 +119,7 @@ SAFETY / RECOVERY:
     fallback in the same release.
   - No flash.manifest => zero eMMC writes (flasher is display/diagnostic only).
 EOF
+printf '\nROOTFS VARIANT: %s\n' "$FLAVOR" >> "$STAGE/README.txt"
 # Real-HW verify SOP (docs/053): L0 green band / L1 TTY / L2 IP, so a single
 # flash gives a decidable signal for the next iteration. Best-effort: if the
 # doc is absent the package still builds.
