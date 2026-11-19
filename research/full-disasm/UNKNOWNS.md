@@ -105,3 +105,4 @@
   无法完成（不是遗漏，是确证不存在）；已改从内核侧 + SDK 真源码还原（display_chain.md §2）。
 - 所有产物只读、写入仅 `TMP/stock-rom-research/full-disasm/`；仓库工作区未改动
   （`git status` 的两条遗留项 `scripts/qemu-boot-test.sh`/submodule 为既存、非本轮产生）。
+  （2026-11-19 更新：这两条遗留已处理，脚本删除已提交、子模块已切到 7.4-rc2，详见 `README.md`。）
